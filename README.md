@@ -97,11 +97,11 @@ What we ported and tuned:
 
 ## Why this exists
 
-Conventional wisdom says NVIDIA is fast but power-hungry; Apple is efficient but slower. On paper, that checks out, 267 tok/s at 350 W on llama.cpp vs 229 tok/s at 130 W on an M5 Max.
+Local AI should be a default, not a privilege. Running capable models on your own machine keeps your data private, skips the per-token bill, and removes the vendor dependency. The hardware to do it already sits on desks: an RTX 3090, a Ryzen AI MAX+ 395, an Apple M-series chip. The software to run those chips well doesn't.
 
-We've thought the problem was never the hardware. It was ~100 kernel launches per token. It was speculative decoding research stuck on H100 BF16 demos while consumer GPU users ran chain EAGLE. It was generic software on capable silicon.
+General-purpose frameworks won the last decade for a reason: hand-tuning a kernel for every chip and every model was too expensive to justify. So everyone ships one stack that's decent on everything and great on nothing. Most of the silicon's capability stays on the floor.
 
-Lucebox is where we publish the fixes. Each project is a standalone artifact, a kernel, a spec-decode port, a benchmark harness, with full writeup and MIT source. Together they build toward a single command surface, `lucebox`, that makes local inference on consumer chips a one-line install.
+That calculus is flipping. AI-assisted development makes per-chip, per-model rewrites tractable in days instead of months. A kernel that would have taken a small team a quarter now fits inside a single release cycle. Lucebox is where we publish those rewrites: one chip, one model family, one optimization problem at a time. Each artifact ships standalone, a kernel, a spec-decode port, a benchmark harness, with full writeup and MIT source. Together they build toward a single command surface, `lucebox`, that makes local inference on consumer chips a one-line install.
 
 ---
 
@@ -162,9 +162,9 @@ Per-project citations live in each subproject's README.
 ## Inspired by
 
 - [Hazy Research](https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles): megakernel idea and the intelligence-per-watt methodology.
-- [DDTree (Ringel et al., 2025)](https://arxiv.org/abs/2502.20762): tree-structured verify for speculative decoding, what DFlash 27B leans on for its 3.5× speedup.
+- [z-lab/DFlash](https://arxiv.org/abs/2502.20762) (Wang et al., 2025): block-diffusion speculative decoding algorithm. We use their published Qwen3.5-27B-DFlash draft weights as-is.
+- [DDTree](https://arxiv.org/abs/2604.12989) (Ringel & Romano, 2025): tree-structured verify that DFlash 27B uses for its 3.5× speedup over chain spec decoding. [liranringel/ddtree](https://github.com/liranringel/ddtree).
 - [AlpinDale/qwen_megakernel](https://github.com/AlpinDale/qwen_megakernel), [Infatoshi/MegaQwen](https://github.com/Infatoshi/MegaQwen): prior art on fused Qwen kernels.
-- [z-lab/dflash](https://github.com/z-lab/dflash): the linear-attention kernel work whose name we borrow for project 02.
 
 ---
 
