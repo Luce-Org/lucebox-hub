@@ -35,7 +35,7 @@ GSM8K                 37.65         96.15          2.55x
 
 On a 24 GB RTX 3090 with Q4_K_M weights, autoregressive decode of Qwen3.5-27B hits ~37.7 tok/s regardless of framework. Every token reads the full model from VRAM.
 
-Speculative decoding breaks that ceiling: a tiny draft proposes multiple tokens per step, the target verifies them in one forward. [DFlash (z-lab, 2025)](https://arxiv.org/abs/2602.06036) takes this further with **block-diffusion drafting**: a 5-layer non-causal denoising draft conditioned on captured target hidden states. Accepts ~8 tokens/step vs ~3 for chain EAGLE. The official draft is [`z-lab/Qwen3.5-27B-DFlash`](https://huggingface.co/z-lab/Qwen3.5-27B-DFlash). [DDTree (Ringel & Romano, 2025)](https://arxiv.org/abs/2604.12989) adds tree-structured verify on top, recovering the last 30% of the speedup.
+Speculative decoding breaks that ceiling: a tiny draft proposes multiple tokens per step, the target verifies them in one forward. [DFlash (z-lab, 2026)](https://arxiv.org/abs/2602.06036) takes this further with **block-diffusion drafting**: a 5-layer non-causal denoising draft conditioned on captured target hidden states. Accepts ~8 tokens/step vs ~3 for chain EAGLE. The official draft is [`z-lab/Qwen3.5-27B-DFlash`](https://huggingface.co/z-lab/Qwen3.5-27B-DFlash). [DDTree (Ringel & Romano, 2026)](https://arxiv.org/abs/2604.12989) adds tree-structured verify on top, recovering the last 30% of the speedup.
 
 **What was missing:** no public implementation ran either on consumer hardware. z-lab targets BF16 on B200 (60+ GB VRAM). No GGUF path. No DDTree port. AWQ INT4 of the target + BF16 draft doesn't leave room for the verify tree on 24 GB.
 
@@ -174,18 +174,18 @@ Open an issue or PR against `Luce-Org/lucebox-hub`. Good first picks:
   year   = {2026}
 }
 
-@article{dflash2025,
+@article{dflash2026,
   title   = {DFlash: Block-Diffusion Speculative Decoding},
   author  = {z-lab},
   journal = {arXiv:2602.06036},
-  year    = {2025}
+  year    = {2026}
 }
 
-@article{ddtree2025,
+@article{ddtree2026,
   title   = {Accelerating Speculative Decoding with Block Diffusion Draft Trees},
   author  = {Ringel, Liran and Romano, Yaniv},
   journal = {arXiv:2604.12989},
-  year    = {2025}
+  year    = {2026}
 }
 ```
 

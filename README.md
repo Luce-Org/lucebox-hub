@@ -99,8 +99,8 @@ python3 scripts/bench_llm.py
 **The constraint that shaped the project.** AWQ INT4 of Qwen3.5-27B plus the BF16 draft doesn't leave room for the DDTree verify state on a 24 GB card. Q4_K_M GGUF (~16 GB target) is the largest format that fits target + 3.46 GB draft + budget=22 tree state + KV cache in 24 GB on the RTX 3090. Picking it forced a new port on top of ggml, since no public DFlash runtime supports a GGUF target.
 
 **What we built vs what we didn't.** The algorithms are not ours:
-- [**DFlash**](https://arxiv.org/abs/2602.06036) (z-lab, 2025): block-diffusion draft conditioned on target hidden states.
-- [**DDTree**](https://arxiv.org/abs/2604.12989) (Ringel et al., 2025): tree-structured verify that beats chain verify at the same compute budget.
+- [**DFlash**](https://arxiv.org/abs/2602.06036) (z-lab, 2026): block-diffusion draft conditioned on target hidden states.
+- [**DDTree**](https://arxiv.org/abs/2604.12989) (Ringel et al., 2026): tree-structured verify that beats chain verify at the same compute budget.
 
 What we ported and tuned:
 - C++/CUDA decode engine on top of ggml (no libllama, no Python runtime, Q4_K_M target path).
@@ -170,8 +170,8 @@ Per-project citations live in each subproject's README.
 ## Inspired by
 
 - [Hazy Research](https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles): megakernel idea and the intelligence-per-watt methodology.
-- [z-lab/DFlash](https://arxiv.org/abs/2602.06036) (Wang et al., 2025): block-diffusion speculative decoding algorithm. We use their published Qwen3.5-27B-DFlash draft weights as-is.
-- [DDTree](https://arxiv.org/abs/2604.12989) (Ringel & Romano, 2025): tree-structured verify that DFlash 27B uses for its 3.5× speedup over chain spec decoding. [liranringel/ddtree](https://github.com/liranringel/ddtree).
+- [z-lab/DFlash](https://arxiv.org/abs/2602.06036) (Wang et al., 2026): block-diffusion speculative decoding algorithm. We use their published Qwen3.5-27B-DFlash draft weights as-is.
+- [DDTree](https://arxiv.org/abs/2604.12989) (Ringel & Romano, 2026): tree-structured verify that DFlash 27B uses for its 3.5× speedup over chain spec decoding. [liranringel/ddtree](https://github.com/liranringel/ddtree).
 - [AlpinDale/qwen_megakernel](https://github.com/AlpinDale/qwen_megakernel), [Infatoshi/MegaQwen](https://github.com/Infatoshi/MegaQwen): prior art on fused Qwen kernels.
 
 ---
