@@ -109,6 +109,7 @@ static int argmax_f32(const float * x, int n) {
 static constexpr int KQ_MASK_PAD = 32;
 static int g_kq_stride_pad = KQ_MASK_PAD;   // overridden to 256 when TBQ KV is active
 static int g_max_ctx_override = 0;           // overridden by --max-ctx=N (default 4096)
+static int g_fa_window       = 2048;         // overridden by DFLASH27B_FA_WINDOW=N
 static int align_up(int x, int a) { return ((x + a - 1) / a) * a; }
 
 // F16 encoding for the two values we use: 0 and -inf.
@@ -117,14 +118,18 @@ static constexpr uint16_t F16_ZERO = 0x0000;
 static constexpr uint16_t F16_NEG_INF = 0xFC00;
 
 static void build_causal_mask(std::vector<uint16_t> & out,
-                              int kv_len, int n_tokens, int kv_start) {
+                              int kv_len, int n_tokens, int kv_start,
+                              int win_start = 0) {
     const int kv_pad = align_up(kv_len, g_kq_stride_pad);
     const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
     out.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
+    const int abs_end = win_start + kv_len;
     for (int q = 0; q < n_tokens; q++) {
-        const int max_k = kv_start + q;
-        for (int k = 0; k <= max_k && k < kv_len; k++) {
-            out[(size_t)q * kv_pad + k] = F16_ZERO;
+        const int abs_q = kv_start + q;
+        const int min_k = std::max(0, win_start);
+        const int max_k = abs_q;
+        for (int k = min_k; k <= max_k && k < abs_end; k++) {
+            out[(size_t)q * kv_pad + (k - win_start)] = F16_ZERO;
         }
     }
 }
@@ -421,21 +426,20 @@ static std::vector<int> follow_verified_tree(const DDTree & tree,
 //                                     = -inf otherwise
 // Shape matches the ggml flash_attn_ext expectation: [kv_pad, q_pad] f16.
 static void build_tree_mask(const DDTree & tree, int past_length,
-                            std::vector<uint16_t> & out_mask) {
+                            std::vector<uint16_t> & out_mask,
+                            int win_start = 0) {
     const int N      = 1 + tree.n_nodes;
-    const int kv_len = past_length + N;
-    const int kv_pad = align_up(kv_len, g_kq_stride_pad);
+    const int win_len = past_length + N - win_start;
+    const int kv_pad = align_up(win_len, g_kq_stride_pad);
     const int q_pad  = align_up(N,      KQ_MASK_PAD);
     out_mask.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
     for (int q = 0; q < N; q++) {
-        // Past KV (prompt + previously-committed decode tokens): always visible.
-        for (int k = 0; k < past_length; k++) {
-            out_mask[(size_t)q * kv_pad + k] = F16_ZERO;
+        for (int k = std::max(0, win_start); k < past_length; k++) {
+            out_mask[(size_t)q * kv_pad + (k - win_start)] = F16_ZERO;
         }
-        // Tree region: ancestors-only per the tree.visibility matrix.
         for (int j = 0; j < N; j++) {
             if (tree.visibility[(size_t)q * N + j]) {
-                out_mask[(size_t)q * kv_pad + (past_length + j)] = F16_ZERO;
+                out_mask[(size_t)q * kv_pad + (past_length + j - win_start)] = F16_ZERO;
             }
         }
     }
@@ -492,6 +496,79 @@ static void step_graph_destroy(StepGraph & sg) {
     step_graph_free(sg);
 }
 
+// Build a single-layer forward graph for layer-segmented prefill.
+// Processes n_tokens tokens through one layer, reading from act_in and
+// writing to act_out. Returns false on failure.
+static bool build_layer_step(
+    StepGraph & sg,
+    const TargetWeights & w,
+    TargetCache & cache,
+    ggml_backend_t backend,
+    int layer_idx,
+    ggml_tensor * act_in,      // [hidden, prompt_len] full activation buffer
+    ggml_tensor * act_out,     // [hidden, prompt_len] full activation buffer
+    int chunk_start,           // token offset into activation buffers
+    int n_tokens,
+    int kv_start,
+    bool with_mask,
+    bool capture,
+    int fa_window = 0)
+{
+    step_graph_free(sg);
+
+    const bool is_attn = (((layer_idx + 1) % w.full_attention_interval) == 0);
+
+    ggml_init_params ip{};
+    ip.mem_size   = 512 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    sg.ctx = ggml_init(ip);
+    if (!sg.ctx) return false;
+
+    const int hidden = DFLASH27B_TARGET_HIDDEN;
+
+    sg.inp_embed = ggml_view_2d(sg.ctx, act_in,
+        hidden, n_tokens,
+        act_in->nb[1], (size_t)chunk_start * act_in->nb[1]);
+    ggml_set_name(sg.inp_embed, "inp_embed");
+    ggml_set_input(sg.inp_embed);
+
+    if (is_attn) {
+        sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
+        ggml_set_name(sg.positions, "positions");
+        ggml_set_input(sg.positions);
+
+        if (with_mask) {
+            const int win_start_l = (fa_window > 0 && kv_start > fa_window)
+                                        ? (kv_start - fa_window) : 0;
+            const int win_len_l = kv_start + n_tokens - win_start_l;
+            const int kv_pad = align_up(win_len_l, g_kq_stride_pad);
+            const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
+            sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
+            ggml_set_name(sg.attn_mask, "attn_mask");
+            ggml_set_input(sg.attn_mask);
+        }
+    }
+
+    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+
+    ggml_tensor * layer_out = dflash27b::build_qwen35_layer(
+        sg.ctx, sg.gf, w, cache, layer_idx,
+        sg.inp_embed, sg.positions, sg.attn_mask,
+        kv_start, n_tokens, capture, fa_window);
+    if (!layer_out) return false;
+
+    ggml_tensor * out_view = ggml_view_2d(sg.ctx, act_out,
+        hidden, n_tokens,
+        act_out->nb[1], (size_t)chunk_start * act_out->nb[1]);
+    ggml_build_forward_expand(sg.gf, ggml_cpy(sg.ctx, layer_out, out_view));
+
+    if (!sg.alloc) {
+        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
+}
+
 // Forward declaration used only by the tree-mode build_target_step_tree.
 struct DDTree;  // full def above
 
@@ -511,7 +588,8 @@ static bool build_target_step_tree(
     TargetCache & cache,
     ggml_backend_t backend,
     int kv_start,
-    int n_tokens);   // implemented below after the regular build_target_step
+    int n_tokens,
+    int fa_window = 0);   // implemented below after the regular build_target_step
 
 static bool build_target_step(
     StepGraph & sg,
@@ -522,7 +600,8 @@ static bool build_target_step(
     int n_tokens,
     bool with_mask,
     bool capture,
-    bool capture_delta_intermediate = false) {
+    bool capture_delta_intermediate = false,
+    int fa_window = 0) {
     step_graph_free(sg);
 
     ggml_init_params ip{};
@@ -546,8 +625,9 @@ static bool build_target_step(
     ggml_set_input(sg.positions);
 
     if (with_mask) {
-        const int kv_len = kv_start + n_tokens;
-        const int kv_pad = align_up(kv_len, g_kq_stride_pad);
+        const int win_start = (fa_window > 0 && kv_start > fa_window) ? (kv_start - fa_window) : 0;
+        const int win_len = kv_start + n_tokens - win_start;
+        const int kv_pad = align_up(win_len, g_kq_stride_pad);
         const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
         sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
         ggml_set_name(sg.attn_mask, "attn_mask");
@@ -564,6 +644,7 @@ static bool build_target_step(
     gi.kv_start                   = kv_start;
     gi.capture_layers             = capture;
     gi.capture_delta_intermediate = capture_delta_intermediate;
+    gi.fa_window                  = fa_window;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
@@ -592,7 +673,8 @@ static bool build_target_step_tree(
     TargetCache & cache,
     ggml_backend_t backend,
     int kv_start,
-    int n_tokens) {
+    int n_tokens,
+    int fa_window) {
     step_graph_free(sg);
 
     ggml_init_params ip{};
@@ -611,15 +693,14 @@ static bool build_target_step_tree(
     ggml_set_name(sg.positions, "positions");
     ggml_set_input(sg.positions);
 
-    const int kv_len = kv_start + n_tokens;
-    const int kv_pad = align_up(kv_len, g_kq_stride_pad);
+    const int win_start = (fa_window > 0 && kv_start > fa_window) ? (kv_start - fa_window) : 0;
+    const int win_len = kv_start + n_tokens - win_start;
+    const int kv_pad = align_up(win_len, g_kq_stride_pad);
     const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
     sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
     ggml_set_name(sg.attn_mask, "attn_mask");
     ggml_set_input(sg.attn_mask);
 
-    // parent_ids[n_tokens] i32 — tree-mode DeltaNet input. -1 = reload from
-    // pre-block state, k = reload from intermediate[k], t-1 = sequential (hot path).
     sg.parent_ids = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
     ggml_set_name(sg.parent_ids, "parent_ids");
     ggml_set_input(sg.parent_ids);
@@ -632,6 +713,7 @@ static bool build_target_step_tree(
     gi.attn_mask                  = sg.attn_mask;
     gi.n_tokens                   = n_tokens;
     gi.kv_start                   = kv_start;
+    gi.fa_window                  = fa_window;
     gi.capture_layers             = true;
     gi.capture_delta_intermediate = true;
     gi.parent_ids                 = sg.parent_ids;
@@ -724,6 +806,9 @@ int main(int argc, char ** argv) {
     if (const char * s = std::getenv("DFLASH27B_KV_TQ3")) {
         if (std::atoi(s) != 0) g_kq_stride_pad = 256;
     }
+    if (const char * s = std::getenv("DFLASH27B_FA_WINDOW")) {
+        g_fa_window = std::max(0, std::atoi(s));
+    }
     const char * target_path = argv[1];
     const char * draft_path  = argv[2];
     const char * prompt_path = (argc >= 6 && argv[3][0] != '-') ? argv[3] : nullptr;
@@ -802,9 +887,9 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "--fast-rollback and --seq-verify are mutually exclusive\n");
         return 2;
     }
-    std::printf("[cfg] seq_verify=%d fast_rollback=%d ddtree=%d budget=%d temp=%.2f chain_seed=%d\n",
+    std::printf("[cfg] seq_verify=%d fast_rollback=%d ddtree=%d budget=%d temp=%.2f chain_seed=%d fa_window=%d\n",
                 (int)seq_verify, (int)fast_rollback, (int)ddtree_mode,
-                ddtree_budget, ddtree_temp, (int)ddtree_chain_seed);
+                ddtree_budget, ddtree_temp, (int)ddtree_chain_seed, g_fa_window);
 
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) { std::fprintf(stderr, "cuda init failed\n"); return 1; }
@@ -834,7 +919,8 @@ int main(int argc, char ** argv) {
             ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, ddtree_budget + 1)
             : DFLASH27B_DRAFT_BLOCK_SIZE);
     TargetCache cache;
-    if (!create_target_cache(w, max_ctx, max_verify_tokens, backend, cache)) {
+    if (!create_target_cache(w, max_ctx, max_verify_tokens, backend, cache,
+                             /*prefill_only=*/true)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
         return 1;
     }
@@ -926,7 +1012,8 @@ int main(int argc, char ** argv) {
                 step_graph_free(sg);
                 sg = StepGraph{};
                 free_target_cache(cache);
-                if (!create_target_cache(w, max_ctx, max_verify_tokens, backend, cache)) {
+                if (!create_target_cache(w, max_ctx, max_verify_tokens, backend, cache,
+                                         /*prefill_only=*/true)) {
                     std::fprintf(stderr, "cache realloc: %s\n", dflash27b_last_error());
                     stream_emit(-1);
                     continue;
@@ -953,27 +1040,177 @@ int main(int argc, char ** argv) {
         int committed = 0;
         int32_t last_tok = -1;
 
-    // ── Prefill: batched decode over prompt. Chunks of up to PREFILL_UBATCH
-    // tokens are pushed through a single forward pass with a causal mask,
-    // matching llama.cpp's n_ubatch behavior. Bit-equivalent to the old
-    // single-token loop because the persistent SSM/conv state + KV cache
-    // advance identically across calls. The last-token logits from the final
-    // chunk seed the decode loop.
-    // Prefill batch size. Default picks a short-prompt-friendly value of 16
-    // (matches the DFlash block_size and chain-verify q_len, so per-chunk
-    // FA drift is smallest) for prompts ≤ 2048 tokens and bumps to 192 for
-    // longer prompts where prefill time dominates. 192 hits the OOM ceiling
-    // from the embedded gated_delta_net intermediate-state region — bigger
-    // batches would need a kernel-side fix. At 192 we get ~878 tok/s on
-    // 13K prompts vs ~336 tok/s at UBATCH=16, with a ~5% AL cost on the
-    // following decode. Override via `DFLASH27B_PREFILL_UBATCH=N` env.
+    // ── Prefill: two modes available ────────────────────────────────────
+    // Layer-segmented: iterate layers (outer) × token chunks (inner).
+    //   Reads each layer's weights once per chunk instead of once per full
+    //   forward. Better L2 cache warmth on weights across token chunks.
+    // Token-segmented (legacy): iterate token chunks (outer) × layers (inner).
+    //   Matches llama.cpp's n_ubatch behavior.
+    // Controlled by DFLASH27B_LAYER_PREFILL=1 env var (default: off).
+    // Currently faster only at short contexts (<8K); at longer contexts the
+    // graph rebuild overhead per layer dominates.
     const int prompt_len_auto = (int)prompt.size();
-    int prefill_ubatch_env = (prompt_len_auto > 2048) ? 192 : 16;
+    bool layer_prefill = false;
+    if (const char * s = std::getenv("DFLASH27B_LAYER_PREFILL")) {
+        layer_prefill = (std::atoi(s) != 0);
+    }
+
+    // ── Layer-segmented prefill ─────────────────────────────────────────
+    if (layer_prefill) {
+        int layer_ubatch_env = 384;
+        if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
+            layer_ubatch_env = std::max(1, std::atoi(s));
+        }
+        const int LAYER_UBATCH = layer_ubatch_env;
+        std::printf("[prefill] layer-segmented ubatch=%d\n", LAYER_UBATCH);
+        const int prompt_len = (int)prompt.size();
+
+        // Allocate ping-pong activation buffers [hidden, prompt_len]
+        ggml_init_params act_ip{};
+        act_ip.mem_size   = (size_t)4 * ggml_tensor_overhead();
+        act_ip.mem_buffer = nullptr;
+        act_ip.no_alloc   = true;
+        ggml_context * act_ctx = ggml_init(act_ip);
+        ggml_tensor * act_in  = ggml_new_tensor_2d(act_ctx, GGML_TYPE_F32, hidden, prompt_len);
+        ggml_set_name(act_in, "act_in");
+        ggml_tensor * act_out = ggml_new_tensor_2d(act_ctx, GGML_TYPE_F32, hidden, prompt_len);
+        ggml_set_name(act_out, "act_out");
+        ggml_backend_buffer_t act_buf = ggml_backend_alloc_ctx_tensors(act_ctx, backend);
+        if (!act_buf) {
+            std::fprintf(stderr, "activation buffer alloc failed\n"); return 1;
+        }
+
+        // Embed all prompt tokens into act_in (batched)
+        {
+            const int EMBED_BATCH = 4096;
+            std::vector<float> emb_buf((size_t)hidden * EMBED_BATCH);
+            for (int i = 0; i < prompt_len; i += EMBED_BATCH) {
+                const int n = std::min(EMBED_BATCH, prompt_len - i);
+                if (!w.embedder.embed(prompt.data() + i, n, emb_buf.data())) return 1;
+                ggml_backend_tensor_set(act_in, emb_buf.data(),
+                                        (size_t)i * act_in->nb[1],
+                                        sizeof(float) * hidden * n);
+            }
+        }
+
+        auto t_pf0 = std::chrono::steady_clock::now();
+        StepGraph lsg;
+
+        for (int il = 0; il < w.n_layer; il++) {
+            const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
+
+            for (int start = 0; start < prompt_len; start += LAYER_UBATCH) {
+                const int n_tokens = std::min(LAYER_UBATCH, prompt_len - start);
+                const int kv_len   = start + n_tokens;
+                const bool with_mask = (g_kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1);
+
+                if (!build_layer_step(lsg, w, cache, backend, il,
+                                      act_in, act_out, start, n_tokens,
+                                      start, with_mask, true)) {
+                    std::fprintf(stderr, "layer-seg build layer=%d @%d\n", il, start);
+                    return 1;
+                }
+
+                // M-RoPE positions for this chunk (FA layers only)
+                if (is_attn && lsg.positions) {
+                    std::vector<int32_t> pos_buf((size_t)4 * n_tokens, 0);
+                    for (int i = 0; i < n_tokens; i++) {
+                        const int p = start + i;
+                        pos_buf[0 * n_tokens + i] = p;
+                        pos_buf[1 * n_tokens + i] = p;
+                        pos_buf[2 * n_tokens + i] = p;
+                        pos_buf[3 * n_tokens + i] = 0;
+                    }
+                    ggml_backend_tensor_set(lsg.positions, pos_buf.data(), 0,
+                                            sizeof(int32_t) * pos_buf.size());
+                }
+
+                if (is_attn && with_mask && lsg.attn_mask) {
+                    std::vector<uint16_t> mask_buf;
+                    build_causal_mask(mask_buf, kv_len, n_tokens, /*kv_start=*/start);
+                    ggml_backend_tensor_set(lsg.attn_mask, mask_buf.data(), 0,
+                                            sizeof(uint16_t) * mask_buf.size());
+                }
+
+                auto st = ggml_backend_graph_compute(backend, lsg.gf);
+                if (st != GGML_STATUS_SUCCESS) {
+                    std::fprintf(stderr, "layer-seg compute layer=%d @%d\n", il, start);
+                    return 1;
+                }
+            }
+
+            // Swap activation buffers after each layer
+            std::swap(act_in, act_out);
+        }
+
+        // Final norm + LM head on last token only
+        {
+            step_graph_free(lsg);
+            ggml_init_params fip{};
+            fip.mem_size   = 512 * 1024 * 1024;
+            fip.mem_buffer = nullptr;
+            fip.no_alloc   = true;
+            lsg.ctx = ggml_init(fip);
+
+            ggml_tensor * last_row = ggml_view_1d(lsg.ctx, act_in,
+                hidden, (size_t)(prompt_len - 1) * act_in->nb[1]);
+            ggml_tensor * normed   = ggml_rms_norm(lsg.ctx, last_row, DFLASH27B_RMS_EPS);
+            normed = ggml_mul(lsg.ctx, normed, w.out_norm);
+            ggml_tensor * logits   = ggml_mul_mat(lsg.ctx, w.output, normed);
+            ggml_set_name(logits, "logits");
+            ggml_set_output(logits);
+            lsg.logits = logits;
+            lsg.gf = ggml_new_graph_custom(lsg.ctx, 1024, false);
+            ggml_build_forward_expand(lsg.gf, logits);
+
+            if (!lsg.alloc) {
+                lsg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            }
+            if (!ggml_gallocr_alloc_graph(lsg.alloc, lsg.gf)) {
+                std::fprintf(stderr, "final norm alloc failed\n"); return 1;
+            }
+
+            auto st = ggml_backend_graph_compute(backend, lsg.gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "final norm compute failed\n"); return 1;
+            }
+
+            std::vector<float> logits_buf(vocab, 0.0f);
+            ggml_backend_tensor_get(lsg.logits, logits_buf.data(), 0,
+                                    sizeof(float) * vocab);
+            last_tok = argmax_f32(logits_buf.data(), vocab);
+            step_graph_destroy(lsg);
+        }
+
+        committed = prompt_len;
+        ggml_backend_buffer_free(act_buf);
+        ggml_free(act_ctx);
+
+        auto t_pf1 = std::chrono::steady_clock::now();
+        std::printf("[prefill] layer-seg %d tokens in %.2f s, last_tok=%d\n",
+                    committed,
+                    std::chrono::duration<double>(t_pf1 - t_pf0).count(),
+                    last_tok);
+
+        // Promote prefill-only cache to full decode cache
+        auto t_mig0 = std::chrono::steady_clock::now();
+        sg = StepGraph{};
+        if (!migrate_prefill_cache(w, max_ctx, max_verify_tokens, backend, cache)) {
+            std::fprintf(stderr, "cache migration: %s\n", dflash27b_last_error());
+            return 1;
+        }
+        auto t_mig1 = std::chrono::steady_clock::now();
+        std::printf("[migrate] %.2f ms\n",
+                    std::chrono::duration<double, std::milli>(t_mig1 - t_mig0).count());
+    }
+    // ── Token-segmented prefill (legacy) ────────────────────────────────
+    if (!layer_prefill) {
+    int prefill_ubatch_env = (prompt_len_auto > 2048) ? 384 : 16;
     if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
         prefill_ubatch_env = std::max(1, std::atoi(s));
     }
     const int PREFILL_UBATCH = prefill_ubatch_env;
-    std::printf("[prefill] ubatch=%d\n", PREFILL_UBATCH);
+    std::printf("[prefill] token-seg ubatch=%d\n", PREFILL_UBATCH);
     auto t_pf0 = std::chrono::steady_clock::now();
     std::vector<uint16_t> pf_mask_buf;
     std::vector<float>    pf_embed_buf;
@@ -983,10 +1220,6 @@ int main(int argc, char ** argv) {
     for (int start = 0; start < prompt_len; start += PREFILL_UBATCH) {
         const int n_tokens = std::min(PREFILL_UBATCH, prompt_len - start);
         const int kv_len   = start + n_tokens;
-
-        // TBQ FA requires kv_len aligned to 256, which means we always need
-        // a mask (padding positions must be -inf). For f16/Q-KV the existing
-        // n_tokens>1 heuristic stays valid.
         const bool pf_with_mask = (g_kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1);
         if (!build_target_step(sg, w, cache, backend,
                                 /*kv_start=*/start, /*n_tokens=*/n_tokens,
@@ -1038,6 +1271,20 @@ int main(int argc, char ** argv) {
                 committed,
                 std::chrono::duration<double>(t_pf1 - t_pf0).count(),
                 last_tok);
+
+    // Promote prefill-only cache to full decode cache with rollback tensors.
+    // Copies KV, SSM/conv state, and target_feat device→device (~1 ms).
+    auto t_mig0 = std::chrono::steady_clock::now();
+    step_graph_free(sg);
+    sg = StepGraph{};
+    if (!migrate_prefill_cache(w, max_ctx, max_verify_tokens, backend, cache)) {
+        std::fprintf(stderr, "cache migration: %s\n", dflash27b_last_error());
+        return 1;
+    }
+    auto t_mig1 = std::chrono::steady_clock::now();
+    std::printf("[migrate] %.2f ms\n",
+                std::chrono::duration<double, std::milli>(t_mig1 - t_mig0).count());
+    } // end if (!layer_prefill)
 
     // ── DFlash decode loop
     int n_draft_steps = 0, n_accept_sum = 0, n_generated = 0;
@@ -1236,7 +1483,8 @@ int main(int argc, char ** argv) {
             const int N = 1 + tree.n_nodes;  // flat size including root
 
             if (!build_target_step_tree(sg, w, cache, backend,
-                                        /*kv_start=*/committed, /*n_tokens=*/N)) {
+                                        /*kv_start=*/committed, /*n_tokens=*/N,
+                                        g_fa_window)) {
                 std::fprintf(stderr, "ddtree verify build failed\n"); return 1;
             }
             T_verify_build = sync_us();
@@ -1265,7 +1513,9 @@ int main(int argc, char ** argv) {
             ggml_backend_tensor_set(sg.positions, pos4.data(), 0, sizeof(int32_t) * 4 * N);
 
             // Ancestor-only attention mask (f16).
-            build_tree_mask(tree, /*past_length=*/committed, mask_buf);
+            const int tree_win_start = (g_fa_window > 0 && committed > g_fa_window)
+                                           ? (committed - g_fa_window) : 0;
+            build_tree_mask(tree, /*past_length=*/committed, mask_buf, tree_win_start);
             ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
                                     sizeof(uint16_t) * mask_buf.size());
 
@@ -1531,10 +1781,12 @@ int main(int argc, char ** argv) {
         }
 
         if (!seq_verify) {
+            const int verify_fa_window = g_fa_window;
             if (!build_target_step(sg, w, cache, backend,
                                     /*kv_start=*/committed, /*n_tokens=*/q_len,
                                     /*with_mask=*/true, /*capture=*/true,
-                                    /*capture_delta_intermediate=*/fast_rollback)) {
+                                    /*capture_delta_intermediate=*/fast_rollback,
+                                    verify_fa_window)) {
                 std::fprintf(stderr, "verify build failed\n"); return 1;
             }
             T_verify_build = sync_us();
@@ -1556,7 +1808,12 @@ int main(int argc, char ** argv) {
             }
             ggml_backend_tensor_set(sg.positions, pos4_buf.data(), 0, sizeof(int32_t) * 4 * q_len);
 
-            build_causal_mask(mask_buf, committed + q_len, q_len, committed);
+            {
+                const int win_start_v = (verify_fa_window > 0 && committed > verify_fa_window)
+                                            ? (committed - verify_fa_window) : 0;
+                const int win_len_v = committed + q_len - win_start_v;
+                build_causal_mask(mask_buf, win_len_v, q_len, committed, win_start_v);
+            }
             ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0, sizeof(uint16_t) * mask_buf.size());
             T_verify_set = sync_us();
             tt_verify_set += std::chrono::duration<double, std::micro>(T_verify_set - T_verify_build).count();
@@ -1781,9 +2038,11 @@ int main(int argc, char ** argv) {
             }
 
             bool replay_with_mask = (commit_n > 1);
+            const int replay_fa_window = g_fa_window;
             if (!build_target_step(sg, w, cache, backend,
                                     committed, commit_n,
-                                    replay_with_mask, /*capture=*/true)) {
+                                    replay_with_mask, /*capture=*/true,
+                                    false, replay_fa_window)) {
                 std::fprintf(stderr, "replay build failed\n"); return 1;
             }
             auto T_replay_build = sync_us();
@@ -1802,7 +2061,10 @@ int main(int argc, char ** argv) {
             }
             ggml_backend_tensor_set(sg.positions, replay_pos.data(), 0, sizeof(int32_t) * 4 * commit_n);
             if (replay_with_mask) {
-                build_causal_mask(mask_buf, committed + commit_n, commit_n, committed);
+                const int win_start_r = (replay_fa_window > 0 && committed > replay_fa_window)
+                                            ? (committed - replay_fa_window) : 0;
+                const int win_len_r = committed + commit_n - win_start_r;
+                build_causal_mask(mask_buf, win_len_r, commit_n, committed, win_start_r);
                 ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0, sizeof(uint16_t) * mask_buf.size());
             }
             auto T_replay_set = sync_us();
