@@ -77,9 +77,17 @@ Set `DFLASH27B_KV_TQ3=1` (TQ3_0, 3.5 bpv, default) or `DFLASH27B_KV_Q4=1` (Q4_0,
 Qwen3.6-27B ships the same `qwen35` architecture string and identical layer/head dims as 3.5, so `test_dflash` loads it with no code change:
 
 ```bash
+# 1. target
 huggingface-cli download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
+
+# 2. matched 3.6 draft (gated: accept terms + set HF_TOKEN first)
+huggingface-cli download z-lab/Qwen3.6-27B-DFlash --local-dir models/draft/
+
+# 3. bench
 DFLASH_TARGET=models/Qwen3.6-27B-Q4_K_M.gguf python3 scripts/bench_he.py --n-gen 128
 ```
+
+> The draft path is fixed at `models/draft/model.safetensors`; swapping targets requires also swapping the draft file (or pointing `DFLASH_DRAFT` at a different `model.safetensors`).
 
 **Throughput is lower than on 3.5.** z-lab published a matched [Qwen3.6-27B-DFlash](https://huggingface.co/z-lab/Qwen3.6-27B-DFlash) draft on 2026-04-26 (still under training). AL should climb as the draft matures. Measured on the same RTX 3090:
 
