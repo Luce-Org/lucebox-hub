@@ -55,3 +55,34 @@ Sweet spot: 220W, 1.87 tok/J.
 - Models larger than 0.8B parameters
 - Multi-GPU or tensor-parallel setups
 - Total system power (CPU, RAM, PSU losses)
+
+## NVIDIA DGX Spark (GB10, sm_121a)
+
+First results for the megakernel on NVIDIA's DGX Spark (GB10). Decode runs
+through a persistent NVFP4 megakernel; prefill uses a bf16 body with an
+NVFP4 LM head (the default "hybrid" prefill mode).
+
+**Hardware:** NVIDIA GB10 Grace Blackwell Superchip (DGX Spark), compute cap
+12.1 (`sm_121a`), driver 580.126.09, CUDA 13.2, PyTorch 2.13.0a (cu13.2).
+
+| Method | Prefill pp520 (tok/s) | Decode tg128 (tok/s) |
+|---|:---:|:---:|
+| **Megakernel (NVFP4 decode, hybrid prefill)** | **20,639** | **181** |
+| PyTorch HuggingFace (bf16) | 5,649 | 65 |
+
+**3.6× PyTorch HF on prefill, 2.8× on decode.** Output tokens match the
+PyTorch reference on the pp520 prompt from `final_bench.py`.
+
+### Run
+
+```bash
+# Auto-dispatches to the NVFP4 path on Blackwell
+python megakernel/final_bench.py
+
+# Or force a backend
+python megakernel/final_bench.py --backend nvfp4
+python megakernel/final_bench.py --backend bf16
+
+# Switch prefill mode (default is "hybrid"; "raw" uses prefill_megakernel_nvfp4)
+MEGAKERNEL_PREFILL_MODE=raw python megakernel/final_bench.py --backend nvfp4
+```

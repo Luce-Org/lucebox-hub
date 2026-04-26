@@ -119,6 +119,12 @@ python final_bench.py    # runs pp520 tg128 (properly warmed), prints tok/s
 - PyTorch 2.0+
 - ~1.5 GB VRAM for BF16 weights
 
+**Blackwell (sm_120 / sm_121a):** runs on Blackwell consumer GPUs (RTX 5090)
+and the NVIDIA DGX Spark (GB10) via an NVFP4 decode path. The build
+auto-detects your GPU and `final_bench.py` dispatches to the right backend;
+use `--backend nvfp4` to force it. First DGX Spark numbers are in
+[RESULTS.md](RESULTS.md#nvidia-dgx-spark-gb10-sm_121a).
+
 **Optional:** Set a power limit to find your GPU's sweet spot:
 ```bash
 sudo nvidia-smi -pl 220    # or whatever your target wattage
@@ -132,10 +138,14 @@ sudo nvidia-smi -pl 220    # or whatever your target wattage
 | `prefill.cu` | Prefill (cuBLAS + standalone kernels) |
 | `torch_bindings.cpp` | PyTorch C++ bindings |
 | `model.py` | Weight loading + decoder |
-| `setup.py` | Build configuration |
+| `setup.py` | Build configuration (arch auto-detect, Blackwell gating) |
 | `final_bench.py` | Benchmark (prefill + decode, 10 warmup + 20 timed runs averaged — use this for published numbers) |
 | `bench_pp_tg.py` | Quick single-run benchmark with correctness check (not warmed, under-reports prefill) |
 | `RESULTS.md` | Full benchmark results and DVFS sweep |
+| `kernel_gb10_nvfp4.cu` | Blackwell-only: NVFP4 persistent decode megakernel |
+| `prefill_megakernel.cu` | Blackwell-only: single-dispatch prefill megakernel |
+| `model_nvfp4.py` | Blackwell-only: NVFP4 decoder driving the ops above |
+| `final_bench_nvfp4.py` / `bench_pp_tg_nvfp4.py` | Blackwell bench siblings dispatched by `--backend nvfp4` |
 
 ## Scope and limitations
 
