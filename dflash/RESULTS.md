@@ -3,7 +3,7 @@
 Target: `unsloth/Qwen3.5-27B-GGUF` (Q4_K_M, ~16 GB).
 Draft:  `z-lab/Qwen3.5-27B-DFlash` (BF16, 3.46 GB).
 Concurrency = 1, greedy decoding, `n_gen=256`.
-Reproduce with `uv run scripts/bench_llm.py` (samples 10 prompts/dataset, seed=42).
+Reproduce with `python3 scripts/bench_llm.py` (samples 10 prompts/dataset, seed=42).
 
 ## Headline — AR vs Luce DFlash at concurrency 1
 
@@ -237,7 +237,7 @@ Starting point: Chain DFlash at 112.8 tok/s mean on HumanEval, AL 7.67.
 - Full bench (10×3 = 30 prompts): ~15 min.
 - All numbers above reproduced on 2026-04-20 from commit `5bb7f8c` with:
   ```
-  uv run scripts/bench_llm.py
+  python3 scripts/bench_llm.py
   ```
 
 ## Hardware ceiling notes

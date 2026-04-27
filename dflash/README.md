@@ -111,10 +111,10 @@ Qwen3.6-27B ships the same `qwen35` architecture string and identical layer/head
 
 ```bash
 # 1. target
-hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
+huggingface-cli download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
 
 # 2. matched 3.6 draft (gated: accept terms + set HF_TOKEN first)
-hf download z-lab/Qwen3.6-27B-DFlash --local-dir models/draft/
+huggingface-cli download z-lab/Qwen3.6-27B-DFlash --local-dir models/draft/
 
 # 3. bench
 DFLASH_TARGET=models/Qwen3.6-27B-Q4_K_M.gguf python3 scripts/bench_he.py --n-gen 128
@@ -155,8 +155,8 @@ cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target test_dflash -j
 
 # Fetch models: ~16 GB target + 3.46 GB draft
-hf download unsloth/Qwen3.5-27B-GGUF Qwen3.5-27B-Q4_K_M.gguf --local-dir models/
-hf download z-lab/Qwen3.5-27B-DFlash model.safetensors --local-dir models/draft/
+huggingface-cli download unsloth/Qwen3.5-27B-GGUF Qwen3.5-27B-Q4_K_M.gguf --local-dir models/
+huggingface-cli download z-lab/Qwen3.5-27B-DFlash model.safetensors --local-dir models/draft/
 
 # Streaming one-shot generate
 python3 scripts/run.py --prompt "def fibonacci(n):"
