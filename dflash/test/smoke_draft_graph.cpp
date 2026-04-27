@@ -52,13 +52,7 @@ int main(int argc, char ** argv) {
     }
     const char * path = argv[1];
     const int ctx_len = (argc >= 3) ? std::atoi(argv[2]) : 64;
-    const int q_len   = DFLASH27B_DRAFT_BLOCK_SIZE;      // 16
-    const int hidden  = DFLASH27B_TARGET_HIDDEN;         // 5120
-    const int fc_in   = DFLASH27B_DRAFT_N_TARGET_LAYERS * hidden;  // 25600
 
-    std::printf("ctx_len=%d q_len=%d hidden=%d fc_in=%d\n", ctx_len, q_len, hidden, fc_in);
-
-    // ── 1. Backend + weights
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) { std::fprintf(stderr, "ggml_backend_cuda_init failed\n"); return 1; }
 
@@ -68,6 +62,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
     std::printf("draft loaded\n");
+
+    const int hidden_actual = w.hparams.hidden;
+    const int q_len_actual  = w.hparams.block_size;
+    const int fc_in_actual  = w.hparams.n_target_layers * hidden_actual;
+
+    std::printf("ctx_len=%d q_len=%d hidden=%d fc_in=%d\n", ctx_len, q_len_actual, hidden_actual, fc_in_actual);
 
     // ── 2. Graph context (separate from weights context)
     const size_t mem_size = 256 * 1024 * 1024;  // 256 MB — plenty for nodes
@@ -81,10 +81,10 @@ int main(int argc, char ** argv) {
     // ── 3. Input placeholder tensors
     // Activations flow as F32 through the graph (CUDA rms_norm requires F32).
     // Weights stay bf16 — ggml_mul_mat auto-casts.
-    ggml_tensor * noise_embed = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, hidden, q_len, 1);
-    ggml_tensor * target_hid  = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, fc_in, ctx_len, 1);
-    ggml_tensor * pos_q       = ggml_new_tensor_1d(gctx, GGML_TYPE_I32,  q_len);
-    ggml_tensor * pos_k       = ggml_new_tensor_1d(gctx, GGML_TYPE_I32,  ctx_len + q_len);
+    ggml_tensor * noise_embed = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, hidden_actual, q_len_actual, 1);
+    ggml_tensor * target_hid  = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, fc_in_actual, ctx_len, 1);
+    ggml_tensor * pos_q       = ggml_new_tensor_1d(gctx, GGML_TYPE_I32,  q_len_actual);
+    ggml_tensor * pos_k       = ggml_new_tensor_1d(gctx, GGML_TYPE_I32,  ctx_len + q_len_actual);
     ggml_set_name(noise_embed, "noise_embed");
     ggml_set_name(target_hid,  "target_hidden_cat");
     ggml_set_name(pos_q,       "positions_q");
@@ -122,23 +122,23 @@ int main(int argc, char ** argv) {
     std::uniform_real_distribution<float> u(-0.02f, 0.02f);
 
     {
-        std::vector<float> data((size_t)hidden * q_len);
+        std::vector<float> data((size_t)hidden_actual * q_len_actual);
         for (auto & v : data) v = u(rng);
         ggml_backend_tensor_set(noise_embed, data.data(), 0, sizeof(float) * data.size());
     }
     {
-        std::vector<float> data((size_t)fc_in * ctx_len);
+        std::vector<float> data((size_t)fc_in_actual * ctx_len);
         for (auto & v : data) v = u(rng);
         ggml_backend_tensor_set(target_hid, data.data(), 0, sizeof(float) * data.size());
     }
     {
-        std::vector<int32_t> pq(q_len);
-        for (int i = 0; i < q_len; i++) pq[i] = ctx_len + i;
+        std::vector<int32_t> pq(q_len_actual);
+        for (int i = 0; i < q_len_actual; i++) pq[i] = ctx_len + i;
         ggml_backend_tensor_set(pos_q, pq.data(), 0, sizeof(int32_t) * pq.size());
     }
     {
-        std::vector<int32_t> pk(ctx_len + q_len);
-        for (int i = 0; i < ctx_len + q_len; i++) pk[i] = i;
+        std::vector<int32_t> pk(ctx_len + q_len_actual);
+        for (int i = 0; i < ctx_len + q_len_actual; i++) pk[i] = i;
         ggml_backend_tensor_set(pos_k, pk.data(), 0, sizeof(int32_t) * pk.size());
     }
 
@@ -152,8 +152,8 @@ int main(int argc, char ** argv) {
 
     // ── 8. Read output, check shape + no NaN + print summary stats
     const size_t n_out_elems = ggml_nelements(go.hidden_states);
-    if (n_out_elems != (size_t)hidden * q_len) {
-        std::fprintf(stderr, "out elems mismatch: %zu vs %d\n", n_out_elems, hidden * q_len);
+    if (n_out_elems != (size_t)hidden_actual * q_len_actual) {
+        std::fprintf(stderr, "out elems mismatch: %zu vs %d\n", n_out_elems, hidden_actual * q_len_actual);
         return 1;
     }
     std::vector<float> out(n_out_elems);

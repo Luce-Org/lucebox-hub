@@ -51,6 +51,8 @@
 #include <unistd.h>
 #endif
 
+#include <fstream>
+#include <sstream>
 #include <unordered_map>
 #include <vector>
 
@@ -307,11 +309,109 @@ static void bf16_to_f32_array(const uint16_t * src, float * dst, size_t n) {
     }
 }
 
+static bool parse_config_json(const std::string & model_dir, DraftHparams & hp) {
+    std::string cfg_path = model_dir + "/config.json";
+    std::ifstream ifs(cfg_path);
+    if (!ifs.is_open()) return false;
+    std::stringstream ss;
+    ss << ifs.rdbuf();
+    std::string json = ss.str();
+
+    auto find_number = [&](const std::string & key, double def) -> double {
+        auto pos = json.find("\"" + key + "\"");
+        if (pos == std::string::npos) return def;
+        auto colon = json.find(':', pos + key.size() + 2);
+        if (colon == std::string::npos) return def;
+        size_t start = colon + 1;
+        while (start < json.size() && (json[start] == ' ' || json[start] == '\t' || json[start] == '\n' || json[start] == '\r')) start++;
+        if (start >= json.size()) return def;
+        char * end = nullptr;
+        double v = std::strtod(json.c_str() + start, &end);
+        if (end == json.c_str() + start) return def;
+        return v;
+    };
+
+    auto find_int = [&](const std::string & key, int def) -> int {
+        return (int)find_number(key, (double)def);
+    };
+
+    hp.n_layer      = find_int("num_hidden_layers", hp.n_layer);
+    hp.hidden       = find_int("hidden_size", hp.hidden);
+    hp.n_head       = find_int("num_attention_heads", hp.n_head);
+    hp.n_kv_head    = find_int("num_key_value_heads", hp.n_kv_head);
+    hp.head_dim     = find_int("head_dim", -1);
+    if (hp.head_dim <= 0) hp.head_dim = hp.hidden / hp.n_head;
+    hp.intermediate = find_int("intermediate_size", hp.intermediate);
+    hp.block_size   = find_int("block_size", hp.block_size);
+    hp.mask_token_id = find_int("mask_token_id", hp.mask_token_id);
+    hp.rope_theta   = (float)find_number("rope_theta", hp.rope_theta);
+    hp.rms_eps      = (float)find_number("rms_norm_eps", hp.rms_eps);
+
+    {
+        auto pos = json.find("\"dflash_config\"");
+        if (pos != std::string::npos) {
+            hp.mask_token_id = find_int("mask_token_id", hp.mask_token_id);
+            auto ids_pos = json.find("\"target_layer_ids\"", pos);
+            if (ids_pos != std::string::npos) {
+                auto bracket = json.find('[', ids_pos);
+                if (bracket != std::string::npos) {
+                    int count = 0;
+                    auto end_bracket = json.find(']', bracket + 1);
+                    if (end_bracket != std::string::npos) {
+                        std::string arr = json.substr(bracket + 1, end_bracket - bracket - 1);
+                        const char * p = arr.c_str();
+                        while (*p) {
+                            while (*p && (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+                            if (!*p) break;
+                            char * ep = nullptr;
+                            std::strtol(p, &ep, 10);
+                            if (ep == p) break;
+                            count++;
+                            p = ep;
+                        }
+                    }
+                    if (count > 0) hp.n_target_layers = count;
+                }
+            }
+        }
+    }
+
+    {
+        auto pos = json.find("\"rope_scaling\"");
+        if (pos != std::string::npos) {
+            hp.rope_factor    = (float)find_number("factor", hp.rope_factor);
+            hp.rope_beta_fast = (float)find_number("beta_fast", hp.rope_beta_fast);
+            hp.rope_beta_slow = (float)find_number("beta_slow", hp.rope_beta_slow);
+            hp.rope_orig_ctx  = find_int("original_max_position_embeddings", hp.rope_orig_ctx);
+        }
+    }
+
+    return true;
+}
+
 } // namespace
 
 bool load_draft_safetensors(const std::string & path,
                             ggml_backend_t       backend,
                             DraftWeights &       out) {
+    // ── 0. Try to load config.json from the model directory ──────
+    {
+        std::string model_dir;
+        auto slash = path.rfind('/');
+#if defined(_WIN32)
+        auto bslash = path.rfind('\\');
+        if (bslash != std::string::npos && (slash == std::string::npos || bslash > slash))
+            slash = bslash;
+#endif
+        if (slash != std::string::npos)
+            model_dir = path.substr(0, slash);
+        else
+            model_dir = ".";
+        if (!parse_config_json(model_dir, out.hparams)) {
+            out.hparams = DraftHparams{};
+        }
+    }
+
     // ── 1. Open + mmap ────────────────────────────────────────────
     Mmap mm;
     std::string err;
@@ -334,9 +434,9 @@ bool load_draft_safetensors(const std::string & path,
     const uint8_t * blob = (const uint8_t *)mm.addr + 8 + header_len;
     const size_t    blob_len = mm.len - 8 - header_len;
 
-    // ── 3. Allocate ggml context big enough for 5 layers × 11 + 3 top ─
-    const int n_layers    = DFLASH27B_DRAFT_LAYERS;
-    const int n_tensors   = 3 + 11 * n_layers;  // with some headroom below
+    // ── 3. Allocate ggml context ──────────────────────────────────
+    const int n_layers    = out.hparams.n_layer;
+    const int n_tensors   = 3 + 11 * n_layers;
     ggml_init_params ip{};
     ip.mem_size   = (size_t)(n_tensors + 16) * ggml_tensor_overhead();
     ip.mem_buffer = nullptr;
@@ -346,12 +446,12 @@ bool load_draft_safetensors(const std::string & path,
     out.backend = backend;
     out.layers.assign(n_layers, DraftLayer{});
 
-    const int64_t HIDDEN  = DFLASH27B_TARGET_HIDDEN;           // 5120
-    const int64_t Q_DIM   = DFLASH27B_TARGET_N_HEADS * DFLASH27B_TARGET_HEAD_DIM;     // 4096
-    const int64_t KV_DIM  = DFLASH27B_TARGET_N_KV_HEADS * DFLASH27B_TARGET_HEAD_DIM;  // 1024
-    const int64_t INTER   = DFLASH27B_TARGET_INTERMEDIATE;     // 17408
-    const int64_t HD      = DFLASH27B_TARGET_HEAD_DIM;         // 128
-    const int64_t FC_IN   = DFLASH27B_DRAFT_N_TARGET_LAYERS * HIDDEN; // 25600
+    const int64_t HIDDEN  = out.hparams.hidden;
+    const int64_t Q_DIM   = (int64_t)out.hparams.n_head * out.hparams.head_dim;
+    const int64_t KV_DIM  = (int64_t)out.hparams.n_kv_head * out.hparams.head_dim;
+    const int64_t INTER   = out.hparams.intermediate;
+    const int64_t HD      = out.hparams.head_dim;
+    const int64_t FC_IN   = (int64_t)out.hparams.n_target_layers * HIDDEN;
 
     // ── 4. Create named tensors in the context ───────────────────
     //

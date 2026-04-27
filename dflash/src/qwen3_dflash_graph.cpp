@@ -40,15 +40,20 @@ DraftGraphOutputs build_draft_graph(
     const DraftWeights &      w,
     const DraftGraphInputs &  in) {
 
-    const int q_len    = DFLASH27B_DRAFT_BLOCK_SIZE;
+    const int q_len    = w.hparams.block_size;
     const int ctx_len  = in.ctx_len;
     const int total_k  = ctx_len + q_len;
-    const int n_head   = DFLASH27B_TARGET_N_HEADS;           // 32
-    const int n_kv     = DFLASH27B_TARGET_N_KV_HEADS;        // 8
-    const int head_dim = DFLASH27B_TARGET_HEAD_DIM;          // 128
-    const float eps    = DFLASH27B_RMS_EPS;
-    const float rope_base = DFLASH27B_ROPE_THETA;
-    (void)ctx_len;  // used only via input tensor shapes
+    const int n_head   = w.hparams.n_head;
+    const int n_kv     = w.hparams.n_kv_head;
+    const int head_dim = w.hparams.head_dim;
+    const float eps    = w.hparams.rms_eps;
+    const float rope_base = w.hparams.rope_theta;
+    (void)ctx_len;
+
+    const float freq_scale = 1.0f / w.hparams.rope_factor;
+    const float ext_factor = (w.hparams.rope_factor > 1.0f) ? 1.0f : 0.0f;
+    const float mscale = (w.hparams.rope_factor > 1.0f) ?
+        1.0f / (0.1f * std::log(w.hparams.rope_factor) + 1.0f) : 1.0f;
 
     // ── 1. Feature fusion: target_feat = rms_norm(fc @ target_hidden_cat, hidden_norm)
     //    fc:                [5*hidden, hidden]  (ggml: ne[0]=5*hidden, ne[1]=hidden)
@@ -62,7 +67,7 @@ DraftGraphOutputs build_draft_graph(
     // ── 2. Decoder layers
     ggml_tensor * h = in.noise_embed;  // [hidden, q_len, 1]
 
-    for (int il = 0; il < DFLASH27B_DRAFT_LAYERS; il++) {
+    for (int il = 0; il < w.hparams.n_layer; il++) {
         const DraftLayer & L = w.layers[il];
 
         // ── 2a. Attention pre-norm
@@ -97,14 +102,16 @@ DraftGraphOutputs build_draft_graph(
         // ── 2d. RoPE (NEOX, theta=10M)
         //   Q: positions_q  [q_len]      values [ctx_len..ctx_len+q_len-1]
         //   K: positions_k  [total_k]    values [0..total_k-1]
-        Q = ggml_rope_ext(ctx, Q, in.positions_q, /*freq_factors=*/nullptr,
-                          head_dim, GGML_ROPE_TYPE_NEOX, /*n_ctx_orig=*/0,
-                          rope_base, /*freq_scale=*/1.0f,
-                          /*ext_factor=*/0.0f, /*attn_factor=*/1.0f,
-                          /*beta_fast=*/0.0f, /*beta_slow=*/0.0f);
+        Q = ggml_rope_ext(ctx, Q, in.positions_q, nullptr,
+                          head_dim, GGML_ROPE_TYPE_NEOX, w.hparams.rope_orig_ctx,
+                          rope_base, freq_scale,
+                          ext_factor, mscale,
+                          w.hparams.rope_beta_fast, w.hparams.rope_beta_slow);
         K = ggml_rope_ext(ctx, K, in.positions_k, nullptr,
-                          head_dim, GGML_ROPE_TYPE_NEOX, 0,
-                          rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+                          head_dim, GGML_ROPE_TYPE_NEOX, w.hparams.rope_orig_ctx,
+                          rope_base, freq_scale,
+                          ext_factor, mscale,
+                          w.hparams.rope_beta_fast, w.hparams.rope_beta_slow);
 
         // ── 2e. Permute into the layout flash_attn_ext wants
         //   q: [n_embd_k=head_dim, n_batch=q_len, n_head,   ne3]

@@ -615,7 +615,7 @@ static bool build_target_step(
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
 
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    const int hidden = w.n_embd;
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
     ggml_set_name(sg.inp_embed, "inp_embed");
     ggml_set_input(sg.inp_embed);
@@ -684,7 +684,7 @@ static bool build_target_step_tree(
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
 
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    const int hidden = w.n_embd;
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
     ggml_set_name(sg.inp_embed, "inp_embed");
     ggml_set_input(sg.inp_embed);
@@ -731,6 +731,91 @@ static bool build_target_step_tree(
     return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
 }
 
+// Reusable tree-verify graph: fixed n_tokens and kv_start so CUDA graphs can
+// replay across steps.  Writes K/V to scratch slots [ws..ws+max_n-1] and
+// the attention mask covers [0..ws+max_n).  After compute the caller copies
+// K/V from scratch slots to the real committed positions.
+static bool build_target_step_tree_reusable(
+    StepGraph & sg,
+    const TargetWeights & w,
+    TargetCache & cache,
+    ggml_backend_t backend,
+    int max_ctx,
+    int max_n)
+{
+    step_graph_free(sg);
+
+    ggml_init_params ip{};
+    ip.mem_size   = 512 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    sg.ctx = ggml_init(ip);
+    if (!sg.ctx) return false;
+
+    const int hidden = w.n_embd;
+    const int write_start = max_ctx - max_n;
+
+    sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, max_n, 1);
+    ggml_set_name(sg.inp_embed, "inp_embed");
+    ggml_set_input(sg.inp_embed);
+
+    sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * max_n);
+    ggml_set_name(sg.positions, "positions");
+    ggml_set_input(sg.positions);
+
+    const int kv_pad = align_up(max_ctx, g_kq_stride_pad);
+    const int q_pad  = align_up(max_n, KQ_MASK_PAD);
+    sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
+    ggml_set_name(sg.attn_mask, "attn_mask");
+    ggml_set_input(sg.attn_mask);
+
+    sg.parent_ids = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, max_n);
+    ggml_set_name(sg.parent_ids, "parent_ids");
+    ggml_set_input(sg.parent_ids);
+
+    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+
+    QwenGraphInputs gi{};
+    gi.inp_embed                  = sg.inp_embed;
+    gi.positions                  = sg.positions;
+    gi.attn_mask                  = sg.attn_mask;
+    gi.n_tokens                   = max_n;
+    gi.kv_start                   = write_start;
+    gi.capture_layers             = true;
+    gi.capture_delta_intermediate = true;
+    gi.parent_ids                 = sg.parent_ids;
+
+    QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
+    if (!go.logits) return false;
+    sg.logits = go.logits;
+    sg.delta_captures = std::move(go.delta_captures);
+    ggml_set_output(sg.logits);
+    ggml_build_forward_expand(sg.gf, sg.logits);
+
+    if (!sg.alloc) {
+        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    if (!ggml_gallocr_reserve(sg.alloc, sg.gf)) return false;
+    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
+}
+
+static void copy_kv_slots_batch(
+    const std::vector<ggml_tensor *> & cache_tensors,
+    int src_start, int dst_start, int n_slots, int n_heads)
+{
+    for (auto * ct : cache_tensors) {
+        const size_t slot_bytes = ct->nb[1];
+        const size_t head_stride = ct->nb[2];
+        const char * base = (const char *) ct->data;
+        for (int s = 0; s < n_slots; s++) {
+            cudaMemcpy2D(
+                (void *)(base + (size_t)(dst_start + s) * slot_bytes), head_stride,
+                (const void *)(base + (size_t)(src_start + s) * slot_bytes), head_stride,
+                slot_bytes, n_heads, cudaMemcpyDeviceToDevice);
+        }
+    }
+}
+
 static bool build_draft_step(
     StepGraph & sg,
     const DraftWeights & dw,
@@ -746,9 +831,9 @@ static bool build_draft_step(
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
 
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
-    const int q_len  = DFLASH27B_DRAFT_BLOCK_SIZE;
-    const int fc_in  = DFLASH27B_DRAFT_N_TARGET_LAYERS * hidden;
+    const int hidden = tw.n_embd;
+    const int q_len  = dw.hparams.block_size;
+    const int fc_in  = dw.hparams.n_target_layers * hidden;
 
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, q_len, 1);
     ggml_set_name(sg.inp_embed, "inp_embed");
@@ -916,10 +1001,10 @@ int main(int argc, char ** argv) {
     // Profile mode intentionally keeps the intermediate cache tiny (no capture)
     // so we can go up to n_tokens=128 without OOM.
     const int max_verify_tokens = profile_scaling
-        ? DFLASH27B_DRAFT_BLOCK_SIZE
+        ? dw.hparams.block_size
         : (ddtree_mode
-            ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, ddtree_budget + 1)
-            : DFLASH27B_DRAFT_BLOCK_SIZE);
+            ? std::max<int>(dw.hparams.block_size, ddtree_budget + 1)
+            : dw.hparams.block_size);
     TargetCache cache;
     if (!create_target_cache(w, max_ctx, max_verify_tokens, backend, cache,
                              /*prefill_only=*/true)) {
@@ -929,7 +1014,7 @@ int main(int argc, char ** argv) {
 
     // ── Profile mode: microbench target forward at varying N ───────────
     if (profile_scaling) {
-        const int hidden_p = DFLASH27B_TARGET_HIDDEN;
+        const int hidden_p = w.n_embd;
         StepGraph psg;
         const int n_values[] = { 1, 4, 8, 12, 16, 20, 24, 32, 48, 64, 96, 128 };
         std::printf("[profile] target forward ms at varying N (kv_start=0, no capture)\n");
@@ -1499,6 +1584,22 @@ int main(int argc, char ** argv) {
     std::vector<int32_t> pos_q_buf(q_len), pos_k_buf(max_ctx + q_len);
     std::vector<int32_t> pos4_buf(4 * q_len);
 
+    // Reusable tree-verify graph for DDTree CUDA graph replay.
+    // Built once with max_n = budget+1 tokens and fixed kv_start.
+    StepGraph sg_tree;
+    const int ddtree_max_n = ddtree_budget + 1;
+    const int tree_write_start = max_ctx - ddtree_max_n;
+    const int tree_kv_pad = align_up(max_ctx, g_kq_stride_pad);
+    const int tree_q_pad  = align_up(ddtree_max_n, KQ_MASK_PAD);
+    const int n_head_kv_tree = w.n_head_kv;
+    std::vector<uint16_t> tree_mask_buf((size_t)tree_kv_pad * tree_q_pad, F16_NEG_INF);
+    if (ddtree_mode) {
+        if (!build_target_step_tree_reusable(sg_tree, w, cache, backend,
+                                              max_ctx, ddtree_max_n)) {
+            std::fprintf(stderr, "reusable tree verify build failed\n"); return 1;
+        }
+    }
+
     auto t_gen0 = std::chrono::steady_clock::now();
 
     // Per-phase timing accumulators (microseconds)
@@ -1682,64 +1783,80 @@ int main(int argc, char ** argv) {
 
             const int N = 1 + tree.n_nodes;  // flat size including root
 
-            if (!build_target_step_tree(sg, w, cache, backend,
-                                        /*kv_start=*/committed, /*n_tokens=*/N,
-                                        g_fa_window)) {
-                std::fprintf(stderr, "ddtree verify build failed\n"); return 1;
-            }
+            // Reuse pre-built graph — no rebuild needed
             T_verify_build = sync_us();
             tt_verify_build += std::chrono::duration<double, std::micro>(T_verify_build - T_snap).count();
 
             // Embeddings: [last_tok, tree.token_ids[0..n_nodes-1]]
-            std::vector<int32_t> flat_tokens(N);
+            // Pad to ddtree_max_n with last_tok (harmless — unused by the mask)
+            std::vector<int32_t> flat_tokens(ddtree_max_n, last_tok);
             flat_tokens[0] = last_tok;
             for (int i = 0; i < tree.n_nodes; i++) flat_tokens[1 + i] = tree.token_ids[i];
 
-            std::vector<float> tree_embed(hidden * N);
-            if (!w.embedder.embed(flat_tokens.data(), N, tree_embed.data())) return 1;
-            ggml_backend_tensor_set(sg.inp_embed, tree_embed.data(), 0,
-                                    sizeof(float) * hidden * N);
+            std::vector<float> tree_embed(hidden * ddtree_max_n);
+            if (!w.embedder.embed(flat_tokens.data(), ddtree_max_n, tree_embed.data())) return 1;
+            ggml_backend_tensor_set(sg_tree.inp_embed, tree_embed.data(), 0,
+                                    sizeof(float) * hidden * ddtree_max_n);
 
-            // M-RoPE axis-major positions: committed + depth_of_node.
-            // Slot 0 = root = depth 0 → position `committed`.
-            std::vector<int32_t> pos4(4 * N);
-            for (int i = 0; i < N; i++) {
-                int p = committed + (i == 0 ? 0 : tree.depths[i - 1]);
-                pos4[0 * N + i] = p;
-                pos4[1 * N + i] = p;
-                pos4[2 * N + i] = p;
-                pos4[3 * N + i] = 0;
+            // M-RoPE positions: committed + depth_of_node for real nodes;
+            // pad remaining slots with committed (harmless, masked out).
+            std::vector<int32_t> pos4(4 * ddtree_max_n);
+            for (int i = 0; i < ddtree_max_n; i++) {
+                int p = (i < N)
+                    ? committed + (i == 0 ? 0 : tree.depths[i - 1])
+                    : committed;
+                pos4[0 * ddtree_max_n + i] = p;
+                pos4[1 * ddtree_max_n + i] = p;
+                pos4[2 * ddtree_max_n + i] = p;
+                pos4[3 * ddtree_max_n + i] = 0;
             }
-            ggml_backend_tensor_set(sg.positions, pos4.data(), 0, sizeof(int32_t) * 4 * N);
+            ggml_backend_tensor_set(sg_tree.positions, pos4.data(), 0,
+                                    sizeof(int32_t) * 4 * ddtree_max_n);
 
-            // Ancestor-only attention mask (f16).
+            // Ancestor-only mask: fill the full fixed-size buffer.
+            // build_tree_mask writes [q_pad, kv_pad] but with variable kv_pad.
+            // We build into a temp buffer then copy, OR build directly into
+            // tree_mask_buf which is pre-sized for max dimensions.
             const int tree_win_start = (g_fa_window > 0 && committed > g_fa_window)
                                            ? (committed - g_fa_window) : 0;
-            build_tree_mask(tree, /*past_length=*/committed, mask_buf, tree_win_start);
-            ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
-                                    sizeof(uint16_t) * mask_buf.size());
+            {
+                // Fill with -inf
+                tree_mask_buf.assign((size_t)tree_kv_pad * tree_q_pad, F16_NEG_INF);
+                // Past KV (windowed committed positions): always visible
+                for (int q = 0; q < N; q++) {
+                    for (int k = tree_win_start; k < committed; k++) {
+                        tree_mask_buf[(size_t)q * tree_kv_pad + k] = F16_ZERO;
+                    }
+                    // Tree region at scratch slots: ancestors only
+                    for (int j = 0; j < N; j++) {
+                        if (tree.visibility[(size_t)q * N + j]) {
+                            tree_mask_buf[(size_t)q * tree_kv_pad + (tree_write_start + j)] = F16_ZERO;
+                        }
+                    }
+                }
+            }
+            ggml_backend_tensor_set(sg_tree.attn_mask, tree_mask_buf.data(), 0,
+                                    sizeof(uint16_t) * tree_mask_buf.size());
 
-            // parent_ids for tree-mode DeltaNet kernel.
-            // Slot 0 (root): -1 (reload initial state — matches kernel's skip
-            // at t==0). Slots 1..N-1: the tree's parent index in the flat array.
-            std::vector<int32_t> parent_ids(N);
+            // parent_ids: pad to ddtree_max_n with -1
+            std::vector<int32_t> parent_ids(ddtree_max_n, -1);
             parent_ids[0] = -1;
             for (int i = 1; i < N; i++) parent_ids[i] = (int32_t)tree.parents[i];
-            ggml_backend_tensor_set(sg.parent_ids, parent_ids.data(), 0,
-                                    sizeof(int32_t) * N);
+            ggml_backend_tensor_set(sg_tree.parent_ids, parent_ids.data(), 0,
+                                    sizeof(int32_t) * ddtree_max_n);
 
             T_verify_set = sync_us();
             tt_verify_set += std::chrono::duration<double, std::micro>(T_verify_set - T_verify_build).count();
 
-            st = ggml_backend_graph_compute(backend, sg.gf);
+            st = ggml_backend_graph_compute(backend, sg_tree.gf);
             if (st != GGML_STATUS_SUCCESS) {
                 std::fprintf(stderr, "ddtree verify compute %d\n", (int)st); return 1;
             }
             T_verify_compute = sync_us();
             tt_verify_compute += std::chrono::duration<double, std::micro>(T_verify_compute - T_verify_set).count();
 
-            // Read the N verify logits, compute posterior argmax per slot.
-            ggml_backend_tensor_get(sg.logits, verify_logits_buf.data(), 0,
+            // Read the N verify logits (only first N of ddtree_max_n slots)
+            ggml_backend_tensor_get(sg_tree.logits, verify_logits_buf.data(), 0,
                                     sizeof(float) * vocab * N);
             std::vector<int32_t> posterior(N);
             for (int i = 0; i < N; i++) {
@@ -1825,10 +1942,10 @@ int main(int argc, char ** argv) {
             }
 
             {
-                const int n_delta = (int)sg.delta_captures.size();
+                const int n_delta = (int)sg_tree.delta_captures.size();
                 cudaStream_t stream = nullptr;
                 for (int il = 0; il < n_delta; il++) {
-                    const DeltaNetCapture & cap = sg.delta_captures[il];
+                    const DeltaNetCapture & cap = sg_tree.delta_captures[il];
                     if (!cap.ssm_intermediate_states || !cap.conv_input) {
                         std::fprintf(stderr, "ddtree rollback: missing capture layer %d\n", il);
                         return 1;
@@ -1905,24 +2022,20 @@ int main(int argc, char ** argv) {
                     }
                 }
 
-                // target_feat compaction: written in DFS order during verify
-                // (column kv_start+i = dfs slot i's features). Same logic as
-                // KV cache: when accepted[d] != d, copy the accepted DFS slot's
-                // features to the spine slot at d so next iter's draft reads
-                // the right history. Position→slot uses `% target_feat_cap`
-                // to account for the ring buffer.
+                // target_feat compaction: written at scratch slots
+                // (tree_write_start + dfs_idx) during verify. Copy accepted
+                // DFS slots' features to the committed spine positions.
                 if (cache.target_feat) {
                     const size_t elt = ggml_element_size(cache.target_feat);
-                    const int    fc_in = (int)cache.target_feat->ne[0];  // 5*hidden
+                    const int    fc_in = (int)cache.target_feat->ne[0];
                     const size_t col_stride = cache.target_feat->nb[1];
                     const int    tcap = cache.target_feat_cap;
-                    for (int d = 1; d < commit_n; d++) {
+                    for (int d = 0; d < commit_n; d++) {
                         const int src_dfs = accepted[d];
-                        if (src_dfs == d) continue;
-                        const int    src_slot = (committed + src_dfs) % tcap;
-                        const int    dst_slot = (committed + d)       % tcap;
-                        const size_t src_off  = (size_t)src_slot * col_stride;
-                        const size_t dst_off  = (size_t)dst_slot * col_stride;
+                        const int src_feat_slot = (tree_write_start + src_dfs) % tcap;
+                        const int dst_feat_slot = (committed + d) % tcap;
+                        const size_t src_off = (size_t)src_feat_slot * col_stride;
+                        const size_t dst_off = (size_t)dst_feat_slot * col_stride;
                         cudaMemcpyAsync((char *)cache.target_feat->data + dst_off,
                                         (const char *)cache.target_feat->data + src_off,
                                         (size_t)fc_in * elt,
@@ -1930,34 +2043,22 @@ int main(int argc, char ** argv) {
                     }
                 }
 
-                // Full-attention KV compaction: the verify wrote K/V at slots
-                // [committed..committed+N-1] in DFS tree order (slot 0 = root).
-                // For the next iter's verify to see the correct committed
-                // prefix, slots [committed..committed+commit_n-1] must hold
-                // the K/V of the accepted path's committed tokens. For each
-                // committed position d in 0..commit_n-1, the source K/V is at
-                // DFS slot accepted[d]. d==0 is always the root (DFS slot 0),
-                // trivially aligned. For d>=1, copy if accepted[d] != d.
+                // Full-attention KV compaction: the verify wrote K/V at scratch
+                // slots [tree_write_start..tree_write_start+N-1]. Copy the
+                // accepted DFS slots to committed positions.
                 const int n_full_attn = (int)cache.attn_k.size();
                 for (int d = 0; d < commit_n; d++) {
                     const int src_dfs = accepted[d];
-                    const int dst_slot = d;
-                    if (src_dfs == dst_slot) continue;  // already aligned
+                    const int src_slot = tree_write_start + src_dfs;
+                    const int dst_slot = committed + d;
                     for (int l = 0; l < n_full_attn; l++) {
-                        // Each slot: head_dim * n_kv floats in f16 per tensor.
                         ggml_tensor * ck = cache.attn_k[l];
                         ggml_tensor * cv = cache.attn_v[l];
-                        const size_t slot_bytes = ck->nb[1];  // stride between slots
-                        const size_t src_off = (size_t)(committed + src_dfs) * slot_bytes;
-                        const size_t dst_off = (size_t)(committed + dst_slot) * slot_bytes;
-                        // Per-head-kv layout: shape [head_dim, max_ctx, n_head_kv].
-                        // nb[2] is distance between heads; we copy one slot's
-                        // slice per head. For simplicity, do a 2D copy across
-                        // the head dimension.
+                        const size_t slot_bytes = ck->nb[1];
                         const int n_kv = (int)ck->ne[2];
                         for (int h = 0; h < n_kv; h++) {
-                            const size_t head_src = src_off + (size_t)h * ck->nb[2];
-                            const size_t head_dst = dst_off + (size_t)h * ck->nb[2];
+                            const size_t head_src = (size_t)src_slot * slot_bytes + (size_t)h * ck->nb[2];
+                            const size_t head_dst = (size_t)dst_slot * slot_bytes + (size_t)h * ck->nb[2];
                             cudaMemcpyAsync((char *)ck->data + head_dst,
                                             (const char *)ck->data + head_src,
                                             slot_bytes, cudaMemcpyDeviceToDevice, stream);
