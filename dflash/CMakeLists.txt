@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
+set(DFLASH27B_USER_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 project(dflash27b LANGUAGES C CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -7,6 +8,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # If we do not set this, ggml will output to bin and DLLs will not load
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+# Bake portable rpath into all executables so bundled libggml-cuda / libggml-base
+# are found regardless of LD_LIBRARY_PATH or stale /usr/local/lib (closes #31).
+set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
+set(CMAKE_INSTALL_RPATH "$ORIGIN/deps/llama.cpp/ggml/src;$ORIGIN/deps/llama.cpp/ggml/src/ggml-cuda;$ORIGIN/../deps/llama.cpp/ggml/src;$ORIGIN/../deps/llama.cpp/ggml/src/ggml-cuda")
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
@@ -51,14 +57,22 @@ add_library(dflash27b STATIC
     src/f16_convert.cu
     src/delta_net_chunked.cpp
 )
-# Ampere (86) always; Blackwell consumer (120) added if nvcc supports it
-# (CUDA 12.8+), GB10/Jetson Thor (121) added at CUDA 12.9+.
-set(_dflash27b_archs "86")
-if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8")
-    list(APPEND _dflash27b_archs "120")
-endif()
-if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.9")
-    list(APPEND _dflash27b_archs "121")
+# Ampere (86) always; Blackwell consumer (120) and Thor (110 on CUDA 13+)
+# added when nvcc supports them. DGX Spark /
+# GB10 is compute capability 12.1 (121), added at CUDA 12.9+.
+if(DFLASH27B_USER_CUDA_ARCHITECTURES)
+    set(_dflash27b_archs "${DFLASH27B_USER_CUDA_ARCHITECTURES}")
+else()
+    set(_dflash27b_archs "86")
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8")
+        list(APPEND _dflash27b_archs "120")
+    endif()
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.0")
+        list(APPEND _dflash27b_archs "110")
+    endif()
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.9")
+        list(APPEND _dflash27b_archs "121")
+    endif()
 endif()
 set_target_properties(dflash27b PROPERTIES CUDA_ARCHITECTURES "${_dflash27b_archs}")
 

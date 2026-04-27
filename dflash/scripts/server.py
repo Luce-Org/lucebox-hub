@@ -447,6 +447,11 @@ def main():
     ap.add_argument("--kv-f16", action="store_true",
                     help="Force F16 KV cache. When --max-ctx > 6144 the server "
                          "auto-enables TQ3_0 KV to fit; pass --kv-f16 to opt out.")
+    ap.add_argument("--fa-window", type=int, default=None,
+                    help="Sliding window for FA layers (KV positions). 0 = full "
+                         "attention. Default 2048 (set in C++); only kicks in "
+                         "once kv_cache > window. Trades attention range for "
+                         "long-context decode speed.")
     ap.add_argument("--tokenizer", type=str, default=None,
                     help="HuggingFace tokenizer repo ID (default: auto-detect "
                          "from target GGUF basename; falls back to Qwen/Qwen3.5-27B)")
@@ -459,6 +464,9 @@ def main():
     # DFLASH27B_KV_TQ3=0 still wins.
     if args.max_ctx > 6144 and not args.kv_f16:
         os.environ.setdefault("DFLASH27B_KV_TQ3", "1")
+
+    if args.fa_window is not None:
+        os.environ["DFLASH27B_FA_WINDOW"] = str(args.fa_window)
 
     if not args.bin.is_file():
         raise SystemExit(f"binary not found at {args.bin}")

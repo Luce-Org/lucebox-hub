@@ -278,13 +278,25 @@ void restore_ssm_state(TargetCache & c);
 // sizes. Default is DFLASH27B_DRAFT_BLOCK_SIZE (16) for chain verify. DDTree
 // mode requires max(chain, 1 + tree_budget) to hold the flat tree + root.
 // Pass 0 to use the default.
+// When prefill_only is true, rollback tensors (snapshots, intermediates) are
+// skipped — saving ~1.4 GB on 48 DeltaNet layers. Use migrate_prefill_cache()
+// to promote the cache to a full decode cache after prefill.
 bool create_target_cache(const TargetWeights & w,
                          int max_ctx,
                          int max_verify_tokens,
                          ggml_backend_t backend,
-                         TargetCache & out);
+                         TargetCache & out,
+                         bool prefill_only = false);
 
 void free_target_cache(TargetCache & c);
+
+// Reallocate a prefill-only cache with full rollback tensors, copying all live
+// state (KV, SSM, conv, target_feat) device-to-device. Frees the old cache.
+bool migrate_prefill_cache(const TargetWeights & w,
+                           int max_ctx,
+                           int max_verify_tokens,
+                           ggml_backend_t backend,
+                           TargetCache & cache);
 
 // ─── Target forward graph ─────────────────────────────────────────
 
@@ -316,12 +328,8 @@ struct QwenGraphInputs {
     int           kv_start;       // position where the new tokens begin
     bool          capture_layers; // if true, write captured layer features into cache.target_feat
     bool          capture_delta_intermediate = false; // if true, populate out_delta_captures
-    // DDTree extension: when non-null, the full-attention layers use the
-    // caller-provided ancestor-only mask (same attn_mask field) and the
-    // delta-net (gated_delta_net) kernel switches to tree mode via this i32
-    // tensor of shape [n_tokens] giving each token's parent index in the
-    // DFS-flattened tree. See test_dflash.cpp::build_target_step_tree.
-    ggml_tensor * parent_ids = nullptr;
+    int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
+    ggml_tensor * parent_ids = nullptr; // [n_tokens] i32; tree mode when non-null
 };
 
 struct QwenGraphOutputs {
@@ -349,5 +357,22 @@ ggml_tensor * build_moe_ffn(
     ggml_tensor *         cur,
     const TargetLayer &   L,
     const TargetWeights & w);
+
+// Build a single-layer forward graph. Mirrors build_qwen35_graph but processes
+// only one layer, taking `inp` as the input activation and returning the output.
+// Used by layer-segmented prefill to iterate layers as the outer loop.
+ggml_tensor * build_qwen35_layer(
+    ggml_context *        ctx,
+    ggml_cgraph *         gf,
+    const TargetWeights & w,
+    TargetCache &         cache,
+    int                   layer_idx,
+    ggml_tensor *         inp,         // [hidden, n_tokens]
+    ggml_tensor *         positions,   // [4 * n_tokens] i32
+    ggml_tensor *         attn_mask,   // optional
+    int                   kv_start,
+    int                   n_tokens,
+    bool                  capture,
+    int                   fa_window = 0);
 
 } // namespace dflash27b

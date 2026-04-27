@@ -72,7 +72,8 @@ bool create_target_cache(const TargetWeights & w,
                          int max_ctx,
                          int max_verify_tokens,
                          ggml_backend_t backend,
-                         TargetCache & out) {
+                         TargetCache & out,
+                         bool prefill_only) {
     out.backend = backend;
     out.max_ctx = max_ctx;
     out.cur_pos = 0;
@@ -104,7 +105,10 @@ bool create_target_cache(const TargetWeights & w,
     //   per delta-net layer  : 6 (ssm, conv, ssm_snap, conv_snap,
     //                             ssm_intermediate, conv_input_cache)
     //   top-level            : 1 (target_feat)
-    const int n_tensors = 2 * n_full_attn + 6 * n_delta + 1;
+    // When prefill_only, skip rollback tensors (ssm_snap, conv_snap,
+    // ssm_intermediate, conv_input_cache) — 4 per delta layer, ~1.4 GB freed.
+    const int tensors_per_delta = prefill_only ? 2 : 6;
+    const int n_tensors = 2 * n_full_attn + tensors_per_delta * n_delta + 1;
     ggml_init_params ip{};
     ip.mem_size   = (size_t)(n_tensors + 32) * ggml_tensor_overhead();
     ip.mem_buffer = nullptr;
@@ -154,42 +158,37 @@ bool create_target_cache(const TargetWeights & w,
             fa_idx++;
         } else {
             // ssm_state: [head_v_dim, head_v_dim, num_v_heads]
-            ggml_tensor * S  = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32,
-                                                  head_v_dim, head_v_dim, num_v_heads);
-            ggml_tensor * Sn = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32,
-                                                  head_v_dim, head_v_dim, num_v_heads);
+            ggml_tensor * S = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32,
+                                                  q35::HEAD_V_DIM, q35::HEAD_V_DIM, q35::SSM_DT_RANK);
             // conv_state: [kernel-1, conv_channels]
-            ggml_tensor * C  = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
-                                                  conv_kern - 1, conv_channels);
-            ggml_tensor * Cn = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
-                                                  conv_kern - 1, conv_channels);
-            // ssm_intermediate: [S_v, S_v, H_v, max_verify_tokens] — one SSM
-            // state per verify-block token. Sized to cover the largest verify
-            // n_tokens we'll use (chain q_len=16 or DDTree 1+budget).
-            // Stored in f16 to halve memory (~3 MB → 1.5 MB per layer per slot),
-            // letting us fit budgets up to ~50 on 24 GB. The gated_delta_net
-            // kernel converts f32 ↔ f16 on write/read via store/load_inter_state.
-            ggml_tensor * Si = ggml_new_tensor_4d(out.ctx, GGML_TYPE_F16,
-                                                  head_v_dim, head_v_dim,
-                                                  num_v_heads, max_verify_tokens);
-            // conv_input_cache: [(K-1) + max_verify_tokens, conv_channels, 1]
-            // — the full conv_input tensor captured during verify.
-            ggml_tensor * Ci = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32,
-                                                  (conv_kern - 1) + max_verify_tokens,
-                                                  conv_channels, 1);
+            ggml_tensor * C = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
+                                                  q35::SSM_CONV_KERN - 1, q35::CONV_CHANNELS);
             char name[64];
-            std::snprintf(name, sizeof(name), "ssm_state_%d", il);       ggml_set_name(S,  name);
-            std::snprintf(name, sizeof(name), "conv_state_%d", il);      ggml_set_name(C,  name);
-            std::snprintf(name, sizeof(name), "ssm_state_snap_%d", il);  ggml_set_name(Sn, name);
-            std::snprintf(name, sizeof(name), "conv_state_snap_%d", il); ggml_set_name(Cn, name);
-            std::snprintf(name, sizeof(name), "ssm_intermediate_%d", il); ggml_set_name(Si, name);
-            std::snprintf(name, sizeof(name), "conv_input_cache_%d", il); ggml_set_name(Ci, name);
-            out.ssm_state[dn_idx]       = S;
-            out.conv_state[dn_idx]      = C;
-            out.ssm_state_snap[dn_idx]  = Sn;
-            out.conv_state_snap[dn_idx] = Cn;
-            out.ssm_intermediate[dn_idx] = Si;
-            out.conv_input_cache[dn_idx] = Ci;
+            std::snprintf(name, sizeof(name), "ssm_state_%d", il);  ggml_set_name(S, name);
+            std::snprintf(name, sizeof(name), "conv_state_%d", il); ggml_set_name(C, name);
+            out.ssm_state[dn_idx]  = S;
+            out.conv_state[dn_idx] = C;
+
+            if (!prefill_only) {
+                ggml_tensor * Sn = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32,
+                                                      q35::HEAD_V_DIM, q35::HEAD_V_DIM, q35::SSM_DT_RANK);
+                ggml_tensor * Cn = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
+                                                      q35::SSM_CONV_KERN - 1, q35::CONV_CHANNELS);
+                ggml_tensor * Si = ggml_new_tensor_4d(out.ctx, GGML_TYPE_F16,
+                                                      q35::HEAD_V_DIM, q35::HEAD_V_DIM,
+                                                      q35::SSM_DT_RANK, max_verify_tokens);
+                ggml_tensor * Ci = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32,
+                                                      (q35::SSM_CONV_KERN - 1) + max_verify_tokens,
+                                                      q35::CONV_CHANNELS, 1);
+                std::snprintf(name, sizeof(name), "ssm_state_snap_%d", il);  ggml_set_name(Sn, name);
+                std::snprintf(name, sizeof(name), "conv_state_snap_%d", il); ggml_set_name(Cn, name);
+                std::snprintf(name, sizeof(name), "ssm_intermediate_%d", il); ggml_set_name(Si, name);
+                std::snprintf(name, sizeof(name), "conv_input_cache_%d", il); ggml_set_name(Ci, name);
+                out.ssm_state_snap[dn_idx]  = Sn;
+                out.conv_state_snap[dn_idx] = Cn;
+                out.ssm_intermediate[dn_idx] = Si;
+                out.conv_input_cache[dn_idx] = Ci;
+            }
             dn_idx++;
         }
     }
@@ -254,6 +253,35 @@ void free_target_cache(TargetCache & c) {
     c.cur_pos = 0;
 }
 
+// Migrate live state (KV cache, SSM/conv state, target_feat) from a prefill-only
+// cache into a freshly allocated decode cache that includes rollback tensors.
+// After migration the prefill cache is freed. Returns false on alloc failure.
+bool migrate_prefill_cache(const TargetWeights & w,
+                           int max_ctx,
+                           int max_verify_tokens,
+                           ggml_backend_t backend,
+                           TargetCache & cache) {
+    TargetCache dec;
+    if (!create_target_cache(w, max_ctx, max_verify_tokens, backend, dec, /*prefill_only=*/false)) {
+        return false;
+    }
+
+    for (size_t i = 0; i < cache.attn_k.size(); i++) {
+        ggml_backend_tensor_copy(cache.attn_k[i], dec.attn_k[i]);
+        ggml_backend_tensor_copy(cache.attn_v[i], dec.attn_v[i]);
+    }
+    for (size_t i = 0; i < cache.ssm_state.size(); i++) {
+        ggml_backend_tensor_copy(cache.ssm_state[i], dec.ssm_state[i]);
+        ggml_backend_tensor_copy(cache.conv_state[i], dec.conv_state[i]);
+    }
+    ggml_backend_tensor_copy(cache.target_feat, dec.target_feat);
+
+    dec.cur_pos = cache.cur_pos;
+    free_target_cache(cache);
+    cache = std::move(dec);
+    return true;
+}
+
 // Snapshot/restore SSM+conv state for speculative rollback. Uses device-side
 // tensor copy (ggml_backend_tensor_copy). Called outside of any compute graph.
 void snapshot_ssm_state(TargetCache & c) {
@@ -306,7 +334,8 @@ static ggml_tensor * build_full_attn_block(
     ggml_tensor * attn_mask,
     int kv_start,
     int n_tokens,
-    ggml_type kv_k_type
+    ggml_type kv_k_type,
+    int fa_window = 0
 ) {
     const int head_dim  = w.n_embd_head_k;
     const int n_head    = w.n_head;
@@ -384,20 +413,19 @@ static ggml_tensor * build_full_attn_block(
     ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_T, k_slot));
     ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_T, v_slot));
 
-    // ── Flash attention over the valid slice [0, kv_start + n_tokens)
+    // ── Flash attention over the valid slice
+    // When fa_window > 0 and kv_start >= fa_window, only attend to the last
+    // fa_window positions. This dramatically reduces FA cost during speculative
+    // decode verify/replay at long contexts (60K+ kv entries).
+    const int win_start = (fa_window > 0 && kv_start > fa_window)
+                              ? (kv_start - fa_window) : 0;
     const int kv_len = kv_start + n_tokens;
+    const int win_len = kv_len - win_start;
 
-    // FA kernel alignment requirements for the kv view length (f16/Q* paths
-    // are stride 1; future TurboQuant paths would need 256 alignment, kept
-    // behind a compile-time constant here for drop-in extension).
-    // FATTN_KQ_STRIDE=256 (see fattn.cu:get_best_fattn_kernel). Round up
-    // for TBQ cache types; the caller's attn_mask is built with the same
-    // padded length so positions beyond the real kv_len get -inf.
     const int fattn_stride  = (kv_k_type == GGML_TYPE_TQ3_0) ? 256 : 1;
-    const int kv_len_padded = ((kv_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
+    const int win_len_padded = ((win_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
 
-    // Q needs to be [head_dim, n_tokens, n_head] for flash_attn_ext
-    ggml_tensor * Qfa = ggml_permute(ctx, Q, 0, 2, 1, 3);   // [head_dim, n_tokens, n_head]
+    ggml_tensor * Qfa = ggml_permute(ctx, Q, 0, 2, 1, 3);
     Qfa = ggml_cont(ctx, Qfa);
 
     // For TQ3_0 KV cache, K/V are stored in FWHT-rotated space.
@@ -407,15 +435,13 @@ static ggml_tensor * build_full_attn_block(
         Qfa = ggml_turbo_wht(ctx, Qfa, 0);
     }
 
-    // K and V from cache: a view into the first kv_len_padded slots. For
-    // non-TBQ paths kv_len_padded == kv_len so this is identical to the
-    // old behaviour.
+    // K and V from cache: a windowed view starting at win_start.
     ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
-        head_dim, kv_len_padded, n_head_kv,
-        cache_k->nb[1], cache_k->nb[2], 0);
+        q35::HEAD_DIM, win_len_padded, q35::N_HEAD_KV,
+        cache_k->nb[1], cache_k->nb[2], cache_k->nb[1] * win_start);
     ggml_tensor * Vfa = ggml_view_3d(ctx, cache_v,
-        head_dim, kv_len_padded, n_head_kv,
-        cache_v->nb[1], cache_v->nb[2], 0);
+        q35::HEAD_DIM, win_len_padded, q35::N_HEAD_KV,
+        cache_v->nb[1], cache_v->nb[2], cache_v->nb[1] * win_start);
 
     // Causal mask: for n_tokens==1 we don't need one (a single query attending
     // to all keys is trivially causal). For n_tokens>1 the caller must provide
@@ -708,6 +734,102 @@ after_delta_net:
 
 // ─── Main graph builder ─────────────────────────────────────────────
 
+// Build a single layer of the Qwen3.5-27B model.
+// layer_idx: which of the 64 layers to build (0-based).
+// inp:      input activation [hidden, n_tokens]
+// Returns the output activation [hidden, n_tokens].
+static ggml_tensor * build_single_layer(
+    ggml_context *        ctx,
+    ggml_cgraph *         gf,
+    const TargetWeights & w,
+    TargetCache &         cache,
+    int                   layer_idx,
+    ggml_tensor *         inp,         // [hidden, n_tokens]
+    ggml_tensor *         positions,   // [4 * n_tokens] i32 (M-RoPE)
+    ggml_tensor *         attn_mask,   // optional causal mask
+    int                   kv_start,
+    int                   n_tokens,
+    bool                  capture,
+    int                   fa_window = 0)
+{
+    const int hidden = w.n_embd;
+    const float eps   = q35::EPS;
+    const TargetLayer & L = w.layers[layer_idx];
+    const bool is_attn = (((layer_idx + 1) % w.full_attention_interval) == 0);
+
+    static const int CAPTURE_LAYERS[DFLASH27B_DRAFT_N_TARGET_LAYERS] =
+        { 1, 16, 31, 46, 61 };
+
+    ggml_tensor * inpSA = inp;
+    ggml_tensor * cur   = rms_norm_mul(ctx, inp, L.attn_norm, eps);
+
+    if (is_attn) {
+        int fa_idx = 0;
+        for (int il = 0; il < layer_idx; il++) {
+            if (((il + 1) % w.full_attention_interval) == 0) fa_idx++;
+        }
+        cur = build_full_attn_block(ctx, gf, w, L, cur, positions, w.rope_sections,
+                                    cache.attn_k[fa_idx], cache.attn_v[fa_idx],
+                                    attn_mask, kv_start, n_tokens,
+                                    cache.kv_k_type, fa_window);
+    } else {
+        int dn_idx = 0;
+        for (int il = 0; il < layer_idx; il++) {
+            if (((il + 1) % w.full_attention_interval) != 0) dn_idx++;
+        }
+        cur = build_delta_net_block(ctx, gf, w, L, cur,
+                                    cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
+                                    n_tokens, nullptr, nullptr);
+    }
+
+    cur = ggml_add(ctx, cur, inpSA);
+
+    ggml_tensor * ffn_residual = cur;
+    ggml_tensor * post = rms_norm_mul(ctx, cur, L.attn_post_norm, eps);
+    ggml_tensor * ffn  = build_swiglu_ffn(ctx, post, L);
+    cur = ggml_add(ctx, ffn, ffn_residual);
+
+    if (capture && cache.target_feat) {
+        int capture_idx = -1;
+        for (int k = 0; k < DFLASH27B_DRAFT_N_TARGET_LAYERS; k++) {
+            if (CAPTURE_LAYERS[k] == layer_idx) { capture_idx = k; break; }
+        }
+        if (capture_idx >= 0) {
+            const size_t elt        = ggml_element_size(cache.target_feat);
+            const size_t col_stride = cache.target_feat->nb[1];
+            const int    cap        = cache.target_feat_cap;
+            const int    slot_start = kv_start % cap;
+            const int    pre_n      = std::min(n_tokens, cap - slot_start);
+            const int    post_n     = n_tokens - pre_n;
+
+            ggml_tensor * cur_2d = ggml_reshape_2d(ctx, cur, hidden, n_tokens);
+
+            {
+                const size_t offset =
+                    (size_t)slot_start * col_stride +
+                    (size_t)capture_idx * hidden * elt;
+                ggml_tensor * slot = ggml_view_2d(ctx, cache.target_feat,
+                    hidden, pre_n, col_stride, offset);
+                ggml_tensor * src  = ggml_view_2d(ctx, cur_2d,
+                    hidden, pre_n, cur_2d->nb[1], 0);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, src, slot));
+            }
+            if (post_n > 0) {
+                const size_t offset =
+                    (size_t)capture_idx * hidden * elt;
+                ggml_tensor * slot = ggml_view_2d(ctx, cache.target_feat,
+                    hidden, post_n, col_stride, offset);
+                ggml_tensor * src  = ggml_view_2d(ctx, cur_2d,
+                    hidden, post_n, cur_2d->nb[1],
+                    (size_t)pre_n * cur_2d->nb[1]);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, src, slot));
+            }
+        }
+    }
+
+    return cur;
+}
+
 QwenGraphOutputs build_qwen35_graph(
     ggml_context *         ctx,
     ggml_cgraph *          gf,
@@ -758,7 +880,7 @@ QwenGraphOutputs build_qwen35_graph(
             cur = build_full_attn_block(ctx, gf, w, L, cur, in.positions, w.rope_sections,
                                         cache.attn_k[fa_idx], cache.attn_v[fa_idx],
                                         in.attn_mask, in.kv_start, n_tokens,
-                                        cache.kv_k_type);
+                                        cache.kv_k_type, in.fa_window);
             fa_idx++;
         } else {
             DeltaNetCapture * cap_ptr = nullptr;
@@ -854,13 +976,6 @@ QwenGraphOutputs build_qwen35_graph(
     return og;
 }
 
-} // namespace dflash27b (end of qwen35 target graph)
-
-// ─── MoE FFN (qwen35moe) ───────────────────────────────────────────
-// Lives here temporarily; will be extracted to qwen35moe_target_graph.cpp.
-
-namespace dflash27b {
-
 ggml_tensor * build_moe_ffn(
     ggml_context *        ctx,
     ggml_cgraph *         gf,
@@ -952,4 +1067,22 @@ ggml_tensor * build_moe_ffn(
     return moe_out;
 }
 
-} // namespace dflash27b (moe ffn)
+ggml_tensor * build_qwen35_layer(
+    ggml_context *        ctx,
+    ggml_cgraph *         gf,
+    const TargetWeights & w,
+    TargetCache &         cache,
+    int                   layer_idx,
+    ggml_tensor *         inp,
+    ggml_tensor *         positions,
+    ggml_tensor *         attn_mask,
+    int                   kv_start,
+    int                   n_tokens,
+    bool                  capture,
+    int                   fa_window)
+{
+    return build_single_layer(ctx, gf, w, cache, layer_idx, inp, positions,
+                              attn_mask, kv_start, n_tokens, capture, fa_window);
+}
+
+} // namespace dflash27b

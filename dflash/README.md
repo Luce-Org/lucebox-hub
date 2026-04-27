@@ -77,17 +77,26 @@ Set `DFLASH27B_KV_TQ3=1` (TQ3_0, 3.5 bpv, default) or `DFLASH27B_KV_Q4=1` (Q4_0,
 Qwen3.6-27B ships the same `qwen35` architecture string and identical layer/head dims as 3.5, so `test_dflash` loads it with no code change:
 
 ```bash
+# 1. target
 huggingface-cli download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
+
+# 2. matched 3.6 draft (gated: accept terms + set HF_TOKEN first)
+huggingface-cli download z-lab/Qwen3.6-27B-DFlash --local-dir models/draft/
+
+# 3. bench
 DFLASH_TARGET=models/Qwen3.6-27B-Q4_K_M.gguf python3 scripts/bench_he.py --n-gen 128
 ```
 
-**Throughput is lower than on 3.5.** The z-lab draft was distilled against Qwen3.5 hidden states; Qwen3.6's captured features at layers {1, 16, 31, 46, 61} are shifted, so per-position accept drops about 30 points uniformly. Measured on the same RTX 3090:
+> The draft path is fixed at `models/draft/model.safetensors`; swapping targets requires also swapping the draft file (or pointing `DFLASH_DRAFT` at a different `model.safetensors`).
 
-| Target | Bench | AL | Accept | Mean tok/s |
-|---|---|---:|---:|---:|
-| Qwen3.5-27B Q4_K_M | HumanEval (README config) | 8.33 | ~65% | 134.78 |
-| Qwen3.6-27B Q4_K_M | HumanEval (10 prompts, n_gen=128) | 4.74 | 30.6% | 73.67 |
-| Qwen3.6-27B Q4_K_M | Math (10 prompts, n_gen=128) | 3.63 | 23.7% | 57.00 |
+**Throughput is lower than on 3.5.** z-lab published a matched [Qwen3.6-27B-DFlash](https://huggingface.co/z-lab/Qwen3.6-27B-DFlash) draft on 2026-04-26 (still under training). AL should climb as the draft matures. Measured on the same RTX 3090:
+
+| Target | Draft | Bench | AL | Accept | Mean tok/s |
+|---|---|---|---:|---:|---:|
+| Qwen3.5-27B Q4_K_M | z-lab/Qwen3.5-27B-DFlash | HumanEval (README config) | 8.33 | ~65% | 134.78 |
+| Qwen3.6-27B Q4_K_M | z-lab/Qwen3.5-27B-DFlash (mismatch) | HumanEval (10 prompts, n_gen=128) | 4.74 | 30.6% | 73.67 |
+| Qwen3.6-27B Q4_K_M | z-lab/Qwen3.6-27B-DFlash (still training) | HumanEval (10 prompts, n_gen=128) | 5.05 | 32.3% | 77.77 |
+| Qwen3.6-27B Q4_K_M | z-lab/Qwen3.5-27B-DFlash (mismatch) | Math (10 prompts, n_gen=128) | 3.63 | 23.7% | 57.00 |
 
 Full `bench_llm.py` suite on **Qwen3.6-27B UD-Q4_K_XL** (unsloth Dynamic 2.0, 10 prompts, n_gen=256, RTX 3090 24 GB, auto-fit `--max-ctx`):
 
@@ -108,8 +117,8 @@ Numbers will move once a Qwen3.6-matched DFlash draft lands; swap it in via `DFL
 git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub
 cd lucebox-hub/dflash
 
-# Build (CUDA 12+, CMake 3.18+, sm_86-compatible GPU)
-cmake -B build -S . -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release
+# Build (CUDA 12+, CMake 3.18+, sm_86-compatible GPU; CUDA 13+ required for Jetson AGX Thor sm_110)
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target test_dflash -j
 
 # Fetch models: ~16 GB target + 3.46 GB draft
@@ -137,10 +146,10 @@ python3 scripts/bench_he.py --n-gen 256 --ddtree-budget 22   # minimal HE bench
 DFLASH27B_KV_TQ3=1 DFLASH27B_PREFILL_UBATCH=16 \
   build/test_dflash models/Qwen3.5-27B-Q4_K_M.gguf \
   models/draft/model.safetensors /tmp/long_prompt.bin 64 /tmp/out.bin \
-  --fast-rollback --ddtree --ddtree-budget=16 --max-ctx=N   # N = align_up(prompt + n_gen + 64, 256); up to 262144
+  --fast-rollback --ddtree --ddtree-budget=16 --max-ctx=4096   # align_up(prompt + n_gen + 64, 256); raise up to 262144 for long prompts
 ```
 
-**Requirements:** NVIDIA sm_86+ GPU (3090, A10, A40, 4090), CUDA 12+, 24 GB VRAM, ~80 GB disk.
+**Requirements:** NVIDIA sm_86+ GPU (3090, A10, A40, 4090) or Jetson AGX Thor sm_110, CUDA 12+ (CUDA 13+ required for Thor), 24 GB VRAM, ~80 GB disk.
 
 ## How it works
 
@@ -182,7 +191,7 @@ Research proof-of-concept, not production.
 - **Batch size 1**, single-user local inference target (Ollama / LM Studio use case)
 - **One model pair**: Qwen3.5-27B Q4_K_M target + z-lab DFlash BF16 draft. Does not generalize without rewriting the graph builders.
 - **Greedy only**: `temperature`/`top_p` on the OpenAI server accepted but ignored. Rejection sampling in the verify path is a weekend-sized addition.
-- **CUDA sm_86+** only. No Metal, ROCm, multi-GPU.
+- **CUDA sm_86+ / sm_110 Thor** only. No Metal, ROCm, multi-GPU.
 - **Q4_K_M target** costs ~30 points of per-position accept vs the paper's BF16. Q5_K_M / Q6_K would recover most of it, if they fit.
 
 Correctness: `test_vs_oracle` validates the draft graph at cos sim 0.999812 vs the PyTorch reference. The target graph matches llama.cpp's `models/qwen35.cpp` semantically and produces bit-identical output to `test_generate` in autoregressive mode.

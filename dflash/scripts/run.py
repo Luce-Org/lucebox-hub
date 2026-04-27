@@ -66,6 +66,10 @@ def main():
                     help="Q4_0 KV cache (required for max_ctx=131072)")
     ap.add_argument("--kv-tq3", action="store_true",
                     help="TQ3_0 KV cache (3.5 bpv, near-lossless)")
+    ap.add_argument("--fa-window", type=int, default=None,
+                    help="Sliding window for FA layers (KV positions). 0 = full "
+                         "attention. Default 2048 (set in C++); only kicks in "
+                         "once kv_cache > window.")
     ap.add_argument("--max-ctx", type=int, default=0,
                     help="Override max KV context (default: auto-fit "
                          "prompt+n_gen+block, aligned to 256). Passing a "
@@ -106,6 +110,8 @@ def main():
         env["DFLASH27B_KV_Q4"] = "1"
     if args.kv_tq3:
         env["DFLASH27B_KV_TQ3"] = "1"
+    if args.fa_window is not None:
+        env["DFLASH27B_FA_WINDOW"] = str(args.fa_window)
 
     with tempfile.TemporaryDirectory() as tmp:
         in_bin  = os.path.join(tmp, "prompt.bin")
