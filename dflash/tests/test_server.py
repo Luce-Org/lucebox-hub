@@ -211,6 +211,34 @@ def test_tool_choice_invalid_returns_400(client):
     assert r.json()["error"]["param"] == "tool_choice"
 
 
+@patch("dflash.server.os.read")
+def test_tool_choice_required_forwarded_streaming(mock_read, client, mock_tokenizer):
+    mock_read.side_effect = _token_bytes(10, -1)
+    mock_tokenizer.decode.return_value = ""
+    client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [_INSPECT_TOOL],
+        "tool_choice": "required",
+        "stream": True,
+    })
+    call_kwargs = mock_tokenizer.apply_chat_template.call_args[1]
+    assert call_kwargs.get("tool_choice") == "required"
+
+
+@patch("dflash.server.os.read")
+def test_tool_choice_none_suppresses_tools_streaming(mock_read, client, mock_tokenizer):
+    mock_read.side_effect = _token_bytes(10, -1)
+    mock_tokenizer.decode.return_value = ""
+    client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [_INSPECT_TOOL],
+        "tool_choice": "none",
+        "stream": True,
+    })
+    call_kwargs = mock_tokenizer.apply_chat_template.call_args[1]
+    assert "tools" not in call_kwargs
+
+
 # ── /v1/messages (Anthropic) ───────────────────────────────────────
 
 @patch("dflash.server.os.read")
