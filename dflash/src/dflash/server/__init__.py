@@ -39,10 +39,28 @@ from .schemas import ChatRequest, AnthropicMessagesRequest
 
 
 ROOT = Path(__file__).resolve().parent.parent.parent.parent
-DEFAULT_TARGET = ROOT / "models" / "Qwen3.5-27B-Q4_K_M.gguf"
+DEFAULT_MODELS_DIR = ROOT / "models"
 DEFAULT_DRAFT_ROOT = ROOT / "models" / "draft"
 DEFAULT_BIN = ROOT / "build" / ("test_dflash" + (".exe" if sys.platform == "win32" else ""))
 DEFAULT_BUDGET = 22
+
+
+def autodetect_target(models_dir: Path) -> Path | None:
+    """Pick a Qwen3.x GGUF from models_dir, preferring the highest version."""
+    if not models_dir.is_dir():
+        return None
+    candidates = sorted(models_dir.glob("*.gguf"))
+    if not candidates:
+        return None
+
+    def version_key(p: Path):
+        import re
+        m = re.search(r"Qwen(\d+(?:\.\d+)*)", p.stem)
+        if not m:
+            return (0,)
+        return tuple(int(x) for x in m.group(1).split("."))
+
+    return max(candidates, key=version_key)
 
 _QWEN35_FAMILY_TOKENIZERS = {
     "Qwen3.5-27B": "Qwen/Qwen3.5-27B",
@@ -506,7 +524,8 @@ def main():
     ap = argparse.ArgumentParser(description="Luce DFlash OpenAI-compatible server")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=1236)
-    ap.add_argument("--target", type=Path, default=DEFAULT_TARGET)
+    ap.add_argument("--target", type=Path, default=None,
+                    help="Path to target GGUF (default: auto-detect newest Qwen*.gguf in models/)")
     ap.add_argument("--draft",  type=Path, default=DEFAULT_DRAFT_ROOT)
     ap.add_argument("--bin",    type=Path, default=DEFAULT_BIN)
     ap.add_argument("--budget", type=int,  default=DEFAULT_BUDGET)
@@ -529,6 +548,11 @@ def main():
 
     if not args.bin.is_file():
         raise SystemExit(f"binary not found at {args.bin}")
+    if args.target is None:
+        detected = autodetect_target(DEFAULT_MODELS_DIR)
+        if detected is None:
+            raise SystemExit(f"no GGUF found in {DEFAULT_MODELS_DIR}; pass --target")
+        args.target = detected
     if not args.target.is_file():
         raise SystemExit(f"target GGUF not found at {args.target}")
     draft = resolve_draft(args.draft) if args.draft.is_dir() else args.draft
