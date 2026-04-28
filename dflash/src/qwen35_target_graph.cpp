@@ -105,6 +105,29 @@ bool create_target_cache(const TargetWeights & w,
     if (const char * s = std::getenv("DFLASH27B_KV_TQ3")) {
         if (std::atoi(s) != 0) { kv_k_type = GGML_TYPE_TQ3_0; kv_v_type = GGML_TYPE_TQ3_0; }
     }
+    // Per-axis overrides (applied after joint vars, so they take priority).
+    // E.g. DFLASH27B_KV_TQ3=1 + DFLASH27B_KV_K=q8  →  K=Q8, V=TQ3.
+    if (const char * s = std::getenv("DFLASH27B_KV_K")) {
+        if (std::atoi(s) != 0) {
+            // accept: f16, q4, q8, tq3
+            std::string sv = std::string(s);
+            for (auto &c : sv) c = std::tolower(c);
+            if (sv == "f16") kv_k_type = GGML_TYPE_F16;
+            else if (sv == "q4" || sv == "q4_0") kv_k_type = GGML_TYPE_Q4_0;
+            else if (sv == "q8" || sv == "q8_0") kv_k_type = GGML_TYPE_Q8_0;
+            else if (sv == "tq3" || sv == "tq3_0") kv_k_type = GGML_TYPE_TQ3_0;
+        }
+    }
+    if (const char * s = std::getenv("DFLASH27B_KV_V")) {
+        if (std::atoi(s) != 0) {
+            std::string sv = std::string(s);
+            for (auto &c : sv) c = std::tolower(c);
+            if (sv == "f16") kv_v_type = GGML_TYPE_F16;
+            else if (sv == "q4" || sv == "q4_0") kv_v_type = GGML_TYPE_Q4_0;
+            else if (sv == "q8" || sv == "q8_0") kv_v_type = GGML_TYPE_Q8_0;
+            else if (sv == "tq3" || sv == "tq3_0") kv_v_type = GGML_TYPE_TQ3_0;
+        }
+    }
     out.kv_k_type = kv_k_type;
     const int max_ctx_alloc = (kv_k_type == GGML_TYPE_TQ3_0)
         ? ((max_ctx + 255) / 256) * 256
