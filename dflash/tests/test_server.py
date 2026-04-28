@@ -146,6 +146,71 @@ def test_chat_streaming(mock_read, client):
     assert finish_events[-1]["choices"][0]["finish_reason"] == "stop"
 
 
+# ── tool_choice ───────────────────────────────────────────────────
+
+_INSPECT_TOOL = {"type": "function", "function": {
+    "name": "inspect", "description": "Inspect a target.",
+    "parameters": {"type": "object", "properties": {"target": {"type": "string"}}},
+}}
+
+
+@patch("dflash.server.os.read")
+def test_tool_choice_none_suppresses_tools(mock_read, client, mock_tokenizer):
+    mock_read.side_effect = _token_bytes(10, -1)
+    mock_tokenizer.decode.return_value = "I cannot call tools."
+    client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [_INSPECT_TOOL],
+        "tool_choice": "none",
+        "stream": False,
+    })
+    call_kwargs = mock_tokenizer.apply_chat_template.call_args[1]
+    assert "tools" not in call_kwargs
+
+
+@patch("dflash.server.os.read")
+def test_tool_choice_required_forwarded(mock_read, client, mock_tokenizer):
+    mock_read.side_effect = _token_bytes(10, -1)
+    mock_tokenizer.decode.return_value = (
+        "<tool_call><function=inspect><parameter=target>x</parameter></function></tool_call>"
+    )
+    client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [_INSPECT_TOOL],
+        "tool_choice": "required",
+        "stream": False,
+    })
+    call_kwargs = mock_tokenizer.apply_chat_template.call_args[1]
+    assert call_kwargs.get("tool_choice") == "required"
+
+
+@patch("dflash.server.os.read")
+def test_tool_choice_named_function_forwarded(mock_read, client, mock_tokenizer):
+    mock_read.side_effect = _token_bytes(10, -1)
+    mock_tokenizer.decode.return_value = (
+        "<tool_call><function=inspect><parameter=target>x</parameter></function></tool_call>"
+    )
+    tc = {"type": "function", "function": {"name": "inspect"}}
+    client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [_INSPECT_TOOL],
+        "tool_choice": tc,
+        "stream": False,
+    })
+    call_kwargs = mock_tokenizer.apply_chat_template.call_args[1]
+    assert call_kwargs.get("tool_choice") == tc
+
+
+def test_tool_choice_invalid_returns_400(client):
+    r = client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "hi"}],
+        "tool_choice": "hallucinated_value",
+        "stream": False,
+    })
+    assert r.status_code == 400
+    assert r.json()["error"]["param"] == "tool_choice"
+
+
 # ── /v1/messages (Anthropic) ───────────────────────────────────────
 
 @patch("dflash.server.os.read")

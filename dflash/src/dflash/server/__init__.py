@@ -151,8 +151,13 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
             msgs.append(d)
 
         kwargs: dict = dict(tokenize=False, add_generation_prompt=True)
-        if req.tools:
+        tool_choice = req.tool_choice
+        if tool_choice == "none":
+            pass  # suppress tools so the model can't see or call them
+        elif req.tools:
             kwargs["tools"] = [t.model_dump() for t in req.tools]
+            if tool_choice not in (None, "auto"):
+                kwargs["tool_choice"] = tool_choice
         if req.chat_template_kwargs:
             kwargs.update(req.chat_template_kwargs)
         prompt = tokenizer.apply_chat_template(msgs, **kwargs)
@@ -209,6 +214,19 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatRequest):
+        tc = req.tool_choice
+        if tc not in (None, "auto", "none", "required") and not (
+            isinstance(tc, dict)
+            and tc.get("type") == "function"
+            and isinstance(tc.get("function"), dict)
+            and isinstance(tc["function"].get("name"), str)
+        ):
+            return JSONResponse(
+                {"error": {"code": "unsupported_parameter", "param": "tool_choice",
+                           "message": "tool_choice must be 'auto', 'none', 'required', "
+                                      "or {type:'function',function:{name:str}}"}},
+                status_code=400)
+
         prompt_bin, started_in_thinking = _tokenize_prompt(req)
         prompt_len = prompt_bin.stat().st_size // 4
         available_gen = max_ctx - prompt_len - 20
