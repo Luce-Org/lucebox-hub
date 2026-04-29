@@ -1,6 +1,5 @@
 # Luce DFlash benchmark results
 
-Single RTX 3090 24 GB, CUDA 12, driver 535.
 Target: `unsloth/Qwen3.5-27B-GGUF` (Q4_K_M, ~16 GB).
 Draft:  `z-lab/Qwen3.5-27B-DFlash` (BF16, 3.46 GB).
 Concurrency = 1, greedy decoding, `n_gen=256`.
@@ -8,11 +7,53 @@ Reproduce with `python3 scripts/bench_llm.py` (samples 10 prompts/dataset, seed=
 
 ## Headline — AR vs Luce DFlash at concurrency 1
 
+### RTX 3090 24 GB desktop (sm_86) — CUDA 12, driver 535
+
 | Task      | AR tok/s | DFlash tok/s | AL   | Speedup |
 |-----------|:--------:|:------------:|:----:|:-------:|
 | HumanEval | 37.78    | **129.52**   | 8.31 | **3.43×** |
 | Math500   | 37.71    | **110.51**   | 7.04 | **2.93×** |
 | GSM8K     | 37.65    | **96.15**    | 6.14 | **2.55×** |
+
+### RTX 5090 Laptop 24 GB (sm_120) — CUDA 13.2, driver 581.80
+
+| Task      | AR tok/s | DFlash tok/s | AL   | Speedup |
+|-----------|:--------:|:------------:|:----:|:-------:|
+| HumanEval | 23.96    | **87.30**    | 8.49 | **3.64×** |
+| GSM8K     | 23.77    | **70.92**    | 6.92 | **2.98×** |
+| Math500   | 23.77    | **72.97**    | 7.15 | **3.07×** |
+
+AR is lower than on the 3090 (~24 vs ~38 tok/s) due to laptop power limits and memory bandwidth. The DFlash speedup ratio holds — HumanEval actually improves to 3.64× at AL 8.49, consistent with the draft having been distilled on Qwen3.5 hidden states which transfer across quantisation targets.
+
+### RTX 5090 Laptop — TQ3_0 KV cache (`DFLASH27B_KV_TQ3=1`)
+
+| Task      | AR tok/s | DFlash tok/s | AL   | Speedup |
+|-----------|:--------:|:------------:|:----:|:-------:|
+| HumanEval | 24.09    | 78.91        | 7.76 | 3.28×   |
+| GSM8K     | 23.95    | 64.75        | 6.40 | 2.70×   |
+| Math500   | 24.01    | 67.85        | 6.57 | 2.83×   |
+
+TQ3_0 (3.5 bpv) costs ~0.7 AL and ~10 tok/s vs the default KV format at short contexts. The memory saving (9.7× vs F16, vs 8× for Q4_0) is the point — TQ3 enables longer contexts on the same VRAM budget, not higher short-context throughput.
+
+### RTX 5090 Laptop — Long-context sweep: Q4_0 vs TQ3_0
+
+`ddtree_budget=16`, `n_gen=128`, layer-segmented prefill for prompts > 8 K (`DFLASH27B_LAYER_PREFILL=1`).
+KV sizes are actual quantized sizes (not F16 equivalent).
+
+| Ctx   | KV    | Prefill  | Decode tok/s | AL    | KV size |
+|:-----:|:-----:|:--------:|:------------:|:-----:|:-------:|
+| 32K   | Q4_0  | 54.3 s   | 64.8         | 11.64 | 0.61 GB |
+| 32K   | TQ3_0 | 59.8 s   | 60.1         | 10.67 | 0.47 GB |
+| 64K   | Q4_0  | 142.0 s  | 48.6         | 11.64 | 1.21 GB |
+| 64K   | TQ3_0 | 151.5 s  | 46.5         | 10.67 | 0.94 GB |
+| 128K  | Q4_0  | OOM      | —            | —     | 2.42 GB |
+| 128K  | TQ3_0 | 436.1 s  | 24.6         | 10.67 | 1.88 GB |
+
+At 32K–64K: TQ3_0 costs ~5–7% decode throughput and ~8% AL vs Q4_0 while saving ~22% KV memory.
+At 128K: Q4_0 exhausts available VRAM (model ~17 GB + draft ~3.5 GB + SSM compute buffer ~1.2 GB
+leaves ~2.3 GB free; Q4_0 KV needs 2.42 GB → OOM). TQ3_0 (1.88 GB KV) fits and decodes at 24.6 tok/s.
+At 256K: TQ3_0 KV grows to 3.76 GB, also exceeding the VRAM budget — timed out after 60 min.
+TQ3_0 is the enabling KV format for 128K on this hardware; 256K is not reachable on 24 GB.
 
 AR = autoregressive target-only decode via `test_generate`.
 DFlash = block-diffusion draft + DDTree budget 22 verify + fast rollback.
@@ -25,7 +66,61 @@ Datasets pulled live via HuggingFace `datasets`:
 
 ## Per-prompt numbers (seed 42)
 
-### HumanEval (10 samples)
+### RTX 5090 Laptop
+
+#### HumanEval (10 samples)
+
+| # | n_tok | AR    | DFlash | AL    |
+|:-:|:-----:|:-----:|:------:|:-----:|
+| 01|  84   | 23.99 |  91.55 |  8.83 |
+| 02| 138   | 24.12 |  87.75 |  8.53 |
+| 03| 134   | 23.90 |  95.30 |  9.14 |
+| 04| 120   | 23.97 |  96.23 |  9.14 |
+| 05| 172   | 24.00 |  87.56 |  8.53 |
+| 06| 118   | 23.96 |  66.36 |  6.40 |
+| 07|  51   | 23.96 |  85.35 |  8.26 |
+| 08| 141   | 23.94 | **100.43** | **9.85** |
+| 09| 125   | 23.94 | **103.38** | **10.67** |
+| 10|  95   | 23.78 |  59.04 |  5.57 |
+| **mean** | | **23.96** | **87.30** | **8.49** |
+
+#### GSM8K (10 samples)
+
+| # | n_tok | AR    | DFlash | AL   |
+|:-:|:-----:|:-----:|:------:|:----:|
+| 01|  45   | 23.75 |  72.46 | 6.92 |
+| 02| 111   | 23.89 |  60.99 | 5.95 |
+| 03|  49   | 23.87 |  88.37 | 8.53 |
+| 04|  70   | 23.68 |  57.84 | 5.45 |
+| 05| 102   | 23.94 |  80.51 | 7.76 |
+| 06| 118   | 23.86 |  66.60 | 6.40 |
+| 07| 113   | 23.93 |  79.68 | 8.12 |
+| 08|  50   | 23.16 |  66.76 | 6.74 |
+| 09|  43   | 23.81 |  72.02 | 7.11 |
+| 10|  96   | 23.85 |  63.93 | 6.24 |
+| **mean** | | **23.77** | **70.92** | **6.92** |
+
+#### Math500 (10 samples)
+
+| # | n_tok | AR    | DFlash | AL   |
+|:-:|:-----:|:-----:|:------:|:----:|
+| 01| 257   | 23.94 |  72.87 | 7.11 |
+| 02|  53   | 24.03 |  74.69 | 7.31 |
+| 03|  40   | 23.34 |  81.72 | 8.00 |
+| 04|  50   | 23.77 |  88.77 | 8.83 |
+| 05| 117   | 23.49 |  63.59 | 6.40 |
+| 06|  76   | 23.89 |  64.93 | 6.40 |
+| 07|  43   | 23.59 |  68.49 | 6.74 |
+| 08|  79   | 23.81 |  63.08 | 6.10 |
+| 09|  52   | 23.92 |  60.94 | 5.82 |
+| 10|  57   | 23.93 |  90.61 | 8.83 |
+| **mean** | | **23.77** | **72.97** | **7.15** |
+
+---
+
+### RTX 3090 Desktop
+
+#### HumanEval (10 samples)
 
 | # | n_tok | AR    | DFlash | AL    |
 |:-:|:-----:|:-----:|:------:|:-----:|
