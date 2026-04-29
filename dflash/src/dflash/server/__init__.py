@@ -529,8 +529,11 @@ def main():
     ap.add_argument("--draft",  type=Path, default=DEFAULT_DRAFT_ROOT)
     ap.add_argument("--bin",    type=Path, default=DEFAULT_BIN)
     ap.add_argument("--budget", type=int,  default=DEFAULT_BUDGET)
-    ap.add_argument("--max-ctx", type=int, default=131072,
-                    help="Maximum context length (default: 131072)")
+    ap.add_argument("--max-ctx", type=int, default=16384,
+                    help="Maximum context length (default: 16384). "
+                         "Larger values trigger the FA-stride / VRAM-cliff "
+                         "trap on 24 GB cards — see issue #10. Bump only "
+                         "if your real per-request context exceeds 16K.")
     ap.add_argument("--kv-f16", action="store_true",
                     help="Force F16 KV cache (default: TQ3_0 when --max-ctx > 6144)")
     ap.add_argument("--fa-window", type=int, default=None,
