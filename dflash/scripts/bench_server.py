@@ -1,13 +1,23 @@
 """
-OpenAI-compat server throughput benchmark — code-agent prompt mix.
+OpenAI-compat server throughput benchmark.
 
 Streams each prompt through /v1/chat/completions and records:
   TTFT   — time to first content token (ms)
   tok/s  — decode throughput (completion_tokens / decode_wall_time)
   n_tok  — completion token count (from usage chunk)
+  p_chars — prompt length in chars (replay mode only)
+
+Two modes:
+
+  Default — short hand-written code-agent prompts (~50–200 tokens).
+            Measures isolated short-prompt decode tok/s.
+
+  Replay  — recorded production prompts from a sessions.jsonl file.
+            Realistic prompt sizes (5K–12K chars typical), measures the
+            same throughput numbers under prefill-dominant load.
 
 Usage:
-    # dflash (default)
+    # dflash (default short-prompt mode)
     uv run scripts/bench_server.py
 
     # LM Studio or any other endpoint
@@ -15,6 +25,10 @@ Usage:
 
     # Repeat each prompt N times for stable averages
     uv run scripts/bench_server.py --repeat 3 --n-gen 256
+
+    # Replay real prompts from a ddx sessions.jsonl
+    uv run scripts/bench_server.py --replay ~/Projects/ddx/.ddx/agent-logs/sessions.jsonl
+    uv run scripts/bench_server.py --replay file.jsonl --max-prompts 10
 """
 import argparse
 import json
@@ -187,10 +201,49 @@ def _stream_prompt(url: str, model: str, system: str, user: str,
                       overall_tok_s=overall_tok_s, n_tok=n_tok)
 
 
+# ── Replay corpus loader ───────────────────────────────────────────
+
+def _load_replay_corpus(path: str, min_chars: int, max_prompts: int) -> list[tuple[str, str]]:
+    """Load prompts from a ddx-style sessions.jsonl (one whole-session record per line).
+
+    Each row is expected to have a top-level `prompt` string field. Sessions
+    without a usable prompt are skipped silently. Sessions whose prompt is
+    shorter than min_chars are also skipped (they are not representative of
+    realistic agentic load).
+
+    Returns [(label, prompt_text), ...] in file order, capped at max_prompts.
+    Label is the session id when present, falling back to "row{n}".
+    """
+    out: list[tuple[str, str]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for n, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            prompt = row.get("prompt")
+            if not isinstance(prompt, str) or len(prompt) < min_chars:
+                continue
+            label = str(row.get("id") or f"row{n}")
+            out.append((label, prompt))
+            if max_prompts and len(out) >= max_prompts:
+                break
+    return out
+
+
+def _bucket(prompt_chars: int) -> str:
+    if prompt_chars < 2000:   return "small"
+    if prompt_chars < 8000:   return "medium"
+    return "large"
+
+
 # ── Main ──────────────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser(description="Server throughput benchmark (code-agent prompts)")
+    ap = argparse.ArgumentParser(description="OpenAI-compat server throughput benchmark")
     ap.add_argument("--url",    default="http://localhost:1236",
                     help="Base URL of the OpenAI-compat server (default: %(default)s)")
     ap.add_argument("--model",  default="",
@@ -200,7 +253,14 @@ def main():
     ap.add_argument("--repeat", type=int, default=1,
                     help="Repeat each prompt N times and average (default: %(default)s)")
     ap.add_argument("--prompts", nargs="+", metavar="NAME",
-                    help="Run only named prompts (default: all)")
+                    help="(default mode) Run only named prompts")
+    ap.add_argument("--replay", metavar="PATH", default=None,
+                    help="Replay prompts from a ddx-style sessions.jsonl. Each row must have "
+                         "a top-level `prompt` string. Disables the default code-agent corpus.")
+    ap.add_argument("--replay-min-chars", type=int, default=500,
+                    help="(replay) Skip sessions with prompts shorter than this (default: %(default)s)")
+    ap.add_argument("--max-prompts", type=int, default=0,
+                    help="(replay) Cap number of prompts to run (0 = no cap)")
     args = ap.parse_args()
 
     # Auto-detect model id if not given
@@ -214,19 +274,33 @@ def main():
         except Exception as e:
             sys.exit(f"Cannot reach {args.url}/v1/models: {e}\nPass --model explicitly.")
 
-    corpus = [(n, p) for n, p in PROMPTS
-              if not args.prompts or n in args.prompts]
-    if not corpus:
-        sys.exit(f"No prompts matched {args.prompts}")
+    if args.replay:
+        corpus = _load_replay_corpus(args.replay, args.replay_min_chars, args.max_prompts)
+        if not corpus:
+            sys.exit(f"No usable prompts (>= {args.replay_min_chars} chars) in {args.replay}")
+        mode_desc = f"replay={args.replay} prompts={len(corpus)}"
+        system_prompt = ""  # replay prompts already contain their own framing
+    else:
+        corpus = [(n, p) for n, p in PROMPTS
+                  if not args.prompts or n in args.prompts]
+        if not corpus:
+            sys.exit(f"No prompts matched {args.prompts}")
+        mode_desc = f"corpus=code-agent prompts={len(corpus)}"
+        system_prompt = SYSTEM
 
-    print(f"\nBenchmarking {args.url}  model={model}  n_gen={args.n_gen}  repeat={args.repeat}")
-    print(f"{'prompt':<25}  {'TTFT ms':>8}  {'dec t/s':>8}  {'ovr t/s':>8}  {'n_tok':>6}")
-    print("-" * 66)
+    print(f"\nBenchmarking {args.url}  model={model}  {mode_desc}  n_gen={args.n_gen}  repeat={args.repeat}")
     print(f"  dec t/s = tok / (t_end - t_first)   ovr t/s = tok / total_wall")
+    if args.replay:
+        print(f"{'prompt':<22}  {'p_chars':>7}  {'TTFT ms':>8}  {'dec t/s':>8}  {'ovr t/s':>8}  {'n_tok':>6}")
+        print("-" * 76)
+    else:
+        print(f"{'prompt':<25}  {'TTFT ms':>8}  {'dec t/s':>8}  {'ovr t/s':>8}  {'n_tok':>6}")
+        print("-" * 66)
 
     all_decode_tok_s:  list[float] = []
     all_overall_tok_s: list[float] = []
     all_ttft:          list[float] = []
+    by_bucket: dict[str, list[tuple[float, float, float]]] = {"small": [], "medium": [], "large": []}
 
     for name, user in corpus:
         run_decode:   list[float] = []
@@ -235,7 +309,7 @@ def main():
         run_ntok:     list[int]   = []
         err = ""
         for _ in range(args.repeat):
-            r = _stream_prompt(args.url, model, SYSTEM, user, args.n_gen)
+            r = _stream_prompt(args.url, model, system_prompt, user, args.n_gen)
             if r.error:
                 err = r.error
                 break
@@ -245,7 +319,10 @@ def main():
             run_ntok.append(r.n_tok)
 
         if err:
-            print(f"{name:<25}  ERROR: {err}")
+            if args.replay:
+                print(f"{name[:22]:<22}  {len(user):>7}  ERROR: {err}")
+            else:
+                print(f"{name:<25}  ERROR: {err}")
             continue
 
         avg_decode  = sum(run_decode)  / len(run_decode)
@@ -255,9 +332,33 @@ def main():
         all_decode_tok_s.append(avg_decode)
         all_overall_tok_s.append(avg_overall)
         all_ttft.append(avg_ttft)
-        print(f"{name:<25}  {avg_ttft:>8.0f}  {avg_decode:>8.1f}  {avg_overall:>8.1f}  {avg_ntok:>6}")
+        if args.replay:
+            by_bucket[_bucket(len(user))].append((avg_ttft, avg_decode, avg_overall))
+            print(f"{name[:22]:<22}  {len(user):>7}  {avg_ttft:>8.0f}  {avg_decode:>8.1f}  {avg_overall:>8.1f}  {avg_ntok:>6}")
+        else:
+            print(f"{name:<25}  {avg_ttft:>8.0f}  {avg_decode:>8.1f}  {avg_overall:>8.1f}  {avg_ntok:>6}")
 
-    if all_decode_tok_s:
+    if not all_decode_tok_s:
+        return
+
+    if args.replay:
+        print("-" * 76)
+        print(f"{'mean':<22}  {'':>7}  {sum(all_ttft)/len(all_ttft):>8.0f}  "
+              f"{sum(all_decode_tok_s)/len(all_decode_tok_s):>8.1f}  "
+              f"{sum(all_overall_tok_s)/len(all_overall_tok_s):>8.1f}")
+        print(f"{'min/max dec t/s':<22}  {'':>7}  {'':>8}  "
+              f"{min(all_decode_tok_s):>5.1f} / {max(all_decode_tok_s):.1f}")
+        print()
+        print(f"{'bucket':<10}  {'n':>3}  {'TTFT ms':>8}  {'dec t/s':>8}  {'ovr t/s':>8}")
+        for b in ("small", "medium", "large"):
+            rows = by_bucket[b]
+            if not rows:
+                continue
+            mean_ttft    = sum(r[0] for r in rows) / len(rows)
+            mean_decode  = sum(r[1] for r in rows) / len(rows)
+            mean_overall = sum(r[2] for r in rows) / len(rows)
+            print(f"{b:<10}  {len(rows):>3}  {mean_ttft:>8.0f}  {mean_decode:>8.1f}  {mean_overall:>8.1f}")
+    else:
         print("-" * 66)
         print(f"{'mean':<25}  {sum(all_ttft)/len(all_ttft):>8.0f}  "
               f"{sum(all_decode_tok_s)/len(all_decode_tok_s):>8.1f}  "
