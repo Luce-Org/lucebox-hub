@@ -182,7 +182,7 @@ DFLASH27B_KV_TQ3=1 DFLASH27B_PREFILL_UBATCH=16 \
   --fast-rollback --ddtree --ddtree-budget=16 --max-ctx=4096   # align_up(prompt + n_gen + 64, 256); raise up to 262144 for long prompts
 ```
 
-**Requirements:** NVIDIA sm_86+ GPU (3090, A10, A40, 4090) or Jetson AGX Thor sm_110, CUDA 12+ (CUDA 13+ required for Thor), 24 GB VRAM, ~80 GB disk.
+**Requirements:** NVIDIA sm_86+ GPU (3090, A10, A40, 4090), sm_120 (RTX 5090), or Jetson AGX Thor sm_110, CUDA 12+ (CUDA 13+ required for sm_120/Thor), 24 GB VRAM, ~80 GB disk.
 
 ## How it works
 
