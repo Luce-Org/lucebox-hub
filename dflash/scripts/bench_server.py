@@ -101,7 +101,8 @@ PROMPTS = [
 class ProbResult:
     name: str
     ttft_ms: float
-    decode_tok_s: float
+    decode_tok_s: float  # n_tok / (t_end - t_first)
+    overall_tok_s: float  # n_tok / (t_end - t0)
     n_tok: int
     error: str = ""
 
@@ -117,7 +118,6 @@ def _stream_prompt(url: str, model: str, system: str, user: str,
         "max_tokens": n_gen,
         "stream": True,
         "stream_options": {"include_usage": True},
-        "chat_template_kwargs": {"enable_thinking": False},
     }).encode()
 
     req = urllib.request.Request(
@@ -162,9 +162,10 @@ def _stream_prompt(url: str, model: str, system: str, user: str,
                         continue
                     delta = choices[0].get("delta", {})
 
-                    # First real content token → record TTFT
+                    # First real token → record TTFT (any text, including reasoning)
                     if t_first is None and (
-                        delta.get("content") or delta.get("tool_calls")
+                        delta.get("content") or delta.get("reasoning_content")
+                        or delta.get("tool_calls")
                     ):
                         t_first = time.perf_counter()
 
@@ -178,9 +179,12 @@ def _stream_prompt(url: str, model: str, system: str, user: str,
 
     ttft_ms = (t_first - t0) * 1000
     decode_wall = t_end - t_first
+    total_wall = t_end - t0
     decode_tok_s = n_tok / decode_wall if decode_wall > 0 else 0.0
+    overall_tok_s = n_tok / total_wall if total_wall > 0 else 0.0
 
-    return ProbResult(name="", ttft_ms=ttft_ms, decode_tok_s=decode_tok_s, n_tok=n_tok)
+    return ProbResult(name="", ttft_ms=ttft_ms, decode_tok_s=decode_tok_s,
+                      overall_tok_s=overall_tok_s, n_tok=n_tok)
 
 
 # ── Main ──────────────────────────────────────────────────────────
@@ -216,23 +220,27 @@ def main():
         sys.exit(f"No prompts matched {args.prompts}")
 
     print(f"\nBenchmarking {args.url}  model={model}  n_gen={args.n_gen}  repeat={args.repeat}")
-    print(f"{'prompt':<25}  {'TTFT ms':>8}  {'tok/s':>7}  {'n_tok':>6}")
-    print("-" * 56)
+    print(f"{'prompt':<25}  {'TTFT ms':>8}  {'dec t/s':>8}  {'ovr t/s':>8}  {'n_tok':>6}")
+    print("-" * 66)
+    print(f"  dec t/s = tok / (t_end - t_first)   ovr t/s = tok / total_wall")
 
-    all_tok_s: list[float] = []
-    all_ttft:  list[float] = []
+    all_decode_tok_s:  list[float] = []
+    all_overall_tok_s: list[float] = []
+    all_ttft:          list[float] = []
 
     for name, user in corpus:
-        run_tok_s: list[float] = []
-        run_ttft:  list[float] = []
-        run_ntok:  list[int]   = []
+        run_decode:   list[float] = []
+        run_overall:  list[float] = []
+        run_ttft:     list[float] = []
+        run_ntok:     list[int]   = []
         err = ""
         for _ in range(args.repeat):
             r = _stream_prompt(args.url, model, SYSTEM, user, args.n_gen)
             if r.error:
                 err = r.error
                 break
-            run_tok_s.append(r.decode_tok_s)
+            run_decode.append(r.decode_tok_s)
+            run_overall.append(r.overall_tok_s)
             run_ttft.append(r.ttft_ms)
             run_ntok.append(r.n_tok)
 
@@ -240,19 +248,20 @@ def main():
             print(f"{name:<25}  ERROR: {err}")
             continue
 
-        avg_tok_s = sum(run_tok_s) / len(run_tok_s)
-        avg_ttft  = sum(run_ttft)  / len(run_ttft)
-        avg_ntok  = sum(run_ntok)  // len(run_ntok)
-        all_tok_s.append(avg_tok_s)
+        avg_decode  = sum(run_decode)  / len(run_decode)
+        avg_overall = sum(run_overall) / len(run_overall)
+        avg_ttft    = sum(run_ttft)    / len(run_ttft)
+        avg_ntok    = sum(run_ntok)    // len(run_ntok)
+        all_decode_tok_s.append(avg_decode)
+        all_overall_tok_s.append(avg_overall)
         all_ttft.append(avg_ttft)
-        print(f"{name:<25}  {avg_ttft:>8.0f}  {avg_tok_s:>7.1f}  {avg_ntok:>6}")
+        print(f"{name:<25}  {avg_ttft:>8.0f}  {avg_decode:>8.1f}  {avg_overall:>8.1f}  {avg_ntok:>6}")
 
-    if all_tok_s:
-        print("-" * 56)
+    if all_decode_tok_s:
+        print("-" * 66)
         print(f"{'mean':<25}  {sum(all_ttft)/len(all_ttft):>8.0f}  "
-              f"{sum(all_tok_s)/len(all_tok_s):>7.1f}")
-        print(f"{'min/max tok/s':<25}  {'':>8}  "
-              f"{min(all_tok_s):>5.1f} / {max(all_tok_s):.1f}")
+              f"{sum(all_decode_tok_s)/len(all_decode_tok_s):>8.1f}  "
+              f"{sum(all_overall_tok_s)/len(all_overall_tok_s):>8.1f}")
 
 
 if __name__ == "__main__":
