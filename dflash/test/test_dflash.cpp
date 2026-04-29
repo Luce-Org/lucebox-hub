@@ -870,6 +870,25 @@ int main(int argc, char ** argv) {
             ddtree_acceptwin_margin = std::atoi(argv[i] + 26);
             ddtree_acceptwin_active = true;
         }
+        else if (std::strncmp(argv[i], "--preset=", 9) == 0) {
+            const char * v = argv[i] + 9;
+            if (!std::strcmp(v, "audit")) {
+                // Post-fix winner on AEON Qwen3.6-27B Q4_K_M @ RTX PRO 6000 Blackwell.
+                // sec@32K: 86.46 tok/s, score 100/100 (Opus 4.7 graded).
+                ddtree_mode        = true;
+                fast_rollback      = true;
+                ddtree_budget      = 36;
+                ddtree_chain_seed  = true;
+                ddtree_acceptwin_active = true;
+                ddtree_acceptwin_margin = 4;
+                ddtree_acceptwin_size   = 32;
+                std::printf("[preset] audit applied: ddtree=%d budget=%d acceptwin=p95+%d\n",
+                    (int)ddtree_mode, ddtree_budget, ddtree_acceptwin_margin);
+            } else {
+                std::fprintf(stderr, "unknown preset: %s (known: audit)\n", v);
+                return 2;
+            }
+        }
         else if (std::strcmp(argv[i], "--test-window") == 0)      { test_window_mode = true; }
     else if (std::strcmp(argv[i], "--profile-scaling") == 0) {
             profile_scaling = true;
