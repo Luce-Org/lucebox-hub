@@ -245,14 +245,39 @@ void free_target_cache(TargetCache & c) {
     c.cur_pos = 0;
 }
 
+void reset_target_cache(TargetCache & c) {
+    c.cur_pos = 0;
+    std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
+    ggml_context * ctx_list[] = { c.base_ctx, c.rollback_ctx };
+    for (int ci = 0; ci < 2; ci++) {
+        ggml_context * ctx = ctx_list[ci];
+        if (!ctx) continue;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr;
+             t = ggml_get_next_tensor(ctx, t)) {
+            size_t nb = ggml_nbytes(t);
+            size_t off = 0;
+            while (off < nb) {
+                size_t chunk = std::min(nb - off, zeros.size());
+                ggml_backend_tensor_set(t, zeros.data(), off, chunk);
+                off += chunk;
+            }
+        }
+    }
+}
+
 // Attach rollback tensors to an existing prefill cache without touching the
 // base tensors (KV, SSM, conv, target_feat) that prefill already populated.
 // No D2D copies — the base tensors stay right where the graph wrote them.
+// If rollback tensors are already present (e.g. daemon mode second request),
+// this is a no-op.
 bool migrate_prefill_cache(const TargetWeights & w,
                            int max_ctx,
                            int max_verify_tokens,
                            ggml_backend_t backend,
                            TargetCache & cache) {
+    // Already migrated (e.g. daemon mode second+ request after reset_target_cache).
+    if (cache.rollback_ctx) return true;
+
     const int n_delta = (int)cache.ssm_state.size(); // 48
     if (max_verify_tokens <= 0) {
         max_verify_tokens = DFLASH27B_DRAFT_BLOCK_SIZE;

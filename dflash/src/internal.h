@@ -255,6 +255,11 @@ bool create_target_cache(const TargetWeights & w,
 
 void free_target_cache(TargetCache & c);
 
+// Zero all state tensors (KV, SSM, conv, target_feat, rollback) in place
+// without freeing/reallocating GPU buffers. Used by daemon mode between
+// requests to avoid the ~5 s overhead of full cache destruction + recreation.
+void reset_target_cache(TargetCache & c);
+
 // Reallocate a prefill-only cache with full rollback tensors, copying all live
 // state (KV, SSM, conv, target_feat) device-to-device. Frees the old cache.
 bool migrate_prefill_cache(const TargetWeights & w,
