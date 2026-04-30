@@ -1213,18 +1213,193 @@ int main(int argc, char ** argv) {
         std::fflush(stdout);
     }
 
+    constexpr int PREFIX_CACHE_SLOTS = 8;
+    PrefixSnapshot prefix_snapshots[PREFIX_CACHE_SLOTS];   // default-constructed, ctx==nullptr
+
     StepGraph sg;
     bool daemon_first_iter = true;
 
     while (true) {
         std::string prompt_file_str;
+        bool restore_from_slot        = false;
+        int  restore_slot_id          = -1;
+        bool chain_restore_requested  = false;
+        int  chain_thick_slot         = -1;
+        std::vector<int> chain_thin_ids;
+        // Inline-snap: snapshot at boundary during prefill (single snap only;
+        // multi-snap "snap=A:1,B:2" is not implemented — use separate SNAPSHOT).
+        int  snap_pos  = -1;
+        int  snap_slot = -1;
+
         if (daemon_mode) {
             std::string line;
             if (!std::getline(std::cin, line)) break;
-            char ppath[1024];
-            if (std::sscanf(line.c_str(), "%1023s %d", ppath, &n_gen) != 2) continue;
-            prompt_file_str = ppath;
-            prompt_path = prompt_file_str.c_str();
+
+            // Try keyword commands first (longer keywords before shorter prefixes).
+            if (line.rfind("SNAPSHOT_THIN ", 0) == 0) {
+                int slot = -1, kv_start = -1, kv_end = -1;
+                if (std::sscanf(line.c_str() + 14, "%d %d %d", &slot, &kv_start, &kv_end) != 3
+                    || slot < 0 || slot >= PREFIX_CACHE_SLOTS) {
+                    std::fprintf(stderr, "[snap] SNAPSHOT_THIN bad args\n");
+                    continue;
+                }
+                if (!snapshot_target_cache_thin(w, cache, backend, kv_start, kv_end,
+                                                 prefix_snapshots[slot])) {
+                    std::fprintf(stderr, "[snap] thin failed slot=%d: %s\n", slot,
+                                 dflash27b_last_error());
+                    continue;
+                }
+                std::printf("[snap] thin slot=%d kv=%d,%d\n", slot, kv_start, kv_end);
+                std::fflush(stdout);
+                continue;
+            }
+            if (line.rfind("SNAPSHOT ", 0) == 0) {
+                int slot = -1;
+                if (std::sscanf(line.c_str() + 9, "%d", &slot) != 1
+                    || slot < 0 || slot >= PREFIX_CACHE_SLOTS) {
+                    std::fprintf(stderr, "[snap] invalid slot %d\n", slot);
+                    continue;
+                }
+                if (!snapshot_target_cache(w, cache, backend, prefix_snapshots[slot])) {
+                    std::fprintf(stderr, "[snap] failed slot=%d: %s\n", slot, dflash27b_last_error());
+                    continue;
+                }
+                std::printf("[snap] slot=%d cur_pos=%d\n", slot, prefix_snapshots[slot].cur_pos);
+                std::fflush(stdout);
+                continue;
+            }
+            if (line.rfind("FREE_SNAPSHOT ", 0) == 0) {
+                int slot = -1;
+                if (std::sscanf(line.c_str() + 14, "%d", &slot) != 1
+                    || slot < 0 || slot >= PREFIX_CACHE_SLOTS) continue;
+                free_prefix_snapshot(prefix_snapshots[slot]);
+                std::printf("[snap] freed slot=%d\n", slot);
+                std::fflush(stdout);
+                continue;
+            }
+            if (line == "LIST_SLOTS") {
+                std::printf("[snap] slots=");
+                bool first = true;
+                for (int i = 0; i < PREFIX_CACHE_SLOTS; i++) {
+                    if (prefix_snapshots[i].ctx != nullptr) {
+                        std::printf("%s%d", first ? "" : ",", i);
+                        first = false;
+                    }
+                }
+                std::printf("\n");
+                std::fflush(stdout);
+                continue;
+            }
+            if (line.rfind("RESTORE_CHAIN ", 0) == 0) {
+                // Format: RESTORE_CHAIN <thick_slot> <thin_slot_list> <prompt_file> <n_gen>
+                // <thin_slot_list> is "0,1,2" or "-" for empty.
+                int  thick_slot_local = -2;
+                char thin_str[256]    = {0};
+                char ppath[1024]      = {0};
+                int  n_gen_local      = 0;
+                if (std::sscanf(line.c_str() + 14, "%d %255s %1023s %d",
+                                &thick_slot_local, thin_str, ppath, &n_gen_local) != 4) {
+                    std::fprintf(stderr, "[snap] RESTORE_CHAIN bad args\n");
+                    stream_emit(-1);
+                    continue;
+                }
+                // Validate thick_slot (-1 = none).
+                if (thick_slot_local != -1
+                    && (thick_slot_local < 0 || thick_slot_local >= PREFIX_CACHE_SLOTS
+                        || prefix_snapshots[thick_slot_local].ctx == nullptr
+                        || prefix_snapshots[thick_slot_local].is_thin)) {
+                    std::fprintf(stderr, "[snap] RESTORE_CHAIN bad thick slot=%d\n", thick_slot_local);
+                    stream_emit(-1);
+                    continue;
+                }
+                // Parse thin slot list. Strict: every comma-separated token
+                // must be a valid non-negative integer (rejects "1,foo,3",
+                // empty entries "1,,3", trailing junk). Codex review fix.
+                std::vector<int> thin_ids_local;
+                bool thin_parse_ok = true;
+                if (std::strcmp(thin_str, "-") != 0 && thin_str[0] != '\0') {
+                    const char * p = thin_str;
+                    while (*p && thin_parse_ok) {
+                        char * end = nullptr;
+                        long id_l = std::strtol(p, &end, 10);
+                        if (end == p) {
+                            std::fprintf(stderr,
+                                "[snap] RESTORE_CHAIN malformed thin list near '%s'\n", p);
+                            thin_parse_ok = false; break;
+                        }
+                        int id = (int)id_l;
+                        if (id < 0 || id >= PREFIX_CACHE_SLOTS
+                            || prefix_snapshots[id].ctx == nullptr
+                            || !prefix_snapshots[id].is_thin) {
+                            std::fprintf(stderr, "[snap] RESTORE_CHAIN bad thin slot=%d\n", id);
+                            thin_parse_ok = false; break;
+                        }
+                        thin_ids_local.push_back(id);
+                        if (*end == '\0') break;
+                        if (*end != ',') {
+                            std::fprintf(stderr,
+                                "[snap] RESTORE_CHAIN expected ',' after slot %d, got '%c'\n",
+                                id, *end);
+                            thin_parse_ok = false; break;
+                        }
+                        p = end + 1;
+                        if (*p == '\0' || *p == ',') {
+                            std::fprintf(stderr,
+                                "[snap] RESTORE_CHAIN empty thin slot entry\n");
+                            thin_parse_ok = false; break;
+                        }
+                    }
+                }
+                if (!thin_parse_ok) {
+                    stream_emit(-1);
+                    continue;
+                }
+                n_gen                    = n_gen_local;
+                prompt_file_str          = ppath;
+                prompt_path              = prompt_file_str.c_str();
+                chain_restore_requested  = true;
+                chain_thick_slot         = thick_slot_local;
+                chain_thin_ids           = std::move(thin_ids_local);
+                // Fall through into the existing cache-rebuild + prefill path.
+            } else if (line.rfind("RESTORE ", 0) == 0) {
+                int slot = -1;
+                char ppath[1024];
+                if (std::sscanf(line.c_str() + 8, "%d %1023s %d", &slot, ppath, &n_gen) != 3
+                    || slot < 0 || slot >= PREFIX_CACHE_SLOTS
+                    || prefix_snapshots[slot].ctx == nullptr) {
+                    std::fprintf(stderr, "[snap] RESTORE bad args or empty slot %d\n", slot);
+                    stream_emit(-1);
+                    continue;
+                }
+                prompt_file_str = ppath;
+                prompt_path = prompt_file_str.c_str();
+                restore_from_slot = true;
+                restore_slot_id   = slot;
+                // Parse optional inline-snap suffix: snap=<pos>:<slot_id>
+                if (const char * sp = std::strstr(line.c_str(), "snap=")) {
+                    if (std::sscanf(sp, "snap=%d:%d", &snap_pos, &snap_slot) != 2
+                        || snap_slot < 0 || snap_slot >= PREFIX_CACHE_SLOTS) {
+                        std::fprintf(stderr, "[snap] bad inline-snap arg\n");
+                        snap_pos = -1; snap_slot = -1;
+                    }
+                }
+                // Fall through into the existing prefill path; the cache reset
+                // and restore happen after the cache rebuild block below.
+            } else {
+                // Legacy: bare `<prompt_file> <n_gen>` line — full reset path.
+                char ppath[1024];
+                if (std::sscanf(line.c_str(), "%1023s %d", ppath, &n_gen) != 2) continue;
+                prompt_file_str = ppath;
+                prompt_path = prompt_file_str.c_str();
+                // Parse optional inline-snap suffix: snap=<pos>:<slot_id>
+                if (const char * sp = std::strstr(line.c_str(), "snap=")) {
+                    if (std::sscanf(sp, "snap=%d:%d", &snap_pos, &snap_slot) != 2
+                        || snap_slot < 0 || snap_slot >= PREFIX_CACHE_SLOTS) {
+                        std::fprintf(stderr, "[snap] bad inline-snap arg\n");
+                        snap_pos = -1; snap_slot = -1;
+                    }
+                }
+            }
 
             // Reset cache state between requests. On the first request the
             // cache was promoted from prefill-only to full (with rollback
@@ -1235,6 +1410,37 @@ int main(int argc, char ** argv) {
                 reset_target_cache(cache);
             }
             daemon_first_iter = false;
+
+            // After cache is fresh, optionally restore from snapshot.
+            if (restore_from_slot) {
+                if (!restore_target_cache(prefix_snapshots[restore_slot_id], cache)) {
+                    std::fprintf(stderr, "[snap] restore failed: %s\n", dflash27b_last_error());
+                    stream_emit(-1);
+                    continue;
+                }
+                std::printf("[snap] restored slot=%d cur_pos=%d\n",
+                            restore_slot_id, cache.cur_pos);
+                std::fflush(stdout);
+            }
+
+            // After cache is fresh, optionally apply chain restore.
+            if (chain_restore_requested) {
+                const PrefixSnapshot * thick_ptr =
+                    (chain_thick_slot == -1) ? nullptr : &prefix_snapshots[chain_thick_slot];
+                std::vector<const PrefixSnapshot *> thin_ptrs;
+                for (int id : chain_thin_ids) thin_ptrs.push_back(&prefix_snapshots[id]);
+                if (!restore_target_cache_chain(thick_ptr,
+                                                 thin_ptrs.empty() ? nullptr : thin_ptrs.data(),
+                                                 (int)thin_ptrs.size(),
+                                                 cache)) {
+                    std::fprintf(stderr, "[snap] RESTORE_CHAIN failed: %s\n", dflash27b_last_error());
+                    stream_emit(-1);
+                    continue;
+                }
+                std::printf("[snap] chain restored thick=%d thins=%zu cur_pos=%d\n",
+                            chain_thick_slot, thin_ptrs.size(), cache.cur_pos);
+                std::fflush(stdout);
+            }
         }
 
         auto prompt = read_int32_file(prompt_path);
@@ -1431,9 +1637,40 @@ int main(int argc, char ** argv) {
     std::vector<float>    pf_embed_buf;
     std::vector<int32_t>  pf_pos_buf;
     std::vector<float>    pf_logits_buf;
-    const int prompt_len = (int)prompt.size();
-    for (int start = 0; start < prompt_len; start += PREFILL_UBATCH) {
-        const int n_tokens = std::min(PREFILL_UBATCH, prompt_len - start);
+    const int prompt_len     = (int)prompt.size();
+    const int prefill_start  = cache.cur_pos;   // 0 for fresh cache; >0 after snapshot restore
+    for (int start = prefill_start; start < prompt_len; start += PREFILL_UBATCH) {
+        int n_tokens = std::min(PREFILL_UBATCH, prompt_len - start);
+
+        // Inline-snap: if snap_pos == start exactly, fire snapshot before any
+        // prefill work this iteration, then continue with the full ubatch.
+        if (snap_pos >= 0 && snap_pos == start) {
+            cache.cur_pos = start;
+            if (snap_slot >= 0) {
+                if (snapshot_target_cache(w, cache, backend, prefix_snapshots[snap_slot])) {
+                    std::printf("[snap] inline slot=%d cur_pos=%d\n", snap_slot, start);
+                    std::fflush(stdout);
+                } else {
+                    std::fprintf(stderr, "[snap] inline snap failed slot=%d: %s\n",
+                                 snap_slot, dflash27b_last_error());
+                }
+            }
+            snap_pos = -1; snap_slot = -1;   // consume
+            // n_tokens is unchanged; continue prefilling this ubatch.
+        }
+
+        // Inline-snap: if snap_pos falls inside this ubatch, clip n_tokens to
+        // land exactly at snap_pos so the snapshot captures the right boundary.
+        bool fire_snap_after = false;
+        if (snap_pos > start && snap_pos <= start + n_tokens) {
+            n_tokens = snap_pos - start;   // land exactly at snap_pos
+            fire_snap_after = (n_tokens > 0);
+            if (n_tokens == 0) {
+                // snap_pos == start already handled above; shouldn't reach here.
+                snap_pos = -1; snap_slot = -1;
+            }
+        }
+
         const int kv_len   = start + n_tokens;
         const bool pf_with_mask = (g_kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1);
         if (!build_target_step(sg, w, cache, backend,
@@ -1480,8 +1717,36 @@ int main(int argc, char ** argv) {
                                 sizeof(float) * vocab);
         last_tok = argmax_f32(pf_logits_buf.data(), vocab);
         committed = start + n_tokens;
+
+        // Fire inline snapshot after compute, so cache boundary is exact.
+        if (fire_snap_after) {
+            cache.cur_pos  = committed;
+            cache.last_tok = last_tok;
+            if (snap_slot >= 0) {
+                if (snapshot_target_cache(w, cache, backend, prefix_snapshots[snap_slot])) {
+                    std::printf("[snap] inline slot=%d cur_pos=%d\n", snap_slot, committed);
+                    std::fflush(stdout);
+                } else {
+                    std::fprintf(stderr, "[snap] inline snap failed slot=%d: %s\n",
+                                 snap_slot, dflash27b_last_error());
+                }
+            }
+            snap_pos = -1; snap_slot = -1;   // consume
+            // Adjust loop increment: next iteration must start at committed,
+            // not at (start + PREFILL_UBATCH). Override via start arithmetic:
+            // the for-loop does start += PREFILL_UBATCH, so back-adjust.
+            start = committed - PREFILL_UBATCH;
+        }
     }
     auto t_pf1 = std::chrono::steady_clock::now();
+    // If prefill was a no-op due to a snapshot RESTORE (cache.cur_pos already
+    // covers the prompt), seed last_tok from the restored cache so the decode
+    // loop has a valid starting token. Detected by prefill_start == prompt_len:
+    // the for loop ran zero iterations and `committed` stayed at 0.
+    if (last_tok == -1 && cache.last_tok != -1 && prefill_start == prompt_len) {
+        last_tok  = cache.last_tok;
+        committed = prompt_len;
+    }
     std::printf("[prefill] %d tokens in %.2f s, last_tok=%d\n",
                 committed,
                 std::chrono::duration<double>(t_pf1 - t_pf0).count(),
@@ -2351,6 +2616,13 @@ int main(int argc, char ** argv) {
     std::printf("\n");
 
     if (daemon_mode) {
+        // Update cache.cur_pos / cache.last_tok to reflect end-of-generation
+        // state so a subsequent SNAPSHOT command captures the correct boundary.
+        // Both fields are otherwise unused by the prefill/decode hot path
+        // (kv_start is tracked separately, last_tok is a local) — they exist
+        // for cross-request snapshot accounting.
+        cache.cur_pos  = (int)out_all.size();
+        cache.last_tok = last_tok;
         stream_emit(-1);
     } else {
         if (out_path) write_int32_file(out_path, out_all);
@@ -2359,6 +2631,9 @@ int main(int argc, char ** argv) {
 
     } // end while(true)
 
+    if (daemon_mode) {
+        for (int i = 0; i < PREFIX_CACHE_SLOTS; i++) free_prefix_snapshot(prefix_snapshots[i]);
+    }
     step_graph_destroy(sg);
     free_target_cache(cache);
     free_draft_weights(dw);

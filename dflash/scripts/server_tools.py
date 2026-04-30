@@ -42,6 +42,8 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import iterate_in_threadpool
 from transformers import AutoTokenizer
 
+from prefix_cache import DaemonStdoutBus, PrefixCache
+
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TARGET = ROOT / "models" / "Qwen3.5-27B-Q4_K_M.gguf"
@@ -306,7 +308,8 @@ def parse_tool_calls(text: str, tools=None) -> tuple[str, list[dict]]:
 # ─── app ───────────────────────────────────────────────────────────
 
 def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
-              max_ctx: int, tokenizer: AutoTokenizer, stop_ids: set[int]) -> FastAPI:
+              max_ctx: int, tokenizer: AutoTokenizer, stop_ids: set[int],
+              prefix_cache_slots: int = 4) -> FastAPI:
     import asyncio
     app = FastAPI(title="Luce DFlash OpenAI server (tool-aware)")
     daemon_lock = asyncio.Lock()
@@ -316,8 +319,40 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
            "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}",
            f"--max-ctx={max_ctx}",
            f"--stream-fd={w_pipe}"]
-    daemon_proc = subprocess.Popen(cmd, pass_fds=(w_pipe,), stdin=subprocess.PIPE)
+    daemon_proc = subprocess.Popen(cmd, pass_fds=(w_pipe,), stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, bufsize=0)
     os.close(w_pipe)
+
+    bus = DaemonStdoutBus(daemon_proc.stdout)
+    # Mirror server.py: resolve effective KV-K type + FA window from env so
+    # they participate in the prefix-cache hash key.
+    def _resolve_kv_k_type():
+        kv = "q8_0"
+        if os.environ.get("DFLASH27B_KV_F16", "0") != "0":
+            kv = "f16"
+        if os.environ.get("DFLASH27B_KV_Q4", "0") != "0":
+            kv = "q4_0"
+        if os.environ.get("DFLASH27B_KV_TQ3", "0") != "0":
+            kv = "tq3_0"
+        if os.environ.get("DFLASH27B_KV_K"):
+            kv = os.environ["DFLASH27B_KV_K"].lower()
+        return kv
+    _fa_window = int(os.environ.get("DFLASH27B_FA_WINDOW", 2048))
+    prefix_cache = PrefixCache(
+        daemon_stdin=daemon_proc.stdin,
+        await_reply=bus.await_reply,
+        daemon_lock=daemon_lock,
+        tokenizer=tokenizer,
+        kv_k_type=_resolve_kv_k_type(),
+        fa_window=_fa_window,
+        cap=prefix_cache_slots,
+    )
+
+    @app.on_event("startup")
+    async def _startup():
+        import asyncio
+        bus.start(asyncio.get_running_loop())
+        await prefix_cache.startup_sync()
 
     @app.get("/v1/models")
     def list_models():
@@ -402,6 +437,10 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
             if generated >= n_gen:
                 hit_stop = True
 
+    async def _drain_pipe_to_sentinel():
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: list(_token_stream(r_pipe, 0)))
+
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatRequest):
         prompt_bin, started_in_thinking = _tokenize_prompt(req)
@@ -413,20 +452,37 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
                 {"detail": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"},
                 status_code=400)
 
+        # Read back token ids for cache key (cheap — file is small).
+        raw = prompt_bin.read_bytes()
+        prompt_ids = [struct.unpack_from("<i", raw, i)[0]
+                      for i in range(0, len(raw), 4)]
+
         completion_id = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
 
         if req.stream:
-            return await _stream_response(req, prompt_bin, gen_len,
+            return await _stream_response(req, prompt_bin, prompt_ids, gen_len,
                                            completion_id, created,
                                            started_in_thinking, daemon_lock)
 
         # Non-streaming: collect, parse, return.
         async with daemon_lock:
-            cmd_line = f"{prompt_bin} {gen_len}\n"
+            hit = prefix_cache.lookup(prompt_ids)
+            snap_prep = prefix_cache.prepare_inline_snap(prompt_ids)
+            if hit:
+                slot, _prefix_len = hit
+                cmd_line = f"RESTORE {slot} {prompt_bin} {gen_len}"
+            else:
+                cmd_line = f"{prompt_bin} {gen_len}"
+            if snap_prep:
+                cmd_line += f" snap={snap_prep[1]}:{snap_prep[0]}"
+            cmd_line += "\n"
             daemon_proc.stdin.write(cmd_line.encode("utf-8"))
             daemon_proc.stdin.flush()
             tokens = list(_token_stream(r_pipe, gen_len))
+            if snap_prep:
+
+                prefix_cache.confirm_inline_snap(*snap_prep, prompt_ids)
         try: prompt_bin.unlink()
         except Exception: pass
 
@@ -471,8 +527,8 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
                       "total_tokens": prompt_len + len(tokens)},
         })
 
-    async def _stream_response(req, prompt_bin, gen_len, completion_id, created,
-                                started_in_thinking, lock):
+    async def _stream_response(req, prompt_bin, prompt_ids, gen_len, completion_id,
+                                created, started_in_thinking, lock):
         prompt_len = prompt_bin.stat().st_size // 4
         include_usage = bool(req.stream_options and req.stream_options.get("include_usage"))
         def chunk(delta_obj, finish=None):
@@ -483,7 +539,16 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
 
         async def sse() -> AsyncIterator[str]:
             async with lock:
-                cmd_line = f"{prompt_bin} {gen_len}\n"
+                hit = prefix_cache.lookup(prompt_ids)
+                snap_prep = prefix_cache.prepare_inline_snap(prompt_ids)
+                if hit:
+                    slot, _prefix_len = hit
+                    cmd_line = f"RESTORE {slot} {prompt_bin} {gen_len}"
+                else:
+                    cmd_line = f"{prompt_bin} {gen_len}"
+                if snap_prep:
+                    cmd_line += f" snap={snap_prep[1]}:{snap_prep[0]}"
+                cmd_line += "\n"
                 daemon_proc.stdin.write(cmd_line.encode("utf-8"))
                 daemon_proc.stdin.flush()
 
@@ -626,6 +691,11 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
                     try: prompt_bin.unlink()
                     except Exception: pass
 
+                if snap_prep:
+
+
+                    prefix_cache.confirm_inline_snap(*snap_prep, prompt_ids)
+
                 yield f"data: {json.dumps(chunk({}, finish=finish_reason))}\n\n"
                 if include_usage:
                     usage_chunk = {
@@ -711,6 +781,11 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
                            "message": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"}},
                 status_code=400)
 
+        # Read back token ids for cache key.
+        raw = prompt_bin.read_bytes()
+        prompt_ids = [struct.unpack_from("<i", raw, i)[0]
+                      for i in range(0, len(raw), 4)]
+
         msg_id = "msg_" + uuid.uuid4().hex[:24]
 
         if req.stream:
@@ -733,7 +808,16 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
                     }
                     yield f"event: content_block_start\ndata: {json.dumps(cb_start)}\n\n"
 
-                    cmd_line = f"{prompt_bin} {gen_len}\n"
+                    hit = prefix_cache.lookup(prompt_ids)
+                    snap_prep = prefix_cache.prepare_inline_snap(prompt_ids)
+                    if hit:
+                        slot, _prefix_len = hit
+                        cmd_line = f"RESTORE {slot} {prompt_bin} {gen_len}"
+                    else:
+                        cmd_line = f"{prompt_bin} {gen_len}"
+                    if snap_prep:
+                        cmd_line += f" snap={snap_prep[1]}:{snap_prep[0]}"
+                    cmd_line += "\n"
                     daemon_proc.stdin.write(cmd_line.encode("utf-8"))
                     daemon_proc.stdin.flush()
 
@@ -751,6 +835,11 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
                         try: prompt_bin.unlink()
                         except Exception: pass
 
+                    if snap_prep:
+
+
+                        prefix_cache.confirm_inline_snap(*snap_prep, prompt_ids)
+
                     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
 
                     msg_delta = {
@@ -765,10 +854,22 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
 
         # Non-streaming
         async with daemon_lock:
-            cmd_line = f"{prompt_bin} {gen_len}\n"
+            hit = prefix_cache.lookup(prompt_ids)
+            snap_prep = prefix_cache.prepare_inline_snap(prompt_ids)
+            if hit:
+                slot, _prefix_len = hit
+                cmd_line = f"RESTORE {slot} {prompt_bin} {gen_len}"
+            else:
+                cmd_line = f"{prompt_bin} {gen_len}"
+            if snap_prep:
+                cmd_line += f" snap={snap_prep[1]}:{snap_prep[0]}"
+            cmd_line += "\n"
             daemon_proc.stdin.write(cmd_line.encode("utf-8"))
             daemon_proc.stdin.flush()
             tokens = [t async for t in _astream_tokens(r_pipe, gen_len)]
+            if snap_prep:
+
+                prefix_cache.confirm_inline_snap(*snap_prep, prompt_ids)
 
         try: prompt_bin.unlink()
         except Exception: pass
@@ -821,6 +922,8 @@ def main():
                          "long-context decode speed.")
     ap.add_argument("--tokenizer", default="Qwen/Qwen3.5-27B",
                     help="HF tokenizer id; Qwen3.6 shares this tokenizer.")
+    ap.add_argument("--prefix-cache-slots", type=int, default=4,
+                    help="Number of prefix-cache snapshot slots (0 to disable)")
     args = ap.parse_args()
 
     # Auto-enable TQ3_0 KV cache when the requested context exceeds what F16 fits.
@@ -850,7 +953,8 @@ def main():
         if ids: stop_ids.add(ids[0])
 
     app = build_app(args.target, draft, args.bin, args.budget, args.max_ctx,
-                    tokenizer, stop_ids)
+                    tokenizer, stop_ids,
+                    prefix_cache_slots=args.prefix_cache_slots)
 
     import uvicorn
     print(f"Luce DFlash OpenAI server (tool-aware) on http://{args.host}:{args.port}")
