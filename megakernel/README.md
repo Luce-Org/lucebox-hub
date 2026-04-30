@@ -16,6 +16,7 @@
 ```
                         Prefill      Decode      tok/J
 Megakernel (RTX 3090)   21,347       413         1.87  @220W
+Megakernel (RTX 2080 Ti) 13,919      250          —
 llama.cpp  (RTX 3090)   11,247       267         0.76
 Apple M5 Max               -         229         1.76
 ```
@@ -41,11 +42,13 @@ So we fused everything into one kernel.
 
 | Method | Prefill pp520 (tok/s) | Decode tg128 (tok/s) |
 |--------|:---------------------:|:--------------------:|
-| **Megakernel** | **21,347** | **413** |
-| llama.cpp BF16 | 11,247 | 267 |
-| PyTorch HuggingFace | 7,578 | 108 |
+| **Megakernel (RTX 3090)** | **21,347** | **413** |
+| **Megakernel (RTX 2080 Ti)** | **13,919** | **250** |
+| llama.cpp BF16 (RTX 3090) | 11,247 | 267 |
+| PyTorch HuggingFace (RTX 3090) | 7,578 | 108 |
+| PyTorch HuggingFace (RTX 2080 Ti) | 1,050 | 12 |
 
-1.9x faster prefill, 1.55x faster decode, 2.8x faster than PyTorch. Same hardware, same model, same weights.
+RTX 3090: 1.9x faster prefill, 1.55x faster decode vs llama.cpp. RTX 2080 Ti: 13.3x faster prefill, 20x faster decode vs PyTorch HF on the same GPU.
 
 ### Energy Efficiency (DVFS Power Sweep)
 
@@ -77,7 +80,7 @@ A single persistent CUDA kernel processes the entire Qwen 3.5-0.8B forward pass 
 
 **Kernel specs:**
 - 82 blocks, 512 threads, all SMs on the RTX 3090 kept occupied; launch count is clamped to the resident-block ceiling on smaller GPUs to avoid grid-sync deadlock
-- BF16 weights and activations, FP32 accumulation where it matters
+- BF16 weights and activations on Ampere+ (sm_80+), FP16 on Turing (sm_75); FP32 accumulation where it matters
 - DeltaNet recurrence via warp-cooperative state updates in F32 registers
 - Full attention with online softmax (fused QKV, RoPE, causal mask, output projection)
 - Cooperative grid sync between layers instead of kernel launches (zero inter-layer overhead)
@@ -117,10 +120,12 @@ python final_bench.py    # runs pp520 tg128 (properly warmed), prints tok/s
 ```
 
 **Requirements:**
-- Built and benchmarked on NVIDIA RTX 3090 (2020); portable to other Ampere+ (sm_86+) NVIDIA GPUs with minor tuning
+- **RTX 3090** (sm_86, BF16) — primary target, all benchmarks above
+- **RTX 2080 Ti** (sm_75, FP16) — supported via compile-time `TARGET_SM` flag; auto-detected at build time
+- Portable to other Turing+ (sm_75+) NVIDIA GPUs
 - CUDA 12+
 - PyTorch 2.0+
-- ~1.5 GB VRAM for BF16 weights
+- ~1.5 GB VRAM for weights
 
 **Blackwell (sm_120 / sm_121a):** runs on Blackwell consumer GPUs (RTX 5090)
 and the NVIDIA DGX Spark (GB10) via an NVFP4 decode path. The build
@@ -139,6 +144,7 @@ sudo nvidia-smi -pl 220    # or whatever your target wattage
 |------|-------------|
 | `kernel.cu` | Decode megakernel, all 24 layers in one dispatch |
 | `prefill.cu` | Prefill (cuBLAS + standalone kernels) |
+| `half_type.h` | Portable half-precision type alias (BF16 on sm_80+, FP16 on sm_75) |
 | `torch_bindings.cpp` | PyTorch C++ bindings |
 | `model.py` | Weight loading + decoder |
 | `setup.py` | Build configuration (arch auto-detect, Blackwell gating) |
@@ -156,7 +162,7 @@ This is a **research proof-of-concept**, not a production inference server.
 
 - **Batch size 1 only.** This targets single-user local inference (the llama.cpp/Ollama use case), not multi-tenant serving. If you need batched throughput, use vLLM or SGLang.
 - **Single model, single architecture.** The kernel is hand-written for Qwen 3.5-0.8B's specific layer pattern (18 DeltaNet + 6 Attention). It does not generalize to other models without rewriting.
-- **BF16 only.** No quantization support (GGUF/GPTQ/AWQ). We benchmark at BF16 to isolate kernel-level efficiency from quantization tradeoffs.
+- **BF16 (Ampere+) / FP16 (Turing).** Uses BF16 on sm_80+ and FP16 on sm_75 via compile-time `TARGET_SM` flag. No quantization support (GGUF/GPTQ/AWQ). We benchmark at half-precision to isolate kernel-level efficiency from quantization tradeoffs.
 - **0.8B parameters.** This is a small model. Megakernel fusion benefits shrink as model size grows and compute begins to dominate over launch overhead. We chose 0.8B because it's the first hybrid DeltaNet model available, not because it's representative of all workloads.
 - **Power methodology.** Efficiency numbers measure accelerator power only (NVML for NVIDIA, `powermetrics` for Apple), following [Hazy Research's Intelligence Per Watt](https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles) methodology. Total system draw is higher for both platforms.
 - **Correctness.** `bench_pp_tg.py` includes an end-to-end correctness check comparing megakernel output against a reference decode path. Use `final_bench.py` for performance numbers (properly warmed, 10 warmup + 20 timed runs averaged).
@@ -187,6 +193,10 @@ llama.cpp is the most widely used local inference engine. It's what most people 
 ## Why an RTX 3090?
 
 Deliberately chosen as the "worst case" for NVIDIA: a 2020 GPU, widely dismissed as power-hungry, available for ~$900 used. If the software gap is real on old hardware, it's even larger on newer cards.
+
+## RTX 2080 Ti support
+
+The megakernel also runs on the RTX 2080 Ti (Turing, sm_75, 2018) using FP16 instead of BF16. The build system auto-detects the GPU and selects the right code path via a compile-time `TARGET_SM` flag. On the 2080 Ti, the megakernel delivers 250 tok/s decode and 13,919 tok/s prefill — 20x faster than PyTorch HuggingFace on the same GPU.
 ## Community
 
 Questions, ideas, or want to see what others are building? Join the [Luce Discord](https://discord.gg/yHfswqZmJQ).

@@ -7,7 +7,7 @@
  * Model:         Qwen/Qwen3.5-0.8B (bf16 weights)
  */
 
-#include <cuda_bf16.h>
+#include "half_type.h"
 #include <cuda_runtime.h>
 
 // =============================================================================
@@ -71,34 +71,34 @@ __device__ __constant__ int LAYER_TYPE[NUM_LAYERS] = {
 // =============================================================================
 
 struct FullAttnWeights {
-    const __nv_bfloat16 *input_layernorm_weight;   // [1024]
-    const __nv_bfloat16 *q_proj_weight;             // [4096, 1024]
-    const __nv_bfloat16 *k_proj_weight;             // [512, 1024]
-    const __nv_bfloat16 *v_proj_weight;             // [512, 1024]
-    const __nv_bfloat16 *q_norm_weight;              // [256]
-    const __nv_bfloat16 *k_norm_weight;              // [256]
-    const __nv_bfloat16 *o_proj_weight;             // [1024, 2048]
-    const __nv_bfloat16 *post_attn_layernorm_weight;
-    const __nv_bfloat16 *gate_proj_weight;          // [3584, 1024]
-    const __nv_bfloat16 *up_proj_weight;            // [3584, 1024]
-    const __nv_bfloat16 *down_proj_weight;          // [1024, 3584]
+    const half_t *input_layernorm_weight;   // [1024]
+    const half_t *q_proj_weight;             // [4096, 1024]
+    const half_t *k_proj_weight;             // [512, 1024]
+    const half_t *v_proj_weight;             // [512, 1024]
+    const half_t *q_norm_weight;              // [256]
+    const half_t *k_norm_weight;              // [256]
+    const half_t *o_proj_weight;             // [1024, 2048]
+    const half_t *post_attn_layernorm_weight;
+    const half_t *gate_proj_weight;          // [3584, 1024]
+    const half_t *up_proj_weight;            // [3584, 1024]
+    const half_t *down_proj_weight;          // [1024, 3584]
 };
 
 struct DeltaNetWeights {
-    const __nv_bfloat16 *input_layernorm_weight;
-    const __nv_bfloat16 *qkv_proj_weight;           // [6144, 1024]
-    const __nv_bfloat16 *z_proj_weight;             // [2048, 1024]
-    const __nv_bfloat16 *beta_proj_weight;          // [16, 1024]
-    const __nv_bfloat16 *alpha_proj_weight;         // [16, 1024]
-    const __nv_bfloat16 *conv1d_weight;             // [6144, 1, 4]
-    const __nv_bfloat16 *a_log;                     // [16]
-    const __nv_bfloat16 *dt_bias;                   // [16]
-    const __nv_bfloat16 *norm_weight;               // [128]
-    const __nv_bfloat16 *out_proj_weight;           // [1024, 2048]
-    const __nv_bfloat16 *post_attn_layernorm_weight;
-    const __nv_bfloat16 *gate_proj_weight;
-    const __nv_bfloat16 *up_proj_weight;
-    const __nv_bfloat16 *down_proj_weight;
+    const half_t *input_layernorm_weight;
+    const half_t *qkv_proj_weight;           // [6144, 1024]
+    const half_t *z_proj_weight;             // [2048, 1024]
+    const half_t *beta_proj_weight;          // [16, 1024]
+    const half_t *alpha_proj_weight;         // [16, 1024]
+    const half_t *conv1d_weight;             // [6144, 1, 4]
+    const half_t *a_log;                     // [16]
+    const half_t *dt_bias;                   // [16]
+    const half_t *norm_weight;               // [128]
+    const half_t *out_proj_weight;           // [1024, 2048]
+    const half_t *post_attn_layernorm_weight;
+    const half_t *gate_proj_weight;
+    const half_t *up_proj_weight;
+    const half_t *down_proj_weight;
 };
 
 struct LayerWeights {
@@ -162,18 +162,23 @@ __device__ __forceinline__ float fast_silu(float x) { return x * fast_sigmoid(x)
 
 __device__ __forceinline__ uint4 load_128bit(const uint4 *ptr) {
     uint4 out;
+#if TARGET_SM >= 80
     asm volatile("ld.global.L1::no_allocate.v4.b32 {%0, %1, %2, %3}, [%4];"
                  : "=r"(out.x), "=r"(out.y), "=r"(out.z), "=r"(out.w) : "l"(ptr));
+#else
+    asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(out.x), "=r"(out.y), "=r"(out.z), "=r"(out.w) : "l"(ptr));
+#endif
     return out;
 }
 
 // BF16 dot product: 8 bf16 weights × 8 bf16 activations → f32
-__device__ __forceinline__ float dot8_bf16(const uint4 &w_u4, const __nv_bfloat16 *act) {
-    const __nv_bfloat16 *w = reinterpret_cast<const __nv_bfloat16 *>(&w_u4);
+__device__ __forceinline__ float dot8_bf16(const uint4 &w_u4, const half_t *act) {
+    const half_t *w = reinterpret_cast<const half_t *>(&w_u4);
     float sum = 0.0f;
 #pragma unroll
     for (int i = 0; i < 8; i++)
-        sum += __bfloat162float(w[i]) * __bfloat162float(act[i]);
+        sum += H2F(w[i]) * H2F(act[i]);
     return sum;
 }
 
@@ -182,10 +187,10 @@ __device__ __forceinline__ float dot8_bf16(const uint4 &w_u4, const __nv_bfloat1
 // =============================================================================
 
 __device__ void rmsnorm_redundant(
-    const __nv_bfloat16 *__restrict__ input,
-    const __nv_bfloat16 *__restrict__ weight,
-    __nv_bfloat16 *__restrict__ s_out,        // shared memory bf16
-    __nv_bfloat16 *__restrict__ g_residual)   // global bf16
+    const half_t *__restrict__ input,
+    const half_t *__restrict__ weight,
+    half_t *__restrict__ s_out,        // shared memory bf16
+    half_t *__restrict__ g_residual)   // global bf16
 {
     int block_id = blockIdx.x;
     int warp_id = threadIdx.x / WARP_SIZE;
@@ -194,8 +199,8 @@ __device__ void rmsnorm_redundant(
 
     float local_sum_sq = 0.0f;
     for (int i = threadIdx.x; i < HIDDEN_SIZE; i += BLOCK_SIZE) {
-        float v = __bfloat162float(__ldg(input + i));
-        s_out[i] = __float2bfloat16(v);
+        float v = H2F(__ldg(input + i));
+        s_out[i] = F2H(v);
         local_sum_sq += v * v;
     }
 
@@ -218,19 +223,19 @@ __device__ void rmsnorm_redundant(
 
     float rstd = smem_reduce[0];
     for (int i = threadIdx.x; i < HIDDEN_SIZE; i += BLOCK_SIZE) {
-        float w = __bfloat162float(__ldg(weight + i));
-        float v = __bfloat162float(s_out[i]);
-        s_out[i] = __float2bfloat16(v * rstd * (1.0f + w));
+        float w = H2F(__ldg(weight + i));
+        float v = H2F(s_out[i]);
+        s_out[i] = F2H(v * rstd * (1.0f + w));
     }
     __syncthreads();
 }
 
 // RMSNorm from bf16 buffer (for post-attn norm)
 __device__ void rmsnorm_from_bf16(
-    const __nv_bfloat16 *__restrict__ input,
-    const __nv_bfloat16 *__restrict__ weight,
-    __nv_bfloat16 *__restrict__ s_out,
-    __nv_bfloat16 *__restrict__ g_residual)
+    const half_t *__restrict__ input,
+    const half_t *__restrict__ weight,
+    half_t *__restrict__ s_out,
+    half_t *__restrict__ g_residual)
 {
     int block_id = blockIdx.x;
     int warp_id = threadIdx.x / WARP_SIZE;
@@ -239,8 +244,8 @@ __device__ void rmsnorm_from_bf16(
 
     float local_sum_sq = 0.0f;
     for (int i = threadIdx.x; i < HIDDEN_SIZE; i += BLOCK_SIZE) {
-        float v = __bfloat162float(input[i]);
-        s_out[i] = __float2bfloat16(v);
+        float v = H2F(input[i]);
+        s_out[i] = F2H(v);
         local_sum_sq += v * v;
     }
 
@@ -263,9 +268,9 @@ __device__ void rmsnorm_from_bf16(
 
     float rstd = smem_reduce[0];
     for (int i = threadIdx.x; i < HIDDEN_SIZE; i += BLOCK_SIZE) {
-        float w = __bfloat162float(__ldg(weight + i));
-        float v = __bfloat162float(s_out[i]);
-        s_out[i] = __float2bfloat16(v * rstd * (1.0f + w));
+        float w = H2F(__ldg(weight + i));
+        float v = H2F(s_out[i]);
+        s_out[i] = F2H(v * rstd * (1.0f + w));
     }
     __syncthreads();
 }
@@ -275,8 +280,8 @@ __device__ void rmsnorm_from_bf16(
 // =============================================================================
 
 __device__ void matvec_bf16(
-    const __nv_bfloat16 *__restrict__ s_input,  // shared memory bf16 [in_dim]
-    const __nv_bfloat16 *__restrict__ weight,   // [out_dim, in_dim] bf16
+    const half_t *__restrict__ s_input,  // shared memory bf16 [in_dim]
+    const half_t *__restrict__ weight,   // [out_dim, in_dim] bf16
     float *__restrict__ output,                  // [out_dim] f32 (accumulate in f32)
     int in_dim, int out_dim, int num_blocks)
 {
@@ -291,7 +296,7 @@ __device__ void matvec_bf16(
     for (int m_base = row_start; m_base < row_end; m_base += NUM_WARPS) {
         int m = m_base + warp_id;
         if (m < row_end) {
-            const __nv_bfloat16 *w_row = weight + m * in_dim;
+            const half_t *w_row = weight + m * in_dim;
             float sum = 0.0f;
 #pragma unroll 4
             for (int k = lane_id * 8; k < in_dim; k += WARP_SIZE * 8) {
@@ -306,9 +311,9 @@ __device__ void matvec_bf16(
 
 // Fused gate+up+SiLU matvec (bf16 weights, bf16 activations)
 __device__ void matvec_gate_up_silu_bf16(
-    const __nv_bfloat16 *__restrict__ s_input,
-    const __nv_bfloat16 *__restrict__ gate_weight,
-    const __nv_bfloat16 *__restrict__ up_weight,
+    const half_t *__restrict__ s_input,
+    const half_t *__restrict__ gate_weight,
+    const half_t *__restrict__ up_weight,
     float *__restrict__ output,
     int in_dim, int out_dim, int num_blocks)
 {
@@ -323,8 +328,8 @@ __device__ void matvec_gate_up_silu_bf16(
     for (int m_base = row_start; m_base < row_end; m_base += NUM_WARPS) {
         int m = m_base + warp_id;
         if (m < row_end) {
-            const __nv_bfloat16 *g_row = gate_weight + m * in_dim;
-            const __nv_bfloat16 *u_row = up_weight + m * in_dim;
+            const half_t *g_row = gate_weight + m * in_dim;
+            const half_t *u_row = up_weight + m * in_dim;
             float gate_sum = 0.0f, up_sum = 0.0f;
 #pragma unroll 4
             for (int k = lane_id * 8; k < in_dim; k += WARP_SIZE * 8) {
@@ -344,9 +349,9 @@ __device__ void matvec_gate_up_silu_bf16(
 // Down projection + residual → bf16 hidden
 __device__ void matvec_down_residual_bf16(
     const float *__restrict__ s_input,           // shared [INTER] f32
-    const __nv_bfloat16 *__restrict__ weight,    // [HIDDEN, INTER] bf16
-    const __nv_bfloat16 *__restrict__ residual,  // [HIDDEN] bf16
-    __nv_bfloat16 *__restrict__ hidden_out,      // [HIDDEN] bf16
+    const half_t *__restrict__ weight,    // [HIDDEN, INTER] bf16
+    const half_t *__restrict__ residual,  // [HIDDEN] bf16
+    half_t *__restrict__ hidden_out,      // [HIDDEN] bf16
     int in_dim, int out_dim, int num_blocks)
 {
     // This needs f32 input (MLP intermediate is f32). Convert on the fly.
@@ -361,19 +366,19 @@ __device__ void matvec_down_residual_bf16(
     for (int m_base = row_start; m_base < row_end; m_base += NUM_WARPS) {
         int m = m_base + warp_id;
         if (m < row_end) {
-            const __nv_bfloat16 *w_row = weight + m * in_dim;
+            const half_t *w_row = weight + m * in_dim;
             float sum = 0.0f;
             // Weight is bf16, input is f32 — convert input to bf16 on the fly
             for (int k = lane_id * 8; k < in_dim; k += WARP_SIZE * 8) {
                 uint4 w_u4 = load_128bit(reinterpret_cast<const uint4 *>(w_row + k));
-                const __nv_bfloat16 *w = reinterpret_cast<const __nv_bfloat16 *>(&w_u4);
+                const half_t *w = reinterpret_cast<const half_t *>(&w_u4);
 #pragma unroll
                 for (int i = 0; i < 8; i++)
-                    sum += __bfloat162float(w[i]) * s_input[k + i];
+                    sum += H2F(w[i]) * s_input[k + i];
             }
             sum = warp_reduce_sum(sum);
             if (lane_id == 0)
-                hidden_out[m] = __float2bfloat16(sum + __bfloat162float(residual[m]));
+                hidden_out[m] = F2H(sum + H2F(residual[m]));
         }
     }
 }
@@ -381,9 +386,9 @@ __device__ void matvec_down_residual_bf16(
 // O projection + residual → bf16
 __device__ void matvec_o_residual_bf16(
     const float *__restrict__ s_input,           // shared [Q_SIZE] f32
-    const __nv_bfloat16 *__restrict__ weight,
-    const __nv_bfloat16 *__restrict__ residual,
-    __nv_bfloat16 *__restrict__ hidden_out,
+    const half_t *__restrict__ weight,
+    const half_t *__restrict__ residual,
+    half_t *__restrict__ hidden_out,
     int in_dim, int out_dim, int num_blocks)
 {
     int block_id = blockIdx.x;
@@ -397,18 +402,18 @@ __device__ void matvec_o_residual_bf16(
     for (int m_base = row_start; m_base < row_end; m_base += NUM_WARPS) {
         int m = m_base + warp_id;
         if (m < row_end) {
-            const __nv_bfloat16 *w_row = weight + m * in_dim;
+            const half_t *w_row = weight + m * in_dim;
             float sum = 0.0f;
             for (int k = lane_id * 8; k < in_dim; k += WARP_SIZE * 8) {
                 uint4 w_u4 = load_128bit(reinterpret_cast<const uint4 *>(w_row + k));
-                const __nv_bfloat16 *w = reinterpret_cast<const __nv_bfloat16 *>(&w_u4);
+                const half_t *w = reinterpret_cast<const half_t *>(&w_u4);
 #pragma unroll
                 for (int i = 0; i < 8; i++)
-                    sum += __bfloat162float(w[i]) * s_input[k + i];
+                    sum += H2F(w[i]) * s_input[k + i];
             }
             sum = warp_reduce_sum(sum);
             if (lane_id == 0)
-                hidden_out[m] = __float2bfloat16(sum + __bfloat162float(residual[m]));
+                hidden_out[m] = F2H(sum + H2F(residual[m]));
         }
     }
 }
@@ -420,18 +425,18 @@ __device__ void matvec_o_residual_bf16(
 __device__ void full_attention_layer(
     AtomicGridSync &grid,
     const FullAttnWeights &w,
-    const __nv_bfloat16 *__restrict__ input,
-    __nv_bfloat16 *__restrict__ k_cache,
-    __nv_bfloat16 *__restrict__ v_cache,
-    __nv_bfloat16 *__restrict__ g_residual,  // [HIDDEN] bf16
+    const half_t *__restrict__ input,
+    half_t *__restrict__ k_cache,
+    half_t *__restrict__ v_cache,
+    half_t *__restrict__ g_residual,  // [HIDDEN] bf16
     float *__restrict__ g_activations,        // scratch f32
     float *__restrict__ g_q,                  // [FA_QPROJ_SIZE] f32
     float *__restrict__ g_kv,                 // [FA_KV_SIZE*2] f32
     float *__restrict__ g_attn_out,           // [FA_Q_SIZE] f32
     float *__restrict__ g_mlp_inter,          // [INTER] f32
-    __nv_bfloat16 *__restrict__ hidden_out,   // [HIDDEN] bf16
+    half_t *__restrict__ hidden_out,   // [HIDDEN] bf16
     int position, int max_seq_len,
-    __nv_bfloat16 *__restrict__ shmem)
+    half_t *__restrict__ shmem)
 {
     int block_id = blockIdx.x;
     int num_blocks = gridDim.x;
@@ -439,7 +444,7 @@ __device__ void full_attention_layer(
     int lane_id = threadIdx.x % WARP_SIZE;
 
     // Phase 1: RMSNorm + QKV projection
-    __nv_bfloat16 *s_norm = shmem;
+    half_t *s_norm = shmem;
     rmsnorm_redundant(input, w.input_layernorm_weight, s_norm, g_residual);
 
     matvec_bf16(s_norm, w.q_proj_weight, g_q, HIDDEN_SIZE, FA_QPROJ_SIZE, num_blocks);
@@ -452,23 +457,23 @@ __device__ void full_attention_layer(
         float *k_buf = g_kv, *v_buf = g_kv + FA_KV_SIZE;
         for (int h = warp_id; h < FA_NUM_KV_HEADS; h += NUM_WARPS) {
             float *kh = k_buf + h * FA_HEAD_DIM, *vh = v_buf + h * FA_HEAD_DIM;
-            __nv_bfloat16 *kc = k_cache + h * max_seq_len * FA_HEAD_DIM + position * FA_HEAD_DIM;
-            __nv_bfloat16 *vc = v_cache + h * max_seq_len * FA_HEAD_DIM + position * FA_HEAD_DIM;
+            half_t *kc = k_cache + h * max_seq_len * FA_HEAD_DIM + position * FA_HEAD_DIM;
+            half_t *vc = v_cache + h * max_seq_len * FA_HEAD_DIM + position * FA_HEAD_DIM;
             float ss = 0; for (int i = lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) ss += kh[i]*kh[i];
             ss = warp_reduce_sum(ss); float sc = rsqrtf(ss / float(FA_HEAD_DIM) + RMS_EPS);
             sc = __shfl_sync(0xffffffff, sc, 0);
             for (int i = lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) {
-                float normed = kh[i] * sc * (1.0f + __bfloat162float(__ldg(w.k_norm_weight + i)));
+                float normed = kh[i] * sc * (1.0f + H2F(__ldg(w.k_norm_weight + i)));
                 if (i < FA_ROTARY_DIM) {
                     float fe = float(2*(i%(FA_ROTARY_DIM/2))) / float(FA_ROTARY_DIM);
                     float freq = float(position) / powf(FA_ROPE_THETA, fe);
                     float cv = cosf(freq), sv = sinf(freq);
                     int p = (i < FA_ROTARY_DIM/2) ? i+FA_ROTARY_DIM/2 : i-FA_ROTARY_DIM/2;
-                    float pv = kh[p]*sc*(1.0f+__bfloat162float(__ldg(w.k_norm_weight+p)));
+                    float pv = kh[p]*sc*(1.0f+H2F(__ldg(w.k_norm_weight+p)));
                     float rotated = (i < FA_ROTARY_DIM/2) ? (normed*cv - pv*sv) : (pv*sv + normed*cv);
-                    kc[i] = __float2bfloat16(rotated);
-                } else { kc[i] = __float2bfloat16(normed); }
-                vc[i] = __float2bfloat16(vh[i]);
+                    kc[i] = F2H(rotated);
+                } else { kc[i] = F2H(normed); }
+                vc[i] = F2H(vh[i]);
             }
         }
     }
@@ -483,13 +488,13 @@ __device__ void full_attention_layer(
                 ss = warp_reduce_sum(ss); float sc = rsqrtf(ss / float(FA_HEAD_DIM) + RMS_EPS);
                 sc = __shfl_sync(0xffffffff, sc, 0);
                 for (int i = lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) {
-                    float normed = qh_ptr[i]*sc*(1.0f+__bfloat162float(__ldg(w.q_norm_weight+i)));
+                    float normed = qh_ptr[i]*sc*(1.0f+H2F(__ldg(w.q_norm_weight+i)));
                     if (i < FA_ROTARY_DIM) {
                         float fe = float(2*(i%(FA_ROTARY_DIM/2))) / float(FA_ROTARY_DIM);
                         float freq = float(position) / powf(FA_ROPE_THETA, fe);
                         float cv = cosf(freq), sv = sinf(freq);
                         int p = (i < FA_ROTARY_DIM/2) ? i+FA_ROTARY_DIM/2 : i-FA_ROTARY_DIM/2;
-                        float pv = qh_ptr[p]*sc*(1.0f+__bfloat162float(__ldg(w.q_norm_weight+p)));
+                        float pv = qh_ptr[p]*sc*(1.0f+H2F(__ldg(w.q_norm_weight+p)));
                         qh_ptr[i] = (i < FA_ROTARY_DIM/2) ? (normed*cv-pv*sv) : (pv*sv+normed*cv);
                     } else { qh_ptr[i] = normed; }
                 }
@@ -517,10 +522,10 @@ __device__ void full_attention_layer(
             for (int e = 0; e < EPL; e++) { out_acc[e] = 0; q_local[e] = q_head[lane_id*EPL+e]; }
 
             for (int pos = warp_id; pos < cache_len; pos += NUM_WARPS) {
-                const __nv_bfloat16 *k_pos = k_cache + kvh*max_seq_len*FA_HEAD_DIM + pos*FA_HEAD_DIM;
-                const __nv_bfloat16 *v_pos = v_cache + kvh*max_seq_len*FA_HEAD_DIM + pos*FA_HEAD_DIM;
+                const half_t *k_pos = k_cache + kvh*max_seq_len*FA_HEAD_DIM + pos*FA_HEAD_DIM;
+                const half_t *v_pos = v_cache + kvh*max_seq_len*FA_HEAD_DIM + pos*FA_HEAD_DIM;
                 float score = 0;
-                for (int e = 0; e < EPL; e++) score += q_local[e] * __bfloat162float(__ldg(k_pos + lane_id*EPL+e));
+                for (int e = 0; e < EPL; e++) score += q_local[e] * H2F(__ldg(k_pos + lane_id*EPL+e));
                 score = warp_reduce_sum(score) * attn_scale;
                 score = __shfl_sync(0xffffffff, score, 0);
                 float old_max = max_score; max_score = fmaxf(max_score, score);
@@ -528,7 +533,7 @@ __device__ void full_attention_layer(
                 sum_exp = sum_exp * exp_diff + fast_exp(score - max_score);
                 float wt = fast_exp(score - max_score);
                 for (int e = 0; e < EPL; e++)
-                    out_acc[e] = out_acc[e]*exp_diff + wt*__bfloat162float(__ldg(v_pos + lane_id*EPL+e));
+                    out_acc[e] = out_acc[e]*exp_diff + wt*H2F(__ldg(v_pos + lane_id*EPL+e));
             }
             if (lane_id == 0) { s_max_score[warp_id] = max_score; s_sum_exp[warp_id] = sum_exp; }
             for (int e = 0; e < EPL; e++) g_activations[warp_id*FA_HEAD_DIM + lane_id*EPL+e] = out_acc[e];
@@ -565,7 +570,7 @@ __device__ void full_attention_layer(
     grid.sync();
 
     // Phase 5: Post-attn norm + MLP
-    __nv_bfloat16 *s_act = shmem;
+    half_t *s_act = shmem;
     rmsnorm_from_bf16(hidden_out, w.post_attn_layernorm_weight, s_act, g_residual);
 
     matvec_gate_up_silu_bf16(s_act, w.gate_proj_weight, w.up_proj_weight,
@@ -589,8 +594,8 @@ __device__ void full_attention_layer(
 __device__ void deltanet_layer(
     AtomicGridSync &grid,
     const DeltaNetWeights &w,
-    const __nv_bfloat16 *__restrict__ input,
-    __nv_bfloat16 *__restrict__ g_residual,
+    const half_t *__restrict__ input,
+    half_t *__restrict__ g_residual,
     float *__restrict__ g_activations,
     float *__restrict__ g_qkv,
     float *__restrict__ g_z,
@@ -600,9 +605,9 @@ __device__ void deltanet_layer(
     float *__restrict__ g_mlp_inter,
     float *__restrict__ dn_state,     // [DN_NUM_HEADS, DN_KEY, DN_VAL] f32
     float *__restrict__ conv_buf,     // [DN_CONV_CH, DN_CONV_K] f32
-    __nv_bfloat16 *__restrict__ hidden_out,
+    half_t *__restrict__ hidden_out,
     int dn_layer_idx,
-    __nv_bfloat16 *__restrict__ shmem)
+    half_t *__restrict__ shmem)
 {
     int block_id = blockIdx.x;
     int num_blocks = gridDim.x;
@@ -610,7 +615,7 @@ __device__ void deltanet_layer(
     int lane_id = threadIdx.x % WARP_SIZE;
 
     // Phase 1: RMSNorm + projections
-    __nv_bfloat16 *s_norm = shmem;
+    half_t *s_norm = shmem;
     rmsnorm_redundant(input, w.input_layernorm_weight, s_norm, g_residual);
 
     matvec_bf16(s_norm, w.qkv_proj_weight, g_qkv, HIDDEN_SIZE, DN_CONV_CHANNELS, num_blocks);
@@ -637,7 +642,7 @@ __device__ void deltanet_layer(
                 layer_conv[ch*DN_CONV_KERNEL+2]=h2; layer_conv[ch*DN_CONV_KERNEL+3]=g_qkv[ch];
                 float co = 0;
                 for (int t = 0; t < DN_CONV_KERNEL; t++)
-                    co += layer_conv[ch*DN_CONV_KERNEL+t] * __bfloat162float(__ldg(w.conv1d_weight + ch*DN_CONV_KERNEL+t));
+                    co += layer_conv[ch*DN_CONV_KERNEL+t] * H2F(__ldg(w.conv1d_weight + ch*DN_CONV_KERNEL+t));
                 dst[c] = fast_silu(co);
             }
         }
@@ -645,8 +650,8 @@ __device__ void deltanet_layer(
         // Beta/alpha activations
         if (threadIdx.x == 0) {
             g_beta[h] = fast_sigmoid(g_beta[h]);
-            float a_log_val = __bfloat162float(__ldg(w.a_log + h));
-            float dt_b = __bfloat162float(__ldg(w.dt_bias + h));
+            float a_log_val = H2F(__ldg(w.a_log + h));
+            float dt_b = H2F(__ldg(w.dt_bias + h));
             float x = g_alpha[h] + dt_b;
             float sp = (x > 20.0f) ? x : logf(1.0f + fast_exp(x));
             g_alpha[h] = fast_exp(-fast_exp(a_log_val) * sp);
@@ -716,7 +721,7 @@ __device__ void deltanet_layer(
             if (warp_id == 0) { float v = (lane_id < NUM_WARPS) ? smem_gnorm[lane_id] : 0; v = warp_reduce_sum(v); if (lane_id == 0) smem_gnorm[0] = rsqrtf(v/DN_VALUE_DIM + RMS_EPS); }
             __syncthreads(); float rstd = smem_gnorm[0];
             for (int i = threadIdx.x; i < DN_VALUE_DIM; i += BLOCK_SIZE) {
-                float normed = out_head[i] * rstd * __bfloat162float(__ldg(w.norm_weight + i));
+                float normed = out_head[i] * rstd * H2F(__ldg(w.norm_weight + i));
                 float gate = fast_silu(g_z[h*DN_VALUE_DIM+i]);
                 out_head[i] = normed * gate;
             }
@@ -736,7 +741,7 @@ __device__ void deltanet_layer(
     grid.sync();
 
     // Phase 5: Post-attn norm + MLP
-    __nv_bfloat16 *s_act = shmem;
+    half_t *s_act = shmem;
     rmsnorm_from_bf16(hidden_out, w.post_attn_layernorm_weight, s_act, g_residual);
 
     matvec_gate_up_silu_bf16(s_act, w.gate_proj_weight, w.up_proj_weight,
@@ -757,7 +762,7 @@ __device__ void deltanet_layer(
 
 __global__ void lm_head_kernel(
     const float *__restrict__ hidden,
-    const __nv_bfloat16 *__restrict__ weight,   // [VOCAB, HIDDEN] bf16
+    const half_t *__restrict__ weight,   // [VOCAB, HIDDEN] bf16
     float *__restrict__ block_max_vals,
     int *__restrict__ block_max_idxs,
     int *__restrict__ output_token,
@@ -776,13 +781,13 @@ __global__ void lm_head_kernel(
 
     float local_max = -INFINITY; int local_max_idx = -1;
     for (int m = rs + warp_id; m < re; m += num_warps) {
-        const __nv_bfloat16 *w_row = weight + m * HIDDEN_SIZE;
+        const half_t *w_row = weight + m * HIDDEN_SIZE;
         float sum = 0;
 #pragma unroll 4
         for (int k = lane_id * 8; k < HIDDEN_SIZE; k += WARP_SIZE * 8) {
             uint4 w_u4 = load_128bit(reinterpret_cast<const uint4 *>(w_row + k));
-            const __nv_bfloat16 *wp = reinterpret_cast<const __nv_bfloat16 *>(&w_u4);
-            for (int i = 0; i < 8; i++) sum += __bfloat162float(wp[i]) * s_hidden[k+i];
+            const half_t *wp = reinterpret_cast<const half_t *>(&w_u4);
+            for (int i = 0; i < 8; i++) sum += H2F(wp[i]) * s_hidden[k+i];
         }
         sum = warp_reduce_sum(sum);
         if (lane_id == 0 && repetition_penalty > 1.0f && seen_token_mask && seen_token_mask[m] > 0.0f) {
@@ -826,17 +831,17 @@ __global__ void lm_head_kernel(
 
 __global__ void __launch_bounds__(BLOCK_SIZE, 1)
 decode_kernel(
-    const __nv_bfloat16 *__restrict__ embed_weight,
-    const __nv_bfloat16 *__restrict__ final_norm_weight,
-    const __nv_bfloat16 *__restrict__ lm_head_weight,
+    const half_t *__restrict__ embed_weight,
+    const half_t *__restrict__ final_norm_weight,
+    const half_t *__restrict__ lm_head_weight,
     const LayerWeights *__restrict__ layer_weights,
-    __nv_bfloat16 *__restrict__ fa_k_cache,
-    __nv_bfloat16 *__restrict__ fa_v_cache,
+    half_t *__restrict__ fa_k_cache,
+    half_t *__restrict__ fa_v_cache,
     float *__restrict__ dn_states,
     float *__restrict__ conv_bufs,
-    __nv_bfloat16 *__restrict__ hidden_buffer,
+    half_t *__restrict__ hidden_buffer,
     float *__restrict__ g_activations,
-    __nv_bfloat16 *__restrict__ g_residual,
+    half_t *__restrict__ g_residual,
     float *__restrict__ g_qkv_scratch,
     float *__restrict__ g_kv_scratch,
     float *__restrict__ g_attn_out,
@@ -864,9 +869,9 @@ decode_kernel(
 
     // Shared memory: large enough for max(HIDDEN_SIZE bf16, INTERMEDIATE_SIZE f32)
     __shared__ __align__(16) char shmem_raw[MAX_ACT_DIM * sizeof(float)];
-    __nv_bfloat16 *shmem_bf16 = reinterpret_cast<__nv_bfloat16 *>(shmem_raw);
+    half_t *shmem_bf16 = reinterpret_cast<half_t *>(shmem_raw);
 
-    const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
+    const half_t *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
 
     int fa_kv_stride = FA_NUM_KV_HEADS * max_seq_len * FA_HEAD_DIM;
     int dn_state_stride = DN_NUM_HEADS * DN_KEY_DIM * DN_VALUE_DIM;
@@ -874,7 +879,7 @@ decode_kernel(
     int dn_layer_idx = 0, fa_layer_idx = 0;
 
     for (int layer = 0; layer < NUM_LAYERS; layer++) {
-        const __nv_bfloat16 *layer_input = (layer == 0) ? embed_row : hidden_buffer;
+        const half_t *layer_input = (layer == 0) ? embed_row : hidden_buffer;
 
         if (LAYER_TYPE[layer] == 0) {
             deltanet_layer(
@@ -902,14 +907,14 @@ decode_kernel(
         int warp_id = threadIdx.x / WARP_SIZE, lane_id = threadIdx.x % WARP_SIZE;
         float local_sum_sq = 0;
         for (int i = threadIdx.x; i < HIDDEN_SIZE; i += BLOCK_SIZE) {
-            float v = __bfloat162float(hidden_buffer[i]); g_activations[i] = v; local_sum_sq += v*v;
+            float v = H2F(hidden_buffer[i]); g_activations[i] = v; local_sum_sq += v*v;
         }
         local_sum_sq = warp_reduce_sum(local_sum_sq);
         if (lane_id == 0) smem_reduce[warp_id] = local_sum_sq; __syncthreads();
         if (warp_id == 0) { float sum = (lane_id < NUM_WARPS) ? smem_reduce[lane_id] : 0; sum = warp_reduce_sum(sum); if (lane_id == 0) smem_reduce[0] = rsqrtf(sum/HIDDEN_SIZE + RMS_EPS); }
         __syncthreads(); float rstd = smem_reduce[0];
         for (int i = threadIdx.x; i < HIDDEN_SIZE; i += BLOCK_SIZE) {
-            float wt = __bfloat162float(__ldg(final_norm_weight + i));
+            float wt = H2F(__ldg(final_norm_weight + i));
             g_normalized[i] = g_activations[i] * rstd * (1.0f + wt);
         }
     }
@@ -978,14 +983,14 @@ extern "C" void launch_decode(
     cudaMemsetAsync(barrier_generation, 0, sizeof(unsigned int), stream);
 
     decode_kernel<<<decode_blocks, BLOCK_SIZE, 0, stream>>>(
-        (const __nv_bfloat16 *)embed_weight,
-        (const __nv_bfloat16 *)final_norm_weight,
-        (const __nv_bfloat16 *)lm_head_weight,
+        (const half_t *)embed_weight,
+        (const half_t *)final_norm_weight,
+        (const half_t *)lm_head_weight,
         layer_weights,
-        (__nv_bfloat16 *)fa_k_cache, (__nv_bfloat16 *)fa_v_cache,
+        (half_t *)fa_k_cache, (half_t *)fa_v_cache,
         (float *)dn_states, (float *)conv_bufs,
-        (__nv_bfloat16 *)hidden_buffer,
-        (float *)g_activations, (__nv_bfloat16 *)g_residual,
+        (half_t *)hidden_buffer,
+        (float *)g_activations, (half_t *)g_residual,
         (float *)g_qkv_scratch, (float *)g_kv_scratch,
         (float *)g_attn_out, (float *)g_mlp_inter,
         (float *)g_z_scratch, (float *)g_beta_scratch,
@@ -998,7 +1003,7 @@ extern "C" void launch_decode(
 
     lm_head_kernel<<<LM_NUM_BLOCKS, LM_BLOCK_SIZE, 0, stream>>>(
         (const float *)g_normalized,
-        (const __nv_bfloat16 *)lm_head_weight,
+        (const half_t *)lm_head_weight,
         block_max_vals, block_max_idxs,
         output_token_id, lm_sync_counter,
         seen_token_mask, repetition_penalty);

@@ -22,6 +22,7 @@ from model import (
     DN_V_SIZE,
     DN_NUM_HEADS,
     MAX_SEQ_LEN,
+    _half_dtype,
 )
 import qwen35_megakernel_bf16_C
 
@@ -91,7 +92,7 @@ tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
 dec = Decoder(verbose=True)
 _pf = torch.ops.qwen35_megakernel_bf16_C.prefill_bf16
 
-bf16 = dict(dtype=torch.bfloat16, device="cuda")
+bf16 = dict(dtype=_half_dtype(), device="cuda")
 f32  = dict(dtype=torch.float32, device="cuda")
 i32  = dict(dtype=torch.int32,   device="cuda")
 

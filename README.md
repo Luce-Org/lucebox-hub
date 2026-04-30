@@ -122,6 +122,7 @@ Supported out of the box; the build just needs the right CUDA toolkit. `dflash/C
 | GPU | Arch | Min CUDA | Status |
 |-----|:----:|:--------:|--------|
 | RTX 3090 Ampere | `sm_86` | 12.0 | **reference, all numbers above** |
+| RTX 2080 Ti Turing | `sm_75` | 12.0 | supported, 53 tok/s DFlash verified (FP16 draft) |
 | RTX 4090 Ada | `sm_89` | 12.0 | should work, unverified, pass `-DCMAKE_CUDA_ARCHITECTURES=89` |
 | RTX 5090 Blackwell consumer | `sm_120` | 12.8 | supported, auto-added by CMake |
 | DGX Spark / GB10 | `sm_121` (compute capability 12.1) | 12.9 | supported, auto-added by CMake |
@@ -181,10 +182,11 @@ All experiments in this repo are built, tuned, and benchmarked on NVIDIA RTX 309
 - **Blackwell consumer** (sm_120, RTX 50xx incl. 5090): supported, CUDA 12.8+.
 - **DGX Spark / GB10** (sm_121, compute capability 12.1): supported, CUDA 12.9+.
 - **Jetson AGX Thor** (sm_110): supported, CUDA 13+.
+- **Turing** (sm_75, RTX 2080): supported, CUDA 12+.
 
 PyTorch 2.0+. `dflash/` needs CMake 3.18+ and `--recurse-submodules` for the pinned `Luce-Org/llama.cpp@luce-dflash` fork (three tree-mode ggml ops); multi-arch build is automatic (see [Running on other GPUs](#running-on-other-gpus-4090-5090-dgx-spark--gb10-jetson-agx-thor)).
 
-**Megakernel porting note.** Tighter than dflash: `megakernel/setup.py` pins `-arch=sm_86 -DNUM_BLOCKS=82` (3090 SM count). To run on a different card, edit both defines and `pip install -e . --force-reinstall --no-deps`. Grid is persistent, one block per SM, so `NUM_BLOCKS` must match exactly. Suggested starting points: 4090 `sm_89` + `128`, 5090 `sm_120` + `170`, DGX Spark / GB10 `sm_121` + run `torch.cuda.get_device_properties(0).multi_processor_count` to read SM count, Jetson AGX Thor `sm_110` + the same SM-count query.
+**Megakernel porting note.** `megakernel/setup.py` auto-detects the GPU arch and SM count at build time via `torch.cuda.get_device_capability()`. The decode grid is persistent (one block per SM) and is clamped to the resident-block ceiling at runtime, so no manual tuning is needed. On SM < 80 (Turing), the kernel uses FP16 instead of BF16 via a compile-time `TARGET_SM` flag; on SM ≥ 80 (Ampere+), BF16 is used. Just `pip install -e . --no-build-isolation` and the right code path is selected automatically.
 
 **Optional, find your GPU's sweet spot:** `sudo nvidia-smi -pl 220` (megakernel hits best tok/J at 220 W on 3090; re-sweep for other cards).
 

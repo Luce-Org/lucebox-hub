@@ -9,6 +9,15 @@ INTERMEDIATE_SIZE = 3584
 VOCAB_SIZE = 248320
 MAX_SEQ_LEN = 2048
 
+
+def _half_dtype():
+    """Return the 16-bit dtype matching the compiled kernel: bf16 on SM>=80, fp16 otherwise."""
+    if torch.cuda.is_available():
+        major, _ = torch.cuda.get_device_capability()
+        if major < 8:
+            return torch.float16
+    return torch.bfloat16
+
 FA_NUM_Q_HEADS = 8
 FA_NUM_KV_HEADS = 2
 FA_HEAD_DIM = 256
@@ -55,7 +64,7 @@ def set_decode_blocks(blocks: int):
 
 
 def load_weights(model_name="Qwen/Qwen3.5-0.8B", verbose=True):
-    """Load Qwen3.5-0.8B weights as bf16 (no quantization)."""
+    """Load Qwen3.5-0.8B weights (bf16 on SM>=80, fp16 on SM<80)."""
     if not verbose:
         import os
         os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -63,13 +72,20 @@ def load_weights(model_name="Qwen/Qwen3.5-0.8B", verbose=True):
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    hdtype = _half_dtype()
+    dtype_name = "bf16" if hdtype == torch.bfloat16 else "fp16"
+
     if verbose:
-        print(f"Loading {model_name} (bf16)...")
+        print(f"Loading {model_name} ({dtype_name})...")
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, dtype=torch.bfloat16, device_map="cuda"
+        model_name, dtype=hdtype, device_map="cuda"
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     state = model.state_dict()
+
+    def _w(key):
+        """Get weight tensor, ensuring it's in the target half dtype."""
+        return state[key].to(hdtype).contiguous()
 
     layer_data = []
     for i in range(NUM_LAYERS):
@@ -77,48 +93,52 @@ def load_weights(model_name="Qwen/Qwen3.5-0.8B", verbose=True):
         lt = LAYER_TYPE[i]
 
         if lt == 1:
-            # Full Attention: 11 pointers (all bf16)
+            # Full Attention: 11 pointers
             layer_data.append({
                 "type": 1,
                 "ptrs": [
-                    state[p + "input_layernorm.weight"].contiguous(),
-                    state[p + "self_attn.q_proj.weight"].contiguous(),
-                    state[p + "self_attn.k_proj.weight"].contiguous(),
-                    state[p + "self_attn.v_proj.weight"].contiguous(),
-                    state[p + "self_attn.q_norm.weight"].contiguous(),
-                    state[p + "self_attn.k_norm.weight"].contiguous(),
-                    state[p + "self_attn.o_proj.weight"].contiguous(),
-                    state[p + "post_attention_layernorm.weight"].contiguous(),
-                    state[p + "mlp.gate_proj.weight"].contiguous(),
-                    state[p + "mlp.up_proj.weight"].contiguous(),
-                    state[p + "mlp.down_proj.weight"].contiguous(),
+                    _w(p + "input_layernorm.weight"),
+                    _w(p + "self_attn.q_proj.weight"),
+                    _w(p + "self_attn.k_proj.weight"),
+                    _w(p + "self_attn.v_proj.weight"),
+                    _w(p + "self_attn.q_norm.weight"),
+                    _w(p + "self_attn.k_norm.weight"),
+                    _w(p + "self_attn.o_proj.weight"),
+                    _w(p + "post_attention_layernorm.weight"),
+                    _w(p + "mlp.gate_proj.weight"),
+                    _w(p + "mlp.up_proj.weight"),
+                    _w(p + "mlp.down_proj.weight"),
                 ]
             })
         else:
-            # DeltaNet: 14 pointers (all bf16)
+            # DeltaNet: 14 pointers
             layer_data.append({
                 "type": 0,
                 "ptrs": [
-                    state[p + "input_layernorm.weight"].contiguous(),
-                    state[p + "linear_attn.in_proj_qkv.weight"].contiguous(),
-                    state[p + "linear_attn.in_proj_z.weight"].contiguous(),
-                    state[p + "linear_attn.in_proj_b.weight"].contiguous(),
-                    state[p + "linear_attn.in_proj_a.weight"].contiguous(),
-                    state[p + "linear_attn.conv1d.weight"].contiguous(),
-                    state[p + "linear_attn.A_log"].contiguous(),
-                    state[p + "linear_attn.dt_bias"].contiguous(),
-                    state[p + "linear_attn.norm.weight"].contiguous(),
-                    state[p + "linear_attn.out_proj.weight"].contiguous(),
-                    state[p + "post_attention_layernorm.weight"].contiguous(),
-                    state[p + "mlp.gate_proj.weight"].contiguous(),
-                    state[p + "mlp.up_proj.weight"].contiguous(),
-                    state[p + "mlp.down_proj.weight"].contiguous(),
+                    _w(p + "input_layernorm.weight"),
+                    _w(p + "linear_attn.in_proj_qkv.weight"),
+                    _w(p + "linear_attn.in_proj_z.weight"),
+                    _w(p + "linear_attn.in_proj_b.weight"),
+                    _w(p + "linear_attn.in_proj_a.weight"),
+                    _w(p + "linear_attn.conv1d.weight"),
+                    _w(p + "linear_attn.A_log"),
+                    _w(p + "linear_attn.dt_bias"),
+                    _w(p + "linear_attn.norm.weight"),
+                    _w(p + "linear_attn.out_proj.weight"),
+                    _w(p + "post_attention_layernorm.weight"),
+                    _w(p + "mlp.gate_proj.weight"),
+                    _w(p + "mlp.up_proj.weight"),
+                    _w(p + "mlp.down_proj.weight"),
                 ]
             })
 
-    embed_weight = state["model.embed_tokens.weight"].contiguous()
-    final_norm_weight = state["model.norm.weight"].contiguous()
-    lm_head = state.get("lm_head.weight", embed_weight).contiguous()
+    embed_weight = _w("model.embed_tokens.weight")
+    final_norm_weight = _w("model.norm.weight")
+    lm_head = state.get("lm_head.weight")
+    if lm_head is None:
+        lm_head = embed_weight
+    else:
+        lm_head = lm_head.to(hdtype).contiguous()
 
     weights = {
         "embed_weight": embed_weight,
@@ -132,7 +152,7 @@ def load_weights(model_name="Qwen/Qwen3.5-0.8B", verbose=True):
 
     if verbose:
         total = sum(sum(t.numel() for t in ld["ptrs"]) for ld in layer_data) + lm_head.numel()
-        print(f"BF16 weights: {total/1e6:.1f}M params ({total*2/1e6:.0f} MB)")
+        print(f"{dtype_name.upper()} weights: {total/1e6:.1f}M params ({total*2/1e6:.0f} MB)")
 
     return weights, tokenizer
 
@@ -185,7 +205,7 @@ class Decoder:
         self._layer_weights_packed = _pack_layer_weights(weights["layer_data"])
         _set_decode_blocks(0 if decode_blocks is None else int(decode_blocks))
 
-        bf16 = dict(dtype=torch.bfloat16, device="cuda")
+        bf16 = dict(dtype=_half_dtype(), device="cuda")
         f32 = dict(dtype=torch.float32, device="cuda")
         i32 = dict(dtype=torch.int32, device="cuda")
         u32 = dict(dtype=torch.uint32, device="cuda")

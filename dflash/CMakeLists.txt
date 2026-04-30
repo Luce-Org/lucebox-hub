@@ -58,13 +58,13 @@ add_library(dflash27b STATIC
     src/f16_convert.cu
     src/delta_net_chunked.cpp
 )
-# Ampere (86) always; Blackwell consumer (120) and Thor (110 on CUDA 13+)
-# added when nvcc supports them. DGX Spark /
+# Turing (75) and Ampere (86) always; Blackwell consumer (120) and Thor
+# (110 on CUDA 13+) added when nvcc supports them. DGX Spark /
 # GB10 is compute capability 12.1 (121), added at CUDA 12.9+.
 if(DFLASH27B_USER_CUDA_ARCHITECTURES)
     set(_dflash27b_archs "${DFLASH27B_USER_CUDA_ARCHITECTURES}")
 else()
-    set(_dflash27b_archs "86")
+    set(_dflash27b_archs "75;86")
     if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8")
         list(APPEND _dflash27b_archs "120")
     endif()
@@ -76,6 +76,14 @@ else()
     endif()
 endif()
 set_target_properties(dflash27b PROPERTIES CUDA_ARCHITECTURES "${_dflash27b_archs}")
+
+# Extract the minimum SM from the arch list so safetensors_draft.cpp can decide
+# at compile time whether to convert BF16 draft weights to FP16 (cuBLAS BF16
+# GEMM has no tensor core acceleration on SM < 80).
+list(GET _dflash27b_archs 0 _dflash27b_min_sm)
+# Strip any trailing 'a' suffix (e.g. "121a" → "121")
+string(REGEX REPLACE "[^0-9]" "" _dflash27b_min_sm "${_dflash27b_min_sm}")
+target_compile_definitions(dflash27b PRIVATE DFLASH27B_MIN_SM=${_dflash27b_min_sm})
 
 target_include_directories(dflash27b
     PUBLIC

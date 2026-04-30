@@ -307,6 +307,43 @@ static void bf16_to_f32_array(const uint16_t * src, float * dst, size_t n) {
     }
 }
 
+// Convert an array of bf16 values to fp16 via f32 intermediate.
+static void bf16_to_f16_array(const uint16_t * src, uint16_t * dst, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        uint32_t bits = ((uint32_t)src[i]) << 16;
+        float f;
+        std::memcpy(&f, &bits, 4);
+        // IEEE 754 f32→f16: truncate mantissa, clamp exponent.
+        uint32_t u;
+        std::memcpy(&u, &f, 4);
+        uint32_t sign = (u >> 16) & 0x8000;
+        int32_t  exp  = ((u >> 23) & 0xFF) - 127 + 15;
+        uint32_t mant = (u >> 13) & 0x03FF;
+        if (exp <= 0)       dst[i] = (uint16_t)sign;          // flush to zero
+        else if (exp >= 31) dst[i] = (uint16_t)(sign | 0x7C00); // inf
+        else                dst[i] = (uint16_t)(sign | (exp << 10) | mant);
+    }
+}
+
+// Returns true if the current CUDA device has native BF16 tensor core support
+// (Ampere SM 8.0+). On Turing (SM 7.5) cuBLAS BF16 GEMM falls back to slow
+// CUDA cores instead of tensor cores. Uses ggml's CUDA backend info at runtime.
+static bool cuda_has_native_bf16() {
+    // Check at runtime: link against ggml-cuda's device info if available,
+    // otherwise fall back to env var DFLASH27B_DRAFT_FP16 for manual override.
+    const char * env = std::getenv("DFLASH27B_DRAFT_FP16");
+    if (env && std::atoi(env) != 0) return false;  // force fp16
+
+    // Probe via ggml_backend_cuda device properties (compiled-in at build time).
+    // The CMAKE_CUDA_ARCHITECTURES list tells us the minimum supported arch.
+    // If the smallest arch is < 80, return false.
+#if defined(DFLASH27B_MIN_SM) && DFLASH27B_MIN_SM < 80
+    return false;
+#else
+    return true;
+#endif
+}
+
 } // namespace
 
 bool load_draft_safetensors(const std::string & path,
@@ -356,10 +393,14 @@ bool load_draft_safetensors(const std::string & path,
     // ── 4. Create named tensors in the context ───────────────────
     //
     // Norms (rms_norm weights) are loaded as F32 because ggml's CUDA
-    // elementwise ops require F32/F16 operands. Projection weights stay bf16.
+    // elementwise ops require F32/F16 operands. Projection weights stay bf16
+    // on Ampere+ (native tensor core support) or are converted to fp16 on
+    // Turing (SM 7.5) where cuBLAS BF16 GEMM falls back to slow CUDA cores.
     const ggml_type NORM_GT = GGML_TYPE_F32;
+    const bool native_bf16 = cuda_has_native_bf16();
+    const ggml_type PROJ_GT = native_bf16 ? GGML_TYPE_COUNT : GGML_TYPE_F16;
 
-    out.fc          = alloc_tensor(out.ctx, st, "fc.weight",           {HIDDEN, FC_IN});
+    out.fc          = alloc_tensor(out.ctx, st, "fc.weight",           {HIDDEN, FC_IN},  "BF16", PROJ_GT);
     out.hidden_norm = alloc_tensor(out.ctx, st, "hidden_norm.weight",  {HIDDEN}, "BF16", NORM_GT);
     out.out_norm    = alloc_tensor(out.ctx, st, "norm.weight",         {HIDDEN}, "BF16", NORM_GT);
     if (!out.fc || !out.hidden_norm || !out.out_norm) return false;
@@ -371,15 +412,15 @@ bool load_draft_safetensors(const std::string & path,
         DraftLayer & L = out.layers[il];
         L.attn_norm = alloc_tensor(out.ctx, st, p + "input_layernorm.weight",          {HIDDEN}, "BF16", NORM_GT);
         L.ffn_norm  = alloc_tensor(out.ctx, st, p + "post_attention_layernorm.weight", {HIDDEN}, "BF16", NORM_GT);
-        L.wq        = alloc_tensor(out.ctx, st, p + "self_attn.q_proj.weight", {Q_DIM,  HIDDEN});
-        L.wk        = alloc_tensor(out.ctx, st, p + "self_attn.k_proj.weight", {KV_DIM, HIDDEN});
-        L.wv        = alloc_tensor(out.ctx, st, p + "self_attn.v_proj.weight", {KV_DIM, HIDDEN});
-        L.wo        = alloc_tensor(out.ctx, st, p + "self_attn.o_proj.weight", {HIDDEN, Q_DIM});
+        L.wq        = alloc_tensor(out.ctx, st, p + "self_attn.q_proj.weight", {Q_DIM,  HIDDEN}, "BF16", PROJ_GT);
+        L.wk        = alloc_tensor(out.ctx, st, p + "self_attn.k_proj.weight", {KV_DIM, HIDDEN}, "BF16", PROJ_GT);
+        L.wv        = alloc_tensor(out.ctx, st, p + "self_attn.v_proj.weight", {KV_DIM, HIDDEN}, "BF16", PROJ_GT);
+        L.wo        = alloc_tensor(out.ctx, st, p + "self_attn.o_proj.weight", {HIDDEN, Q_DIM},  "BF16", PROJ_GT);
         L.q_norm    = alloc_tensor(out.ctx, st, p + "self_attn.q_norm.weight", {HD}, "BF16", NORM_GT);
         L.k_norm    = alloc_tensor(out.ctx, st, p + "self_attn.k_norm.weight", {HD}, "BF16", NORM_GT);
-        L.w_gate    = alloc_tensor(out.ctx, st, p + "mlp.gate_proj.weight",    {INTER,  HIDDEN});
-        L.w_up      = alloc_tensor(out.ctx, st, p + "mlp.up_proj.weight",      {INTER,  HIDDEN});
-        L.w_down    = alloc_tensor(out.ctx, st, p + "mlp.down_proj.weight",    {HIDDEN, INTER});
+        L.w_gate    = alloc_tensor(out.ctx, st, p + "mlp.gate_proj.weight",    {INTER,  HIDDEN}, "BF16", PROJ_GT);
+        L.w_up      = alloc_tensor(out.ctx, st, p + "mlp.up_proj.weight",      {INTER,  HIDDEN}, "BF16", PROJ_GT);
+        L.w_down    = alloc_tensor(out.ctx, st, p + "mlp.down_proj.weight",    {HIDDEN, INTER},  "BF16", PROJ_GT);
         if (!L.attn_norm || !L.ffn_norm || !L.wq || !L.wk || !L.wv || !L.wo ||
             !L.q_norm || !L.k_norm || !L.w_gate || !L.w_up || !L.w_down) {
             return false;
@@ -392,9 +433,10 @@ bool load_draft_safetensors(const std::string & path,
 
     // Walk the tensors in the context and upload their bytes.
     // For tensors whose ggml type differs from the safetensors dtype (i.e.
-    // BF16-on-disk, F32-in-ggml for norms), convert on the fly via a scratch
-    // float buffer.
-    std::vector<float> scratch_f32;
+    // BF16-on-disk, F32-in-ggml for norms, or BF16-on-disk, F16-in-ggml for
+    // projection weights on Turing), convert on the fly via scratch buffers.
+    std::vector<float>    scratch_f32;
+    std::vector<uint16_t> scratch_f16;
     for (ggml_tensor * t = ggml_get_first_tensor(out.ctx); t != nullptr;
          t = ggml_get_next_tensor(out.ctx, t)) {
         const char * name = ggml_get_name(t);
@@ -432,6 +474,16 @@ bool load_draft_safetensors(const std::string & path,
             bf16_to_f32_array((const uint16_t *)(blob + e.data_start),
                               scratch_f32.data(), n);
             ggml_backend_tensor_set(t, scratch_f32.data(), 0, dst_nbytes);
+        } else if (e.dtype == "BF16" && t->type == GGML_TYPE_F16) {
+            const size_t n = ggml_nelements(t);
+            if (src_nbytes != n * sizeof(uint16_t) || dst_nbytes != n * sizeof(uint16_t)) {
+                set_last_error("BF16->F16 size mismatch for '" + std::string(name) + "'");
+                return false;
+            }
+            scratch_f16.resize(n);
+            bf16_to_f16_array((const uint16_t *)(blob + e.data_start),
+                              scratch_f16.data(), n);
+            ggml_backend_tensor_set(t, scratch_f16.data(), 0, dst_nbytes);
         } else {
             set_last_error(std::string("unsupported dtype conversion for '") +
                            name + "': " + e.dtype + " -> ggml type " +

@@ -150,3 +150,82 @@ Starting point: Chain DFlash at 112.8 tok/s mean on HumanEval, AL 7.67.
 - Published DFlash paper on Qwen3-4B/8B/30B-MoE (pure attention, BF16, B200) reports 4-5× over AR on HumanEval/Math500 at concurrency 1. Ours: 3.43× on 27B hybrid Q4_K_M on RTX 3090.
 - Memory ceiling: per-token SSM intermediate cache (hybrid-only cost) caps tree budget at ~26 on 24 GB. The paper uses budgets up to 1024 on pure-attention models with zero per-node memory tax.
 - Per-token verify cost drops from 25 ms at N=1 to 0.97 ms at N=128 (ggml-cuda Q4_K matmul amortises well with batch size).
+
+## RTX 2080 Ti (Turing, sm_75, 22 GB)
+
+Single RTX 2080 Ti 22 GB, CUDA 12.4.
+Same target/draft as above. BF16 draft weights auto-converted to FP16 at load time
+(cuBLAS BF16 GEMM has no tensor core acceleration on SM 7.5; FP16 conversion
+gives 3.9× faster draft compute via Turing tensor cores).
+
+Build: `cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=75`
+
+### RTX 2080 Ti headline
+
+| Task      | AR tok/s | DFlash tok/s | AL   | Speedup |
+|-----------|:--------:|:------------:|:----:|:-------:|
+| HumanEval | 19.88    | **53.42**    | 8.14 | **2.69×** |
+| Math500   | 19.67    | **49.01**    | 7.30 | **2.49×** |
+| GSM8K     | 19.49    | **43.55**    | 6.53 | **2.23×** |
+
+### RTX 2080 Ti per-prompt — HumanEval (10 samples)
+
+| # | n_tok | AR    | DFlash | AL    |
+|:-:|:-----:|:-----:|:------:|:-----:|
+| 01| 84    | 19.88 |  58.69 | 8.83  |
+| 02| 138   | 19.43 |  45.47 | 9.14  |
+| 03| 134   | 19.60 |  62.67 | 9.14  |
+| 04| 120   | 20.16 |  63.42 | 9.14  |
+| 05| 172   | 19.74 |  56.89 | 8.53  |
+| 06| 118   | 20.20 |  44.32 | 6.40  |
+| 07| 51    | 20.26 |  54.14 | 8.00  |
+| 08| 141   | 19.70 |  40.34 | 5.95  |
+| 09| 125   | 19.91 | **70.70** | **10.67** |
+| 10| 95    | 19.88 |  37.56 | 5.57  |
+| **mean** |   | **19.88** | **53.42** | **8.14** |
+
+Peak per-prompt: **70.70 tok/s at AL 10.67** (3.55× over AR on the same prompt).
+
+### RTX 2080 Ti per-prompt — GSM8K (10 samples)
+
+| # | n_tok | AR    | DFlash | AL   |
+|:-:|:-----:|:-----:|:------:|:----:|
+| 01| 45    | 19.24 |  39.54 | 5.82 |
+| 02| 111   | 19.70 |  39.49 | 5.82 |
+| 03| 49    | 19.33 |  57.01 | 8.53 |
+| 04| 70    | 19.70 |  38.35 | 5.69 |
+| 05| 102   | 19.67 |  36.77 | 5.45 |
+| 06| 118   | 19.39 |  40.45 | 5.95 |
+| 07| 113   | 19.55 |  54.02 | 8.46 |
+| 08| 50    | 18.92 |  42.16 | 6.51 |
+| 09| 43    | 19.68 |  48.07 | 7.11 |
+| 10| 96    | 19.72 |  39.63 | 5.95 |
+| **mean** |   | **19.49** | **43.55** | **6.53** |
+
+### RTX 2080 Ti per-prompt — Math500 (10 samples)
+
+| # | n_tok | AR    | DFlash | AL   |
+|:-:|:-----:|:-----:|:------:|:----:|
+| 01| 257   | 19.70 |  42.64 | 6.40 |
+| 02| 53    | 19.80 |  49.53 | 7.31 |
+| 03| 40    | 19.96 |  52.76 | 8.00 |
+| 04| 50    | 19.49 | **62.08** | **9.48** |
+| 05| 117   | 17.85 |  43.69 | 6.56 |
+| 06| 76    | 19.87 |  45.42 | 6.74 |
+| 07| 43    | 20.05 |  42.57 | 6.40 |
+| 08| 79    | 19.42 |  51.86 | 7.76 |
+| 09| 52    | 20.02 |  39.34 | 5.82 |
+| 10| 57    | 20.53 |  60.18 | 8.53 |
+| **mean** |   | **19.67** | **49.01** | **7.30** |
+
+### RTX 2080 Ti vs RTX 3090 comparison
+
+| Metric           | RTX 3090 | RTX 2080 Ti | Ratio |
+|------------------|:--------:|:-----------:|:-----:|
+| AR tok/s (HE)    | 37.78    | 19.88       | 0.53× |
+| DFlash tok/s (HE)| 129.52   | 53.42       | 0.41× |
+| Mem BW            | 936 GB/s | 616 GB/s   | 0.66× |
+| SMs               | 82       | 68          | 0.83× |
+| VRAM              | 24 GB    | 22 GB       | 0.92× |
+
+AR scaling (~0.53×) tracks bandwidth × SM count. DFlash scaling (~0.41×) is lower because the draft compute bottleneck is proportionally larger on a slower GPU, even after the BF16→FP16 fix. Acceptance length is identical (same draft model, same tokens), confirming the FP16 conversion is numerically faithful.

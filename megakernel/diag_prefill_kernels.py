@@ -11,7 +11,7 @@ Decision rule:
 import time
 import torch
 from model import Decoder, HIDDEN_SIZE, INTERMEDIATE_SIZE, FA_QPROJ_SIZE, FA_Q_SIZE, FA_KV_SIZE
-from model import DN_CONV_CHANNELS, DN_V_SIZE, DN_NUM_HEADS, MAX_SEQ_LEN
+from model import DN_CONV_CHANNELS, DN_V_SIZE, DN_NUM_HEADS, MAX_SEQ_LEN, _half_dtype
 import qwen35_megakernel_bf16_C
 from transformers import AutoTokenizer
 
@@ -23,7 +23,7 @@ dec = Decoder(verbose=False)
 _pf = torch.ops.qwen35_megakernel_bf16_C.prefill_bf16
 
 S_MAX = 512
-bf16 = dict(dtype=torch.bfloat16, device="cuda")
+bf16 = dict(dtype=_half_dtype(), device="cuda")
 f32 = dict(dtype=torch.float32, device="cuda")
 i32 = dict(dtype=torch.int32, device="cuda")
 mx = max(DN_CONV_CHANNELS, FA_QPROJ_SIZE, INTERMEDIATE_SIZE)

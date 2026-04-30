@@ -17,7 +17,7 @@ def _detect_arch():
             return f"sm_{major}{minor}"
     except Exception:
         pass
-    return "sm_86"
+    return "sm_75"
 
 
 def _int_env(name, default):
@@ -26,6 +26,12 @@ def _int_env(name, default):
 
 arch = _detect_arch()
 is_blackwell = arch.startswith("sm_12")
+
+# Extract numeric SM level (e.g. "sm_75" → 75, "sm_120a" → 120) for compile-time guards.
+import re
+_sm_match = re.search(r"sm_(\d+)", arch)
+target_sm = int(_sm_match.group(1)) if _sm_match else 86
+
 num_blocks = _int_env("MEGAKERNEL_NUM_BLOCKS", 82)
 block_size = _int_env("MEGAKERNEL_BLOCK_SIZE", 512)
 lm_num_blocks = _int_env("MEGAKERNEL_LM_NUM_BLOCKS", 512)
@@ -49,10 +55,12 @@ nvcc_args = [
     f"-DLM_NUM_BLOCKS={lm_num_blocks}",
     f"-DLM_BLOCK_SIZE={lm_block_size}",
     f"-DMEGAKERNEL_DN_PHASE2_WMMA={dn_phase2_wmma}",
+    f"-DTARGET_SM={target_sm}",
 ]
 # Expose to host compiler (torch_bindings.cpp, prefill.cu host-side) so it
 # can also branch on the flag without needing a separate nvcc pass.
 cxx_args.append(f"-DMEGAKERNEL_DN_PHASE2_WMMA={dn_phase2_wmma}")
+cxx_args.append(f"-DTARGET_SM={target_sm}")
 
 if is_blackwell:
     sources.append("kernel_gb10_nvfp4.cu")
