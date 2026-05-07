@@ -558,6 +558,7 @@ struct GemmaTargetWeights {
     float logit_softcap  = 30.0f;
     float attn_scale     = 1.0f;
 
+    int32_t bos_id       = -1;
     int32_t eos_id       = -1;
     int32_t eos_chat_id  = -1;
 

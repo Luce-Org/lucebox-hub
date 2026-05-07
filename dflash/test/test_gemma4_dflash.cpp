@@ -751,6 +751,12 @@ int main(int argc, char ** argv) {
                     prompt_ids.size());
     }
 
+    // ── Ensure BOS is prepended (Gemma4 requires BOS at position 0) ──
+    if (w.bos_id >= 0 && (prompt_ids.empty() || prompt_ids[0] != w.bos_id)) {
+        prompt_ids.insert(prompt_ids.begin(), w.bos_id);
+        std::printf("[tokens] prepended BOS token %d\n", w.bos_id);
+    }
+
     if ((int)prompt_ids.size() >= ctx_size) {
         std::fprintf(stderr, "error: prompt (%zu tokens) >= ctx_size (%d)\n",
                      prompt_ids.size(), ctx_size);
@@ -1176,6 +1182,16 @@ int main(int argc, char ** argv) {
                     build_causal_mask(mask_buf, kv_len, q_len, committed);
                     ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
                                             sizeof(uint16_t) * mask_buf.size());
+                }
+
+                // SWA mask for target verify (required when n_tokens > 1)
+                if (sg.swa_mask) {
+                    const int kv_len = committed + q_len;
+                    std::vector<uint16_t> swa_buf;
+                    build_swa_causal_mask(swa_buf, kv_len, q_len, committed,
+                                          w.swa_window);
+                    ggml_backend_tensor_set(sg.swa_mask, swa_buf.data(), 0,
+                                            sizeof(uint16_t) * swa_buf.size());
                 }
 
                 {

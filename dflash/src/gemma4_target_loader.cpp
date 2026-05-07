@@ -373,14 +373,24 @@ bool load_gemma4_target_gguf(const std::string & path,
     out.n_ff_exp         = (int)n_ff_exp;
     out.logit_softcap    = logit_softcap;
 
-    // EOS tokens (missing key → -1)
+    // BOS / EOS tokens (missing key → -1)
     {
         const uint32_t kMissing = 0xFFFFFFFFu;
+        const uint32_t raw_bos  = get_u32_or(gctx, "tokenizer.ggml.bos_token_id",  kMissing);
         const uint32_t raw_eos  = get_u32_or(gctx, "tokenizer.ggml.eos_token_id",  kMissing);
         const uint32_t raw_eot  = get_u32_or(gctx, "tokenizer.ggml.eot_token_id",  kMissing);
+        out.bos_id      = (raw_bos == kMissing) ? -1 : (int32_t)raw_bos;
         out.eos_id      = (raw_eos == kMissing) ? -1 : (int32_t)raw_eos;
         out.eos_chat_id = (raw_eot == kMissing) ? -1 : (int32_t)raw_eot;
-        std::printf("[gemma4_loader] eos_id=%d eos_chat_id=%d\n", out.eos_id, out.eos_chat_id);
+
+        // Gemma4 fallback: <end_of_turn> (107) is the chat stop token.
+        // Many GGUFs omit eot_token_id; default to 107 when missing.
+        if (out.eos_chat_id < 0) {
+            out.eos_chat_id = 107;
+        }
+
+        std::printf("[gemma4_loader] bos_id=%d eos_id=%d eos_chat_id=%d\n",
+                    out.bos_id, out.eos_id, out.eos_chat_id);
     }
 
     // ── 5. Compute capture_layer_ids ─────────────────────────────────────────
