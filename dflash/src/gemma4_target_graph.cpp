@@ -294,9 +294,7 @@ static ggml_tensor * build_swa_attn_block(
 
     const bool q_rotate   = (kv_k_type == GGML_TYPE_TQ3_0);
     const bool out_rotate = (kv_v_type == GGML_TYPE_TQ3_0);
-    if (q_rotate) {
-        Qfa = ggml_turbo_wht(ctx, Qfa, 0);
-    }
+    (void)q_rotate; (void)out_rotate;  // rotation now fused into FA kernel
 
     ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
         head_dim, win_len_padded, n_head_kv,
@@ -310,11 +308,6 @@ static ggml_tensor * build_swa_attn_block(
     // Gemma4: attn_scale = 1.0 (self.scaling = 1.0, no 1/sqrt(head_dim))
     ggml_tensor * attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask,
                                              1.0f, 0.0f, 0.0f);
-
-    if (out_rotate) {
-        attn = ggml_cont(ctx, attn);
-        attn = ggml_turbo_wht(ctx, attn, 1);
-    }
 
     attn = ggml_reshape_2d(ctx, attn, q_dim, n_tokens);
     attn = ggml_mul_mat(ctx, L.wo, attn);
@@ -420,9 +413,7 @@ static ggml_tensor * build_full_attn_block(
 
     const bool q_rotate   = (kv_k_type == GGML_TYPE_TQ3_0);
     const bool out_rotate = (kv_v_type == GGML_TYPE_TQ3_0);
-    if (q_rotate) {
-        Qfa = ggml_turbo_wht(ctx, Qfa, 0);
-    }
+    (void)q_rotate; (void)out_rotate;  // rotation now fused into FA kernel
 
     ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
         head_dim, win_len_padded, n_head_kv,
@@ -436,11 +427,6 @@ static ggml_tensor * build_full_attn_block(
     // Gemma4: attn_scale = 1.0 (self.scaling = 1.0, no 1/sqrt(head_dim))
     ggml_tensor * attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask,
                                              1.0f, 0.0f, 0.0f);
-
-    if (out_rotate) {
-        attn = ggml_cont(ctx, attn);
-        attn = ggml_turbo_wht(ctx, attn, 1);
-    }
 
     attn = ggml_reshape_2d(ctx, attn, q_dim, n_tokens);
     attn = ggml_mul_mat(ctx, L.wo, attn);
