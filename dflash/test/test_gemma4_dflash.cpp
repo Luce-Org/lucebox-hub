@@ -8,9 +8,9 @@
 //   3. Decode loop (until n_predict):
 //      a. [target-only path, always active]
 //         Run target forward for last committed token → logits → sample next.
-//      b. [speculative path, active when draft is loaded] — TODO
+//      b. [speculative path, active when draft is loaded]
 //         i.  Get target_feat from cache.
-//         ii. Run draft model to propose a block of tokens (DDTree).
+//         ii. Run draft model to propose a block of tokens.
 //         iii. Verify proposals against target in one batched forward.
 //         iv. Accept longest verified prefix + bonus token, advance cache.
 //   4. Print generated text and timing stats.
@@ -50,6 +50,12 @@
 #include <random>
 
 using namespace dflash27b;
+
+// bf16→f32 CUDA conversion kernel (defined in f16_convert.cu)
+extern "C" void dflash27b_launch_bf16_to_f32(const void * src,
+                                             void * dst,
+                                             size_t n_elems,
+                                             cudaStream_t stream);
 
 // ─── Utilities ────────────────────────────────────────────────────────────
 
@@ -190,6 +196,54 @@ static void step_graph_destroy(StepGraph & sg) {
     step_graph_free(sg);
 }
 
+// ─── Draft step graph state ───────────────────────────────────────────────
+
+struct DraftStepGraph {
+    ggml_context   * ctx         = nullptr;
+    ggml_cgraph    * gf          = nullptr;
+    ggml_gallocr_t   alloc       = nullptr;
+    ggml_tensor    * draft_embed = nullptr;
+    ggml_tensor    * positions   = nullptr;
+    ggml_tensor    * attn_mask   = nullptr;
+    ggml_tensor    * logits      = nullptr;
+};
+
+static void draft_step_free(DraftStepGraph & dsg) {
+    if (dsg.ctx) { ggml_free(dsg.ctx); dsg.ctx = nullptr; }
+    dsg.gf          = nullptr;
+    dsg.draft_embed = nullptr;
+    dsg.positions   = nullptr;
+    dsg.attn_mask   = nullptr;
+    dsg.logits      = nullptr;
+}
+
+static void draft_step_destroy(DraftStepGraph & dsg) {
+    if (dsg.alloc) { ggml_gallocr_free(dsg.alloc); dsg.alloc = nullptr; }
+    draft_step_free(dsg);
+}
+
+// ─── Draft KV prefill graph state ────────────────────────────────────────────
+
+struct DraftKVPrefillGraph {
+    ggml_context   * ctx         = nullptr;
+    ggml_cgraph    * gf          = nullptr;
+    ggml_gallocr_t   alloc       = nullptr;
+    ggml_tensor    * target_feat = nullptr;  // input: [6*target_hidden, n_tokens]
+    ggml_tensor    * positions   = nullptr;  // input: [n_tokens] i32
+};
+
+static void draft_kv_prefill_free(DraftKVPrefillGraph & pkg) {
+    if (pkg.ctx) { ggml_free(pkg.ctx); pkg.ctx = nullptr; }
+    pkg.gf          = nullptr;
+    pkg.target_feat = nullptr;
+    pkg.positions   = nullptr;
+}
+
+static void draft_kv_prefill_destroy(DraftKVPrefillGraph & pkg) {
+    if (pkg.alloc) { ggml_gallocr_free(pkg.alloc); pkg.alloc = nullptr; }
+    draft_kv_prefill_free(pkg);
+}
+
 // Build a single-step target forward graph.
 //   n_tokens  - number of tokens in this forward (1 for decode, >1 for prefill)
 //   kv_start  - index of the first new token in the KV cache
@@ -249,6 +303,93 @@ static bool build_gemma4_step(StepGraph & sg,
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     }
     return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
+}
+
+// Build a draft KV prefill graph: project target features → draft KV cache.
+static bool build_draft_kv_prefill(DraftKVPrefillGraph & pkg,
+                                   const GemmaDraftWeights & dw,
+                                   GemmaTargetCache & cache,
+                                   ggml_backend_t backend,
+                                   int n_tokens) {
+    // Free previous graph state
+    if (pkg.ctx) { ggml_free(pkg.ctx); pkg.ctx = nullptr; }
+    pkg.gf          = nullptr;
+    pkg.target_feat = nullptr;
+    pkg.positions   = nullptr;
+
+    const int target_feat_w = dw.n_target_layers * dw.target_hidden;
+
+    ggml_init_params ip{};
+    ip.mem_size   = 256 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    pkg.ctx = ggml_init(ip);
+    if (!pkg.ctx) return false;
+
+    pkg.target_feat = ggml_new_tensor_2d(pkg.ctx, GGML_TYPE_F32, target_feat_w, n_tokens);
+    ggml_set_name(pkg.target_feat, "prefill_target_feat");
+    ggml_set_input(pkg.target_feat);
+
+    pkg.positions = ggml_new_tensor_1d(pkg.ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(pkg.positions, "prefill_positions");
+    ggml_set_input(pkg.positions);
+
+    pkg.gf = ggml_new_graph_custom(pkg.ctx, 4096, false);
+
+    build_draft_kv_prefill_graph(pkg.ctx, pkg.gf, dw, cache,
+                                 pkg.target_feat, pkg.positions, n_tokens);
+
+    if (!pkg.alloc) {
+        pkg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    return ggml_gallocr_alloc_graph(pkg.alloc, pkg.gf);
+}
+
+// Build a draft model forward graph for one diffusion step.
+static bool build_draft_step(DraftStepGraph & dsg,
+                             const GemmaDraftWeights & dw,
+                             GemmaTargetCache & cache,
+                             ggml_backend_t backend,
+                             int n_tokens,
+                             int kv_start) {
+    draft_step_free(dsg);
+
+    ggml_init_params ip{};
+    ip.mem_size   = 256 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    dsg.ctx = ggml_init(ip);
+    if (!dsg.ctx) return false;
+
+    dsg.draft_embed = ggml_new_tensor_2d(dsg.ctx, GGML_TYPE_F32, dw.n_embd, n_tokens);
+    ggml_set_name(dsg.draft_embed, "draft_embed");
+    ggml_set_input(dsg.draft_embed);
+
+    dsg.positions = ggml_new_tensor_1d(dsg.ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(dsg.positions, "positions");
+    ggml_set_input(dsg.positions);
+
+    // Attention mask: block tokens attend to context + block (causal).
+    const int kv_len = kv_start + n_tokens;
+    const int kv_pad = align_up(kv_len, KQ_MASK_PAD);
+    const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
+    dsg.attn_mask = ggml_new_tensor_2d(dsg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
+    ggml_set_name(dsg.attn_mask, "draft_attn_mask");
+    ggml_set_input(dsg.attn_mask);
+
+    dsg.gf = ggml_new_graph_custom(dsg.ctx, 8192, false);
+    dsg.logits = build_gemma4_draft_graph(
+        dsg.ctx, dsg.gf, dw, cache,
+        dsg.draft_embed, dsg.positions, dsg.attn_mask,
+        n_tokens, kv_start);
+    if (!dsg.logits) return false;
+    ggml_set_output(dsg.logits);
+    ggml_build_forward_expand(dsg.gf, dsg.logits);
+
+    if (!dsg.alloc) {
+        dsg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    return ggml_gallocr_alloc_graph(dsg.alloc, dsg.gf);
 }
 
 // ─── Embed one token into the inp_embed input tensor ─────────────────────
@@ -483,15 +624,65 @@ int main(int argc, char ** argv) {
     }
 
     // ── Load draft weights (optional) ────────────────────────────────────
-    // The GemmaDraftWeights struct is defined file-locally in gemma4_dflash_graph.cpp;
-    // we forward-declare the loader here via the internal linkage it provides.
-    // For now the driver supports target-only mode; draft integration is a TODO.
     const bool have_draft = !draft_path.empty();
+
+    // Draft state: declared in main scope so they persist across bench iterations
+    // and are accessible in cleanup.
+    GemmaDraftWeights    dw;
+    ggml_context       * tok_embd_ctx = nullptr;
+    ggml_backend_buffer_t tok_embd_buf = nullptr;
+
     if (have_draft) {
-        std::printf("[draft] TODO: load_gemma4_draft_safetensors(\"%s\") — "
-                    "draft integration pending\n",
-                    draft_path.c_str());
-        std::printf("[draft] Running in target-only mode for this build.\n");
+        double t0 = now_ms();
+        if (!load_gemma4_draft_safetensors(draft_path, backend, dw)) {
+            std::fprintf(stderr, "load_gemma4_draft_safetensors: %s\n", dflash27b_last_error());
+            return 1;
+        }
+        double t1 = now_ms();
+
+        // Upload tok_embd from target embedder to GPU (tied lm_head for draft).
+        // tw.embedder keeps the bytes CPU-side; we upload once and inject a pointer.
+        {
+            ggml_init_params ep{};
+            ep.mem_size   = ggml_tensor_overhead() * 2;
+            ep.mem_buffer = nullptr;
+            ep.no_alloc   = true;
+            tok_embd_ctx = ggml_init(ep);
+            if (!tok_embd_ctx) {
+                std::fprintf(stderr, "[draft] ggml_init for tok_embd failed\n");
+                return 1;
+            }
+
+            const ggml_type emb_type  = w.embedder.tok_embd_type;
+            const int64_t   n_embd_t  = w.embedder.n_embd;
+            const int64_t   n_vocab_t = w.embedder.n_vocab;
+
+            // ggml convention: ne[0] = n_embd (fast axis), ne[1] = n_vocab
+            ggml_tensor * te = ggml_new_tensor_2d(tok_embd_ctx, emb_type, n_embd_t, n_vocab_t);
+            ggml_set_name(te, "tok_embd_gpu");
+
+            tok_embd_buf = ggml_backend_alloc_ctx_tensors(tok_embd_ctx, backend);
+            if (!tok_embd_buf) {
+                std::fprintf(stderr, "[draft] ggml_backend_alloc_ctx_tensors for tok_embd failed\n");
+                ggml_free(tok_embd_ctx);
+                tok_embd_ctx = nullptr;
+                return 1;
+            }
+
+            const size_t emb_bytes = (size_t)w.embedder.row_bytes * (size_t)n_vocab_t;
+            ggml_backend_tensor_set(te, w.embedder.tok_embd_bytes, 0, emb_bytes);
+            std::printf("[tok_embd] uploaded %.1f MiB to GPU (%s [%" PRId64 ", %" PRId64 "])\n",
+                        (double)emb_bytes / (1024.0 * 1024.0),
+                        ggml_type_name(emb_type), n_embd_t, n_vocab_t);
+
+            dw.tok_embd = te;
+            dw.n_vocab  = (int)n_vocab_t;
+        }
+
+        std::printf("[draft] loaded n_layer=%d n_head=%d n_embd=%d n_vocab=%d "
+                    "target_hidden=%d block_size=%d  (%.1f ms)\n",
+                    dw.n_layer, dw.n_head, dw.n_embd, dw.n_vocab,
+                    dw.target_hidden, dw.block_size, t1 - t0);
     }
 
     // ── Create KV cache ───────────────────────────────────────────────────
@@ -505,6 +696,15 @@ int main(int argc, char ** argv) {
         double t1 = now_ms();
         std::printf("[cache] created max_ctx=%d, kv_layers=%zu  (%.1f ms)\n",
                     cache.max_ctx, cache.attn_k.size(), t1 - t0);
+    }
+
+    // ── Allocate draft KV cache (requires cache to already exist) ─────────
+    if (have_draft) {
+        if (!create_draft_kv_cache(dw, backend, cache)) {
+            std::fprintf(stderr, "create_draft_kv_cache failed\n");
+            return 1;
+        }
+        std::printf("[draft] KV cache allocated: %d slots\n", cache.draft_kv_cap);
     }
 
     // ── Tokenize prompt ───────────────────────────────────────────────────
@@ -537,13 +737,23 @@ int main(int argc, char ** argv) {
     const int bench_runs = bench_mode ? 3 : 1;
     std::vector<double> bench_tok_per_sec;
 
-    // Declared here (main scope) so step_graph_destroy(sg) in cleanup is valid.
-    StepGraph sg;
+    // Declared here (main scope) so step_graph_destroy(sg)/draft_step_destroy(dsg)
+    // in cleanup is valid.
+    StepGraph      sg;
+    DraftStepGraph dsg;
+
+    // Speculative decode stats (accumulated across bench iterations when bench_mode)
+    int total_draft_steps = 0;
+    int total_accepted    = 0;
 
     for (int bench_iter = 0; bench_iter < bench_runs; bench_iter++) {
 
         if (bench_runs > 1) {
             reset_gemma4_cache(cache);
+            // Reset draft step state for the new bench iteration
+            draft_step_free(dsg);
+            total_draft_steps = 0;
+            total_accepted    = 0;
             std::printf("[bench] run %d/%d\n", bench_iter + 1, bench_runs);
         }
 
@@ -617,25 +827,60 @@ int main(int argc, char ** argv) {
         std::printf("[prefill] done in %.1f ms  (last sampled token: %d)\n",
                     prefill_t1 - prefill_t0, last_logit_tok);
 
+        // ── Draft KV prefill: materialize draft KV for all prompt positions ─
+        if (have_draft) {
+            const int n_prompt = (int)prompt_ids.size();
+            const int target_feat_w = dw.n_target_layers * dw.target_hidden;
+
+            DraftKVPrefillGraph pkg;
+            if (!build_draft_kv_prefill(pkg, dw, cache, backend, n_prompt)) {
+                std::fprintf(stderr, "[draft] KV prefill build failed\n");
+                return 1;
+            }
+
+            // Extract target_feat from ring buffer (bf16 → f32) directly into GPU tensor.
+            // The ring buffer stores tokens at slot (pos % cap).
+            // Prompt filled positions 0..n_prompt-1 sequentially.
+            {
+                const int    cap          = cache.target_feat_cap;
+                const size_t feat_elt     = ggml_element_size(cache.target_feat);
+                const int    slot0        = 0;  // prefill starts at position 0
+                const int    pre_n        = std::min(n_prompt, cap - slot0);
+                const int    post_n       = n_prompt - pre_n;
+
+                dflash27b_launch_bf16_to_f32(
+                    (const char *)cache.target_feat->data + (size_t)slot0 * feat_elt * target_feat_w,
+                    (float *)pkg.target_feat->data,
+                    (size_t)pre_n * target_feat_w, nullptr);
+                if (post_n > 0) {
+                    dflash27b_launch_bf16_to_f32(
+                        (const char *)cache.target_feat->data,
+                        (float *)pkg.target_feat->data + (size_t)pre_n * target_feat_w,
+                        (size_t)post_n * target_feat_w, nullptr);
+                }
+                cudaDeviceSynchronize();
+            }
+
+            // Positions: [0, 1, ..., n_prompt-1]
+            {
+                std::vector<int32_t> pos(n_prompt);
+                for (int i = 0; i < n_prompt; i++) pos[i] = i;
+                ggml_backend_tensor_set(pkg.positions, pos.data(), 0, sizeof(int32_t) * n_prompt);
+            }
+
+            auto st = ggml_backend_graph_compute(backend, pkg.gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "[draft] KV prefill compute failed\n");
+                draft_kv_prefill_destroy(pkg);
+                return 1;
+            }
+            cache.draft_kv_pos = n_prompt;
+
+            draft_kv_prefill_destroy(pkg);
+            std::printf("[draft] KV prefill done: %d positions materialized\n", n_prompt);
+        }
+
         // ── Decode loop ───────────────────────────────────────────────────
-        //
-        // Target-only autoregressive path.
-        // Each iteration:
-        //   1. Feed `last_tok` through the target at position `committed`.
-        //   2. Sample the next token from logits.
-        //   3. Append to generated sequence.
-        //   4. Stop if EOS or n_predict reached.
-        //
-        // TODO: When a draft model is loaded, replace this with the speculative
-        // decoding loop:
-        //   a. Sync target_feat to the draft feature mirror.
-        //   b. Build noise block: [last_tok, MASK * (block_size-1)].
-        //   c. Run draft forward → draft logits.
-        //   d. Build DDTree from top-K distributions (budget = ddtree_budget).
-        //   e. Run tree-verify batched target forward with ancestor-only mask.
-        //   f. Walk tree accepting longest prefix + bonus token.
-        //   g. Rollback SSM/conv state to accepted position.
-        //   h. Advance committed, last_tok.
 
         std::vector<int32_t> generated;
         generated.reserve(n_predict);
@@ -647,77 +892,427 @@ int main(int argc, char ** argv) {
         double decode_t0 = now_ms();
         double first_token_ms = -1.0;
 
-        while ((int)generated.size() < n_predict) {
+        if (have_draft) {
+            // ── SPECULATIVE DECODE LOOP ───────────────────────────────────
+            //
+            // Each iteration proposes a block of q_len tokens via the draft
+            // model, then verifies with a single batched target forward.
+            // Accepted prefix tokens are committed; the loop advances by
+            // accept_n tokens per target call instead of 1.
+            //
+            // Gemma4 is pure attention (no SSM/conv state), so rollback is
+            // trivially: just don't advance committed past accepted tokens.
+            // Stale KV at positions [committed+commit_n..committed+q_len-1]
+            // will be overwritten by the next verify pass.
 
-            if (IS_EOS_TOK(cur_tok, w)) {
-                std::printf("\n[decode] EOS token %d at step %zu\n",
-                            cur_tok, generated.size());
-                break;
+            const int q_len        = dw.block_size;   // 16
+            const int mask_tok     = dw.mask_token_id; // 4
+            const int target_feat_w = dw.n_target_layers * dw.target_hidden;
+            const int vocab         = w.n_vocab;
+
+            std::vector<int32_t> noise_ids(q_len);
+            std::vector<float>   noise_embed_buf((size_t)dw.n_embd * q_len);
+            std::vector<int32_t> draft_tok(q_len);
+            std::vector<int32_t> target_tok(q_len);
+            std::vector<float>   draft_logits_buf((size_t)vocab * q_len);
+            std::vector<float>   verify_logits_buf((size_t)vocab * q_len);
+
+            while ((int)generated.size() < n_predict) {
+
+                if (IS_EOS_TOK(cur_tok, w)) {
+                    std::printf("\n[decode] EOS token %d\n", cur_tok);
+                    break;
+                }
+                if (committed >= ctx_size - q_len) {
+                    std::printf("\n[decode] context full\n");
+                    break;
+                }
+
+                // Not enough context for target_feat extraction yet:
+                // fall back to single-token target-only decode.
+                if (committed < q_len) {
+                    if (!build_gemma4_step(sg, w, cache, backend,
+                                           committed, /*n_tokens=*/1,
+                                           /*with_mask=*/true,
+                                           /*capture=*/true)) {
+                        std::fprintf(stderr, "[decode] warmup build failed at step %zu\n",
+                                     generated.size());
+                        return 1;
+                    }
+
+                    if (sg.attn_mask) {
+                        const int kv_len = committed + 1;
+                        std::vector<uint16_t> mask_buf;
+                        build_causal_mask(mask_buf, kv_len, 1, committed);
+                        ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
+                                                sizeof(uint16_t) * mask_buf.size());
+                    }
+
+                    if (!embed_token(w, cur_tok, sg.inp_embed, backend)) return 1;
+
+                    int32_t pos_val = committed;
+                    ggml_backend_tensor_set(sg.positions, &pos_val, 0, sizeof(int32_t));
+
+                    double step_t0 = now_ms();
+                    auto st = ggml_backend_graph_compute(backend, sg.gf);
+                    double step_t1 = now_ms();
+
+                    if (st != GGML_STATUS_SUCCESS) {
+                        std::fprintf(stderr, "[decode] warmup compute failed at step %zu\n",
+                                     generated.size());
+                        return 1;
+                    }
+
+                    committed++;
+                    cache.cur_pos = committed;
+
+                    // Draft KV prefill for this warmup token (position committed-1).
+                    {
+                        const int warmup_pos     = committed - 1;
+                        const int target_feat_w_w = dw.n_target_layers * dw.target_hidden;
+                        DraftKVPrefillGraph wpkg;
+                        if (!build_draft_kv_prefill(wpkg, dw, cache, backend, 1)) {
+                            std::fprintf(stderr, "[decode] warmup draft KV prefill build failed\n");
+                            return 1;
+                        }
+                        {
+                            const int    cap      = cache.target_feat_cap;
+                            const size_t feat_elt = ggml_element_size(cache.target_feat);
+                            const int    slot     = warmup_pos % cap;
+                            dflash27b_launch_bf16_to_f32(
+                                (const char *)cache.target_feat->data + (size_t)slot * feat_elt * target_feat_w_w,
+                                (float *)wpkg.target_feat->data,
+                                (size_t)target_feat_w_w, nullptr);
+                            cudaDeviceSynchronize();
+                        }
+                        {
+                            int32_t p = warmup_pos;
+                            ggml_backend_tensor_set(wpkg.positions, &p, 0, sizeof(int32_t));
+                        }
+                        auto wst = ggml_backend_graph_compute(backend, wpkg.gf);
+                        if (wst != GGML_STATUS_SUCCESS) {
+                            std::fprintf(stderr, "[decode] warmup draft KV prefill compute failed\n");
+                            draft_kv_prefill_destroy(wpkg);
+                            return 1;
+                        }
+                        cache.draft_kv_pos++;
+                        draft_kv_prefill_destroy(wpkg);
+                    }
+
+                    const int vocab_inner = w.n_vocab;
+                    std::vector<float> logits_cpu(vocab_inner);
+                    ggml_backend_tensor_get(sg.logits, logits_cpu.data(), 0,
+                                            sizeof(float) * vocab_inner);
+
+                    const int32_t next_tok = (int32_t)sample_logits(
+                        logits_cpu.data(), vocab_inner, sampler, history, rng);
+
+                    generated.push_back(cur_tok);
+                    history.push_back(cur_tok);
+
+                    if (first_token_ms < 0.0) {
+                        first_token_ms = step_t1 - step_t0;
+                    }
+
+                    std::printf("%d ", cur_tok);
+                    std::fflush(stdout);
+
+                    cur_tok = next_tok;
+                    cache.last_tok = cur_tok;
+
+                    step_graph_free(sg);
+                    continue;
+                }
+
+                // ── 1. Build noise block: [cur_tok, MASK, MASK, ..., MASK]
+                noise_ids[0] = cur_tok;
+                for (int i = 1; i < q_len; i++) noise_ids[i] = mask_tok;
+                if (!w.embedder.embed(noise_ids.data(), q_len, noise_embed_buf.data())) {
+                    std::fprintf(stderr, "[spec] embed noise_ids failed\n");
+                    return 1;
+                }
+
+                // ── 2. Build draft graph (KV-cached, no target_feat input)
+                if (!build_draft_step(dsg, dw, cache, backend, q_len, committed)) {
+                    std::fprintf(stderr, "[spec] draft build failed\n");
+                    return 1;
+                }
+
+                // ── 3. Set draft inputs
+
+                // draft_embed: noise embeddings [n_embd, q_len] f32
+                ggml_backend_tensor_set(dsg.draft_embed, noise_embed_buf.data(), 0,
+                                        sizeof(float) * noise_embed_buf.size());
+
+                // positions: absolute [committed, committed+1, ..., committed+q_len-1]
+                {
+                    std::vector<int32_t> pos(q_len);
+                    for (int i = 0; i < q_len; i++) pos[i] = committed + i;
+                    ggml_backend_tensor_set(dsg.positions, pos.data(), 0, sizeof(int32_t) * q_len);
+                }
+
+                // Causal mask: block token i attends to context [0..committed-1] plus
+                // block tokens [0..i]. Shape: [kv_pad, q_pad] f16.
+                {
+                    const int kv_len = committed + q_len;
+                    const int kv_pad = align_up(kv_len, KQ_MASK_PAD);
+                    const int q_pad  = align_up(q_len, KQ_MASK_PAD);
+                    std::vector<uint16_t> mask((size_t)kv_pad * q_pad, F16_NEG_INF);
+                    for (int q = 0; q < q_len; q++) {
+                        const int max_k = committed + q;
+                        for (int k = 0; k <= max_k; k++) {
+                            mask[(size_t)q * kv_pad + k] = F16_ZERO;
+                        }
+                    }
+                    ggml_backend_tensor_set(dsg.attn_mask, mask.data(), 0,
+                                            sizeof(uint16_t) * mask.size());
+                }
+
+                // ── 4. Draft compute
+                {
+                    auto st = ggml_backend_graph_compute(backend, dsg.gf);
+                    if (st != GGML_STATUS_SUCCESS) {
+                        std::fprintf(stderr, "[spec] draft compute failed: %d\n", (int)st);
+                        return 1;
+                    }
+                }
+
+                // ── 5. Read draft logits and argmax
+                ggml_backend_tensor_get(dsg.logits, draft_logits_buf.data(), 0,
+                                        sizeof(float) * draft_logits_buf.size());
+                for (int i = 0; i < q_len; i++) {
+                    draft_tok[i] = argmax_f32(draft_logits_buf.data() + (size_t)i * vocab, vocab);
+                }
+                draft_tok[0] = cur_tok;  // pin first token (it was cur_tok, not a prediction)
+
+                // ── 6. Target verify: batched forward on draft_tok[0..q_len-1]
+                if (!build_gemma4_step(sg, w, cache, backend,
+                                       committed, q_len,
+                                       /*with_mask=*/true, /*capture=*/true)) {
+                    std::fprintf(stderr, "[spec] verify build failed\n");
+                    return 1;
+                }
+
+                if (!embed_tokens_batch(w, draft_tok.data(), q_len, sg.inp_embed, backend)) {
+                    return 1;
+                }
+
+                // Target positions: [committed, committed+1, ..., committed+q_len-1]
+                {
+                    std::vector<int32_t> pos(q_len);
+                    for (int i = 0; i < q_len; i++) pos[i] = committed + i;
+                    ggml_backend_tensor_set(sg.positions, pos.data(), 0, sizeof(int32_t) * q_len);
+                }
+
+                // Causal mask for target verify
+                if (sg.attn_mask) {
+                    const int kv_len = committed + q_len;
+                    std::vector<uint16_t> mask_buf;
+                    build_causal_mask(mask_buf, kv_len, q_len, committed);
+                    ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
+                                            sizeof(uint16_t) * mask_buf.size());
+                }
+
+                {
+                    auto st = ggml_backend_graph_compute(backend, sg.gf);
+                    if (st != GGML_STATUS_SUCCESS) {
+                        std::fprintf(stderr, "[spec] verify compute failed: %d\n", (int)st);
+                        return 1;
+                    }
+                }
+
+                // ── 7. Read target logits and argmax
+                ggml_backend_tensor_get(sg.logits, verify_logits_buf.data(), 0,
+                                        sizeof(float) * verify_logits_buf.size());
+                for (int i = 0; i < q_len; i++) {
+                    target_tok[i] = argmax_f32(verify_logits_buf.data() + (size_t)i * vocab, vocab);
+                }
+
+                // ── 8. Acceptance: longest prefix match
+                //   draft_tok[0] = cur_tok (accepted unconditionally as the current token)
+                //   target_tok[i] = target's prediction for position committed+i+1
+                //   Check: draft_tok[i+1] == target_tok[i]  (draft proposed the right next token)
+                int accept_n = 1;
+                for (int i = 0; i < q_len - 1; i++) {
+                    if (draft_tok[i + 1] == target_tok[i]) accept_n++;
+                    else break;
+                }
+                int commit_n = accept_n;
+                if (commit_n > n_predict - (int)generated.size()) {
+                    commit_n = n_predict - (int)generated.size();
+                }
+
+                // ── 9. Commit accepted tokens
+                bool hit_eos = false;
+                for (int i = 0; i < commit_n; i++) {
+                    generated.push_back(draft_tok[i]);
+                    history.push_back(draft_tok[i]);
+                    std::printf("%d ", draft_tok[i]);
+                    std::fflush(stdout);
+                    if (IS_EOS_TOK(draft_tok[i], w)) { hit_eos = true; break; }
+                }
+
+                // ── 10. Draft KV prefill for the committed positions, then advance state.
+                //   The target verify pass (step 6) captured target_feat for positions
+                //   [committed..committed+q_len-1]. We prefill draft KV for the accepted
+                //   prefix [committed..committed+commit_n-1] before advancing committed.
+                {
+                    DraftKVPrefillGraph cpkg;
+                    if (!build_draft_kv_prefill(cpkg, dw, cache, backend, commit_n)) {
+                        std::fprintf(stderr, "[spec] draft KV prefill build failed\n");
+                        return 1;
+                    }
+
+                    // Extract target_feat for positions [committed..committed+commit_n-1]
+                    // from the ring buffer (bf16 → f32).
+                    {
+                        const int    cap      = cache.target_feat_cap;
+                        const size_t feat_elt = ggml_element_size(cache.target_feat);
+                        const int    slot0    = committed % cap;
+                        const int    pre_n    = std::min(commit_n, cap - slot0);
+                        const int    post_n   = commit_n - pre_n;
+
+                        dflash27b_launch_bf16_to_f32(
+                            (const char *)cache.target_feat->data + (size_t)slot0 * feat_elt * target_feat_w,
+                            (float *)cpkg.target_feat->data,
+                            (size_t)pre_n * target_feat_w, nullptr);
+                        if (post_n > 0) {
+                            dflash27b_launch_bf16_to_f32(
+                                (const char *)cache.target_feat->data,
+                                (float *)cpkg.target_feat->data + (size_t)pre_n * target_feat_w,
+                                (size_t)post_n * target_feat_w, nullptr);
+                        }
+                        cudaDeviceSynchronize();
+                    }
+
+                    {
+                        std::vector<int32_t> pos(commit_n);
+                        for (int i = 0; i < commit_n; i++) pos[i] = committed + i;
+                        ggml_backend_tensor_set(cpkg.positions, pos.data(), 0,
+                                                sizeof(int32_t) * commit_n);
+                    }
+
+                    auto cst = ggml_backend_graph_compute(backend, cpkg.gf);
+                    if (cst != GGML_STATUS_SUCCESS) {
+                        std::fprintf(stderr, "[spec] draft KV prefill compute failed\n");
+                        draft_kv_prefill_destroy(cpkg);
+                        return 1;
+                    }
+                    cache.draft_kv_pos += commit_n;
+                    draft_kv_prefill_destroy(cpkg);
+                }
+
+                //   Gemma4 is pure attention — no SSM/conv rollback needed.
+                //   Stale KV at positions [committed+commit_n..committed+q_len-1]
+                //   will be overwritten by the next verify pass.
+                committed += commit_n;
+                cache.cur_pos = committed;
+                cur_tok = target_tok[commit_n - 1];
+                cache.last_tok = cur_tok;
+
+                total_draft_steps++;
+                total_accepted += commit_n;
+
+                if (first_token_ms < 0.0) {
+                    first_token_ms = now_ms() - decode_t0;
+                }
+
+                double avg_accept = (total_draft_steps > 0)
+                    ? (double)total_accepted / total_draft_steps : 0.0;
+                std::printf("[step %d] accept=%d/%d avg=%.1f\n",
+                            total_draft_steps, accept_n, q_len, avg_accept);
+
+                if (hit_eos) break;
+
+                step_graph_free(sg);
+                draft_step_free(dsg);
             }
 
-            if (committed >= ctx_size - 1) {
-                std::printf("\n[decode] context full at step %zu\n",
-                            generated.size());
-                break;
+        } else {
+            // ── TARGET-ONLY DECODE LOOP ───────────────────────────────────
+            //
+            // Single-token autoregressive path.
+            // Each iteration:
+            //   1. Feed `cur_tok` through the target at position `committed`.
+            //   2. Sample the next token from logits.
+            //   3. Append to generated sequence.
+            //   4. Stop if EOS or n_predict reached.
+
+            while ((int)generated.size() < n_predict) {
+
+                if (IS_EOS_TOK(cur_tok, w)) {
+                    std::printf("\n[decode] EOS token %d at step %zu\n",
+                                cur_tok, generated.size());
+                    break;
+                }
+
+                if (committed >= ctx_size - 1) {
+                    std::printf("\n[decode] context full at step %zu\n",
+                                generated.size());
+                    break;
+                }
+
+                // Build single-token decode graph
+                if (!build_gemma4_step(sg, w, cache, backend,
+                                       committed, /*n_tokens=*/1,
+                                       /*with_mask=*/true,
+                                       /*capture=*/false)) {
+                    std::fprintf(stderr, "[decode] build failed at step %zu\n",
+                                 generated.size());
+                    return 1;
+                }
+
+                if (sg.attn_mask) {
+                    const int kv_len = committed + 1;
+                    std::vector<uint16_t> mask_buf;
+                    build_causal_mask(mask_buf, kv_len, 1, committed);
+                    ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
+                                            sizeof(uint16_t) * mask_buf.size());
+                }
+
+                if (!embed_token(w, cur_tok, sg.inp_embed, backend)) return 1;
+
+                int32_t pos_val = committed;
+                ggml_backend_tensor_set(sg.positions, &pos_val, 0, sizeof(int32_t));
+
+                double step_t0 = now_ms();
+                auto st = ggml_backend_graph_compute(backend, sg.gf);
+                double step_t1 = now_ms();
+
+                if (st != GGML_STATUS_SUCCESS) {
+                    std::fprintf(stderr, "[decode] compute failed at step %zu\n",
+                                 generated.size());
+                    return 1;
+                }
+
+                committed++;
+                cache.cur_pos = committed;
+
+                // Fetch logits and sample
+                const int vocab = w.n_vocab;
+                std::vector<float> logits_cpu(vocab);
+                ggml_backend_tensor_get(sg.logits, logits_cpu.data(), 0,
+                                        sizeof(float) * vocab);
+
+                const int32_t next_tok = (int32_t)sample_logits(
+                    logits_cpu.data(), vocab, sampler, history, rng);
+
+                generated.push_back(cur_tok);
+                history.push_back(cur_tok);
+
+                if (first_token_ms < 0.0 && !generated.empty()) {
+                    first_token_ms = step_t1 - step_t0;
+                }
+
+                // Print token id (a proper decoder would map id -> string here)
+                std::printf("%d ", cur_tok);
+                std::fflush(stdout);
+
+                cur_tok = next_tok;
+                cache.last_tok = cur_tok;
+
+                step_graph_free(sg);
             }
-
-            // Build single-token decode graph
-            if (!build_gemma4_step(sg, w, cache, backend,
-                                   committed, /*n_tokens=*/1,
-                                   /*with_mask=*/false,
-                                   /*capture=*/have_draft)) {
-                std::fprintf(stderr, "[decode] build failed at step %zu\n",
-                             generated.size());
-                return 1;
-            }
-
-            if (!embed_token(w, cur_tok, sg.inp_embed, backend)) return 1;
-
-            int32_t pos_val = committed;
-            ggml_backend_tensor_set(sg.positions, &pos_val, 0, sizeof(int32_t));
-
-            double step_t0 = now_ms();
-            auto st = ggml_backend_graph_compute(backend, sg.gf);
-            double step_t1 = now_ms();
-
-            if (st != GGML_STATUS_SUCCESS) {
-                std::fprintf(stderr, "[decode] compute failed at step %zu\n",
-                             generated.size());
-                return 1;
-            }
-
-            committed++;
-            cache.cur_pos = committed;
-
-            // Fetch logits and sample
-            const int vocab = w.n_vocab;
-            std::vector<float> logits_cpu(vocab);
-            ggml_backend_tensor_get(sg.logits, logits_cpu.data(), 0,
-                                    sizeof(float) * vocab);
-
-            const int32_t next_tok = (int32_t)sample_logits(
-                logits_cpu.data(), vocab, sampler, history, rng);
-
-            generated.push_back(cur_tok);
-            history.push_back(cur_tok);
-
-            if (first_token_ms < 0.0 && !generated.empty()) {
-                first_token_ms = step_t1 - step_t0;
-            }
-
-            // Print token id (a proper decoder would map id -> string here)
-            std::printf("%d ", cur_tok);
-            std::fflush(stdout);
-
-            cur_tok = next_tok;
-            cache.last_tok = cur_tok;
-
-            step_graph_free(sg);
-
-            // TODO (speculative path): when have_draft, run draft + DDTree here
-            // instead of the single-token autoregressive step above.
-            (void)ddtree_budget;
-            (void)fa_window;
         }
 
         double decode_t1 = now_ms();
@@ -735,6 +1330,12 @@ int main(int argc, char ** argv) {
                     n_gen, decode_ms, tps, first_token_ms);
         std::printf("[stats] prefill=%zu tokens  context_used=%d/%d\n",
                     prompt_ids.size(), committed, ctx_size);
+
+        if (have_draft && total_draft_steps > 0) {
+            std::printf("[spec] draft_steps=%d total_accepted=%d avg_accept=%.2f\n",
+                        total_draft_steps, total_accepted,
+                        (double)total_accepted / total_draft_steps);
+        }
 
         // ── Memory stats ──────────────────────────────────────────────────
         {
@@ -759,6 +1360,14 @@ int main(int argc, char ** argv) {
 
     // ── Cleanup ───────────────────────────────────────────────────────────
     step_graph_destroy(sg);
+    draft_step_destroy(dsg);
+    if (have_draft) {
+        free_draft_kv_cache(cache);
+        dw.tok_embd = nullptr;  // prevent double-free (tok_embd lives in tok_embd_buf)
+        free_gemma4_draft_weights(dw);
+        if (tok_embd_buf) ggml_backend_buffer_free(tok_embd_buf);
+        if (tok_embd_ctx) ggml_free(tok_embd_ctx);
+    }
     free_gemma4_cache(cache);
     free_gemma4_target_weights(w);
     ggml_backend_free(backend);

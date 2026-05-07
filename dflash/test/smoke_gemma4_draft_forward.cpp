@@ -108,8 +108,67 @@ int main(int argc, char ** argv) {
     const int target_feat_w = dw.n_target_layers * dw.target_hidden; // 6*4096 = 24576
     const int draft_hidden  = dw.n_embd;
     const int n_vocab       = dw.n_vocab;
+    const int kq_mask_pad   = 32;
 
-    // Build compute graph context
+    auto align_up = [](int x, int a) { return ((x + a - 1) / a) * a; };
+
+    // Allocate draft KV cache
+    GemmaTargetCache cache;
+    cache.backend = backend;
+    if (!create_draft_kv_cache(dw, backend, cache)) {
+        std::fprintf(stderr, "create_draft_kv_cache failed\n");
+        return 1;
+    }
+    std::printf("[draft kv] cap=%d\n", cache.draft_kv_cap);
+
+    // ── Step 1: Prefill draft KV with synthetic target features ──────
+    // Simulate n_tokens context positions with random target features
+    {
+        ggml_init_params ip{};
+        ip.mem_size   = 256 * 1024 * 1024;
+        ip.no_alloc   = true;
+        ggml_context * pctx = ggml_init(ip);
+        if (!pctx) { fail("ggml_init for prefill failed"); }
+
+        ggml_tensor * pf_target_feat = ggml_new_tensor_2d(pctx, GGML_TYPE_F32, target_feat_w, n_tokens);
+        ggml_tensor * pf_positions   = ggml_new_tensor_1d(pctx, GGML_TYPE_I32, n_tokens);
+        ggml_set_name(pf_target_feat, "pf_target_feat");
+        ggml_set_name(pf_positions,   "pf_positions");
+        ggml_set_input(pf_target_feat);
+        ggml_set_input(pf_positions);
+
+        ggml_cgraph * pf_gf = ggml_new_graph_custom(pctx, 4096, false);
+        build_draft_kv_prefill_graph(pctx, pf_gf, dw, cache,
+                                      pf_target_feat, pf_positions, n_tokens);
+
+        ggml_gallocr_t pf_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!ggml_gallocr_alloc_graph(pf_alloc, pf_gf)) { fail("prefill alloc failed"); }
+
+        std::mt19937 rng_pf(42);
+        std::uniform_real_distribution<float> u_pf(-0.05f, 0.05f);
+        {
+            std::vector<float> data((size_t)target_feat_w * n_tokens);
+            for (auto & v : data) v = u_pf(rng_pf);
+            ggml_backend_tensor_set(pf_target_feat, data.data(), 0, sizeof(float) * data.size());
+        }
+        {
+            std::vector<int32_t> pos(n_tokens);
+            for (int i = 0; i < n_tokens; i++) pos[i] = i;
+            ggml_backend_tensor_set(pf_positions, pos.data(), 0, sizeof(int32_t) * n_tokens);
+        }
+
+        auto st = ggml_backend_graph_compute(backend, pf_gf);
+        if (st != GGML_STATUS_SUCCESS) { fail("prefill compute failed"); }
+        cache.draft_kv_pos = n_tokens;
+        std::printf("[prefill] KV materialized for %d positions\n", n_tokens);
+
+        ggml_gallocr_free(pf_alloc);
+        ggml_free(pctx);
+    }
+
+    // ── Step 2: Draft forward with KV cache ──────────────────────────
+    const int kv_start = cache.draft_kv_pos;  // context length = n_tokens
+
     ggml_init_params ip{};
     ip.mem_size   = 256 * 1024 * 1024;
     ip.mem_buffer = nullptr;
@@ -117,34 +176,30 @@ int main(int argc, char ** argv) {
     ggml_context * gctx = ggml_init(ip);
     if (!gctx) { std::fprintf(stderr, "ggml_init failed\n"); return 1; }
 
-    // Input placeholder tensors
-    ggml_tensor * target_feat = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, target_feat_w, n_tokens);
-    ggml_tensor * draft_embed = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, draft_hidden,  n_tokens);
+    ggml_tensor * draft_embed = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, draft_hidden, n_tokens);
     ggml_tensor * positions   = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n_tokens);
-    // Block-causal mask: [n_tokens, n_tokens] f16 (ggml FA requires f16 mask)
-    ggml_tensor * attn_mask   = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, n_tokens, n_tokens);
+    const int kv_len = kv_start + n_tokens;
+    const int kv_pad = align_up(kv_len, kq_mask_pad);
+    const int q_pad  = align_up(n_tokens, kq_mask_pad);
+    ggml_tensor * attn_mask   = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, kv_pad, q_pad);
 
-    ggml_set_name(target_feat, "target_feat");
     ggml_set_name(draft_embed, "draft_embed");
     ggml_set_name(positions,   "positions");
     ggml_set_name(attn_mask,   "attn_mask");
-    ggml_set_input(target_feat);
     ggml_set_input(draft_embed);
     ggml_set_input(positions);
     ggml_set_input(attn_mask);
 
-    // Build draft graph
     ggml_cgraph * gf = ggml_new_graph_custom(gctx, 8192, false);
     ggml_tensor * logits = build_gemma4_draft_graph(
-        gctx, gf, dw,
-        target_feat, draft_embed, positions, attn_mask,
-        n_tokens);
+        gctx, gf, dw, cache,
+        draft_embed, positions, attn_mask,
+        n_tokens, kv_start);
     if (!logits) { std::fprintf(stderr, "build_gemma4_draft_graph returned null\n"); return 1; }
     ggml_set_output(logits);
     ggml_build_forward_expand(gf, logits);
     std::printf("[graph] nodes=%d\n", ggml_graph_n_nodes(gf));
 
-    // Allocate graph memory
     ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     if (!ggml_gallocr_alloc_graph(alloc, gf)) {
         std::fprintf(stderr, "ggml_gallocr_alloc_graph failed\n");
@@ -155,32 +210,27 @@ int main(int argc, char ** argv) {
     std::mt19937 rng(1234);
     std::uniform_real_distribution<float> u(-0.05f, 0.05f);
 
-    // target_feat: [6*target_hidden, 16] f32
-    {
-        std::vector<float> data((size_t)target_feat_w * n_tokens);
-        for (auto & v : data) v = u(rng);
-        ggml_backend_tensor_set(target_feat, data.data(), 0, sizeof(float) * data.size());
-    }
     // draft_embed: [draft_hidden, 16] f32
     {
         std::vector<float> data((size_t)draft_hidden * n_tokens);
         for (auto & v : data) v = u(rng);
         ggml_backend_tensor_set(draft_embed, data.data(), 0, sizeof(float) * data.size());
     }
-    // positions: 0..15
+    // positions: [kv_start, kv_start+1, ..., kv_start+15]
     {
         std::vector<int32_t> pos(n_tokens);
-        for (int i = 0; i < n_tokens; i++) pos[i] = i;
+        for (int i = 0; i < n_tokens; i++) pos[i] = kv_start + i;
         ggml_backend_tensor_set(positions, pos.data(), 0, sizeof(int32_t) * n_tokens);
     }
-    // attn_mask: causal (lower-triangular 0, upper-triangular -inf), F16
+    // attn_mask: causal over full kv_len, block queries attend to all context + causal within block
     {
         const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
         const ggml_fp16_t ninf_h = ggml_fp32_to_fp16(-INFINITY);
-        std::vector<ggml_fp16_t> mask((size_t)n_tokens * n_tokens, ninf_h);
+        std::vector<ggml_fp16_t> mask((size_t)kv_pad * q_pad, ninf_h);
         for (int q = 0; q < n_tokens; q++) {
-            for (int k = 0; k <= q; k++) {
-                mask[(size_t)q * n_tokens + k] = zero_h;
+            int max_kv = kv_start + q;  // attend to all context + block[0..q]
+            for (int k = 0; k <= max_kv; k++) {
+                mask[(size_t)q * kv_pad + k] = zero_h;
             }
         }
         ggml_backend_tensor_set(attn_mask, mask.data(), 0, sizeof(ggml_fp16_t) * mask.size());
@@ -244,6 +294,7 @@ int main(int argc, char ** argv) {
 
     ggml_gallocr_free(alloc);
     ggml_free(gctx);
+    free_draft_kv_cache(cache);
     // dw.tok_embd points into tok_embd_ctx/buf — null it before freeing the draft
     // so free_gemma4_draft_weights doesn't double-free or access freed memory.
     dw.tok_embd = nullptr;

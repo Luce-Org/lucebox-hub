@@ -9,7 +9,7 @@
 //   - Two layer types interleaved per swa_layers[]:
 //       SWA (sliding window): standard RoPE (rope_theta_swa), windowed FA
 //       Full (global):        proportional RoPE via per-layer rope_freqs, full FA
-//   - Attention scale = 1.0 (no sqrt(head_dim) division)
+//   - Attention scale = 1.0 (self.scaling = 1.0, not 1/sqrt(head_dim))
 //   - Logit softcapping: output = softcap * tanh(output / softcap), softcap=30
 //   - Per-Layer Embeddings (PLE): gated embedding added to residual each layer
 //   - Shared KV cache: some layers reuse an earlier layer's KV slot
@@ -43,27 +43,27 @@ static ggml_tensor * rms_norm_mul(ggml_context * ctx, ggml_tensor * x,
     return ggml_mul(ctx, n, weight);
 }
 
-// Standard SwiGLU FFN: w_down @ (silu(w_gate @ x) * (w_up @ x))
-static ggml_tensor * build_swiglu_ffn(ggml_context * ctx,
-                                      ggml_tensor * cur,
-                                      const GemmaTargetLayer & L) {
+// GeGLU FFN: w_down @ (gelu(w_gate @ x) * (w_up @ x))
+static ggml_tensor * build_geglu_ffn(ggml_context * ctx,
+                                     ggml_tensor * cur,
+                                     const GemmaTargetLayer & L) {
     ggml_tensor * gate = ggml_mul_mat(ctx, L.w_gate, cur);
     ggml_tensor * up   = ggml_mul_mat(ctx, L.w_up,   cur);
-    ggml_tensor * gu   = ggml_swiglu_split(ctx, gate, up);
+    ggml_tensor * gu   = ggml_geglu_split(ctx, gate, up);
     return ggml_mul_mat(ctx, L.w_down, gu);
 }
 
 // MoE FFN — shared expert + softmax-gated routed experts.
 // Matches Gemma4-26B-A4B architecture:
-//   shared_out  = w_down @ (silu(w_gate @ x) * (w_up @ x))
+//   shared_out  = w_down @ (gelu(w_gate @ x) * (w_up @ x))
 //   shared_out  = rms_norm(shared_out) * ffn_post_norm_1
-//   router_in   = rms_norm(inpSA) * ffn_pre_norm_2 / sqrt(n_embd)
-//   router_in   = router_in * ffn_gate_inp_s          (per-channel scale)
+//   router_in   = rms_norm(inpSA) / sqrt(n_embd) * ffn_gate_inp_s  (bare rms_norm)
 //   logits      = ffn_gate_inp @ router_in             [n_expert, n_tokens]
 //   probs       = softmax(logits)
 //   top_ids     = argsort_top_k(probs, n_expert_used)  [n_expert_used, n_tokens] i32
 //   weights     = get_rows(probs, top_ids)             [1, n_expert_used, n_tokens]
-//   gate_up_out = mul_mat_id(ffn_gate_up_exps, x, top_ids) → silu+mul → weighted
+//   weights     = weights / sum(weights)               (normalize to 1.0)
+//   gate_up_out = mul_mat_id(ffn_gate_up_exps, x, top_ids) → gelu+mul → weighted
 //   expert_out  = mul_mat_id(ffn_down_exps, act, top_ids) [n_embd, n_expert_used, n_tokens]
 //   expert_out  = sum over expert dim                  [n_embd, n_tokens]
 //   expert_out  = rms_norm(expert_out) * ffn_post_norm_2
@@ -72,7 +72,8 @@ static ggml_tensor * build_moe_ffn(ggml_context * ctx,
                                    ggml_cgraph *  gf,
                                    const GemmaTargetWeights & w,
                                    const GemmaTargetLayer & L,
-                                   ggml_tensor * cur_pre_ffn,
+                                   ggml_tensor * cur_shared_ffn,
+                                   ggml_tensor * cur_moe_ffn,
                                    ggml_tensor * cur_for_router,
                                    int n_tokens) {
     const int n_embd        = w.n_embd;
@@ -83,9 +84,9 @@ static ggml_tensor * build_moe_ffn(ggml_context * ctx,
     // ── Shared expert (always active) ──────────────────────────────────────────
     ggml_tensor * shared_out = nullptr;
     if (L.w_gate && L.w_up && L.w_down) {
-        ggml_tensor * sg  = ggml_mul_mat(ctx, L.w_gate, cur_pre_ffn);
-        ggml_tensor * su  = ggml_mul_mat(ctx, L.w_up,   cur_pre_ffn);
-        ggml_tensor * sgu = ggml_swiglu_split(ctx, sg, su);
+        ggml_tensor * sg  = ggml_mul_mat(ctx, L.w_gate, cur_shared_ffn);
+        ggml_tensor * su  = ggml_mul_mat(ctx, L.w_up,   cur_shared_ffn);
+        ggml_tensor * sgu = ggml_geglu_split(ctx, sg, su);
         shared_out = ggml_mul_mat(ctx, L.w_down, sgu);
         if (L.ffn_post_norm_1) {
             shared_out = rms_norm_mul(ctx, shared_out, L.ffn_post_norm_1, EPS);
@@ -93,11 +94,8 @@ static ggml_tensor * build_moe_ffn(ggml_context * ctx,
     }
 
     // ── Router ─────────────────────────────────────────────────────────────────
-    // router_in = rms_norm(inpSA) * ffn_pre_norm_2 / sqrt(n_embd)
-    ggml_tensor * router_in = cur_for_router;
-    if (L.ffn_pre_norm_2) {
-        router_in = rms_norm_mul(ctx, router_in, L.ffn_pre_norm_2, EPS);
-    }
+    // router_in = rms_norm(inpSA) / sqrt(n_embd) * ffn_gate_inp_s (bare rms_norm, no weight)
+    ggml_tensor * router_in = ggml_rms_norm(ctx, cur_for_router, EPS);
     router_in = ggml_scale(ctx, router_in, 1.0f / std::sqrt((float)n_embd));
     if (L.ffn_gate_inp_s) {
         router_in = ggml_mul(ctx, router_in, L.ffn_gate_inp_s);
@@ -114,13 +112,20 @@ static ggml_tensor * build_moe_ffn(ggml_context * ctx,
     // Routing weights: gather probs at selected indices [1, n_expert_used, n_tokens]
     ggml_tensor * probs_3d   = ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens);
     ggml_tensor * weights    = ggml_get_rows(ctx, probs_3d, selected_experts);
-    // weights: [1, n_expert_used, n_tokens]
+    // weights: [1, n_expert_used, n_tokens] → normalize to sum=1.0
+    {
+        ggml_tensor * w2d = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
+        ggml_tensor * wsum = ggml_sum_rows(ctx, w2d);
+        wsum = ggml_clamp(ctx, wsum, 6.103515625e-5f, INFINITY);
+        w2d = ggml_div(ctx, w2d, wsum);
+        weights = ggml_reshape_3d(ctx, w2d, 1, n_expert_used, n_tokens);
+    }
 
     // ── Routed experts via ggml_mul_mat_id ─────────────────────────────────────
     ggml_tensor * expert_out = nullptr;
     if (L.ffn_gate_up_exps && L.ffn_down_exps) {
-        // cur_pre_ffn is [n_embd, n_tokens]; mul_mat_id expects [n_embd, 1, n_tokens]
-        ggml_tensor * x = ggml_reshape_3d(ctx, cur_pre_ffn, n_embd, 1, n_tokens);
+        // cur_moe_ffn is [n_embd, n_tokens]; mul_mat_id expects [n_embd, 1, n_tokens]
+        ggml_tensor * x = ggml_reshape_3d(ctx, cur_moe_ffn, n_embd, 1, n_tokens);
 
         // Gate+up projection: ffn_gate_up_exps [2*n_ff_exp, n_embd, n_expert]
         // Result: [2*n_ff_exp, n_expert_used, n_tokens]
@@ -141,10 +146,10 @@ static ggml_tensor * build_moe_ffn(ggml_context * ctx,
             (size_t)n_ff_exp * 2 * n_expert_used * elt,
             (size_t)n_ff_exp * elt);
 
-        // SwiGLU activation (views are non-contiguous; ggml_silu requires contiguous)
+        // GeGLU activation (views are non-contiguous; ggml_gelu requires contiguous)
         g_half = ggml_cont(ctx, g_half);
         u_half = ggml_cont(ctx, u_half);
-        ggml_tensor * activated = ggml_mul(ctx, ggml_silu(ctx, g_half), u_half);
+        ggml_tensor * activated = ggml_mul(ctx, ggml_gelu(ctx, g_half), u_half);
 
         // Scale by routing weights [1, n_expert_used, n_tokens]
         activated = ggml_mul(ctx, activated, weights);
@@ -194,7 +199,7 @@ static ggml_tensor * build_moe_ffn(ggml_context * ctx,
         return expert_out;
     }
     // Fallback: should not happen with a correctly loaded MoE model
-    return cur_pre_ffn;
+    return cur_shared_ffn;
 }
 
 // Sliding-Window Attention block.
@@ -233,11 +238,14 @@ static ggml_tensor * build_swa_attn_block(
     if (write_kv) {
         Kcur = ggml_mul_mat(ctx, L.wk, cur);
         Kcur = ggml_reshape_3d(ctx, Kcur, head_dim, n_head_kv, n_tokens);
+
+        Vcur = ggml_mul_mat(ctx, L.wv, cur);
+        Vcur = ggml_reshape_3d(ctx, Vcur, head_dim, n_head_kv, n_tokens);
+
         if (L.k_norm) {
             Kcur = rms_norm_mul(ctx, Kcur, L.k_norm, EPS);
         }
-        Vcur = ggml_mul_mat(ctx, L.wv, cur);
-        Vcur = ggml_reshape_3d(ctx, Vcur, head_dim, n_head_kv, n_tokens);
+        Vcur = ggml_rms_norm(ctx, Vcur, EPS);
     }
 
     // Standard RoPE (SWA uses rope_theta_swa, no freq_factors)
@@ -299,10 +307,9 @@ static ggml_tensor * build_swa_attn_block(
         cache_v->nb[1], cache_v->nb[2],
         cache_v->nb[1] * win_start);
 
-    // Gemma4: attn_scale = 1/sqrt(head_dim) (matches HF head_dim**-0.5)
-    const float attn_scale_swa = 1.0f / std::sqrt((float)head_dim);
+    // Gemma4: attn_scale = 1.0 (self.scaling = 1.0, no 1/sqrt(head_dim))
     ggml_tensor * attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask,
-                                             attn_scale_swa, 0.0f, 0.0f);
+                                             1.0f, 0.0f, 0.0f);
 
     if (out_rotate) {
         attn = ggml_cont(ctx, attn);
@@ -351,16 +358,20 @@ static ggml_tensor * build_full_attn_block(
     if (write_kv) {
         Kcur = ggml_mul_mat(ctx, L.wk, cur);
         Kcur = ggml_reshape_3d(ctx, Kcur, head_dim, n_head_kv, n_tokens);
-        if (L.k_norm) {
-            Kcur = rms_norm_mul(ctx, Kcur, L.k_norm, EPS);
-        }
+
+        // V = K (pre-norm) when wv absent, else separate projection
         if (L.wv == L.wk) {
-            // Gemma4 full-attention: V = K (post-norm, pre-RoPE) — attention_k_eq_v=True
             Vcur = Kcur;
         } else {
             Vcur = ggml_mul_mat(ctx, L.wv, cur);
             Vcur = ggml_reshape_3d(ctx, Vcur, head_dim, n_head_kv, n_tokens);
         }
+
+        // K gets weighted RMSNorm, V gets bare RMSNorm (no learned weights)
+        if (L.k_norm) {
+            Kcur = rms_norm_mul(ctx, Kcur, L.k_norm, EPS);
+        }
+        Vcur = ggml_rms_norm(ctx, Vcur, EPS);
     }
 
     // Proportional RoPE for full-attention layers (uses per-layer rope_freqs)
@@ -422,10 +433,9 @@ static ggml_tensor * build_full_attn_block(
         cache_v->nb[1], cache_v->nb[2],
         cache_v->nb[1] * win_start);
 
-    // Gemma4: attn_scale = 1/sqrt(head_dim) (matches HF head_dim**-0.5)
-    const float attn_scale_full = 1.0f / std::sqrt((float)head_dim);
+    // Gemma4: attn_scale = 1.0 (self.scaling = 1.0, no 1/sqrt(head_dim))
     ggml_tensor * attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask,
-                                             attn_scale_full, 0.0f, 0.0f);
+                                             1.0f, 0.0f, 0.0f);
 
     if (out_rotate) {
         attn = ggml_cont(ctx, attn);
@@ -570,6 +580,7 @@ bool create_gemma4_cache(const GemmaTargetWeights & w,
 }
 
 void free_gemma4_cache(GemmaTargetCache & c) {
+    free_draft_kv_cache(c);
     if (c.base_buf) { ggml_backend_buffer_free(c.base_buf); c.base_buf = nullptr; }
     if (c.base_ctx) { ggml_free(c.base_ctx);                c.base_ctx = nullptr; }
     c.attn_k.clear();
@@ -582,8 +593,9 @@ void free_gemma4_cache(GemmaTargetCache & c) {
 }
 
 void reset_gemma4_cache(GemmaTargetCache & c) {
-    c.cur_pos  = 0;
-    c.last_tok = -1;
+    c.cur_pos      = 0;
+    c.last_tok     = -1;
+    c.draft_kv_pos = 0;
     std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
     if (!c.base_ctx) return;
     for (ggml_tensor * t = ggml_get_first_tensor(c.base_ctx); t != nullptr;
@@ -596,6 +608,75 @@ void reset_gemma4_cache(GemmaTargetCache & c) {
             off += chunk;
         }
     }
+}
+
+// ─── Draft KV cache allocation ───────────────────────────────────────────────
+
+bool create_draft_kv_cache(const GemmaDraftWeights & dw,
+                           ggml_backend_t backend,
+                           GemmaTargetCache & cache) {
+    // Capacity: sliding window + one block + headroom
+    const int draft_kv_cap = dw.sliding_window + dw.block_size + 32;
+
+    const size_t n_tensors = (size_t)(2 * dw.n_layer);  // K + V per layer
+    ggml_init_params ip{};
+    ip.mem_size   = ggml_tensor_overhead() * n_tensors + 256;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    cache.draft_kv_ctx = ggml_init(ip);
+    if (!cache.draft_kv_ctx) {
+        set_last_error("create_draft_kv_cache: ggml_init failed");
+        return false;
+    }
+
+    cache.draft_k.reserve((size_t)dw.n_layer);
+    cache.draft_v.reserve((size_t)dw.n_layer);
+
+    for (int il = 0; il < dw.n_layer; il++) {
+        ggml_tensor * K = ggml_new_tensor_3d(cache.draft_kv_ctx, GGML_TYPE_F32,
+                                             dw.head_dim, dw.n_head_kv, draft_kv_cap);
+        ggml_tensor * V = ggml_new_tensor_3d(cache.draft_kv_ctx, GGML_TYPE_F32,
+                                             dw.head_dim, dw.n_head_kv, draft_kv_cap);
+        char name[64];
+        std::snprintf(name, sizeof(name), "draft_k_%d", il);
+        ggml_set_name(K, name);
+        std::snprintf(name, sizeof(name), "draft_v_%d", il);
+        ggml_set_name(V, name);
+        cache.draft_k.push_back(K);
+        cache.draft_v.push_back(V);
+    }
+
+    cache.draft_kv_buf = ggml_backend_alloc_ctx_tensors(cache.draft_kv_ctx, backend);
+    if (!cache.draft_kv_buf) {
+        set_last_error("create_draft_kv_cache: ggml_backend_alloc_ctx_tensors failed");
+        ggml_free(cache.draft_kv_ctx);
+        cache.draft_kv_ctx = nullptr;
+        cache.draft_k.clear();
+        cache.draft_v.clear();
+        return false;
+    }
+
+    cache.draft_kv_cap = draft_kv_cap;
+    cache.draft_kv_pos = 0;
+
+    ggml_backend_buffer_clear(cache.draft_kv_buf, 0);
+
+    return true;
+}
+
+void free_draft_kv_cache(GemmaTargetCache & cache) {
+    if (cache.draft_kv_buf) {
+        ggml_backend_buffer_free(cache.draft_kv_buf);
+        cache.draft_kv_buf = nullptr;
+    }
+    if (cache.draft_kv_ctx) {
+        ggml_free(cache.draft_kv_ctx);
+        cache.draft_kv_ctx = nullptr;
+    }
+    cache.draft_k.clear();
+    cache.draft_v.clear();
+    cache.draft_kv_cap = 0;
+    cache.draft_kv_pos = 0;
 }
 
 // ─── Main graph builder ───────────────────────────────────────────────────────
@@ -676,13 +757,16 @@ GemmaGraphOutputs build_gemma4_graph(
 
         ggml_tensor * ffn_out = nullptr;
         if (L.ffn_gate_inp != nullptr) {
-            // MoE path (26B-A4B)
+            // MoE path (26B-A4B): shared expert uses ffn_norm, routed use ffn_pre_norm_2
+            ggml_tensor * moe_in = L.ffn_pre_norm_2
+                ? rms_norm_mul(ctx, inpSA_post, L.ffn_pre_norm_2, EPS)
+                : ffn_in;
             ffn_out = build_moe_ffn(ctx, gf, w, L,
-                                    ffn_in, inpSA_post,
+                                    ffn_in, moe_in, inpSA_post,
                                     n_tokens);
         } else {
             // Dense path (31B)
-            ffn_out = build_swiglu_ffn(ctx, ffn_in, L);
+            ffn_out = build_geglu_ffn(ctx, ffn_in, L);
         }
 
         // Post-FFN norm

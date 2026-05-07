@@ -172,11 +172,14 @@ static size_t align_up(size_t x, size_t a) {
 
 // ─── Tensor selection filter ─────────────────────────────────────────────────
 //
-// Everything except token_embd.weight goes to GPU.  token_embd stays on CPU
-// for the same reason as Qwen: CUDA get_rows doesn't support k-quants.
+// All tensors go to GPU, including token_embd.weight which doubles as the LM
+// head (tied weights in Gemma4-26B-A4B).  The CPU embedder keeps its own
+// read-only mmap view of tok_embd for the input embedding path, so placing
+// it on GPU as well is safe and necessary for correct LM head logits.
 
 static bool is_gemma4_gpu_tensor(const char * name) {
-    return std::strcmp(name, "token_embd.weight") != 0;
+    (void)name;
+    return true;
 }
 
 } // namespace
@@ -632,8 +635,7 @@ bool load_gemma4_target_gguf(const std::string & path,
             tok_embd_off  = off;
             tok_embd_sz   = sz;
             tok_embd_type = gguf_get_tensor_type(gctx, tid);
-            // Do NOT upload to GPU.
-            continue;
+            // fall through: also upload to GPU for LM head (tied weights)
         }
         ggml_backend_tensor_set(t, (const uint8_t *)mm.addr + off, 0, sz);
         gpu_bytes_uploaded += sz;
@@ -667,7 +669,7 @@ bool load_gemma4_target_gguf(const std::string & path,
     std::snprintf(summary, sizeof(summary),
         "gemma4 target loaded: n_layer=%u n_embd=%u n_ff=%u n_expert=%u "
         "n_kv_slots=%d n_kv_shared=%u, %zu GPU tensors %.2f GiB, "
-        "tok_embd %.0f MiB CPU-only (%s)",
+        "tok_embd %.0f MiB GPU+CPU-mmap (%s, tied LM head)",
         n_layer, n_embd, n_ff, n_expert, n_kv_slots, n_kv_shared,
         slots.size(), (double)gpu_bytes_uploaded / (1024.0 * 1024.0 * 1024.0),
         (double)tok_embd_sz / (1024.0 * 1024.0), ggml_type_name(tok_embd_type));

@@ -587,6 +587,14 @@ struct GemmaTargetCache {
 
     ggml_tensor * target_feat     = nullptr;
     int           target_feat_cap = 0;
+
+    // Draft KV cache (prefix-direct: projected target features → K/V per layer)
+    ggml_context        * draft_kv_ctx = nullptr;
+    ggml_backend_buffer_t draft_kv_buf = nullptr;
+    std::vector<ggml_tensor *> draft_k;   // [head_dim, n_kv_heads, draft_kv_cap] f32
+    std::vector<ggml_tensor *> draft_v;   // [head_dim, n_kv_heads, draft_kv_cap] f32
+    int draft_kv_cap = 0;
+    int draft_kv_pos = 0;
 };
 
 struct GemmaGraphInputs {
@@ -664,6 +672,7 @@ struct GemmaDraftWeights {
     float logit_softcap  = GEMMA4_LOGIT_SOFTCAP;         // 30.0
     float rope_theta     = GEMMA4_ROPE_THETA;            // 1e6
     int mask_token_id    = GEMMA4_31B_DRAFT_MASK_TOKEN_ID; // 4
+    int sliding_window   = 2048;
 };
 
 // Load Gemma4 DFlash draft weights from a directory containing safetensors shards.
@@ -673,20 +682,40 @@ bool load_gemma4_draft_safetensors(const std::string & dir_path,
 
 void free_gemma4_draft_weights(GemmaDraftWeights & w);
 
-// Build the Gemma4 draft model compute graph for one diffusion refinement step.
+// Allocate draft KV cache tensors on the given backend.
+bool create_draft_kv_cache(const GemmaDraftWeights & dw,
+                           ggml_backend_t backend,
+                           GemmaTargetCache & cache);
+void free_draft_kv_cache(GemmaTargetCache & cache);
+
+// Build graph that projects target features → draft KV cache (prefix-direct).
+// Materializes K,V for n_tokens new positions starting at cache.draft_kv_pos.
 //   target_feat [6*target_hidden, n_tokens] f32
-//   draft_embed [draft_hidden,    n_tokens] f32
-//   positions   [n_tokens]                 i32
-//   attn_mask   [n_tokens, n_tokens]        f32 (nullable)
+//   positions   [n_tokens]                 i32 (absolute positions for RoPE)
+ggml_tensor * build_draft_kv_prefill_graph(
+    ggml_context *            ctx,
+    ggml_cgraph *             gf,
+    const GemmaDraftWeights & w,
+    GemmaTargetCache &        cache,
+    ggml_tensor *             target_feat,
+    ggml_tensor *             positions,
+    int                       n_tokens);
+
+// Build the Gemma4 draft model forward graph with KV cache attention.
+//   draft_embed [draft_hidden, n_tokens] f32 (MASK token embeddings)
+//   positions   [n_tokens]              i32 (absolute positions)
+//   attn_mask   [kv_pad, q_pad]         f16 (causal over context+block)
+//   kv_start    = cache.draft_kv_pos (context length before this block)
 // Returns logits [n_vocab, n_tokens] f32 (softcapped).
 ggml_tensor * build_gemma4_draft_graph(
     ggml_context *               ctx,
     ggml_cgraph *                gf,
     const GemmaDraftWeights &    w,
-    ggml_tensor *                target_feat,
+    GemmaTargetCache &           cache,
     ggml_tensor *                draft_embed,
     ggml_tensor *                positions,
     ggml_tensor *                attn_mask,
-    int                          n_tokens);
+    int                          n_tokens,
+    int                          kv_start);
 
 } // namespace dflash27b
