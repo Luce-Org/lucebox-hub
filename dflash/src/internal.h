@@ -632,6 +632,16 @@ GemmaGraphOutputs build_gemma4_graph(ggml_context * ctx, ggml_cgraph * gf,
                                      GemmaTargetCache & cache,
                                      const GemmaGraphInputs & in);
 
+// Gemma4 pFlash prefill — layer-by-layer prefill using block-sparse attention
+// for full-attention layers and ggml FA for SWA layers.
+// On return: cache.cur_pos = n_prompt, cache.last_tok = argmax of last token.
+// Returns 0 on success, non-zero on failure (check dflash27b_last_error()).
+int gemma4_pflash_prefill(const GemmaTargetWeights & w,
+                          GemmaTargetCache & cache,
+                          ggml_backend_t backend,
+                          const int32_t * prompt_ids, int n_prompt,
+                          float pflash_alpha = 0.12f);
+
 // ─── Gemma4 Draft weights ─────────────────────────────────────────
 
 struct GemmaDraftLayer {

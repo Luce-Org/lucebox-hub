@@ -117,6 +117,7 @@ add_library(dflash27b STATIC
     src/gemma4_target_loader.cpp
     src/gemma4_target_graph.cpp
     src/gemma4_dflash_graph.cpp
+    src/gemma4_pflash_prefill.cpp
     src/qwen3_0p6b_loader.cpp
     src/qwen3_0p6b_graph.cpp
     src/flashprefill_q8.cpp
