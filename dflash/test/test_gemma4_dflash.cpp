@@ -1003,7 +1003,7 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             // draft_kv_pos tracks entries written, bounded by draft_kv_cap.
-            cache.draft_kv_pos = draft_prefill_n;
+            cache.draft_kv_pos = draft_prefill_n % draft_kv_cap;
 
             draft_kv_prefill_destroy(pkg);
             std::printf("[draft] KV prefill done: %d positions materialized "
@@ -1040,6 +1040,9 @@ int main(int argc, char ** argv) {
             const int mask_tok     = dw.mask_token_id; // 4
             const int target_feat_w = dw.n_target_layers * dw.target_hidden;
             const int vocab         = w.n_vocab;
+            const int dkv_cap       = cache.draft_kv_cap > 0
+                                          ? cache.draft_kv_cap
+                                          : (int)cache.draft_k[0]->ne[2];
 
             std::vector<int32_t> noise_ids(q_len);
             std::vector<float>   noise_embed_buf((size_t)dw.n_embd * q_len);
@@ -1126,7 +1129,7 @@ int main(int argc, char ** argv) {
                             draft_kv_prefill_destroy(wpkg);
                             return 1;
                         }
-                        cache.draft_kv_pos++;
+                        cache.draft_kv_pos = (cache.draft_kv_pos + 1) % dkv_cap;
                         draft_kv_prefill_destroy(wpkg);
                     }
 
@@ -1167,16 +1170,8 @@ int main(int argc, char ** argv) {
                 // The draft model operates in its own KV address space bounded by
                 // draft_kv_cap. Use cache.draft_kv_pos (number of entries written into
                 // the draft KV cache) as kv_start, NOT the absolute committed position.
-                {
-                    const int dkv_cap = cache.draft_kv_cap > 0
-                                            ? cache.draft_kv_cap
-                                            : (int)cache.draft_k[0]->ne[2];
-                    if (cache.draft_kv_pos + q_len > dkv_cap) {
-                        std::fprintf(stderr,
-                            "[spec] draft KV overflow: draft_kv_pos=%d q_len=%d cap=%d\n",
-                            cache.draft_kv_pos, q_len, dkv_cap);
-                        return 1;
-                    }
+                if (cache.draft_kv_pos + q_len > dkv_cap) {
+                    cache.draft_kv_pos = 0;
                 }
                 if (!build_draft_step(dsg, dw, cache, backend, q_len, cache.draft_kv_pos)) {
                     std::fprintf(stderr, "[spec] draft build failed\n");
@@ -1356,7 +1351,7 @@ int main(int argc, char ** argv) {
                         draft_kv_prefill_destroy(cpkg);
                         return 1;
                     }
-                    cache.draft_kv_pos += commit_n;
+                    cache.draft_kv_pos = (cache.draft_kv_pos + commit_n) % dkv_cap;
                     draft_kv_prefill_destroy(cpkg);
                 }
 

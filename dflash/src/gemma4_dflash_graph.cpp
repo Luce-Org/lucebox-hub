@@ -101,8 +101,7 @@ ggml_tensor * build_draft_kv_prefill_graph(
 {
     // Guard: writing cache.draft_kv_pos..cache.draft_kv_pos+n_tokens-1 must fit.
     GGML_ASSERT(!cache.draft_k.empty() &&
-                cache.draft_kv_pos + n_tokens <= (int)cache.draft_k[0]->ne[2] &&
-                "draft KV prefill exceeds cache capacity");
+                cache.draft_kv_pos + n_tokens <= (int)cache.draft_k[0]->ne[2]);
 
     const int n_kv     = w.n_head_kv;
     const int head_dim = w.head_dim;
