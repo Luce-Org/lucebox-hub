@@ -303,17 +303,17 @@ static bool build_gemma4_step(StepGraph & sg,
         const int kv_pad = align_up(kv_len, g_kq_stride_pad);
         const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
 
-        if (!use_pflash) {
-            sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
-            ggml_set_name(sg.attn_mask, "attn_mask");
-            ggml_set_input(sg.attn_mask);
-        }
+        sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
+        ggml_set_name(sg.attn_mask, "attn_mask");
+        ggml_set_input(sg.attn_mask);
+        ggml_set_output(sg.attn_mask);  // force gallocr to allocate even if no op references it
 
         if (n_tokens > 1) {
             // SWA mask needed for sliding-window attention layers in batched prefill
             sg.swa_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
             ggml_set_name(sg.swa_mask, "swa_mask");
             ggml_set_input(sg.swa_mask);
+            ggml_set_output(sg.swa_mask);  // force gallocr to allocate even if no op references it
         }
     }
 
@@ -901,7 +901,7 @@ int main(int argc, char ** argv) {
                                                 sizeof(int32_t) * chunk_n);
                     }
 
-                    if (sg.attn_mask) {
+                    if (sg.attn_mask && sg.attn_mask->buffer) {
                         const int kv_len = cs + chunk_n;
                         std::vector<uint16_t> mask_buf;
                         build_causal_mask(mask_buf, kv_len, chunk_n, cs);
@@ -909,7 +909,7 @@ int main(int argc, char ** argv) {
                                                 sizeof(uint16_t) * mask_buf.size());
                     }
 
-                    if (sg.swa_mask) {
+                    if (sg.swa_mask && sg.swa_mask->buffer) {
                         const int kv_len = cs + chunk_n;
                         std::vector<uint16_t> swa_buf;
                         build_swa_causal_mask(swa_buf, kv_len, chunk_n, cs, swa_window);
@@ -1089,7 +1089,7 @@ int main(int argc, char ** argv) {
                         return 1;
                     }
 
-                    if (sg.attn_mask) {
+                    if (sg.attn_mask && sg.attn_mask->buffer) {
                         const int kv_len = committed + 1;
                         std::vector<uint16_t> mask_buf;
                         build_causal_mask(mask_buf, kv_len, 1, committed);
@@ -1210,7 +1210,7 @@ int main(int argc, char ** argv) {
                 // Causal mask: block token i attends to all draft KV context
                 // [0..draft_kv_pos-1] plus block tokens [0..i].
                 // Use draft_kv_pos (draft KV address space), not committed.
-                {
+                if (dsg.attn_mask && dsg.attn_mask->buffer) {
                     const int dkv_ctx = cache.draft_kv_pos;
                     const int kv_len  = dkv_ctx + q_len;
                     const int kv_pad  = align_up(kv_len, KQ_MASK_PAD);
@@ -1263,7 +1263,7 @@ int main(int argc, char ** argv) {
                 }
 
                 // Causal mask for target verify
-                if (sg.attn_mask) {
+                if (sg.attn_mask && sg.attn_mask->buffer) {
                     const int kv_len = committed + q_len;
                     std::vector<uint16_t> mask_buf;
                     build_causal_mask(mask_buf, kv_len, q_len, committed);
@@ -1272,7 +1272,7 @@ int main(int argc, char ** argv) {
                 }
 
                 // SWA mask for target verify (required when n_tokens > 1)
-                if (sg.swa_mask) {
+                if (sg.swa_mask && sg.swa_mask->buffer) {
                     const int kv_len = committed + q_len;
                     std::vector<uint16_t> swa_buf;
                     build_swa_causal_mask(swa_buf, kv_len, q_len, committed,
@@ -1430,7 +1430,7 @@ int main(int argc, char ** argv) {
                     return 1;
                 }
 
-                if (sg.attn_mask) {
+                if (sg.attn_mask && sg.attn_mask->buffer) {
                     const int kv_len = committed + 1;
                     std::vector<uint16_t> mask_buf;
                     build_causal_mask(mask_buf, kv_len, 1, committed);

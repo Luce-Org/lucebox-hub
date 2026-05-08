@@ -451,9 +451,20 @@ static ggml_tensor * build_full_attn_block(
         cache_v->nb[1], cache_v->nb[2],
         cache_v->nb[1] * win_start);
 
+    // pFlash sparse path supports F16, Q8_0, and Q4_0 K/V — the CUDA dispatch layer
+    // dequantizes to F16 before the S<->H BF16 transpose for these types.
+    // TQ3_0 is excluded because it has WHT rotation fused into FA that the sparse
+    // path does not replicate; fall back to dense FA for TQ3_0 and other types.
+    auto pflash_supports = [](enum ggml_type t) {
+        return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0;
+    };
+    const bool can_pflash = use_pflash &&
+                            pflash_supports(Kfa->type) &&
+                            pflash_supports(Vfa->type);
+
     // Gemma4: attn_scale = 1.0 (self.scaling = 1.0, no 1/sqrt(head_dim))
     ggml_tensor * attn;
-    if (use_pflash) {
+    if (can_pflash) {
         attn = ggml_flash_attn_sparse(ctx, Qfa, Kfa, Vfa, 1.0f, pflash_alpha);
     } else {
         attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask, 1.0f, 0.0f, 0.0f);
@@ -752,7 +763,7 @@ GemmaGraphOutputs build_gemma4_graph(
     // when the caller did not supply one so that full-attention layers don't
     // hit BEST_FATTN_KERNEL_NONE → abort.
     ggml_tensor * attn_mask = in.attn_mask;
-    if (!attn_mask && w.head_dim >= 512 && !in.use_pflash) {
+    if (!attn_mask && w.head_dim >= 512) {
         const int kv_len        = kv_start + n_tokens;
         // Pad to 256 — required by FATTN_KQ_STRIDE for TQ3 / large head_dim.
         const int kv_len_padded = ((kv_len + 255) / 256) * 256;
