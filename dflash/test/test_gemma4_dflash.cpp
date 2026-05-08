@@ -46,10 +46,18 @@
 #include <cstdlib>
 #include <cctype>
 #include <cstring>
+#include <fstream>
+#include <iostream>
 #include <string>
 #include <unordered_set>
 #include <vector>
 #include <random>
+
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 using namespace dflash27b;
 
@@ -545,6 +553,42 @@ static std::vector<int32_t> parse_token_ids(const std::string & s) {
     return ids;
 }
 
+// ─── Binary token file helper (daemon mode) ──────────────────────────────
+
+static std::vector<int32_t> read_int32_file(const std::string & path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) return {};
+    auto sz = (size_t)f.tellg();
+    f.seekg(0);
+    std::vector<int32_t> out(sz / sizeof(int32_t));
+    f.read((char *)out.data(), (std::streamsize)sz);
+    return out;
+}
+
+// Parse optional " samp=temp,top_p,top_k,rep_pen[,seed]" suffix from line.
+// Erases the matched suffix from line. Returns true if parsed.
+static bool parse_sampler_token(std::string & line, SamplerCfg & out) {
+    auto pos = line.find(" samp=");
+    if (pos == std::string::npos) return false;
+    auto end = line.find(' ', pos + 1);
+    std::string tok = (end == std::string::npos)
+                          ? line.substr(pos + 6)
+                          : line.substr(pos + 6, end - (pos + 6));
+    line.erase(pos, (end == std::string::npos ? std::string::npos : end - pos));
+    float t = 0.0f, tp = 1.0f, rp = 1.0f;
+    int   tk = 0;
+    unsigned long long sd = 0;
+    int n = std::sscanf(tok.c_str(), "%f,%f,%d,%f,%llu",
+                        &t, &tp, &tk, &rp, &sd);
+    if (n < 1) return false;
+    out.temp    = t;
+    out.top_p   = tp;
+    out.top_k   = tk;
+    out.rep_pen = rp;
+    out.seed    = sd;
+    return true;
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────
 
 static void print_usage(const char * prog) {
@@ -598,6 +642,8 @@ int main(int argc, char ** argv) {
     bool         use_pflash   = false;
     float        pflash_alpha = 0.12f;
     SamplerCfg   sampler;
+    bool         daemon_mode  = false;
+    int          stream_fd    = -1;
 
     for (int i = 1; i < argc; i++) {
         auto require_next = [&](const char * flag) -> const char * {
@@ -615,6 +661,9 @@ int main(int argc, char ** argv) {
         else if (std::strcmp(argv[i], "--tokens-file") == 0) tokens_file   = require_next("--tokens-file");
         else if (std::strcmp(argv[i], "--n-predict") == 0) n_predict     = std::atoi(require_next("--n-predict"));
         else if (std::strcmp(argv[i], "--ctx-size")  == 0) ctx_size      = std::atoi(require_next("--ctx-size"));
+        else if (std::strncmp(argv[i], "--ctx-size=", 11) == 0) ctx_size = std::atoi(argv[i] + 11);
+        else if (std::strcmp(argv[i], "--max-ctx")   == 0) ctx_size      = std::atoi(require_next("--max-ctx"));
+        else if (std::strncmp(argv[i], "--max-ctx=", 10) == 0) ctx_size  = std::atoi(argv[i] + 10);
         else if (std::strcmp(argv[i], "--kv-k")      == 0) kv_k_str      = require_next("--kv-k");
         else if (std::strcmp(argv[i], "--kv-v")      == 0) kv_v_str      = require_next("--kv-v");
         else if (std::strcmp(argv[i], "--seed")      == 0) sampler.seed  = (uint64_t)std::atoll(require_next("--seed"));
@@ -625,8 +674,18 @@ int main(int argc, char ** argv) {
         else if (std::strcmp(argv[i], "--gpu")       == 0) gpu           = std::atoi(require_next("--gpu"));
         else if (std::strcmp(argv[i], "--fa-window")    == 0) fa_window     = std::atoi(require_next("--fa-window"));
         else if (std::strcmp(argv[i], "--bench")        == 0) bench_mode    = true;
+        else if (std::strcmp(argv[i], "--daemon")       == 0) daemon_mode   = true;
         else if (std::strcmp(argv[i], "--pflash")       == 0) use_pflash    = true;
         else if (std::strcmp(argv[i], "--pflash-alpha") == 0) pflash_alpha  = (float)std::atof(require_next("--pflash-alpha"));
+        else if (std::strncmp(argv[i], "--stream-fd=", 12) == 0) {
+            stream_fd = std::atoi(argv[i] + 12);
+        }
+        // No-op flags forwarded by server.py for Qwen3 compatibility:
+        else if (std::strcmp(argv[i], "--fast-rollback")  == 0) { /* no-op */ }
+        else if (std::strcmp(argv[i], "--ddtree")         == 0) { /* no-op */ }
+        else if (std::strncmp(argv[i], "--ddtree-budget=", 16) == 0) { /* no-op */ }
+        else if (std::strncmp(argv[i], "--ddtree-temp=",   14) == 0) { /* no-op */ }
+        else if (std::strcmp(argv[i], "--ddtree-no-chain-seed") == 0) { /* no-op */ }
         else if (std::strcmp(argv[i], "--help")      == 0 ||
                  std::strcmp(argv[i], "-h")          == 0) {
             print_usage(argv[0]);
@@ -815,7 +874,330 @@ int main(int argc, char ** argv) {
         std::printf("[draft] KV cache allocated: %d slots\n", cache.draft_kv_cap);
     }
 
-    // ── Tokenize prompt ───────────────────────────────────────────────────
+    // ── RNG ───────────────────────────────────────────────────────────────
+    std::mt19937_64 rng(sampler.seed);
+
+    // ── Daemon mode: stream token fd write helper ─────────────────────────
+    auto stream_emit = [&](int32_t tok) {
+        if (stream_fd < 0) return;
+        int32_t v = tok;
+#ifdef _WIN32
+        DWORD written;
+        WriteFile((HANDLE)(intptr_t)stream_fd, &v, sizeof(v), &written, nullptr);
+#else
+        ssize_t n = ::write(stream_fd, &v, sizeof(v));
+        (void)n;
+#endif
+    };
+
+    // ── Daemon mode ───────────────────────────────────────────────────────
+    if (daemon_mode) {
+        std::printf("[daemon] ready\n");
+        std::fflush(stdout);
+
+        StepGraph      sg;
+        DraftStepGraph dsg;
+        bool daemon_first_iter = true;
+        std::string line;
+
+        while (std::getline(std::cin, line)) {
+            // Per-request sampler (reset to CLI defaults each request).
+            SamplerCfg req_sampler = sampler;
+            if (parse_sampler_token(line, req_sampler) && req_sampler.seed != 0) {
+                rng.seed(req_sampler.seed);
+            }
+
+            // ── Unsupported commands: emit -1 sentinel and continue ────────
+            auto starts_with = [](const std::string & s, const char * pre) {
+                size_t n = std::strlen(pre);
+                return s.size() >= n && s.compare(0, n, pre) == 0;
+            };
+            bool unsupported = (starts_with(line, "RESTORE")       ||
+                                starts_with(line, "SNAPSHOT")      ||
+                                starts_with(line, "FREE_SNAPSHOT")  ||
+                                starts_with(line, "LIST_SLOTS")     ||
+                                starts_with(line, "compress ")      ||
+                                starts_with(line, "park")           ||
+                                starts_with(line, "unpark")         ||
+                                line == "free drafter"              ||
+                                line == "drafter free");
+            if (unsupported) {
+                std::fprintf(stderr,
+                    "[daemon] command not supported in gemma4 daemon: %s\n",
+                    line.c_str());
+                std::fflush(stderr);
+                stream_emit(-1);
+                continue;
+            }
+
+            // ── Parse: <prompt_bin_path> <n_gen> ──────────────────────────
+            char ppath[1024] = {0};
+            int  n_gen = 0;
+            if (std::sscanf(line.c_str(), "%1023s %d", ppath, &n_gen) != 2 || n_gen <= 0) {
+                std::fprintf(stderr, "[daemon] bad command line: %s\n", line.c_str());
+                std::fflush(stderr);
+                stream_emit(-1);
+                continue;
+            }
+
+            // Read binary prompt file (int32 LE token IDs).
+            std::vector<int32_t> prompt_ids = read_int32_file(ppath);
+            if (prompt_ids.empty()) {
+                std::fprintf(stderr, "[daemon] empty or unreadable prompt file: %s\n", ppath);
+                std::fflush(stderr);
+                stream_emit(-1);
+                continue;
+            }
+            std::printf("[daemon] prompt=%zu tokens n_gen=%d\n",
+                        prompt_ids.size(), n_gen);
+            std::fflush(stdout);
+
+            // Reset KV cache between requests.
+            if (!daemon_first_iter) {
+                step_graph_free(sg);
+                reset_gemma4_cache(cache);  // also resets draft_kv_pos
+                if (have_draft) {
+                    draft_step_free(dsg);
+                }
+            }
+            daemon_first_iter = false;
+
+            if ((int)prompt_ids.size() + n_gen > ctx_size) {
+                std::fprintf(stderr,
+                    "[daemon] prompt (%zu) + n_gen (%d) > ctx_size (%d)\n",
+                    prompt_ids.size(), n_gen, ctx_size);
+                std::fflush(stderr);
+                stream_emit(-1);
+                continue;
+            }
+
+            // ── Prefill ───────────────────────────────────────────────────
+            int last_logit_tok = -1;
+            {
+                const int n_prompt   = (int)prompt_ids.size();
+                const int swa_window = w.swa_window > 0 ? w.swa_window : 1024;
+                const int chunk_size = std::min(n_prompt, swa_window);
+
+                for (int cs = 0; cs < n_prompt; cs += chunk_size) {
+                    const int chunk_n   = std::min(chunk_size, n_prompt - cs);
+                    const bool is_last  = (cs + chunk_n == n_prompt);
+                    const bool need_mask = (cs + chunk_n > 1);
+
+                    if (!build_gemma4_step(sg, w, cache, backend,
+                                           cs, chunk_n, need_mask,
+                                           /*capture=*/true,
+                                           use_pflash, pflash_alpha,
+                                           /*last_token_logits_only=*/true)) {
+                        std::fprintf(stderr, "[daemon] prefill build failed at %d\n", cs);
+                        std::fflush(stderr);
+                        break;
+                    }
+
+                    if (!embed_tokens_batch(w, prompt_ids.data() + cs, chunk_n,
+                                            sg.inp_embed, backend)) {
+                        std::fprintf(stderr, "[daemon] embed_tokens_batch failed\n");
+                        std::fflush(stderr);
+                        break;
+                    }
+
+                    {
+                        std::vector<int32_t> pos(chunk_n);
+                        for (int i = 0; i < chunk_n; i++) pos[i] = cs + i;
+                        ggml_backend_tensor_set(sg.positions, pos.data(), 0,
+                                                sizeof(int32_t) * chunk_n);
+                    }
+
+                    if (sg.attn_mask && sg.attn_mask->buffer) {
+                        const int kv_len = cs + chunk_n;
+                        std::vector<uint16_t> mask_buf;
+                        build_causal_mask(mask_buf, kv_len, chunk_n, cs);
+                        ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
+                                                sizeof(uint16_t) * mask_buf.size());
+                    }
+
+                    if (sg.swa_mask && sg.swa_mask->buffer) {
+                        const SwaView swa_view = compute_swa_view(cs, chunk_n,
+                                                                    swa_window, cache.swa_ctx_alloc);
+                        std::vector<uint16_t> swa_buf;
+                        build_swa_causal_mask(swa_buf, swa_view.abs_win_start,
+                                              swa_view.effective_win_len,
+                                              chunk_n, cs, swa_window);
+                        ggml_backend_tensor_set(sg.swa_mask, swa_buf.data(), 0,
+                                                sizeof(uint16_t) * swa_buf.size());
+                    }
+
+                    auto st = ggml_backend_graph_compute(backend, sg.gf);
+                    if (st != GGML_STATUS_SUCCESS) {
+                        std::fprintf(stderr, "[daemon] prefill compute failed at %d\n", cs);
+                        std::fflush(stderr);
+                        break;
+                    }
+
+                    cache.cur_pos = cs + chunk_n;
+
+                    if (is_last) {
+                        const int vocab = w.n_vocab;
+                        std::vector<float> logits_cpu(vocab);
+                        ggml_backend_tensor_get(sg.logits, logits_cpu.data(),
+                                                0, sizeof(float) * vocab);
+                        last_logit_tok = sample_logits(logits_cpu.data(), vocab,
+                                                       req_sampler, prompt_ids, rng);
+                        cache.last_tok = last_logit_tok;
+                    }
+
+                    step_graph_free(sg);
+                }
+
+                // Draft KV prefill after target prefill.
+                if (have_draft && last_logit_tok >= 0) {
+                    const int target_feat_w  = dw.n_target_layers * dw.target_hidden;
+                    const int draft_kv_cap   = cache.draft_kv_cap > 0
+                                                   ? cache.draft_kv_cap
+                                                   : (int)cache.draft_k[0]->ne[2];
+                    const int draft_prefill_n    = std::min(n_prompt, draft_kv_cap);
+                    const int draft_prefill_skip = n_prompt - draft_prefill_n;
+
+                    DraftKVPrefillGraph pkg;
+                    if (build_draft_kv_prefill(pkg, dw, cache, backend, draft_prefill_n)) {
+                        // Ring-buffer aware bf16→f32 conversion (same as non-daemon path).
+                        const int    cap      = cache.target_feat_cap;
+                        const size_t feat_elt = ggml_element_size(cache.target_feat);
+                        const int    slot0    = draft_prefill_skip % cap;
+                        const int    pre_n    = std::min(draft_prefill_n, cap - slot0);
+                        const int    post_n   = draft_prefill_n - pre_n;
+
+                        dflash27b_launch_bf16_to_f32(
+                            (const char *)cache.target_feat->data + (size_t)slot0 * feat_elt * target_feat_w,
+                            (float *)pkg.target_feat->data,
+                            (size_t)pre_n * target_feat_w, nullptr);
+                        if (post_n > 0) {
+                            dflash27b_launch_bf16_to_f32(
+                                (const char *)cache.target_feat->data,
+                                (float *)pkg.target_feat->data + (size_t)pre_n * target_feat_w,
+                                (size_t)post_n * target_feat_w, nullptr);
+                        }
+                        cudaDeviceSynchronize();
+
+                        std::vector<int32_t> pos(draft_prefill_n);
+                        for (int pi = 0; pi < draft_prefill_n; pi++) pos[pi] = draft_prefill_skip + pi;
+                        ggml_backend_tensor_set(pkg.positions, pos.data(), 0,
+                                                sizeof(int32_t) * draft_prefill_n);
+
+                        auto dst = ggml_backend_graph_compute(backend, pkg.gf);
+                        if (dst != GGML_STATUS_SUCCESS) {
+                            std::fprintf(stderr, "[daemon] draft KV prefill compute failed\n");
+                            std::fflush(stderr);
+                        }
+                        cache.draft_kv_pos = draft_prefill_n % draft_kv_cap;
+                    }
+                    draft_kv_prefill_destroy(pkg);
+                }
+            }
+
+            if (last_logit_tok < 0) {
+                std::fprintf(stderr, "[daemon] prefill produced no logit token\n");
+                std::fflush(stderr);
+                stream_emit(-1);
+                continue;
+            }
+
+            // ── Decode loop ───────────────────────────────────────────────
+            std::vector<int32_t> history(prompt_ids);
+            int committed = cache.cur_pos;
+            int32_t cur_tok = last_logit_tok;
+            int n_generated = 0;
+
+            while (n_generated < n_gen) {
+                if (IS_EOS_TOK(cur_tok, w)) {
+                    std::printf("[daemon] EOS at step %d\n", n_generated);
+                    std::fflush(stdout);
+                    break;
+                }
+                if (committed >= ctx_size - 1) {
+                    std::printf("[daemon] context full\n");
+                    std::fflush(stdout);
+                    break;
+                }
+
+                if (!build_gemma4_step(sg, w, cache, backend,
+                                       committed, 1,
+                                       /*with_mask=*/true,
+                                       /*capture=*/false)) {
+                    std::fprintf(stderr, "[daemon] decode build failed at step %d\n", n_generated);
+                    std::fflush(stderr);
+                    break;
+                }
+
+                if (sg.attn_mask && sg.attn_mask->buffer) {
+                    const int kv_len = committed + 1;
+                    std::vector<uint16_t> mask_buf;
+                    build_causal_mask(mask_buf, kv_len, 1, committed);
+                    ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
+                                            sizeof(uint16_t) * mask_buf.size());
+                }
+
+                if (!embed_token(w, cur_tok, sg.inp_embed, backend)) {
+                    std::fprintf(stderr, "[daemon] embed_token failed\n");
+                    std::fflush(stderr);
+                    break;
+                }
+
+                int32_t pos_val = committed;
+                ggml_backend_tensor_set(sg.positions, &pos_val, 0, sizeof(int32_t));
+
+                auto st = ggml_backend_graph_compute(backend, sg.gf);
+                if (st != GGML_STATUS_SUCCESS) {
+                    std::fprintf(stderr, "[daemon] decode compute failed at step %d\n", n_generated);
+                    std::fflush(stderr);
+                    break;
+                }
+
+                committed++;
+                cache.cur_pos = committed;
+
+                const int vocab = w.n_vocab;
+                std::vector<float> logits_cpu(vocab);
+                ggml_backend_tensor_get(sg.logits, logits_cpu.data(), 0,
+                                        sizeof(float) * vocab);
+
+                const int32_t next_tok = (int32_t)sample_logits(
+                    logits_cpu.data(), vocab, req_sampler, history, rng);
+
+                // Emit current token to stream fd before advancing.
+                stream_emit(cur_tok);
+
+                history.push_back(cur_tok);
+                n_generated++;
+
+                cur_tok = next_tok;
+                cache.last_tok = cur_tok;
+
+                step_graph_free(sg);
+            }
+
+            // Sentinel: end of stream.
+            stream_emit(-1);
+            std::printf("[daemon] generated %d tokens\n", n_generated);
+            std::fflush(stdout);
+        }
+
+        // ── Daemon exit: clean up ─────────────────────────────────────────
+        step_graph_destroy(sg);
+        draft_step_destroy(dsg);
+        if (have_draft) {
+            free_draft_kv_cache(cache);
+            dw.tok_embd = nullptr;
+            free_gemma4_draft_weights(dw);
+            if (tok_embd_buf) ggml_backend_buffer_free(tok_embd_buf);
+            if (tok_embd_ctx) ggml_free(tok_embd_ctx);
+        }
+        free_gemma4_cache(cache);
+        free_gemma4_target_weights(w);
+        ggml_backend_free(backend);
+        return 0;
+    }
+
+    // ── Non-daemon: tokenize prompt ───────────────────────────────────────
     std::vector<int32_t> prompt_ids;
     if (!token_ids_str.empty()) {
         prompt_ids = parse_token_ids(token_ids_str);
@@ -843,9 +1225,6 @@ int main(int argc, char ** argv) {
                      prompt_ids.size(), ctx_size);
         return 2;
     }
-
-    // ── RNG ───────────────────────────────────────────────────────────────
-    std::mt19937_64 rng(sampler.seed);
 
     // ── Benchmark loop outer container ────────────────────────────────────
     const int bench_runs = bench_mode ? 3 : 1;

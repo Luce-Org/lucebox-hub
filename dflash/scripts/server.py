@@ -58,6 +58,23 @@ def resolve_draft(root: Path) -> Path:
     raise FileNotFoundError(f"no model.safetensors under {root}")
 
 
+def _read_gguf_architecture(gguf_path: Path) -> str:
+    """Return the 'general.architecture' string from a GGUF file, or '' on error."""
+    try:
+        from gguf import GGUFReader  # type: ignore
+        import numpy as np
+        r = GGUFReader(str(gguf_path))
+        f = r.fields.get("general.architecture")
+        if f is None or not f.data:
+            return ""
+        p = f.parts[f.data[0]]
+        if not isinstance(p, np.ndarray):
+            return ""
+        return bytes(p).decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+
 _QWEN35_FAMILY_TOKENIZERS = {
     "Qwen3.5-27B": "Qwen/Qwen3.5-27B",
     "Qwen3.6-27B": "Qwen/Qwen3.6-27B",
@@ -159,7 +176,9 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
               prefill_cfg: PrefillConfig | None = None,
               drafter_tokenizer: AutoTokenizer | None = None,
               prefix_cache_slots: int = 4,
-              prefill_cache_slots: int = 4) -> FastAPI:
+              prefill_cache_slots: int = 4,
+              is_gemma4: bool = False,
+              use_pflash: bool = False) -> FastAPI:
     import asyncio
     app = FastAPI(title="Luce DFlash OpenAI server")
 
@@ -189,10 +208,23 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
     if sys.platform == "win32":
         env["PATH"] = dll_dir + os.pathsep + str(Path(bin_abs).parent) + os.pathsep + env.get("PATH", "")
 
-    cmd = [bin_abs, str(target), str(draft), "--daemon",
-           "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}",
-           f"--max-ctx={max_ctx}",
-           f"--stream-fd={stream_fd_val}"]
+    if is_gemma4:
+        # Gemma4 binary uses named flags (--model, --draft) instead of positional args.
+        # draft is the safetensors directory, not a resolved file.
+        cmd = [bin_abs,
+               "--model", str(target),
+               "--draft", str(draft),
+               "--daemon",
+               "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}",
+               f"--max-ctx={max_ctx}",
+               f"--stream-fd={stream_fd_val}"]
+        if use_pflash:
+            cmd.append("--pflash")
+    else:
+        cmd = [bin_abs, str(target), str(draft), "--daemon",
+               "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}",
+               f"--max-ctx={max_ctx}",
+               f"--stream-fd={stream_fd_val}"]
     if sys.platform == "win32":
         daemon_proc = subprocess.Popen(cmd, close_fds=False, env=env,
                                        stdin=subprocess.PIPE,
@@ -814,6 +846,9 @@ def main():
     ap.add_argument("--prefix-cache-slots", type=int, default=4)
     ap.add_argument("--prefill-cache-slots", type=int, default=4)
     ap.add_argument("--daemon", action="store_true")
+    ap.add_argument("--pflash", action="store_true",
+                    help="Enable pFlash sparse-attention prefill in the daemon binary "
+                         "(Gemma4 only; no-op for Qwen3).")
     add_cli_flags(ap)
     args = ap.parse_args()
     prefill_cfg = config_from_args(args)
@@ -834,13 +869,34 @@ def main():
         os.environ.setdefault("DFLASH_FP_USE_BSA", "1")
         os.environ.setdefault("DFLASH_FP_ALPHA",   "0.85")
 
-    if not args.bin.is_file():
-        raise SystemExit(f"binary not found at {args.bin}")
     if not args.target.is_file():
         raise SystemExit(f"target GGUF not found at {args.target}")
-    draft = resolve_draft(args.draft) if args.draft.is_dir() else args.draft
-    if not draft.is_file():
-        raise SystemExit(f"draft safetensors not found at {args.draft}")
+
+    # Detect architecture and select the right binary.
+    arch = _read_gguf_architecture(args.target)
+    is_gemma4 = (arch == "gemma4")
+
+    if args.bin != DEFAULT_BIN:
+        # User explicitly specified a binary — use it as-is.
+        bin_path = args.bin
+    elif is_gemma4:
+        bin_path = ROOT / "build" / ("test_gemma4_dflash" + (".exe" if sys.platform == "win32" else ""))
+        print(f"[server] detected architecture=gemma4, using binary: {bin_path}")
+    else:
+        bin_path = DEFAULT_BIN
+
+    if not bin_path.is_file():
+        raise SystemExit(f"binary not found at {bin_path}")
+
+    if is_gemma4:
+        # Gemma4 draft is a directory (safetensors dir), not a resolved file.
+        draft = args.draft if args.draft.is_dir() else args.draft.parent
+        if not draft.is_dir():
+            raise SystemExit(f"draft directory not found at {args.draft}")
+    else:
+        draft = resolve_draft(args.draft) if args.draft.is_dir() else args.draft
+        if not draft.is_file():
+            raise SystemExit(f"draft safetensors not found at {args.draft}")
 
     tokenizer_id = args.tokenizer or _tokenizer_id_from_gguf(args.target)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, trust_remote_code=True)
@@ -854,18 +910,21 @@ def main():
         drafter_tokenizer = AutoTokenizer.from_pretrained(
             prefill_cfg.drafter_tokenizer_id, trust_remote_code=True)
 
-    app = build_app(args.target, draft, args.bin, args.budget, args.max_ctx,
+    app = build_app(args.target, draft, bin_path, args.budget, args.max_ctx,
                     tokenizer, stop_ids,
                     prefill_cfg=prefill_cfg if prefill_cfg.enabled else None,
                     drafter_tokenizer=drafter_tokenizer,
                     prefix_cache_slots=args.prefix_cache_slots,
-                    prefill_cache_slots=args.prefill_cache_slots)
+                    prefill_cache_slots=args.prefill_cache_slots,
+                    is_gemma4=is_gemma4,
+                    use_pflash=getattr(args, "pflash", False))
 
     import uvicorn
     print(f"Luce DFlash OpenAI server on http://{args.host}:{args.port}")
     print(f"  target    = {args.target}")
+    print(f"  arch      = {arch or '(unknown)'}")
     print(f"  draft     = {draft}")
-    print(f"  bin       = {args.bin}")
+    print(f"  bin       = {bin_path}")
     print(f"  budget    = {args.budget}")
     print(f"  max_ctx   = {args.max_ctx}")
     print(f"  tokenizer = {tokenizer_id}")
