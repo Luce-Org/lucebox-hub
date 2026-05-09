@@ -31,9 +31,45 @@
 #include "internal.h"
 #include "dflash_graph.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 namespace dflash27b {
+
+bool draft_graph_needs_swa_mask(const DraftWeights & w, int ctx_len) {
+    if (w.swa_window <= 0) {
+        return false;
+    }
+    const int total_k = ctx_len + DFLASH27B_DRAFT_BLOCK_SIZE;
+    if (total_k <= w.swa_window) {
+        return false;
+    }
+    for (int il = 0; il < w.n_layer; ++il) {
+        if (w.layers[il].is_swa) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void build_draft_swa_mask(std::vector<uint16_t> & out,
+                          int ctx_len,
+                          int q_len,
+                          int swa_window) {
+    static constexpr uint16_t F16_ZERO = 0x0000;
+    static constexpr uint16_t F16_NEG_INF = 0xFC00;
+
+    const int total_k = ctx_len + q_len;
+    out.assign((size_t)total_k * q_len, F16_NEG_INF);
+    for (int q = 0; q < q_len; ++q) {
+        const int abs_q = ctx_len + q;
+        const int min_k = std::max(0, abs_q - swa_window);
+        for (int k = min_k; k < total_k; ++k) {
+            out[(size_t)q * total_k + k] = F16_ZERO;
+        }
+    }
+}
 
 DraftGraphOutputs build_draft_graph(
     ggml_context *            ctx,
@@ -118,8 +154,36 @@ DraftGraphOutputs build_draft_graph(
         V = ggml_cont   (ctx, V);
 
         // ── 2f. Non-causal flash attention; GQA broadcast handled internally.
+        //   For SWA layers (Qwen3.6 draft): apply sliding window mask
+        //   limiting context K/V to the last `swa_window` positions.
         const float scale = 1.0f / std::sqrt((float)head_dim);
-        ggml_tensor * attn = ggml_flash_attn_ext(ctx, Q, K, V, /*mask=*/nullptr,
+        ggml_tensor * attn_mask = nullptr;
+        if (L.is_swa && w.swa_window > 0 && total_k > w.swa_window) {
+            if (!in.attn_mask) {
+                set_last_error("build_draft_graph: SWA layer requires a non-null attn_mask");
+                return {};
+            }
+            if (in.attn_mask->type != GGML_TYPE_F16) {
+                char buf[128];
+                std::snprintf(buf, sizeof(buf),
+                              "build_draft_graph: SWA attn_mask must be F16, got %s",
+                              ggml_type_name(in.attn_mask->type));
+                set_last_error(buf);
+                return {};
+            }
+            if (in.attn_mask->ne[0] < total_k || in.attn_mask->ne[1] < q_len) {
+                char buf[160];
+                std::snprintf(buf, sizeof(buf),
+                              "build_draft_graph: SWA attn_mask too small (%lld x %lld, need >= %d x %d)",
+                              (long long)in.attn_mask->ne[0],
+                              (long long)in.attn_mask->ne[1],
+                              total_k, q_len);
+                set_last_error(buf);
+                return {};
+            }
+            attn_mask = in.attn_mask;
+        }
+        ggml_tensor * attn = ggml_flash_attn_ext(ctx, Q, K, V, attn_mask,
                                                  scale, /*max_bias=*/0.0f,
                                                  /*logit_softcap=*/0.0f);
         // attn result: [n_embd_v=head_dim, n_head, n_batch=q_len, 1]

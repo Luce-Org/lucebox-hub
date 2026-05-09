@@ -85,6 +85,12 @@ int main(int argc, char ** argv) {
     ggml_tensor * target_hid  = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, fc_in, ctx_len, 1);
     ggml_tensor * pos_q       = ggml_new_tensor_1d(gctx, GGML_TYPE_I32,  q_len);
     ggml_tensor * pos_k       = ggml_new_tensor_1d(gctx, GGML_TYPE_I32,  ctx_len + q_len);
+    ggml_tensor * attn_mask   = nullptr;
+    if (draft_graph_needs_swa_mask(w, ctx_len)) {
+        attn_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, ctx_len + q_len, q_len);
+        ggml_set_name(attn_mask, "draft_swa_mask");
+        ggml_set_input(attn_mask);
+    }
     ggml_set_name(noise_embed, "noise_embed");
     ggml_set_name(target_hid,  "target_hidden_cat");
     ggml_set_name(pos_q,       "positions_q");
@@ -101,6 +107,7 @@ int main(int argc, char ** argv) {
     gi.target_hidden_cat = target_hid;
     gi.positions_q       = pos_q;
     gi.positions_k       = pos_k;
+    gi.attn_mask         = attn_mask;
 
     DraftGraphOutputs go = build_draft_graph(gctx, w, gi);
     if (!go.hidden_states) { std::fprintf(stderr, "build_draft_graph returned null\n"); return 1; }
@@ -140,6 +147,11 @@ int main(int argc, char ** argv) {
         std::vector<int32_t> pk(ctx_len + q_len);
         for (int i = 0; i < ctx_len + q_len; i++) pk[i] = i;
         ggml_backend_tensor_set(pos_k, pk.data(), 0, sizeof(int32_t) * pk.size());
+    }
+    if (attn_mask) {
+        std::vector<uint16_t> mask;
+        build_draft_swa_mask(mask, ctx_len, q_len, w.swa_window);
+        ggml_backend_tensor_set(attn_mask, mask.data(), 0, sizeof(uint16_t) * mask.size());
     }
 
     // ── 7. Compute
