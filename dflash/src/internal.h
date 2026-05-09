@@ -751,6 +751,14 @@ struct MtpDrafterWeights {
     ggml_tensor * pre_projection  = nullptr;  // [2*n_embd_backbone, n_embd]
     ggml_tensor * post_projection = nullptr;  // [n_embd, n_embd_backbone]
     ggml_tensor * output_norm     = nullptr;  // [n_embd]
+    // Token embedding (shared / tied LM head for the MTP assistant model).
+    // Used ONLY in the centroid-routed LM head (get_rows + mul_mat) and in
+    // the dense fallback. This is the MTP model's own embedding, NOT the
+    // target's tok_embd (which is used only for the step-1 input embedding).
+    // Loaded from "token_embd.weight" in the assistant GGUF.
+    // nullptr if absent (some stripped GGUFs omit it; dense path then uses
+    // target.tok_embd projected through h_post).
+    ggml_tensor * tok_embd        = nullptr;  // [n_embd, n_vocab]
     // Optional centroid head (Edge models only; nullptr for Dense 31B)
     ggml_tensor * centroids       = nullptr;  // [n_embd, n_centroids]
     ggml_tensor * token_ordering  = nullptr;  // [n_vocab] I32 invariant if present
@@ -779,6 +787,48 @@ bool load_gemma4_mtp_assistant(const std::string & gguf_path,
                                MtpDrafterWeights & out);
 
 void free_gemma4_mtp_assistant(MtpDrafterWeights & w);
+
+// ─── Gemma4 MTP step graph ────────────────────────────────────────────────────
+//
+// Build a single MTP step graph that maps:
+//   inputs:  in_tok      (i32 [1])               — last token id
+//            in_h_prev   (f32 [n_embd_backbone, 1]) — last target full-attn hidden
+//            in_pos      (i32 [1])               — absolute target position for RoPE
+//   outputs: out_logits  (f32 [n_vocab, 1])      — full vocab row
+//            out_h_post  (f32 [n_embd_backbone, 1]) — next h_prev
+//            out_argmax  (i32 [1])               — greedy token (in-graph argmax)
+//
+// Each MTP layer reads target K/V from w.layers[il].donor_target_layer
+// (resolved at load time). V always read from cache (attention_k_eq_v quirk).
+// KV mask is nullptr: all committed positions ≤ attn_pos are uniformly admitted.
+//
+// attn_pos is the number of committed target tokens (cache.cur_pos at call time).
+// The caller passes it separately because the graph is rebuilt per-step in the
+// chained γ loop (attn_pos is constant across steps, pos advances per step).
+struct MtpStepGraph {
+    ggml_context * ctx        = nullptr;
+    ggml_cgraph  * gf         = nullptr;
+    // Inputs (caller sets via ggml_backend_tensor_set before each step)
+    ggml_tensor  * in_tok     = nullptr;
+    ggml_tensor  * in_h_prev  = nullptr;
+    ggml_tensor  * in_pos     = nullptr;
+    // Outputs (caller reads via ggml_backend_tensor_get after compute)
+    ggml_tensor  * out_logits = nullptr;
+    ggml_tensor  * out_h_post = nullptr;
+    ggml_tensor  * out_argmax = nullptr;
+};
+
+// Build the MTP step graph. attn_pos = cache.cur_pos at submit time.
+// Returns false and sets last_error on failure.
+bool build_mtp_step_graph(const MtpDrafterWeights  & w,
+                          const GemmaTargetCache   & target_cache,
+                          const GemmaTargetWeights & target,
+                          MtpStepGraph             & out,
+                          int                        attn_pos);
+
+// Free the ggml context owned by the graph (tensors only; backend buffers
+// for KV views are owned by target_cache and must not be freed here).
+void free_mtp_step_graph(MtpStepGraph & g);
 
 // Load Gemma4 DFlash draft weights from a directory containing safetensors shards.
 bool load_gemma4_draft_safetensors(const std::string & dir_path,

@@ -116,6 +116,7 @@ add_library(dflash27b STATIC
     src/qwen3_drafter.cpp
     src/gemma4_target_loader.cpp
     src/gemma4_target_graph.cpp
+    src/gemma4_mtp_graph.cpp
     src/gemma4_dflash_graph.cpp
     src/qwen3_0p6b_loader.cpp
     src/qwen3_0p6b_graph.cpp
@@ -413,5 +414,13 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_mtp_loader PRIVATE dflash27b ggml ggml-cuda)
         find_package(CUDAToolkit REQUIRED)
         target_link_libraries(test_mtp_loader PRIVATE CUDA::cudart)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_mtp_graph_shapes.cpp")
+        add_executable(test_mtp_graph_shapes test/test_mtp_graph_shapes.cpp)
+        target_include_directories(test_mtp_graph_shapes PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(test_mtp_graph_shapes PRIVATE dflash27b ggml ggml-cuda)
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(test_mtp_graph_shapes PRIVATE CUDA::cudart)
     endif()
 endif()

@@ -882,6 +882,10 @@ bool load_gemma4_mtp_assistant(const std::string & gguf_path,
     ggml_tensor * pre_proj   = g("mtp.pre_projection.weight");
     ggml_tensor * post_proj  = g("mtp.post_projection.weight");
     ggml_tensor * out_norm   = g("output_norm.weight");
+    // Token embedding (tied LM head for the MTP model). Used by the centroid
+    // LM head for get_rows(tok_embd, candidate_ids) → mul_mat(·, h_inner).
+    // Optional: absent in stripped GGUFs; graph falls back gracefully.
+    ggml_tensor * tok_embd_t = g("token_embd.weight");
 
     if (!pre_proj || !post_proj || !out_norm) {
         char buf[256];
@@ -1052,6 +1056,7 @@ bool load_gemma4_mtp_assistant(const std::string & gguf_path,
     out.pre_projection      = pre_proj;
     out.post_projection     = post_proj;
     out.output_norm         = out_norm;
+    out.tok_embd            = tok_embd_t;
     out.centroids           = centroids_t;
     out.token_ordering      = token_ordering_t;
     out.layers              = std::move(mtp_layers);
@@ -1089,6 +1094,7 @@ void free_gemma4_mtp_assistant(MtpDrafterWeights & w) {
     w.pre_projection    = nullptr;
     w.post_projection   = nullptr;
     w.output_norm       = nullptr;
+    w.tok_embd          = nullptr;
     w.centroids         = nullptr;
     w.token_ordering    = nullptr;
     w = MtpDrafterWeights{};
