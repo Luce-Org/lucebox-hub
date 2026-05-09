@@ -211,21 +211,13 @@ static ggml_tensor * build_moe_ffn(ggml_context * ctx,
 SwaView compute_swa_view(int kv_start, int n_tokens,
                           int swa_window, int swa_ctx_alloc)
 {
-    const int ring_size = swa_ctx_alloc;
-    const int abs_win_start = (swa_window > 0 && kv_start > swa_window)
-                              ? (kv_start - swa_window) : 0;
-    const int ring_write_pos = kv_start % ring_size;
-    const int kv_len         = kv_start + n_tokens;
-    const int win_len_abs    = kv_len - abs_win_start;
-    const int win_len        = std::min(win_len_abs, ring_size);
-    const int ring_win_start = ((ring_write_pos - (win_len - n_tokens)) % ring_size
-                                 + ring_size) % ring_size;
-    const int effective_win_len = (ring_win_start + win_len <= ring_size)
-                                  ? win_len : (ring_size - ring_win_start);
     SwaView v;
-    v.abs_win_start    = abs_win_start;
-    v.effective_win_len = effective_win_len;
-    v.ring_win_start   = ring_win_start;
+    v.abs_win_start    = (swa_window > 0 && kv_start > swa_window)
+                          ? (kv_start - swa_window) : 0;
+    // K view is ALWAYS the full ring; the host-built mask handles the
+    // non-monotonic ring layout via abs_pos(slot) computation.
+    v.effective_win_len = swa_ctx_alloc;
+    v.ring_win_start    = 0;
     return v;
 }
 
@@ -293,64 +285,74 @@ static ggml_tensor * build_swa_attn_block(
     // so the tensor is never exceeded.
     const int ring_size = cache_k ? (int)cache_k->ne[1] : (kv_start + n_tokens);
 
-    // Write K/V into cache using ring-buffer position
+    // Write K/V into cache using ring-buffer position.
+    // Split-on-wrap: when write_pos + n_tokens > ring_size the chunk straddles
+    // the ring boundary, so we issue two ggml_cpy ops (pre-wrap and post-wrap).
     if (write_kv && cache_k && cache_v && Kcur && Vcur) {
         ggml_tensor * Kcur_T = ggml_permute(ctx, Kcur, 0, 2, 1, 3);
         ggml_tensor * Vcur_T = ggml_permute(ctx, Vcur, 0, 2, 1, 3);
 
         const int write_pos = kv_start % ring_size;
-        ggml_tensor * k_slot = ggml_view_3d(ctx, cache_k,
-            head_dim, n_tokens, n_head_kv,
-            cache_k->nb[1], cache_k->nb[2],
-            cache_k->nb[1] * write_pos);
-        ggml_tensor * v_slot = ggml_view_3d(ctx, cache_v,
-            head_dim, n_tokens, n_head_kv,
-            cache_v->nb[1], cache_v->nb[2],
-            cache_v->nb[1] * write_pos);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_T, k_slot));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_T, v_slot));
-    }
+        const int pre_n  = std::min(n_tokens, ring_size - write_pos);
+        const int post_n = n_tokens - pre_n;
 
-    // Determine window for SWA reads using the shared geometry helper.
-    // This ensures the K/V view and the host-side causal mask always agree.
-    const SwaView swa_view = compute_swa_view(kv_start, n_tokens,
-                                               w.swa_window, ring_size);
-    const int effective_win_len = swa_view.effective_win_len;
-    int ring_win_start          = swa_view.ring_win_start;  // mutable: may be snapped for alignment
+        // First slice: [write_pos .. write_pos+pre_n)
+        {
+            ggml_tensor * k_slot = ggml_view_3d(ctx, cache_k,
+                head_dim, pre_n, n_head_kv,
+                cache_k->nb[1], cache_k->nb[2],
+                cache_k->nb[1] * write_pos);
+            ggml_tensor * v_slot = ggml_view_3d(ctx, cache_v,
+                head_dim, pre_n, n_head_kv,
+                cache_v->nb[1], cache_v->nb[2],
+                cache_v->nb[1] * write_pos);
+            ggml_tensor * k_src = ggml_view_3d(ctx, Kcur_T,
+                head_dim, pre_n, n_head_kv,
+                Kcur_T->nb[1], Kcur_T->nb[2], 0);
+            ggml_tensor * v_src = ggml_view_3d(ctx, Vcur_T,
+                head_dim, pre_n, n_head_kv,
+                Vcur_T->nb[1], Vcur_T->nb[2], 0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, k_src, k_slot));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, v_src, v_slot));
+        }
 
-    const bool need_256_pad = (kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0
-                               || head_dim >= 512);
-    const int fattn_stride = need_256_pad ? 256 : 1;
-    int win_len_padded = ((effective_win_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
-
-    // For TQ3_0 / head_dim>=512, CUDA FA requires win_len_padded to be a
-    // multiple of 256 (FATTN_KQ_STRIDE). When the ring wraps, the natural
-    // max_view_len = ring_size - ring_win_start may not be a multiple of 256,
-    // so clamping win_len_padded down to it breaks alignment and segfaults.
-    // Fix: snap ring_win_start DOWN to the nearest 256-multiple so the view
-    // length stays aligned. The attention mask already marks extra tokens as
-    // -inf, so reading a few extra padding slots is harmless.
-    if (fattn_stride == 256 && ring_win_start % 256 != 0) {
-        const int aligned_start  = (ring_win_start / 256) * 256;
-        const int new_max_view   = ring_size - aligned_start;
-        if (new_max_view >= win_len_padded) {
-            // Aligned start gives enough room — use it.
-            ring_win_start = aligned_start;
-        } else {
-            // Even the aligned start is too tight; fall back to reading from
-            // the beginning of the ring. ring_size is a multiple of 256 (it is
-            // allocated that way in swa_ctx_alloc), so this always satisfies
-            // alignment and win_len_padded <= ring_size is guaranteed.
-            ring_win_start = 0;
+        // Second slice (wrap-around): [0 .. post_n)
+        if (post_n > 0) {
+            ggml_tensor * k_slot = ggml_view_3d(ctx, cache_k,
+                head_dim, post_n, n_head_kv,
+                cache_k->nb[1], cache_k->nb[2],
+                0);
+            ggml_tensor * v_slot = ggml_view_3d(ctx, cache_v,
+                head_dim, post_n, n_head_kv,
+                cache_v->nb[1], cache_v->nb[2],
+                0);
+            ggml_tensor * k_src = ggml_view_3d(ctx, Kcur_T,
+                head_dim, post_n, n_head_kv,
+                Kcur_T->nb[1], Kcur_T->nb[2],
+                Kcur_T->nb[1] * pre_n);
+            ggml_tensor * v_src = ggml_view_3d(ctx, Vcur_T,
+                head_dim, post_n, n_head_kv,
+                Vcur_T->nb[1], Vcur_T->nb[2],
+                Vcur_T->nb[1] * pre_n);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, k_src, k_slot));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, v_src, v_slot));
         }
     }
 
-    // Clamp padded length to tensor boundary (should be a no-op after the
-    // alignment snap above, but kept as a safety net).
-    const int max_view_len = ring_size - ring_win_start;
-    if (win_len_padded > max_view_len) {
-        win_len_padded = max_view_len;
-    }
+    // Determine window for SWA reads using the shared geometry helper.
+    // ring_win_start is always 0 (full-ring read); correctness comes from the
+    // host-built mask which uses abs_pos(slot) arithmetic for ring geometry.
+    const SwaView swa_view = compute_swa_view(kv_start, n_tokens,
+                                               w.swa_window, ring_size);
+    const int effective_win_len = swa_view.effective_win_len;
+    const int ring_win_start    = swa_view.ring_win_start;  // always 0
+
+    // swa_ctx_alloc is already aligned to fattn_stride (set in create_gemma4_cache),
+    // so win_len_padded == effective_win_len == ring_size. No further snap needed.
+    const bool need_256_pad = (kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0
+                               || head_dim >= 512);
+    const int fattn_stride = need_256_pad ? 256 : 1;
+    const int win_len_padded = ((effective_win_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
 
     ggml_tensor * Qfa = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
     Qfa = ggml_cont(ctx, Qfa);
@@ -548,11 +550,14 @@ bool create_gemma4_cache(const GemmaTargetWeights & w,
     const int swa_window_padded = (w.swa_window > 0)
         ? ((w.swa_window + align_stride - 1) / align_stride) * align_stride
         : max_ctx_alloc;
-    // Disable SWA ring optimization: ring-wrap during multi-chunk prefill
-    // silently truncates the K view to the pre-wrap segment, breaking correctness.
-    // Allocate full max_ctx_alloc so SWA layers behave like full-attn layers
-    // during prefill. (TODO: implement double-view SWA reads for VRAM savings.)
-    const int swa_ctx_alloc = max_ctx_alloc;
+    // Ring sized to hold last R = 2*swa_window keys (= 2 chunks worth, since
+    // chunk_size <= swa_window). Combined with a non-monotonic mask in the
+    // test driver's build_swa_causal_mask, this lets the K view be the full
+    // ring while correctness comes from the mask filtering by abs_pos.
+    const int swa_ring_target = 2 * swa_window_padded;
+    const int swa_ctx_alloc = (w.swa_window > 0)
+        ? std::min(max_ctx_alloc, swa_ring_target)
+        : max_ctx_alloc;
     out.swa_ctx_alloc = swa_ctx_alloc;
 
     // Build layer -> KV index mappings.

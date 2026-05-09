@@ -182,30 +182,33 @@ static void build_causal_mask(std::vector<uint16_t> & out,
 
 // ─── SWA causal mask builder (for chunked batched prefill) ───────────────────
 //
-// Mask is in VIEW-RELATIVE coordinates matching the K view that build_gemma4_graph
-// passes to FA.  The K view starts at abs_win_start in absolute token space;
-// k_view=0 corresponds to absolute position abs_win_start.
+// Non-monotonic ring mask.  The K view is always the full ring (ring_size slots,
+// ring_win_start==0).  Slot k_view maps to absolute position via:
+//   latest_slot = (kv_end - 1) % ring_size
+//   offset_back = (latest_slot - k_view + ring_size) % ring_size
+//   abs_k       = (kv_end - 1) - offset_back
 //
 // mask[q_idx][k_view_idx] = 0 (attend) iff:
-//   abs_k = abs_win_start + k_view_idx
-//   abs_q = kv_start + q_idx
-//   abs_k >= (abs_q - swa_window + 1) AND abs_k <= abs_q
+//   abs_k >= (abs_q - swa_window + 1) AND abs_k <= abs_q AND abs_k >= 0
 // else -inf.
 static void build_swa_causal_mask(std::vector<uint16_t> & out,
-                                   int abs_win_start,  // absolute pos of view slot 0
-                                   int win_len,        // effective_win_len
-                                   int n_tokens,
                                    int kv_start,
-                                   int swa_window) {
-    const int kv_pad = align_up(win_len, g_kq_stride_pad);
+                                   int n_tokens,
+                                   int swa_window,
+                                   int ring_size,    // = swa_view.effective_win_len = swa_ctx_alloc
+                                   int kv_end) {     // = kv_start + n_tokens
+    const int kv_pad = align_up(ring_size, g_kq_stride_pad);
     const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
     out.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
+    const int latest_slot = ((kv_end - 1) % ring_size + ring_size) % ring_size;
     for (int q = 0; q < n_tokens; q++) {
-        const int abs_q  = kv_start + q;
-        const int lo_abs = std::max(0, abs_q - swa_window + 1);
-        for (int k_view = 0; k_view < win_len; k_view++) {
-            const int abs_k = abs_win_start + k_view;
-            if (abs_k >= lo_abs && abs_k <= abs_q) {
+        const int abs_q = kv_start + q;
+        const int q_lo  = std::max(0, abs_q - swa_window + 1);
+        for (int k_view = 0; k_view < ring_size; k_view++) {
+            const int offset_back = (latest_slot - k_view + ring_size) % ring_size;
+            const int abs_k       = (kv_end - 1) - offset_back;
+            const bool valid = (abs_k >= q_lo && abs_k <= abs_q && abs_k >= 0);
+            if (valid) {
                 out[(size_t)q * kv_pad + k_view] = F16_ZERO;
             }
         }
@@ -1024,9 +1027,12 @@ int main(int argc, char ** argv) {
                         const SwaView swa_view = compute_swa_view(cs, chunk_n,
                                                                     swa_window, cache.swa_ctx_alloc);
                         std::vector<uint16_t> swa_buf;
-                        build_swa_causal_mask(swa_buf, swa_view.abs_win_start,
-                                              swa_view.effective_win_len,
-                                              chunk_n, cs, swa_window);
+                        build_swa_causal_mask(swa_buf,
+                                              /*kv_start*/ cs,
+                                              /*n_tokens*/ chunk_n,
+                                              /*swa_window*/ swa_window,
+                                              /*ring_size*/ swa_view.effective_win_len,
+                                              /*kv_end*/ cs + chunk_n);
                         ggml_backend_tensor_set(sg.swa_mask, swa_buf.data(), 0,
                                                 sizeof(uint16_t) * swa_buf.size());
                     }
@@ -1336,9 +1342,12 @@ int main(int argc, char ** argv) {
                         const SwaView swa_view = compute_swa_view(cs, chunk_n,
                                                                     swa_window, cache.swa_ctx_alloc);
                         std::vector<uint16_t> swa_buf;
-                        build_swa_causal_mask(swa_buf, swa_view.abs_win_start,
-                                              swa_view.effective_win_len,
-                                              chunk_n, cs, swa_window);
+                        build_swa_causal_mask(swa_buf,
+                                              /*kv_start*/ cs,
+                                              /*n_tokens*/ chunk_n,
+                                              /*swa_window*/ swa_window,
+                                              /*ring_size*/ swa_view.effective_win_len,
+                                              /*kv_end*/ cs + chunk_n);
                         ggml_backend_tensor_set(sg.swa_mask, swa_buf.data(), 0,
                                                 sizeof(uint16_t) * swa_buf.size());
                     }
@@ -1772,9 +1781,12 @@ int main(int argc, char ** argv) {
                     const SwaView swa_view = compute_swa_view(committed, q_len,
                                                                w.swa_window, cache.swa_ctx_alloc);
                     std::vector<uint16_t> swa_buf;
-                    build_swa_causal_mask(swa_buf, swa_view.abs_win_start,
-                                          swa_view.effective_win_len,
-                                          q_len, committed, w.swa_window);
+                    build_swa_causal_mask(swa_buf,
+                                          /*kv_start*/ committed,
+                                          /*n_tokens*/ q_len,
+                                          /*swa_window*/ w.swa_window,
+                                          /*ring_size*/ swa_view.effective_win_len,
+                                          /*kv_end*/ committed + q_len);
                     ggml_backend_tensor_set(sg.swa_mask, swa_buf.data(), 0,
                                             sizeof(uint16_t) * swa_buf.size());
                 }
