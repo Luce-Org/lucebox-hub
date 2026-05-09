@@ -2154,6 +2154,23 @@ int main(int argc, char ** argv) {
                     ggml_backend_tensor_set(mtp_g.in_pos, &p, 0, sizeof(int32_t));
                 }
 
+                // Pre-compute: check input values (inputs are valid in gallocr buffer before compute)
+                if (mtp_steps <= 1) {
+                    if (mtp_g.in_tok_embd) {
+                        std::vector<float> te(8);
+                        ggml_backend_tensor_get(mtp_g.in_tok_embd, te.data(), 0, sizeof(float)*8);
+                        std::printf("[mtp-pre] tok_embd: %.3f %.3f %.3f %.3f tok=%d\n",
+                                    te[0],te[1],te[2],te[3], cur_tok);
+                    }
+                    if (mtp_g.in_h_prev) {
+                        std::vector<float> hp(8);
+                        ggml_backend_tensor_get(mtp_g.in_h_prev, hp.data(), 0, sizeof(float)*8);
+                        std::printf("[mtp-pre] h_prev: %.3f %.3f %.3f %.3f\n",
+                                    hp[0],hp[1],hp[2],hp[3]);
+                    }
+                    std::fflush(stdout);
+                }
+
                 {
                     auto st = ggml_backend_graph_compute(backend, mtp_g.gf);
                     if (st != GGML_STATUS_SUCCESS) {
@@ -2166,6 +2183,20 @@ int main(int argc, char ** argv) {
                 // Read draft token from in-graph argmax
                 int32_t draft_tok = -1;
                 ggml_backend_tensor_get(mtp_g.out_argmax, &draft_tok, 0, sizeof(int32_t));
+                // Debug: check logits and h_post for NaN/inf (read AFTER compute)
+                if (mtp_steps <= 2 && mtp_g.out_logits) {
+                    std::vector<float> lv(8);
+                    ggml_backend_tensor_get(mtp_g.out_logits, lv.data(), 0, sizeof(float)*8);
+                    std::printf("[mtp-logits] first8: %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f  argmax=%d\n",
+                                lv[0],lv[1],lv[2],lv[3],lv[4],lv[5],lv[6],lv[7], draft_tok);
+                    if (mtp_g.out_h_post) {
+                        std::vector<float> hv(8);
+                        ggml_backend_tensor_get(mtp_g.out_h_post, hv.data(), 0, sizeof(float)*8);
+                        std::printf("[mtp-hpost] first8: %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f\n",
+                                    hv[0],hv[1],hv[2],hv[3],hv[4],hv[5],hv[6],hv[7]);
+                    }
+                    std::fflush(stdout);
+                }
 
                 ggml_gallocr_free(mtp_alloc);
 
@@ -2182,6 +2213,12 @@ int main(int argc, char ** argv) {
                 mtp_steps++;
 
                 // ── 4+5. Check if draft matches target's greedy token ───
+                if (mtp_steps <= 8) {
+                    std::printf("[mtp-dbg] step=%d draft=%d target=%d %s\n",
+                                mtp_steps, draft_tok, target_next,
+                                draft_tok == target_next ? "MATCH" : "miss");
+                    std::fflush(stdout);
+                }
                 if (draft_tok == target_next) {
                     // MTP was right: accept draft token as next cur_tok
                     mtp_accepted++;

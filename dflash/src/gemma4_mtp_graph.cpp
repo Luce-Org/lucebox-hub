@@ -117,10 +117,10 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
     }
 
     // ── Allocate ggml context ─────────────────────────────────────────────────
-    // Conservative tensor overhead: 3 inputs + ~70 ops per layer + outputs.
-    // Extras vs original: Kview_f32 cast(1) + Vview_f32 cast(1) + kv_ref/vv_ref GQA(2) +
-    //   Qcur permute+cont(2) + Vt cont_4d+permute(2) = ~10 extra per layer.
-    const size_t n_tensors_est = (size_t)(3 + n_layer * 70 + 20);
+    // Conservative tensor overhead: 3 inputs + ~80 ops per layer + outputs.
+    // Extras vs original: K/V casts, GQA block-broadcast views/materialization,
+    // Q permute/cont, explicit KQ mask, Vt materialization.
+    const size_t n_tensors_est = (size_t)(3 + n_layer * 80 + 20);
     ggml_init_params ip{};
     ip.mem_size   = n_tensors_est * ggml_tensor_overhead() + 1024 * 1024;
     ip.mem_buffer = nullptr;
@@ -298,23 +298,71 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
         // When head_dim_norm == head_dim_fa this is a no-op reshape.
         Qcur = ggml_reshape_3d(ctx, Qcur, head_dim_fa, n_head_fa, 1);
 
-        // K/V view: view [0, attn_pos) from the target KV cache.
-        // cache_k: [head_dim_kv, max_ctx, n_head_kv]
-        // We view attn_pos slots starting at offset 0.
-        // For SWA layers, attn_pos may exceed the ring buffer (swa_ctx_alloc).
-        // Clip to actual cache size — only committed positions exist.
-        const int64_t kv_seq_len = std::min((int64_t)attn_pos, cache_k->ne[1]);
+        // K/V view from the target KV cache.
+        // Full-attention donors read [0, attn_pos). SWA donors use a ring buffer:
+        // slice only the keys admitted by atomicbot's STANDARD SWA mask for an MTP
+        // query at pos=attn_pos, then the remaining mask is an all-zero bias.
+        int64_t kv_seq_len = (int64_t)attn_pos;
+        int64_t kv_start_slot = 0;
+        bool kv_wraps = false;
+        int64_t kv_first_len = 0;
+        if (is_swa) {
+            const int64_t ring_len = std::min(cache_k->ne[1], cache_v->ne[1]);
+            const int64_t swa_prev = target.swa_window > 0
+                ? std::max<int64_t>((int64_t)target.swa_window - 1, 0) : ring_len;
+            kv_seq_len = std::min<int64_t>((int64_t)attn_pos, std::min(swa_prev, ring_len));
+            if (kv_seq_len > 0) {
+                const int64_t first_abs = (int64_t)attn_pos - kv_seq_len;
+                kv_start_slot = first_abs % ring_len;
+                const int64_t kv_end_slot = kv_start_slot + kv_seq_len;
+                kv_wraps = kv_end_slot > ring_len;
+                kv_first_len = kv_wraps ? (ring_len - kv_start_slot) : kv_seq_len;
+            }
+        } else if ((int64_t)attn_pos > cache_k->ne[1] || (int64_t)attn_pos > cache_v->ne[1]) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                "build_mtp_step_graph: attn_pos %d exceeds donor KV cache length (K=%lld V=%lld) for MTP layer %d",
+                attn_pos, (long long)cache_k->ne[1], (long long)cache_v->ne[1], il);
+            set_last_error(buf);
+            ggml_free(ctx);
+            return false;
+        }
         // Pad to 1 minimum to avoid zero-size tensors when attn_pos==0.
         const int64_t kv_view_len = std::max(kv_seq_len, (int64_t)1);
 
-        ggml_tensor * Kview = ggml_view_3d(ctx, cache_k,
-            head_dim_kv, kv_view_len, n_head_kv,
-            cache_k->nb[1], cache_k->nb[2],
-            /*offset=*/0);
-        ggml_tensor * Vview = ggml_view_3d(ctx, cache_v,
-            head_dim_kv, kv_view_len, n_head_kv,
-            cache_v->nb[1], cache_v->nb[2],
-            /*offset=*/0);
+        auto view_kv = [&](ggml_tensor * cache, int64_t start, int64_t len) {
+            return ggml_view_3d(ctx, cache,
+                head_dim_kv, len, n_head_kv,
+                cache->nb[1], cache->nb[2],
+                cache->nb[1] * (size_t)start);
+        };
+
+        ggml_tensor * Kview = nullptr;
+        ggml_tensor * Vview = nullptr;
+        if (kv_wraps) {
+            // ggml_concat on CUDA requires F32 src. Direct TQ3_0→F32 is unsupported
+            // by cpy.cu (it only does TQ3_0→F16 and F16↔F32). So go via F16 first
+            // when the cache is TQ3, else cast directly.
+            auto to_f32 = [&](ggml_tensor * v) {
+                if (v->type == GGML_TYPE_TQ3_0) {
+                    v = ggml_cast(ctx, v, GGML_TYPE_F16);
+                }
+                if (v->type != GGML_TYPE_F32) {
+                    v = ggml_cast(ctx, v, GGML_TYPE_F32);
+                }
+                return v;
+            };
+            const int64_t kv_second_len = kv_view_len - kv_first_len;
+            ggml_tensor * k1 = to_f32(view_kv(cache_k, kv_start_slot, kv_first_len));
+            ggml_tensor * k2 = to_f32(view_kv(cache_k, 0,             kv_second_len));
+            ggml_tensor * v1 = to_f32(view_kv(cache_v, kv_start_slot, kv_first_len));
+            ggml_tensor * v2 = to_f32(view_kv(cache_v, 0,             kv_second_len));
+            Kview = ggml_concat(ctx, k1, k2, 1);
+            Vview = ggml_concat(ctx, v1, v2, 1);
+        } else {
+            Kview = view_kv(cache_k, kv_start_slot, kv_view_len);
+            Vview = view_kv(cache_v, kv_start_slot, kv_view_len);
+        }
         {
             char name[64]; std::snprintf(name, sizeof(name), "mtp_Kview_%d", il);
             ggml_set_name(Kview, name);
@@ -340,8 +388,9 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
             ggml_set_name(Vview_fp, name);
         }
 
-        // GQA broadcast: repeat K/V heads so n_kv_heads == n_head_fa.
-        // Use the same float type (F16 for TQ3_0, F32 for Q8_0/others).
+        // GQA broadcast: repeat KV heads so n_kv_heads matches n_head_fa.
+        // ggml_repeat broadcasts with modulo indexing (0,1,...,Hkv-1,0,1,...),
+        // matching standard GQA implementations (PyTorch repeat_interleave).
         ggml_tensor * Kma = Kview_fp;
         ggml_tensor * Vma = Vview_fp;
         if (n_head_kv != n_head_fa) {
@@ -359,7 +408,8 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
             ggml_set_name(Vma, name);
         }
 
-        // Manual cross-attention (no causal mask: all KV positions < attn_pos admitted).
+        // Manual cross-attention. K/V has already been sliced to the positions
+        // admitted by the donor attention type.
         //
         // ggml mul_mat(A, B) broadcast rule:  B.ne[2] % A.ne[2] == 0.
         // K (A) has ne[2]=n_head_fa; Q (B) must have ne[2]=n_head_fa too.
@@ -398,7 +448,9 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
             ggml_set_name(KQ, name);
         }
 
-        // Step 3: softmax over KV sequence dimension (axis 0 = ctx_len)
+        // Step 3: softmax over KV sequence dimension (axis 0 = ctx_len).
+        // All cells in the KV view are admitted (slice already handles SWA/full window),
+        // so plain softmax with no mask is equivalent to softmax_ext with all-zero mask.
         // KQ: [ctx, 1, n_h] — softmax over dim 0
         ggml_tensor * KQ_soft = ggml_soft_max(ctx, KQ);
         {
