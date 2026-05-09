@@ -465,15 +465,20 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
             }
         }
 
-        // For head_dim==512 with TQ3_0 K: gqa_opt_applies requires K->ne[1] % 256 == 0
-        // AND mask != nullptr (both needed for BEST_FATTN_KERNEL to not return NONE).
-        // We padded K/V to kv_view_len_padded above; now create a mask of that width.
+        // For head_dim==512 (any K type): the MMA dispatcher requires
+        // gqa_opt_applies, which requires BOTH K->ne[1] % 256 == 0 AND
+        // mask != nullptr. Without mask, BEST_FATTN_KERNEL_NONE → abort
+        // even when K is properly aligned. Always provide the mask.
+        // We padded K/V to kv_view_len_padded above when needs_kv_pad is true;
+        // when not padding, mask width == kv_view_len (all positions admitted).
         // The caller fills: positions [0..kv_seq_len-1] = 0.0 (admit),
-        //                   positions [kv_seq_len..kv_view_len_padded-1] = -inf (exclude padding).
+        //                   positions [kv_seq_len..mask_width-1] = -inf (exclude padding).
         //
-        // For head_dim==256 (SWA) with TQ3_0 K (non-wrap): VEC kernel handles it without mask.
+        // For head_dim==256 (SWA) with TQ3_0 K (non-wrap): VEC kernel handles it
+        // without mask UNLESS needs_kv_pad triggers (KV unaligned); then mask is
+        // needed to exclude the padding tail.
         // For wrap case (F32 K/V after concat): no TQ3_0 issues, no mask needed.
-        const bool need_mask = (kv_is_tq3 && head_dim_fa >= 512) || needs_kv_pad;
+        const bool need_mask = head_dim_fa >= 512 || needs_kv_pad;
         const int64_t fa_mask_width = (needs_kv_pad ? kv_view_len_padded : kv_view_len);
         ggml_tensor * fa_mask = nullptr;
         if (need_mask) {
