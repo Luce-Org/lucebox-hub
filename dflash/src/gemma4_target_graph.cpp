@@ -1044,35 +1044,34 @@ GemmaGraphOutputs build_gemma4_graph(
             }
         }
 
-        // ── m) MTP h_prev capture (last full-attention layer, last token) ─────────
-        if (cache.mtp_h_prev_enabled && cache.mtp_h_prev &&
-            il == cache.mtp_last_full_layer) {
-            // Capture the last token's hidden state (post-block, post-FFN).
-            // For decode n_tokens==1 this is trivially the whole cur tensor.
-            // For prefill we slice the last-token column.
-            const int n_embd = (int)cache.mtp_h_prev->ne[0];
-            ggml_tensor * h_last = cur;
-            if (n_tokens > 1) {
-                h_last = ggml_view_2d(ctx, cur,
-                    n_embd, 1,
-                    ggml_row_size(cur->type, n_embd),
-                    ggml_row_size(cur->type, n_embd) * (n_tokens - 1));
-            }
-            // Cast to f32 if needed (cur is typically f32 in this graph)
-            if (h_last->type != GGML_TYPE_F32) {
-                h_last = ggml_cast(ctx, h_last, GGML_TYPE_F32);
-            }
-            // Reshape to [n_embd, 1] to match mtp_h_prev shape
-            h_last = ggml_reshape_2d(ctx, h_last, n_embd, 1);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, h_last, cache.mtp_h_prev));
-        }
-
         // ── l) Advance residual stream ──────────────────────────────────────────
         inpL = cur;
     }
 
     // ── Final norm ─────────────────────────────────────────────────────────────
     ggml_tensor * out = rms_norm_mul(ctx, inpL, w.out_norm, EPS);
+
+    // ── MTP h_prev capture (post-output-norm, last token) ──────────────────────
+    // h_prev must be the backbone hidden AFTER final RMSNorm — the same vector
+    // fed to lm_head — so the MTP draft head sees the same representation as
+    // the target's token prediction.  Capturing inside the layer loop (pre-norm)
+    // caused accept_rate=0 because the draft head was trained on post-norm hiddens.
+    // Source: vLLM PR #41745:569-621 + llama.cpp #22738.
+    if (cache.mtp_h_prev_enabled && cache.mtp_h_prev) {
+        const int n_embd_hp = (int)cache.mtp_h_prev->ne[0];
+        ggml_tensor * h_prev_src = out;
+        if (n_tokens > 1) {
+            h_prev_src = ggml_view_2d(ctx, out,
+                n_embd_hp, 1,
+                ggml_row_size(out->type, n_embd_hp),
+                ggml_row_size(out->type, n_embd_hp) * (n_tokens - 1));
+        }
+        if (h_prev_src->type != GGML_TYPE_F32) {
+            h_prev_src = ggml_cast(ctx, h_prev_src, GGML_TYPE_F32);
+        }
+        h_prev_src = ggml_reshape_2d(ctx, h_prev_src, n_embd_hp, 1);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, h_prev_src, cache.mtp_h_prev));
+    }
 
     // ── last_token_logits_only: slice to the final token before lm_head ────────
     // During chunked prefill we only need the last token's logits to seed decode.

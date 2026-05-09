@@ -447,6 +447,12 @@ bool load_gemma4_target_gguf(const std::string & path,
         }
     }
 
+    // Load global rope_freqs tensor (full-attention layers use this for proportional RoPE).
+    // Gemma4 stores one shared rope_freqs.weight (not per-layer blk.{i}.rope_freqs.weight).
+    // All full-attention layers share this single tensor, matching llama.cpp's TENSOR_DUPLICATED
+    // pattern (llama-model.cpp:4657-4658).
+    ggml_tensor * global_rope_freqs = g("rope_freqs.weight");
+
     // Per-layer tensors.
     out.layers.assign((size_t)n_layer, GemmaTargetLayer{});
 
@@ -498,6 +504,13 @@ bool load_gemma4_target_gguf(const std::string & path,
 
         // Optional per-layer tensors
         L.rope_freqs = fnd("rope_freqs.weight");
+        // Full-attention layers use proportional RoPE via rope_freqs (freq_factors).
+        // Gemma4 stores a single global rope_freqs.weight (no per-layer blk.{i} variant).
+        // Fall back to the global tensor for full-attention layers when the per-layer
+        // variant is absent (which is always the case for this GGUF format).
+        if (!L.rope_freqs && !swa_layers[(size_t)il] && global_rope_freqs) {
+            L.rope_freqs = global_rope_freqs;
+        }
         // This GGUF uses "layer_output_scale.weight"; fall back to legacy name
         L.out_scale  = fnd("layer_output_scale.weight");
         if (!L.out_scale) L.out_scale = fnd("out_scale.weight");
@@ -886,6 +899,10 @@ bool load_gemma4_mtp_assistant(const std::string & gguf_path,
     // LM head for get_rows(tok_embd, candidate_ids) → mul_mat(·, h_inner).
     // Optional: absent in stripped GGUFs; graph falls back gracefully.
     ggml_tensor * tok_embd_t = g("token_embd.weight");
+    // Assistant's own RoPE per-dim freq factors (top-level tensor, used for
+    // proportional RoPE on the full-attn MTP layer's Q rotation). The assistant
+    // was trained with ITS OWN rope_freqs which may differ from target's.
+    ggml_tensor * rope_freqs_t = g("rope_freqs.weight");
 
     if (!pre_proj || !post_proj || !out_norm) {
         char buf[256];
@@ -1057,6 +1074,7 @@ bool load_gemma4_mtp_assistant(const std::string & gguf_path,
     out.post_projection     = post_proj;
     out.output_norm         = out_norm;
     out.tok_embd            = tok_embd_t;
+    out.rope_freqs          = rope_freqs_t;
     out.centroids           = centroids_t;
     out.token_ordering      = token_ordering_t;
     out.layers              = std::move(mtp_layers);

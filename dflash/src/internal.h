@@ -769,6 +769,10 @@ struct MtpDrafterWeights {
     // nullptr if absent (some stripped GGUFs omit it; dense path then uses
     // target.tok_embd projected through h_post).
     ggml_tensor * tok_embd        = nullptr;  // [n_embd, n_vocab]
+    // Per-dim RoPE freq factors (assistant's own; for proportional RoPE on full-attn MTP layer).
+    // Loaded from "rope_freqs.weight" in the assistant GGUF (top-level, NOT per-layer).
+    // nullptr if absent (legacy GGUFs); MTP graph then falls back to target's per-layer rope_freqs.
+    ggml_tensor * rope_freqs      = nullptr;  // [head_dim/2] f32
     // Optional centroid head (Edge models only; nullptr for Dense 31B)
     ggml_tensor * centroids       = nullptr;  // [n_embd, n_centroids]
     ggml_tensor * token_ordering  = nullptr;  // [n_vocab] I32 invariant if present

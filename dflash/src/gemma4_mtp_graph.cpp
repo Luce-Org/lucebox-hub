@@ -264,8 +264,14 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
         float rope_theta_val = target.rope_theta_swa;
         if (!is_swa) {
             rope_theta_val = target.rope_theta;
-            // For full-attention MTP layers, use the donor target layer's rope_freqs
-            if (donor_il >= 0 && donor_il < (int)target.layers.size()) {
+            // For full-attention MTP layers: prefer assistant's OWN rope_freqs
+            // (top-level "rope_freqs.weight" in assistant GGUF — the assistant
+            // was trained with its own per-dim freq factors). Fall back to
+            // target's per-layer rope_freqs only if the assistant didn't ship
+            // one (legacy GGUFs).
+            if (w.rope_freqs) {
+                rope_freq_factors = w.rope_freqs;
+            } else if (donor_il >= 0 && donor_il < (int)target.layers.size()) {
                 rope_freq_factors = target.layers[donor_il].rope_freqs;
             }
         }
@@ -381,8 +387,12 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
             ggml_set_name(KQ, name);
         }
 
-        // Step 2: scale KQ by attn_scale
-        KQ = ggml_scale(ctx, KQ, target.attn_scale);
+        // Step 2: scale KQ by assistant's f_attention_scale = 1.0
+        // (NOT target.attn_scale = 1/sqrt(head_dim) — atomicbot's gemma4-assistant
+        // uses unit scale per llama-model.cpp:1651 / gemma4-assistant.cpp:139-140;
+        // mismatched scale produces a different softmax distribution and 100%
+        // greedy divergence vs target.)
+        KQ = ggml_scale(ctx, KQ, 1.0f);
         {
             char name[64]; std::snprintf(name, sizeof(name), "mtp_KQ_scaled_%d", il);
             ggml_set_name(KQ, name);
