@@ -796,15 +796,36 @@ int main(int argc, char ** argv) {
 
     if (have_draft) {
         double t0 = now_ms();
-        // Auto-detect: if path ends with .gguf, use GGUF loader; else safetensors dir
+        // Auto-detect:
+        //   1. If path ends with .gguf, use GGUF loader directly
+        //   2. If path is a directory containing draft-q8_0.gguf, prefer it
+        //      (Q8 GGUF is ~2x smaller than the BF16 safetensors and avoids
+        //      a memory-pressure perf trap on Dense + TQ3 KV that drops
+        //      target prefill 20x; see commit notes for details)
+        //   3. Otherwise fall back to safetensors loader
+        std::string resolved_draft_path = draft_path;
+        bool is_gguf = (draft_path.size() >= 5 &&
+                        draft_path.compare(draft_path.size() - 5, 5, ".gguf") == 0);
+        if (!is_gguf) {
+            // Check if path is a directory with a draft-q8_0.gguf inside
+            const std::string candidate = draft_path + "/draft-q8_0.gguf";
+            std::ifstream probe(candidate.c_str());
+            if (probe.good()) {
+                resolved_draft_path = candidate;
+                is_gguf = true;
+                std::fprintf(stderr,
+                    "[draft] auto-selected Q8 GGUF: %s\n"
+                    "        (%s also present; Q8 is ~2x smaller and ~20x faster on Dense+TQ3)\n",
+                    candidate.c_str(),
+                    (draft_path + "/model.safetensors").c_str());
+            }
+        }
         bool ok = false;
-        const bool is_gguf = (draft_path.size() >= 5 &&
-                              draft_path.compare(draft_path.size() - 5, 5, ".gguf") == 0);
         if (is_gguf) {
-            ok = load_gemma4_draft_gguf(draft_path, backend, dw);
+            ok = load_gemma4_draft_gguf(resolved_draft_path, backend, dw);
             if (!ok) std::fprintf(stderr, "load_gemma4_draft_gguf: %s\n", dflash27b_last_error());
         } else {
-            ok = load_gemma4_draft_safetensors(draft_path, backend, dw);
+            ok = load_gemma4_draft_safetensors(resolved_draft_path, backend, dw);
             if (!ok) std::fprintf(stderr, "load_gemma4_draft_safetensors: %s\n", dflash27b_last_error());
         }
         if (!ok) return 1;
