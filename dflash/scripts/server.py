@@ -16,7 +16,6 @@ Streams tokens as Server-Sent Events using the OpenAI delta format.
 import argparse
 import json
 import os
-import re
 import struct
 import subprocess
 import sys
@@ -46,20 +45,23 @@ DEFAULT_TARGET = Path(os.environ.get(
     str(ROOT / "models" / "Qwen3.6-27B-Q4_K_M.gguf"),
 ))
 DEFAULT_DRAFT_ROOT = ROOT / "models" / "draft"
-DEFAULT_BIN = ROOT / "build" / ("test_dflash" + (".exe" if sys.platform == "win32" else ""))
+DEFAULT_BIN = ROOT / "build" / "Release" / ("test_dflash" + (".exe" if sys.platform == "win32" else ""))
 DEFAULT_BUDGET = 22
 MODEL_NAME = "luce-dflash"
 
-# Architecture strings stored in `general.architecture` of every GGUF this
-# server can drive. test_dflash dispatches by GGUF arch internally:
-#   qwen35 / qwen36  -> existing DFlash + DDTree pipeline
-#   laguna           -> dflash27b::run_laguna_daemon() (no spec-decode)
-# server.py just needs to omit --draft + the DFlash/DDTree flags when the
-# arch doesn't support speculative decoding yet.
-_QWEN35_ARCHES = {"qwen35", "qwen36"}
-_LAGUNA_ARCHES  = {"laguna"}
-
 _ALLOWED_TEMPLATE_KWARGS = frozenset({"enable_thinking", "tools", "add_generation_prompt"})
+
+
+def _resolve_gpu_arg(value: int | None, env_name: str) -> int | None:
+    if value is not None:
+        return value
+    raw = os.environ.get(env_name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{env_name} must be an integer, got {raw!r}") from exc
 
 
 def resolve_draft(root: Path) -> Path:
@@ -72,134 +74,31 @@ _QWEN35_FAMILY_TOKENIZERS = {
     "Qwen3.5-27B": "Qwen/Qwen3.5-27B",
     "Qwen3.6-27B": "Qwen/Qwen3.6-27B",
 }
-THINK_OPEN_TAG = "<think>"
-THINK_CLOSE_TAG = "</think>"
-
-_LAGUNA_FAMILY_TOKENIZERS = {
-    "Laguna-XS.2": "poolside/Laguna-XS.2",
-    "Laguna-XS":   "poolside/Laguna-XS.2",
-    "laguna-xs2":  "poolside/Laguna-XS.2",
-}
-
-
-def _read_gguf_str(reader, key: str) -> str | None:
-    f = reader.fields.get(key)
-    if f is None or not f.data:
-        return None
-    import numpy as np
-    p = f.parts[f.data[0]]
-    if not isinstance(p, np.ndarray):
-        return None
-    try:
-        return bytes(p).decode("utf-8", errors="replace")
-    except Exception:
-        return None
-
-
-def _arch_from_gguf(gguf_path: Path) -> str:
-    """Return the value of ``general.architecture`` from the GGUF, or 'unknown'.
-
-    server.py uses this to dispatch between the qwen35 stack (test_dflash +
-    DFlash + DDTree) and the laguna stack (test_laguna_daemon, autoregressive
-    only). 'unknown' falls back to the qwen35 path so existing setups keep
-    working when the field is missing.
-    """
-    try:
-        from gguf import GGUFReader  # type: ignore
-        r = GGUFReader(str(gguf_path))
-        v = _read_gguf_str(r, "general.architecture")
-        return v.lower() if v else "unknown"
-    except Exception:
-        return "unknown"
 
 
 def _tokenizer_id_from_gguf(gguf_path: Path) -> str:
-    default = "Qwen/Qwen3.5-27B"
+    default = "Qwen/Qwen3.6-27B"
     try:
         from gguf import GGUFReader  # type: ignore
         r = GGUFReader(str(gguf_path))
-        arch = (_read_gguf_str(r, "general.architecture") or "").lower()
-        family = _LAGUNA_FAMILY_TOKENIZERS if arch in _LAGUNA_ARCHES else _QWEN35_FAMILY_TOKENIZERS
-        if arch in _LAGUNA_ARCHES:
-            default = next(iter(_LAGUNA_FAMILY_TOKENIZERS.values()))
         for key in ("general.basename", "general.name"):
-            val = _read_gguf_str(r, key)
-            if val is None:
+            f = r.fields.get(key)
+            if f is None or not f.data:
                 continue
-            for known, repo in family.items():
+            import numpy as np
+            p = f.parts[f.data[0]]
+            if not isinstance(p, np.ndarray):
+                continue
+            try:
+                val = bytes(p).decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            for known, repo in _QWEN35_FAMILY_TOKENIZERS.items():
                 if known.lower() in val.lower():
                     return repo
     except Exception:
         pass
     return default
-
-
-def parse_reasoning(
-    text: str,
-    thinking_enabled: bool = True,
-    started_in_thinking: bool = False,
-) -> tuple[str, str | None]:
-    # Qwen chat templates can prefill `<think>\n` into the prompt, so the
-    # generated output contains only the reasoning body plus `</think>`.
-    parts = text.partition(THINK_OPEN_TAG)
-    saw_open_tag = bool(parts[1])
-    rest = parts[2] if saw_open_tag else parts[0]
-    if THINK_CLOSE_TAG not in rest:
-        if thinking_enabled and (started_in_thinking or saw_open_tag):
-            return "", (rest.strip() or None)
-        return rest.strip(), None
-    reasoning, _, content = rest.partition(THINK_CLOSE_TAG)
-    return content.strip(), (reasoning.strip() or None)
-
-
-def prompt_starts_in_thinking(prompt: str) -> bool:
-    return bool(re.search(r"<think>\s*$", prompt))
-
-
-def consume_stream_piece(window: str, mode: str, piece: str):
-    outputs = []
-    holdback = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG))
-    window += piece
-    while True:
-        if mode == "reasoning":
-            idx = window.find(THINK_CLOSE_TAG)
-            if idx != -1:
-                pre = window[:idx]
-                if pre:
-                    outputs.append(("reasoning_content", pre))
-                window = window[idx + len(THINK_CLOSE_TAG):]
-                mode = "content"
-                continue
-            if len(window) > holdback:
-                safe = window[:-holdback]
-                if safe:
-                    outputs.append(("reasoning_content", safe))
-                window = window[-holdback:]
-            break
-
-        idx = window.find(THINK_OPEN_TAG)
-        if idx != -1:
-            pre = window[:idx]
-            if pre:
-                outputs.append(("content", pre))
-            window = window[idx + len(THINK_OPEN_TAG):]
-            mode = "reasoning"
-            continue
-        if len(window) > holdback:
-            safe = window[:-holdback]
-            if safe:
-                outputs.append(("content", safe))
-            window = window[-holdback:]
-        break
-
-    return outputs, window, mode
-
-
-def flush_stream_deltas(window: str, mode: str):
-    if not window:
-        return []
-    kind = "reasoning_content" if mode == "reasoning" else "content"
-    return [(kind, window)]
 
 
 # FIX 2: _content_to_str helper used for BOTH OpenAI and Anthropic message
@@ -226,11 +125,9 @@ class ChatRequest(BaseModel):
     messages: list[ChatMessage]
     stream: bool = False
     max_tokens: int = 512
-    temperature: float | None = None   # 0 = greedy, >0 = sample
-    seed: int | None = None             # rng seed for sampling
-    top_p: float | None = None         # nucleus, applied when temperature > 0
-    top_k: int | None = None           # top-k, applied when temperature > 0
-    frequency_penalty: float | None = None  # OAI -> rep_pen = 1 + freq_pen (sampling only)
+    temperature: float | None = None   # accepted, ignored (greedy-only)
+    top_p: float | None = None         # accepted, ignored
+    top_k: int | None = None           # accepted, ignored
     stop: list[str] | str | None = None  # FIX 3: accept stop field (Open WebUI sends it)
     chat_template_kwargs: dict | None = None
 
@@ -248,32 +145,20 @@ class AnthropicMessagesRequest(BaseModel):
     stream: bool = False
     temperature: float | None = None
     top_p: float | None = None
-    seed: int | None = None
-    frequency_penalty: float | None = None
     stop_sequences: list[str] | None = None
     chat_template_kwargs: dict | None = None
 
 
-def _samp_suffix(req) -> str:
-    # Render ` samp=temp,top_p,top_k,rep_pen[,seed]` tail when the request asks for
-    # non-greedy decoding. Empty string keeps the daemon protocol greedy-compatible.
-    t  = float(getattr(req, "temperature", 0.0) or 0.0)
-    if t <= 0.0:
-        return ""
-    tp = float(getattr(req, "top_p", 1.0) or 1.0)
-    tk = int(getattr(req, "top_k", 0) or 0)
-    rp = float(getattr(req, "frequency_penalty", 0.0) or 0.0) + 1.0
-    seed = int(getattr(req, "seed", 0) or 0)
-    return f" samp={t:.4f},{tp:.4f},{tk},{rp:.4f},{seed}"
-
-
-def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max_ctx: int,
+def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: int,
               tokenizer: AutoTokenizer, stop_ids: set[int],
               prefill_cfg: PrefillConfig | None = None,
               drafter_tokenizer: AutoTokenizer | None = None,
               prefix_cache_slots: int = 4,
               prefill_cache_slots: int = 4,
-              arch: str = "qwen35") -> FastAPI:
+              target_cache_slots: int = 1,
+              draft_feature_mirror: bool = False,
+              target_gpu: int | None = None,
+              draft_gpu: int | None = None) -> FastAPI:
     import asyncio
     app = FastAPI(title="Luce DFlash OpenAI server")
 
@@ -300,25 +185,24 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
     bin_abs = str(Path(bin_path).resolve())
     dll_dir = str(Path(bin_abs).parent / "bin")
     env = {**os.environ}
+    if target_gpu is not None:
+        env["DFLASH_TARGET_GPU"] = str(target_gpu)
+    if draft_gpu is not None:
+        env["DFLASH_DRAFT_GPU"] = str(draft_gpu)
     if sys.platform == "win32":
         env["PATH"] = dll_dir + os.pathsep + str(Path(bin_abs).parent) + os.pathsep + env.get("PATH", "")
 
-    if arch in _LAGUNA_ARCHES:
-        # test_dflash detects arch=laguna from the GGUF and dispatches
-        # internally to dflash27b::run_laguna_daemon(). No --draft, no
-        # --fast-rollback, no --ddtree (no Laguna spec-decode draft yet).
-        # Tokens stream as int32 LE on stream_fd terminated by -1, byte-
-        # identical to the qwen35 path so SSE/stream consumers stay shared.
-        cmd = [bin_abs, str(target), "--daemon",
-               f"--max-ctx={max_ctx}",
-               f"--stream-fd={stream_fd_val}"]
-    else:
-        if draft is None:
-            raise SystemExit("qwen35 arch requires --draft model.safetensors")
-        cmd = [bin_abs, str(target), str(draft), "--daemon",
-               "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}",
-               f"--max-ctx={max_ctx}",
-               f"--stream-fd={stream_fd_val}"]
+    cmd = [bin_abs, str(target), str(draft), "--daemon",
+           "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}",
+           f"--max-ctx={max_ctx}",
+           f"--target-cache-slots={target_cache_slots}",
+           f"--stream-fd={stream_fd_val}"]
+    if draft_feature_mirror:
+        cmd.append("--draft-feature-mirror")
+    if target_gpu is not None:
+        cmd.append(f"--target-gpu={target_gpu}")
+    if draft_gpu is not None:
+        cmd.append(f"--draft-gpu={draft_gpu}")
     if sys.platform == "win32":
         daemon_proc = subprocess.Popen(cmd, close_fds=False, env=env,
                                        stdin=subprocess.PIPE,
@@ -403,13 +287,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
 
         ``template_kwargs`` is passed through to ``apply_chat_template`` so callers
         can toggle template knobs like ``enable_thinking`` per-request.
-
-        Thinking is disabled by default (enable_thinking=False) because Qwen3.6's
-        think mode wrecks DFlash acceptance rates. Clients can opt in by sending
-        ``"chat_template_kwargs": {"enable_thinking": true}`` in the request.
         """
-        tpl_kwargs: dict = {"tokenize": False, "add_generation_prompt": True,
-                            "enable_thinking": False}
+        tpl_kwargs: dict = {"tokenize": False, "add_generation_prompt": True}
         tpl_kwargs.update(
             {k: v for k, v in (template_kwargs or {}).items() if k in _ALLOWED_TEMPLATE_KWARGS}
         )
@@ -417,18 +296,12 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         ids = tokenizer.encode(prompt, add_special_tokens=False)
         return _ids_to_bin(ids), ids, prompt
 
-    def _thinking_enabled(kwargs: dict | None) -> bool:
-        if kwargs:
-            return kwargs.get("enable_thinking", True)
-        return True
-
     # FIX 2 applied: always call _content_to_str on message content
-    def _tokenize_prompt(req: ChatRequest) -> tuple[Path, list[int], list[dict], bool]:
+    def _tokenize_prompt(req: ChatRequest) -> tuple[Path, list[int], list[dict]]:
         msgs = [{"role": m.role, "content": _content_to_str(m.content)}
                 for m in req.messages]
-        path, ids, prompt = _render_messages(msgs, req.chat_template_kwargs)
-        think = _thinking_enabled(req.chat_template_kwargs) and prompt_starts_in_thinking(prompt)
-        return path, ids, msgs, think
+        path, ids, _prompt = _render_messages(msgs, req.chat_template_kwargs)
+        return path, ids, msgs
 
     def _maybe_compress(msgs: list[dict], prompt_bin: Path, prompt_ids: list[int],
                         template_kwargs: dict | None = None
@@ -452,7 +325,6 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             drafter_tokenizer=drafter_tokenizer,
             cfg=prefill_cfg,
             prompt_text=long_text,
-            skip_park=prefill_cfg.skip_park,
         )
 
         new_msgs = list(msgs)
@@ -523,7 +395,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         daemon_proc.stdin.write(cmd_line.encode("utf-8"))
         daemon_proc.stdin.flush()
 
-    def _build_cmd_line(req, cur_bin, cur_ids, gen_len, prefix_cache,
+    def _build_cmd_line(cur_bin, cur_ids, gen_len, prefix_cache,
                         prompt_ids, full_snap_prep_ref: list,
                         compression_fired: bool):
         """
@@ -535,12 +407,11 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         if compression_fired:
             full_snap_prep = prefix_cache.prepare_full_snap(prompt_ids)
             full_snap_prep_ref[0] = full_snap_prep
-            samp = _samp_suffix(req)
             if full_snap_prep is not None:
                 fslot, _ = full_snap_prep
-                return f"{cur_bin} {gen_len} snap={len(cur_ids)}:{fslot}" + samp + "\n", None
+                return f"{cur_bin} {gen_len} snap={len(cur_ids)}:{fslot}\n", None
             else:
-                return f"{cur_bin} {gen_len}" + samp + "\n", None
+                return f"{cur_bin} {gen_len}\n", None
         else:
             full_snap_prep_ref[0] = None
             hit = prefix_cache.lookup(cur_ids)
@@ -552,7 +423,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 cmd_line = f"{cur_bin} {gen_len}"
             if snap_prep:
                 cmd_line += f" snap={snap_prep[1]}:{snap_prep[0]}"
-            return cmd_line + _samp_suffix(req) + "\n", snap_prep
+            return cmd_line + "\n", snap_prep
 
     def _gen_len_for(prompt_len: int, max_tokens: int) -> int:
         return min(max_tokens, max_ctx - prompt_len - 20)
@@ -561,7 +432,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatRequest):
-        prompt_bin, prompt_ids, raw_msgs, started_in_thinking = _tokenize_prompt(req)
+        prompt_bin, prompt_ids, raw_msgs = _tokenize_prompt(req)
         completion_id = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
 
@@ -587,7 +458,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             yield f"data: {json.dumps(err)}\n\n"
                             yield "data: [DONE]\n\n"
                             return
-                        cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}" + _samp_suffix(req) + "\n"
+                        cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}\n"
                     else:
                         cur_bin, cur_ids = await asyncio.to_thread(
                             _maybe_compress, raw_msgs, prompt_bin, prompt_ids,
@@ -606,7 +477,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             return
                         compression_fired = (cur_bin != prompt_bin)
                         cmd_line, snap_prep = _build_cmd_line(
-                            req, cur_bin, cur_ids, gen_len, prefix_cache,
+                            cur_bin, cur_ids, gen_len, prefix_cache,
                             prompt_ids, full_snap_prep_ref, compression_fired)
 
                     # FIX 7: guard against dead daemon
@@ -625,29 +496,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                      "finish_reason": None}],
                     }
                     yield f"data: {json.dumps(head)}\n\n"
-                    window, mode = "", ("reasoning" if started_in_thinking else "content")
 
                     try:
                         async for tok_id in _astream_tokens(r_pipe, gen_len):
-                            outputs, window, mode = consume_stream_piece(
-                                window, mode, tokenizer.decode([tok_id]))
-                            for kind, text in outputs:
-                                chunk = {
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created, "model": MODEL_NAME,
-                                    "choices": [{"index": 0,
-                                                 "delta": {kind: text},
-                                                 "finish_reason": None}],
-                                }
-                                yield f"data: {json.dumps(chunk)}\n\n"
-                        for kind, text in flush_stream_deltas(window, mode):
                             chunk = {
                                 "id": completion_id,
                                 "object": "chat.completion.chunk",
                                 "created": created, "model": MODEL_NAME,
                                 "choices": [{"index": 0,
-                                             "delta": {kind: text},
+                                             "delta": {"content": tokenizer.decode([tok_id])},
                                              "finish_reason": None}],
                             }
                             yield f"data: {json.dumps(chunk)}\n\n"
@@ -695,7 +552,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     return JSONResponse(
                         {"detail": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"},
                         status_code=400)
-                cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}" + _samp_suffix(req) + "\n"
+                cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}\n"
             else:
                 cur_bin, cur_ids = await asyncio.to_thread(
                     _maybe_compress, raw_msgs, prompt_bin, prompt_ids,
@@ -710,7 +567,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         status_code=400)
                 compression_fired = (cur_bin != prompt_bin)
                 cmd_line, snap_prep = _build_cmd_line(
-                    req, cur_bin, cur_ids, gen_len, prefix_cache,
+                    cur_bin, cur_ids, gen_len, prefix_cache,
                     prompt_ids, full_snap_prep_ref, compression_fired)
 
             try:
@@ -736,14 +593,6 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             except Exception: pass
 
         text = tokenizer.decode(tokens, skip_special_tokens=True)
-        cleaned, reasoning = parse_reasoning(
-            text,
-            thinking_enabled=_thinking_enabled(req.chat_template_kwargs),
-            started_in_thinking=started_in_thinking,
-        )
-        msg = {"role": "assistant", "content": cleaned}
-        if reasoning:
-            msg["reasoning_content"] = reasoning
         return JSONResponse({
             "id": completion_id,
             "object": "chat.completion",
@@ -751,7 +600,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             "model": MODEL_NAME,
             "choices": [{
                 "index": 0,
-                "message": msg,
+                "message": {"role": "assistant", "content": text},
                 "finish_reason": "stop",
             }],
             "usage": {"prompt_tokens": prompt_len,
@@ -762,20 +611,19 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
     # ── Anthropic Messages API ──────────────────────────────────────────────
 
     def _tokenize_anthropic(req: AnthropicMessagesRequest
-                            ) -> tuple[Path, list[int], list[dict], bool]:
+                            ) -> tuple[Path, list[int], list[dict]]:
         msgs = []
         system_text = _content_to_str(req.system) if req.system else None
         if system_text:
             msgs.append({"role": "system", "content": system_text})
         for m in req.messages:
             msgs.append({"role": m.role, "content": _content_to_str(m.content)})
-        path, ids, prompt = _render_messages(msgs, req.chat_template_kwargs)
-        think = _thinking_enabled(req.chat_template_kwargs) and prompt_starts_in_thinking(prompt)
-        return path, ids, msgs, think
+        path, ids, _prompt = _render_messages(msgs, req.chat_template_kwargs)
+        return path, ids, msgs
 
     @app.post("/v1/messages")
     async def anthropic_messages(req: AnthropicMessagesRequest):
-        prompt_bin, prompt_ids, raw_msgs, started_in_thinking = _tokenize_anthropic(req)
+        prompt_bin, prompt_ids, raw_msgs = _tokenize_anthropic(req)
         msg_id = "msg_" + uuid.uuid4().hex[:24]
 
         if req.stream:
@@ -799,7 +647,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                              "message": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"}}
                             yield f"event: error\ndata: {json.dumps(err)}\n\n"
                             return
-                        cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}" + _samp_suffix(req) + "\n"
+                        cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}\n"
                     else:
                         cur_bin, cur_ids = await asyncio.to_thread(
                             _maybe_compress, raw_msgs, prompt_bin, prompt_ids,
@@ -816,7 +664,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             return
                         compression_fired = (cur_bin != prompt_bin)
                         cmd_line, snap_prep = _build_cmd_line(
-                            req, cur_bin, cur_ids, gen_len, prefix_cache,
+                            cur_bin, cur_ids, gen_len, prefix_cache,
                             prompt_ids, full_snap_prep_ref, compression_fired)
 
                     message_start = {
@@ -829,6 +677,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         },
                     }
                     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
 
                     try:
                         _write_cmd(cmd_line)
@@ -837,42 +686,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         return
 
                     out_tokens = 0
-                    window, mode = "", ("reasoning" if started_in_thinking else "content")
-                    block_index = 0
-                    active_kind = "thinking" if mode == "reasoning" else "text"
-                    block = {"type": active_kind}
-                    if active_kind == "thinking":
-                        block["thinking"] = ""
-                    else:
-                        block["text"] = ""
-                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': block})}\n\n"
                     try:
                         async for tok_id in _astream_tokens(r_pipe, gen_len):
                             out_tokens += 1
-                            outputs, window, mode = consume_stream_piece(
-                                window, mode, tokenizer.decode([tok_id]))
-                            for kind, text in outputs:
-                                target_kind = "thinking" if kind == "reasoning_content" else "text"
-                                if target_kind != active_kind:
-                                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
-                                    block_index += 1
-                                    active_kind = target_kind
-                                    new_block = {"type": active_kind, active_kind: ""}
-                                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': new_block})}\n\n"
-                                delta_type = "thinking_delta" if target_kind == "thinking" else "text_delta"
-                                delta_key = "thinking" if target_kind == "thinking" else "text"
-                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': delta_type, delta_key: text}})}\n\n"
-                        for kind, text in flush_stream_deltas(window, mode):
-                            target_kind = "thinking" if kind == "reasoning_content" else "text"
-                            if target_kind != active_kind:
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
-                                block_index += 1
-                                active_kind = target_kind
-                                new_block = {"type": active_kind, active_kind: ""}
-                                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': new_block})}\n\n"
-                            delta_type = "thinking_delta" if target_kind == "thinking" else "text_delta"
-                            delta_key = "thinking" if target_kind == "thinking" else "text"
-                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': delta_type, delta_key: text}})}\n\n"
+                            delta = {
+                                "type": "content_block_delta", "index": 0,
+                                "delta": {"type": "text_delta",
+                                          "text": tokenizer.decode([tok_id])},
+                            }
+                            yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
                     finally:
                         if full_hit is None:
                             try: cur_bin.unlink()
@@ -888,7 +710,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     elif snap_prep:
                         prefix_cache.confirm_inline_snap(*snap_prep, cur_ids)
 
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
                     msg_delta = {
                         "type": "message_delta",
                         "delta": {"stop_reason": "end_turn", "stop_sequence": None},
@@ -918,7 +740,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         {"type": "error", "error": {"type": "invalid_request_error",
                          "message": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"}},
                         status_code=400)
-                cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}" + _samp_suffix(req) + "\n"
+                cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}\n"
             else:
                 cur_bin, cur_ids = await asyncio.to_thread(
                     _maybe_compress, raw_msgs, prompt_bin, prompt_ids,
@@ -934,7 +756,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         status_code=400)
                 compression_fired = (cur_bin != prompt_bin)
                 cmd_line, snap_prep = _build_cmd_line(
-                    req, cur_bin, cur_ids, gen_len, prefix_cache,
+                    cur_bin, cur_ids, gen_len, prefix_cache,
                     prompt_ids, full_snap_prep_ref, compression_fired)
 
             try:
@@ -961,20 +783,12 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             except Exception: pass
 
         text = tokenizer.decode(tokens, skip_special_tokens=True)
-        cleaned, reasoning = parse_reasoning(
-            text,
-            thinking_enabled=_thinking_enabled(req.chat_template_kwargs),
-            started_in_thinking=started_in_thinking,
-        )
-        content = [{"type": "text", "text": cleaned}]
-        if reasoning:
-            content.insert(0, {"type": "thinking", "thinking": reasoning})
         return JSONResponse({
             "id": msg_id,
             "type": "message",
             "role": "assistant",
             "model": req.model or MODEL_NAME,
-            "content": content,
+            "content": [{"type": "text", "text": text}],
             "stop_reason": "end_turn",
             "stop_sequence": None,
             "usage": {"input_tokens": prompt_len,
@@ -1008,10 +822,29 @@ def main():
     ap.add_argument("--tokenizer", type=str, default=None)
     ap.add_argument("--prefix-cache-slots", type=int, default=4)
     ap.add_argument("--prefill-cache-slots", type=int, default=4)
+    ap.add_argument("--target-cache-slots", "--cache-slots", dest="target_cache_slots",
+                    type=int, default=1,
+                    help="Native TargetCache slots per daemon process")
+    ap.add_argument("--draft-feature-mirror", action="store_true",
+                    help="Mirror target features for split target/draft GPU experiments")
+    ap.add_argument("--gpu", type=int, default=None,
+                    help="CUDA device ordinal to use for both target and draft")
+    ap.add_argument("--target-gpu", type=int, default=None,
+                    help="CUDA device ordinal for target model/cache")
+    ap.add_argument("--draft-gpu", type=int, default=None,
+                    help="CUDA device ordinal for draft model/cache")
     ap.add_argument("--daemon", action="store_true")
     add_cli_flags(ap)
     args = ap.parse_args()
     prefill_cfg = config_from_args(args)
+    target_gpu = _resolve_gpu_arg(
+        args.target_gpu if args.target_gpu is not None else args.gpu,
+        "DFLASH_TARGET_GPU",
+    )
+    draft_gpu = _resolve_gpu_arg(
+        args.draft_gpu if args.draft_gpu is not None else args.gpu,
+        "DFLASH_DRAFT_GPU",
+    )
 
     if args.cache_type_k:
         os.environ["DFLASH27B_KV_K"] = args.cache_type_k
@@ -1028,33 +861,14 @@ def main():
         os.environ.setdefault("DFLASH27B_FA_WINDOW", "0")
         os.environ.setdefault("DFLASH_FP_USE_BSA", "1")
         os.environ.setdefault("DFLASH_FP_ALPHA",   "0.85")
-        if prefill_cfg.skip_park:
-            os.environ["DFLASH_COMPRESS_NO_PARK"] = "1"
-
-    if not args.target.is_file():
-        raise SystemExit(f"target GGUF not found at {args.target}")
-
-    # Architecture detection. test_dflash itself dispatches by GGUF arch at
-    # main() entry, so server.py just needs to know enough to omit --draft +
-    # DFlash/DDTree flags on archs that lack a spec-decode draft. Same
-    # binary serves every arch.
-    arch = _arch_from_gguf(args.target)
 
     if not args.bin.is_file():
-        raise SystemExit(f"binary not found at {args.bin} (arch={arch})")
-
-    if arch in _LAGUNA_ARCHES:
-        # No DFlash draft model exists for laguna yet; test_dflash'́s
-        # internal arch dispatch reads general.architecture, accepts the
-        # no-draft argv layout, and routes to run_laguna_daemon(). PFlash
-        # compression and prefix-cache SNAPSHOT/RESTORE are both wired
-        # through the laguna daemon now, so --prefill-compression and
-        # --prefix-cache-slots behave the same as on the qwen35 path.
-        draft = None
-    else:
-        draft = resolve_draft(args.draft) if args.draft.is_dir() else args.draft
-        if not draft.is_file():
-            raise SystemExit(f"draft safetensors not found at {args.draft}")
+        raise SystemExit(f"binary not found at {args.bin}")
+    if not args.target.is_file():
+        raise SystemExit(f"target GGUF not found at {args.target}")
+    draft = resolve_draft(args.draft) if args.draft.is_dir() else args.draft
+    if not draft.is_file():
+        raise SystemExit(f"draft safetensors not found at {args.draft}")
 
     tokenizer_id = args.tokenizer or _tokenizer_id_from_gguf(args.target)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, trust_remote_code=True)
@@ -1074,16 +888,22 @@ def main():
                     drafter_tokenizer=drafter_tokenizer,
                     prefix_cache_slots=args.prefix_cache_slots,
                     prefill_cache_slots=args.prefill_cache_slots,
-                    arch=arch)
+                    target_cache_slots=args.target_cache_slots,
+                    draft_feature_mirror=args.draft_feature_mirror,
+                    target_gpu=target_gpu,
+                    draft_gpu=draft_gpu)
 
     import uvicorn
     print(f"Luce DFlash OpenAI server on http://{args.host}:{args.port}")
-    print(f"  arch      = {arch}")
     print(f"  target    = {args.target}")
     print(f"  draft     = {draft}")
     print(f"  bin       = {args.bin}")
     print(f"  budget    = {args.budget}")
     print(f"  max_ctx   = {args.max_ctx}")
+    print(f"  cache_slots= {args.target_cache_slots}")
+    print(f"  draft_feature_mirror= {args.draft_feature_mirror}")
+    print(f"  target_gpu= {target_gpu if target_gpu is not None else 'default'}")
+    print(f"  draft_gpu = {draft_gpu if draft_gpu is not None else 'default'}")
     print(f"  tokenizer = {tokenizer_id}")
     if prefill_cfg.enabled:
         print(f"  pflash    = {prefill_cfg.mode} · threshold={prefill_cfg.threshold} "

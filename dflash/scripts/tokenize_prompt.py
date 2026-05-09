@@ -1,5 +1,5 @@
 """
-Tokenize a prompt string using the Qwen3.5 HF tokenizer (via transformers)
+Tokenize a prompt string using the Qwen3.6 HF tokenizer (via transformers)
 and emit the token IDs as a flat int32 binary file.
 
 We depend on Python only for the tokenizer — the C++ library consumes the
@@ -19,7 +19,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--prompt", required=True)
-    ap.add_argument("--model", default="Qwen/Qwen3.5-27B",
+    ap.add_argument("--model", default="Qwen/Qwen3.6-27B",
                     help="HF repo id whose tokenizer to use")
     ap.add_argument("--add-bos", action="store_true", help="Prepend BOS token")
     args = ap.parse_args()

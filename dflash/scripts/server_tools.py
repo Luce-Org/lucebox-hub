@@ -30,6 +30,7 @@ import os
 import re
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -56,9 +57,21 @@ DEFAULT_TARGET = Path(os.environ.get(
     str(ROOT / "models" / "Qwen3.6-27B-Q4_K_M.gguf"),
 ))
 DEFAULT_DRAFT_ROOT = ROOT / "models" / "draft"
-DEFAULT_BIN = ROOT / "build" / "test_dflash"
+DEFAULT_BIN = ROOT / "build" / "Release" / ("test_dflash" + (".exe" if sys.platform == "win32" else ""))
 DEFAULT_BUDGET = 22
 MODEL_NAME = "luce-dflash"
+
+
+def _resolve_gpu_arg(value: int | None, env_name: str) -> int | None:
+    if value is not None:
+        return value
+    raw = os.environ.get(env_name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{env_name} must be an integer, got {raw!r}") from exc
 
 
 def resolve_draft(root: Path) -> Path:
@@ -320,18 +333,52 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
               prefill_cfg: PrefillConfig | None = None,
               drafter_tokenizer: AutoTokenizer | None = None,
               prefix_cache_slots: int = 4,
-              prefill_cache_slots: int = 4) -> FastAPI:
+              prefill_cache_slots: int = 4,
+              target_cache_slots: int = 1,
+              draft_feature_mirror: bool = False,
+              target_gpu: int | None = None,
+              draft_gpu: int | None = None) -> FastAPI:
     import asyncio
     app = FastAPI(title="Luce DFlash OpenAI server (tool-aware)")
     daemon_lock = asyncio.Lock()
 
     r_pipe, w_pipe = os.pipe()
-    cmd = [str(bin_path), str(target), str(draft), "--daemon",
+    if sys.platform == "win32":
+        import msvcrt
+        os.set_inheritable(w_pipe, True)
+        stream_fd_val = int(msvcrt.get_osfhandle(w_pipe))
+    else:
+        stream_fd_val = w_pipe
+
+    bin_abs = str(Path(bin_path).resolve())
+    env = {**os.environ}
+    if target_gpu is not None:
+        env["DFLASH_TARGET_GPU"] = str(target_gpu)
+    if draft_gpu is not None:
+        env["DFLASH_DRAFT_GPU"] = str(draft_gpu)
+    if sys.platform == "win32":
+        bin_dir = str(Path(bin_abs).parent)
+        env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+
+    cmd = [bin_abs, str(target), str(draft), "--daemon",
            "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}",
            f"--max-ctx={max_ctx}",
-           f"--stream-fd={w_pipe}"]
-    daemon_proc = subprocess.Popen(cmd, pass_fds=(w_pipe,), stdin=subprocess.PIPE,
-                                   stdout=subprocess.PIPE, bufsize=0)
+           f"--target-cache-slots={target_cache_slots}",
+           f"--stream-fd={stream_fd_val}"]
+    if draft_feature_mirror:
+        cmd.append("--draft-feature-mirror")
+    if target_gpu is not None:
+        cmd.append(f"--target-gpu={target_gpu}")
+    if draft_gpu is not None:
+        cmd.append(f"--draft-gpu={draft_gpu}")
+    if sys.platform == "win32":
+        daemon_proc = subprocess.Popen(cmd, close_fds=False, env=env,
+                                       stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, bufsize=0)
+    else:
+        daemon_proc = subprocess.Popen(cmd, pass_fds=(w_pipe,), env=env,
+                                       stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, bufsize=0)
     os.close(w_pipe)
 
     bus = DaemonStdoutBus(daemon_proc.stdout)
@@ -399,7 +446,6 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
             drafter_tokenizer=drafter_tokenizer,
             cfg=prefill_cfg,
             prompt_text=last_user.content,
-            skip_park=prefill_cfg.skip_park,
         )
 
         new_msgs = []
@@ -923,7 +969,6 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
             drafter_tokenizer=drafter_tokenizer,
             cfg=prefill_cfg,
             prompt_text=long_text,
-            skip_park=prefill_cfg.skip_park,
         )
         new_msgs = list(msgs)
         new_msgs[last_user_idx] = {"role": "user", "content": compressed_text}
@@ -1193,8 +1238,8 @@ def main():
                          "attention. Default 2048 (set in C++); only kicks in "
                          "once kv_cache > window. Trades attention range for "
                          "long-context decode speed.")
-    ap.add_argument("--tokenizer", default="Qwen/Qwen3.5-27B",
-                    help="HF tokenizer id; Qwen3.6 shares this tokenizer.")
+    ap.add_argument("--tokenizer", default="Qwen/Qwen3.6-27B",
+                    help="HF tokenizer id for the target model.")
     add_cli_flags(ap)
     ap.add_argument("--prefix-cache-slots", type=int, default=4,
                     help="Number of prefix-cache snapshot slots (0 to disable)")
@@ -1202,8 +1247,27 @@ def main():
                     help="Number of full-compress-result cache slots (Option 3). "
                          "Only active when --prefill-compression is enabled. "
                          "prefix-cache-slots + prefill-cache-slots must not exceed 8.")
+    ap.add_argument("--target-cache-slots", "--cache-slots", dest="target_cache_slots",
+                    type=int, default=1,
+                    help="Native TargetCache slots per daemon process")
+    ap.add_argument("--draft-feature-mirror", action="store_true",
+                    help="Mirror target features for split target/draft GPU experiments")
+    ap.add_argument("--gpu", type=int, default=None,
+                    help="CUDA device ordinal to use for both target and draft")
+    ap.add_argument("--target-gpu", type=int, default=None,
+                    help="CUDA device ordinal for target model/cache")
+    ap.add_argument("--draft-gpu", type=int, default=None,
+                    help="CUDA device ordinal for draft model/cache")
     args = ap.parse_args()
     prefill_cfg = config_from_args(args)
+    target_gpu = _resolve_gpu_arg(
+        args.target_gpu if args.target_gpu is not None else args.gpu,
+        "DFLASH_TARGET_GPU",
+    )
+    draft_gpu = _resolve_gpu_arg(
+        args.draft_gpu if args.draft_gpu is not None else args.gpu,
+        "DFLASH_DRAFT_GPU",
+    )
 
     # Auto-enable TQ3_0 KV cache when the requested context exceeds what F16 fits.
     # setdefault so an explicit user DFLASH27B_KV_TQ3=0 still wins.
@@ -1253,7 +1317,11 @@ def main():
                     prefill_cfg=prefill_cfg if prefill_cfg.enabled else None,
                     drafter_tokenizer=drafter_tokenizer,
                     prefix_cache_slots=args.prefix_cache_slots,
-                    prefill_cache_slots=args.prefill_cache_slots)
+                    prefill_cache_slots=args.prefill_cache_slots,
+                    target_cache_slots=args.target_cache_slots,
+                    draft_feature_mirror=args.draft_feature_mirror,
+                    target_gpu=target_gpu,
+                    draft_gpu=draft_gpu)
 
     import uvicorn
     print(f"Luce DFlash OpenAI server (tool-aware) on http://{args.host}:{args.port}")
@@ -1262,6 +1330,10 @@ def main():
     print(f"  bin    = {args.bin}")
     print(f"  budget = {args.budget}")
     print(f"  max_ctx= {args.max_ctx}")
+    print(f"  cache_slots = {args.target_cache_slots}")
+    print(f"  draft_feature_mirror = {args.draft_feature_mirror}")
+    print(f"  target_gpu = {target_gpu if target_gpu is not None else 'default'}")
+    print(f"  draft_gpu  = {draft_gpu if draft_gpu is not None else 'default'}")
     print(f"  tokenizer = {args.tokenizer}")
     if prefill_cfg.enabled:
         print(f"  pflash = {prefill_cfg.mode} · threshold={prefill_cfg.threshold} "

@@ -61,6 +61,8 @@ def main():
     d = default_paths()
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt", type=str, default=None)
+    ap.add_argument("--prompt-file", type=str, default=None,
+                    help="Read the prompt from a UTF-8 text file. Useful on Windows long-context runs where argv length is limited.")
     ap.add_argument("--n-gen", type=int, default=256)
     ap.add_argument("--target", type=str, default=d["target"])
     ap.add_argument("--draft",  type=str, default=d["draft"])
@@ -91,7 +93,12 @@ def main():
                          "because the kernel strides over unused KV.")
     args = ap.parse_args()
 
-    prompt_text = args.prompt if args.prompt else sys.stdin.read().strip()
+    if args.prompt_file:
+        prompt_text = Path(args.prompt_file).read_text(encoding="utf-8")
+    elif args.prompt:
+        prompt_text = args.prompt
+    else:
+        prompt_text = sys.stdin.read().strip()
     if not prompt_text:
         sys.exit("no prompt")
 
@@ -108,7 +115,8 @@ def main():
             msgs.append({"role": "system", "content": args.system})
         msgs.append({"role": "user", "content": prompt_text})
         text = tokenizer.apply_chat_template(msgs, tokenize=False,
-                                             add_generation_prompt=True)
+                                             add_generation_prompt=True,
+                                             enable_thinking=False)
 
     draft_path = resolve_draft(args.draft)
     im_end_id = tokenizer.encode("<|im_end|>", add_special_tokens=False)

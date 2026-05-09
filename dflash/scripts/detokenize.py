@@ -7,7 +7,7 @@ import struct
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="inp", required=True)
-    ap.add_argument("--model", default="Qwen/Qwen3.5-27B")
+    ap.add_argument("--model", default="Qwen/Qwen3.6-27B")
     ap.add_argument("--slice", default=None,
                     help="optional 'start:end' (token indices, exclusive end)")
     args = ap.parse_args()
