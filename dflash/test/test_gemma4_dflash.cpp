@@ -306,6 +306,7 @@ static bool build_gemma4_step(StepGraph & sg,
                               bool capture,
                               bool use_pflash   = false,
                               float pflash_alpha = 0.12f,
+                              int fa_window = 0,
                               bool last_token_logits_only = false) {
     step_graph_free(sg);
 
@@ -360,6 +361,7 @@ static bool build_gemma4_step(StepGraph & sg,
     gi.n_tokens       = n_tokens;
     gi.kv_start       = kv_start;
     gi.capture_layers           = capture;
+    gi.fa_window                = fa_window;
     gi.use_pflash               = use_pflash;
     gi.pflash_alpha             = pflash_alpha;
     gi.last_token_logits_only   = last_token_logits_only;
@@ -623,12 +625,74 @@ static void print_usage(const char * prog) {
         "  --fa-window <N>   sliding attention window for full layers (0 = full, default: 0)\n"
         "  --pflash          use pFlash prefill for prompts >= 4096 tokens\n"
         "  --pflash-alpha <F> pFlash block selection threshold (default: 0.12)\n"
+        "  --draft-max <N>   DFlash draft block cap (0 = model block_size)\n"
+        "  --draft-max-adaptive enable rolling adaptive DFlash draft cap\n"
+        "  --draft-kv-cap <N> override DFlash drafter KV slots\n"
+        "  --draft-swa-trunc enable per-layer SWA truncation in the draft graph\n"
+        "                    (also DFLASH_DRAFT_SWA_TRUNC=1; helps long-prompt decode)\n"
+        "  --mem-diag        print VRAM checkpoints around major allocations\n"
         "\n",
         prog);
 }
 
 // Draft method selection
 enum class DraftMethod { Auto, None, Dflash, Mtp };
+
+static void print_mem_diag(const char * tag) {
+    size_t free_bytes = 0, total_bytes = 0;
+    cudaMemGetInfo(&free_bytes, &total_bytes);
+    const double used_gb  = (total_bytes - free_bytes) / (1024.0 * 1024.0 * 1024.0);
+    const double free_gb  = free_bytes / (1024.0 * 1024.0 * 1024.0);
+    const double total_gb = total_bytes / (1024.0 * 1024.0 * 1024.0);
+    std::printf("[mem-diag] %-18s used=%.2f GB free=%.2f GB total=%.2f GB\n",
+                tag, used_gb, free_gb, total_gb);
+}
+
+struct AdaptiveDraftMax {
+    bool enabled = false;
+    int current = 0;
+    int min_q = 1;
+    int max_q = 0;
+    int window_steps = 8;
+    int window_accepted = 0;
+    int window_capacity = 0;
+    int window_steps_seen = 0;
+
+    void init(bool on, int initial, int block_size) {
+        enabled = on;
+        max_q = block_size;
+        current = initial > 0 ? std::min(initial, block_size) : block_size;
+        current = std::max(min_q, current);
+    }
+
+    void observe(int accepted, int q_len, int step_no) {
+        if (!enabled) return;
+        // accept_n includes the pinned current token. Adapt on speculative
+        // next-token fill so dm=1 does not look artificially perfect.
+        window_accepted += std::max(0, accepted - 1);
+        window_capacity += std::max(1, q_len - 1);
+        window_steps_seen++;
+        if (window_steps_seen < window_steps || window_capacity <= 0) return;
+
+        const double fill = (double)window_accepted / (double)window_capacity;
+        const int old = current;
+        if (fill < 0.35 && current > min_q) {
+            current = std::max(min_q, current / 2);
+        } else if (fill > 0.78 && current < max_q) {
+            current = std::min(max_q, current * 2);
+        }
+        if (current != old) {
+            std::printf("[adaptive] step=%d fill=%.2f draft_max %d -> %d\n",
+                        step_no, fill, old, current);
+        } else {
+            std::printf("[adaptive] step=%d fill=%.2f draft_max=%d\n",
+                        step_no, fill, current);
+        }
+        window_accepted = 0;
+        window_capacity = 0;
+        window_steps_seen = 0;
+    }
+};
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
@@ -657,6 +721,9 @@ int main(int argc, char ** argv) {
     bool         daemon_mode  = false;
     int          stream_fd    = -1;
     int          draft_max    = 0;   // 0 = use model's block_size (default 16)
+    bool         draft_max_adaptive = false;
+    int          draft_kv_cap_override = 0;
+    bool         mem_diag = false;
     DraftMethod  draft_method = DraftMethod::Auto;
 
     for (int i = 1; i < argc; i++) {
@@ -693,6 +760,10 @@ int main(int argc, char ** argv) {
         else if (std::strcmp(argv[i], "--pflash")       == 0) use_pflash    = true;
         else if (std::strcmp(argv[i], "--pflash-alpha") == 0) pflash_alpha  = (float)std::atof(require_next("--pflash-alpha"));
         else if (std::strcmp(argv[i], "--draft-max")    == 0) draft_max     = std::atoi(require_next("--draft-max"));
+        else if (std::strcmp(argv[i], "--draft-max-adaptive") == 0) draft_max_adaptive = true;
+        else if (std::strcmp(argv[i], "--draft-kv-cap") == 0) draft_kv_cap_override = std::atoi(require_next("--draft-kv-cap"));
+        else if (std::strcmp(argv[i], "--draft-swa-trunc") == 0) ::setenv("DFLASH_DRAFT_SWA_TRUNC", "1", 1);
+        else if (std::strcmp(argv[i], "--mem-diag")     == 0) mem_diag = true;
         else if (std::strcmp(argv[i], "--mtp") == 0) mtp_path = require_next("--mtp");
         else if (std::strcmp(argv[i], "--draft-method") == 0) {
             const char * m = require_next("--draft-method");
@@ -795,14 +866,20 @@ int main(int argc, char ** argv) {
     }
     cudaSetDevice(gpu);
 
-    std::printf("[cfg] model=%s draft=%s gpu=%d ctx=%d n_predict=%d kv_k=%s kv_v=%s "
-                "temp=%.2f top_k=%d top_p=%.2f budget=%d bench=%d fa_window=%d\n",
+    std::printf("[cfg] model=%s draft=%s method=%s gpu=%d ctx=%d n_predict=%d kv_k=%s kv_v=%s "
+                "temp=%.2f top_k=%d top_p=%.2f budget=%d bench=%d fa_window=%d "
+                "draft_max=%d adaptive=%d draft_kv_cap_override=%d pflash=%d pflash_alpha=%.3f\n",
                 model_path.c_str(),
                 draft_path.empty() ? "(none)" : draft_path.c_str(),
+                draft_method == DraftMethod::Dflash ? "dflash" :
+                draft_method == DraftMethod::Mtp ? "mtp" :
+                draft_method == DraftMethod::None ? "none" : "auto",
                 gpu, ctx_size, n_predict,
                 kv_k_str.c_str(), kv_v_str.c_str(),
                 sampler.temp, sampler.top_k, sampler.top_p,
-                ddtree_budget, (int)bench_mode, fa_window);
+                ddtree_budget, (int)bench_mode, fa_window,
+                draft_max, (int)draft_max_adaptive, draft_kv_cap_override,
+                (int)use_pflash, pflash_alpha);
 
     // ── Backend init ──────────────────────────────────────────────────────
     ggml_backend_t backend = ggml_backend_cuda_init(gpu);
@@ -810,6 +887,7 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "error: ggml_backend_cuda_init(%d) failed\n", gpu);
         return 1;
     }
+    if (mem_diag) print_mem_diag("after-backend");
 
     // Register the pFlash GGML custom kernel so ggml_flash_attn_sparse ops
     // dispatched from build_gemma4_graph (full-attention layers, use_pflash=true)
@@ -829,6 +907,7 @@ int main(int argc, char ** argv) {
         double t1 = now_ms();
         std::printf("[target] loaded %d layers, n_embd=%d, vocab=%d  (%.1f ms)\n",
                     w.n_layer, w.n_embd, w.n_vocab, t1 - t0);
+        if (mem_diag) print_mem_diag("after-target-load");
     }
 
     // ── Load draft weights (optional) ────────────────────────────────────
@@ -874,6 +953,7 @@ int main(int argc, char ** argv) {
         }
         if (!ok) return 1;
         double t1 = now_ms();
+        if (mem_diag) print_mem_diag("after-draft-load");
 
         // Upload tok_embd from target embedder to GPU (tied lm_head for draft).
         // tw.embedder keeps the bytes CPU-side; we upload once and inject a pointer.
@@ -912,6 +992,7 @@ int main(int argc, char ** argv) {
 
             dw.tok_embd = te;
             dw.n_vocab  = (int)n_vocab_t;
+            if (mem_diag) print_mem_diag("after-tok-embd");
         }
 
         std::printf("[draft] loaded n_layer=%d n_head=%d n_embd=%d n_vocab=%d "
@@ -920,35 +1001,12 @@ int main(int argc, char ** argv) {
                     dw.target_hidden, dw.block_size, t1 - t0);
     }
 
-    // ── Create KV cache ───────────────────────────────────────────────────
-    GemmaTargetCache cache;
-    {
-        double t0 = now_ms();
-        if (!create_gemma4_cache(w, ctx_size, backend, cache)) {
-            std::fprintf(stderr, "create_gemma4_cache: %s\n", dflash27b_last_error());
-            return 1;
-        }
-        double t1 = now_ms();
-        std::printf("[cache] created max_ctx=%d, kv_layers=%zu  (%.1f ms)\n",
-                    cache.max_ctx, cache.attn_k.size(), t1 - t0);
-    }
-
-    // ── Allocate draft KV cache (requires cache to already exist) ─────────
-    if (have_draft) {
-        if (!create_draft_kv_cache(dw, backend, cache)) {
-            std::fprintf(stderr, "create_draft_kv_cache failed\n");
-            return 1;
-        }
-        std::printf("[draft] KV cache allocated: %d slots\n", cache.draft_kv_cap);
-    }
-
-    // ── MTP weights + step graph (optional) ──────────────────────────────
+    // ── Load MTP weights early when enabled ──────────────────────────────
+    // Donor target layers must be known before target KV allocation so TQ3
+    // donor caches can be forced to Q8_0 and avoid wrap-concat FWHT loss.
     MtpDrafterWeights mtp_w;
     MtpStepGraph      mtp_g;
-    // mtp_h_prev context/buffer: separate small allocation so base_ctx stays
-    // unmodified and free_gemma4_cache() doesn't double-free it.
-    ggml_context        * mtp_h_prev_ctx = nullptr;
-    ggml_backend_buffer_t mtp_h_prev_buf = nullptr;
+    std::vector<int>  mtp_extra_q8_layers;
 
     if (have_mtp) {
         double t0 = now_ms();
@@ -959,12 +1017,62 @@ int main(int argc, char ** argv) {
         double t1 = now_ms();
         std::printf("[mtp] loaded n_layers=%d n_embd=%d n_embd_backbone=%d  (%.1f ms)\n",
                     (int)mtp_w.layers.size(), mtp_w.n_embd, mtp_w.n_embd_backbone, t1 - t0);
+        if (mem_diag) print_mem_diag("after-mtp-load");
 
         // Re-resolve donor target layers using the actual target SWA pattern.
-        // The loader uses a hardcoded alternating assumption; the real pattern
-        // from the GGUF may differ (e.g., layer 59 may be full-attention, not SWA).
         resolve_mtp_donor_layers(mtp_w, w.swa_layers);
+        for (const MtpLayerWeights & L : mtp_w.layers) {
+            if (L.donor_target_layer >= 0 &&
+                std::find(mtp_extra_q8_layers.begin(), mtp_extra_q8_layers.end(),
+                          L.donor_target_layer) == mtp_extra_q8_layers.end()) {
+                mtp_extra_q8_layers.push_back(L.donor_target_layer);
+            }
+        }
+    }
 
+    // ── Create KV cache ───────────────────────────────────────────────────
+    GemmaTargetCache cache;
+    {
+        if (mem_diag) print_mem_diag("before-target-kv");
+        double t0 = now_ms();
+        const int draft_kv_default_cap = have_draft
+                                             ? (dw.sliding_window + dw.block_size + 32)
+                                             : 0;
+        const int target_feat_cap_hint = have_draft
+                                             ? std::max(draft_kv_default_cap, draft_kv_cap_override)
+                                             : 0;
+        if (!create_gemma4_cache(w, ctx_size, backend, cache, mtp_extra_q8_layers,
+                                 target_feat_cap_hint,
+                                 /*enable_dflash_capture_overrides=*/have_draft)) {
+            std::fprintf(stderr, "create_gemma4_cache: %s\n", dflash27b_last_error());
+            return 1;
+        }
+        double t1 = now_ms();
+        std::printf("[cache] created max_ctx=%d, kv_layers=%zu  (%.1f ms)\n",
+                    cache.max_ctx, cache.attn_k.size(), t1 - t0);
+        if (mem_diag) print_mem_diag("after-target-kv");
+    }
+
+    // ── Allocate draft KV cache (requires cache to already exist) ─────────
+    if (have_draft) {
+        if (mem_diag) print_mem_diag("before-draft-kv");
+        if (!create_draft_kv_cache(dw, backend, cache, draft_kv_cap_override)) {
+            std::fprintf(stderr, "create_draft_kv_cache failed\n");
+            return 1;
+        }
+        std::printf("[draft] KV cache allocated: %d slots%s\n",
+                    cache.draft_kv_cap,
+                    draft_kv_cap_override > 0 ? " (override)" : "");
+        if (mem_diag) print_mem_diag("after-draft-kv");
+    }
+
+    // ── MTP state + step graph (optional) ────────────────────────────────
+    // mtp_h_prev context/buffer: separate small allocation so base_ctx stays
+    // unmodified and free_gemma4_cache() doesn't double-free it.
+    ggml_context        * mtp_h_prev_ctx = nullptr;
+    ggml_backend_buffer_t mtp_h_prev_buf = nullptr;
+
+    if (have_mtp) {
         // Allocate mtp_h_prev tensor: [n_embd_backbone, 1] f32, GPU-resident,
         // persistent across decode steps. Separate context so free_gemma4_cache
         // doesn't free it.
@@ -1137,6 +1245,7 @@ int main(int argc, char ** argv) {
                                            cs, chunk_n, need_mask,
                                            /*capture=*/true,
                                            use_pflash, pflash_alpha,
+                                           fa_window,
                                            /*last_token_logits_only=*/true)) {
                         std::fprintf(stderr, "[daemon] prefill build failed at %d\n", cs);
                         std::fflush(stderr);
@@ -1260,7 +1369,12 @@ int main(int argc, char ** argv) {
                             std::fprintf(stderr, "[daemon] draft KV prefill compute failed\n");
                             std::fflush(stderr);
                         }
-                        cache.draft_kv_pos = draft_prefill_n % draft_kv_cap;
+                        cache.draft_kv_pos = draft_prefill_n;
+                        std::fprintf(stderr,
+                            "[daemon] draft KV prefill done: %d positions materialized "
+                            "(skipped %d early tokens, cap=%d, target_feat_cap=%d, dkv_pos=%d)\n",
+                            draft_prefill_n, draft_prefill_skip, draft_kv_cap,
+                            cache.target_feat_cap, cache.draft_kv_pos);
                     }
                     draft_kv_prefill_destroy(pkg);
                 }
@@ -1294,7 +1408,9 @@ int main(int argc, char ** argv) {
                 if (!build_gemma4_step(sg, w, cache, backend,
                                        committed, 1,
                                        /*with_mask=*/true,
-                                       /*capture=*/false)) {
+                                       /*capture=*/false,
+                                       /*use_pflash=*/false, pflash_alpha,
+                                       fa_window)) {
                     std::fprintf(stderr, "[daemon] decode build failed at step %d\n", n_generated);
                     std::fflush(stderr);
                     break;
@@ -1468,6 +1584,7 @@ int main(int argc, char ** argv) {
                                            /*kv_start=*/cs, chunk_n,
                                            need_mask, /*capture=*/true,
                                            use_pflash, pflash_alpha,
+                                           fa_window,
                                            /*last_token_logits_only=*/true)) {
                         std::fprintf(stderr, "prefill chunk build failed at offset %d\n", cs);
                         return 1;
@@ -1608,12 +1725,13 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             // draft_kv_pos tracks entries written, bounded by draft_kv_cap.
-            cache.draft_kv_pos = draft_prefill_n % draft_kv_cap;
+            cache.draft_kv_pos = draft_prefill_n;
 
             draft_kv_prefill_destroy(pkg);
-            std::printf("[draft] KV prefill done: %d positions materialized "
-                        "(skipped %d early tokens, cap=%d)\n",
-                        draft_prefill_n, draft_prefill_skip, draft_kv_cap);
+                        std::printf("[draft] KV prefill done: %d positions materialized "
+                        "(skipped %d early tokens, cap=%d, target_feat_cap=%d, dkv_pos=%d)\n",
+                        draft_prefill_n, draft_prefill_skip, draft_kv_cap,
+                        cache.target_feat_cap, cache.draft_kv_pos);
         }
 
         // ── Decode loop ───────────────────────────────────────────────────
@@ -1641,8 +1759,12 @@ int main(int argc, char ** argv) {
             // Stale KV at positions [committed+commit_n..committed+q_len-1]
             // will be overwritten by the next verify pass.
 
-            const int q_len        = (draft_max > 0 && draft_max < dw.block_size)
-                                         ? draft_max : dw.block_size;
+            AdaptiveDraftMax adaptive;
+            adaptive.init(draft_max_adaptive, draft_max, dw.block_size);
+            if (draft_max_adaptive) {
+                std::printf("[adaptive] enabled initial=%d max=%d window=%d\n",
+                            adaptive.current, adaptive.max_q, adaptive.window_steps);
+            }
             const int mask_tok     = dw.mask_token_id; // 4
             const int target_feat_w = dw.n_target_layers * dw.target_hidden;
             const int vocab         = w.n_vocab;
@@ -1650,20 +1772,25 @@ int main(int argc, char ** argv) {
                                           ? cache.draft_kv_cap
                                           : (int)cache.draft_k[0]->ne[2];
 
-            std::vector<int32_t> noise_ids(q_len);
-            std::vector<float>   noise_embed_buf((size_t)dw.n_embd * q_len);
-            std::vector<int32_t> draft_tok(q_len);
-            std::vector<int32_t> target_tok(q_len);
-            std::vector<float>   draft_logits_buf((size_t)vocab * q_len);
-            std::vector<float>   verify_logits_buf((size_t)vocab * q_len);
+            std::vector<int32_t> noise_ids(dw.block_size);
+            std::vector<float>   noise_embed_buf((size_t)dw.n_embd * dw.block_size);
+            std::vector<int32_t> draft_tok(dw.block_size);
+            std::vector<int32_t> target_tok(dw.block_size);
+            std::vector<float>   draft_logits_buf((size_t)vocab * dw.block_size);
+            std::vector<float>   verify_logits_buf((size_t)vocab * dw.block_size);
 
             while ((int)generated.size() < n_predict) {
+                int q_len = adaptive.enabled
+                                ? adaptive.current
+                                : ((draft_max > 0 && draft_max < dw.block_size)
+                                       ? draft_max : dw.block_size);
+                q_len = std::min(q_len, std::max(1, ctx_size - committed - 1));
 
                 if (IS_EOS_TOK(cur_tok, w)) {
                     std::printf("\n[decode] EOS token %d\n", cur_tok);
                     break;
                 }
-                if (committed >= ctx_size - q_len) {
+                if (committed >= ctx_size - 1) {
                     std::printf("\n[decode] context full\n");
                     break;
                 }
@@ -1674,7 +1801,9 @@ int main(int argc, char ** argv) {
                     if (!build_gemma4_step(sg, w, cache, backend,
                                            committed, /*n_tokens=*/1,
                                            /*with_mask=*/true,
-                                           /*capture=*/true)) {
+                                           /*capture=*/true,
+                                           /*use_pflash=*/false, pflash_alpha,
+                                           fa_window)) {
                         std::fprintf(stderr, "[decode] warmup build failed at step %zu\n",
                                      generated.size());
                         return 1;
@@ -1748,7 +1877,7 @@ int main(int argc, char ** argv) {
                             draft_kv_prefill_destroy(wpkg);
                             return 1;
                         }
-                        cache.draft_kv_pos = (cache.draft_kv_pos + 1) % dkv_cap;
+                        cache.draft_kv_pos = std::min(dkv_cap, cache.draft_kv_pos + 1);
                         draft_kv_prefill_destroy(wpkg);
                     }
 
@@ -1789,6 +1918,7 @@ int main(int argc, char ** argv) {
                 // The draft model operates in its own KV address space bounded by
                 // draft_kv_cap. Use cache.draft_kv_pos (number of entries written into
                 // the draft KV cache) as kv_start, NOT the absolute committed position.
+                double refill_ms = 0.0;
                 if (cache.draft_kv_pos + q_len > dkv_cap) {
                     // Sliding-window re-prefill: instead of wiping all draft KV context,
                     // keep the most recent (dkv_cap - q_len) committed tokens by
@@ -1807,6 +1937,7 @@ int main(int argc, char ** argv) {
                         // draft_kv_pos + n_tokens <= ne[2].
                         cache.draft_kv_pos = 0;
 
+                        const double refill_t0 = now_ms();
                         DraftKVPrefillGraph rpkg;
                         if (!build_draft_kv_prefill(rpkg, dw, cache, backend, keep)) {
                             std::fprintf(stderr, "[spec] draft KV re-prefill build failed\n");
@@ -1851,6 +1982,7 @@ int main(int argc, char ** argv) {
                         }
                         cache.draft_kv_pos = keep;
                         draft_kv_prefill_destroy(rpkg);
+                        refill_ms = now_ms() - refill_t0;
 
                         std::fprintf(stderr,
                             "[spec] draft KV sliding re-prefill: kept %d tokens "
@@ -1871,7 +2003,7 @@ int main(int argc, char ** argv) {
 
                 // draft_embed: noise embeddings [n_embd, q_len] f32
                 ggml_backend_tensor_set(dsg.draft_embed, noise_embed_buf.data(), 0,
-                                        sizeof(float) * noise_embed_buf.size());
+                                        sizeof(float) * (size_t)dw.n_embd * q_len);
 
                 // positions: absolute [committed, committed+1, ..., committed+q_len-1]
                 // (absolute positions are used for RoPE — they must match training)
@@ -1901,6 +2033,7 @@ int main(int argc, char ** argv) {
                 }
 
                 // ── 4. Draft compute
+                const double draft_t0 = now_ms();
                 {
                     auto st = ggml_backend_graph_compute(backend, dsg.gf);
                     if (st != GGML_STATUS_SUCCESS) {
@@ -1908,10 +2041,11 @@ int main(int argc, char ** argv) {
                         return 1;
                     }
                 }
+                const double draft_t1 = now_ms();
 
                 // ── 5. Read draft logits and argmax
                 ggml_backend_tensor_get(dsg.logits, draft_logits_buf.data(), 0,
-                                        sizeof(float) * draft_logits_buf.size());
+                                        sizeof(float) * (size_t)vocab * q_len);
                 for (int i = 0; i < q_len; i++) {
                     draft_tok[i] = argmax_f32(draft_logits_buf.data() + (size_t)i * vocab, vocab);
                 }
@@ -1920,7 +2054,8 @@ int main(int argc, char ** argv) {
                 // ── 6. Target verify: batched forward on draft_tok[0..q_len-1]
                 if (!build_gemma4_step(sg, w, cache, backend,
                                        committed, q_len,
-                                       /*with_mask=*/true, /*capture=*/true)) {
+                                       /*with_mask=*/true, /*capture=*/true,
+                                       use_pflash, pflash_alpha, fa_window)) {
                     std::fprintf(stderr, "[spec] verify build failed\n");
                     return 1;
                 }
@@ -1960,6 +2095,7 @@ int main(int argc, char ** argv) {
                                             sizeof(uint16_t) * swa_buf.size());
                 }
 
+                const double verify_t0 = now_ms();
                 {
                     auto st = ggml_backend_graph_compute(backend, sg.gf);
                     if (st != GGML_STATUS_SUCCESS) {
@@ -1967,10 +2103,11 @@ int main(int argc, char ** argv) {
                         return 1;
                     }
                 }
+                const double verify_t1 = now_ms();
 
                 // ── 7. Read target logits and argmax
                 ggml_backend_tensor_get(sg.logits, verify_logits_buf.data(), 0,
-                                        sizeof(float) * verify_logits_buf.size());
+                                        sizeof(float) * (size_t)vocab * q_len);
                 for (int i = 0; i < q_len; i++) {
                     target_tok[i] = argmax_f32(verify_logits_buf.data() + (size_t)i * vocab, vocab);
                 }
@@ -2003,6 +2140,7 @@ int main(int argc, char ** argv) {
                 //   The target verify pass (step 6) captured target_feat for positions
                 //   [committed..committed+q_len-1]. We prefill draft KV for the accepted
                 //   prefix [committed..committed+commit_n-1] before advancing committed.
+                const double commit_t0 = now_ms();
                 {
                     DraftKVPrefillGraph cpkg;
                     if (!build_draft_kv_prefill(cpkg, dw, cache, backend, commit_n)) {
@@ -2045,9 +2183,10 @@ int main(int argc, char ** argv) {
                         draft_kv_prefill_destroy(cpkg);
                         return 1;
                     }
-                    cache.draft_kv_pos = (cache.draft_kv_pos + commit_n) % dkv_cap;
+                    cache.draft_kv_pos = std::min(dkv_cap, cache.draft_kv_pos + commit_n);
                     draft_kv_prefill_destroy(cpkg);
                 }
+                const double commit_t1 = now_ms();
 
                 //   Gemma4 is pure attention — no SSM/conv rollback needed.
                 //   Stale KV at positions [committed+commit_n..committed+q_len-1]
@@ -2066,8 +2205,12 @@ int main(int argc, char ** argv) {
 
                 double avg_accept = (total_draft_steps > 0)
                     ? (double)total_accepted / total_draft_steps : 0.0;
-                std::printf("[step %d] accept=%d/%d avg=%.1f\n",
-                            total_draft_steps, accept_n, q_len, avg_accept);
+                std::printf("[step %d] accept=%d/%d avg=%.1f "
+                            "draft_ms=%.2f verify_ms=%.2f kv_ms=%.2f refill_ms=%.2f\n",
+                            total_draft_steps, accept_n, q_len, avg_accept,
+                            draft_t1 - draft_t0, verify_t1 - verify_t0,
+                            commit_t1 - commit_t0, refill_ms);
+                adaptive.observe(accept_n, q_len, total_draft_steps);
 
                 if (hit_eos) break;
 
@@ -2108,7 +2251,9 @@ int main(int argc, char ** argv) {
                 if (!build_gemma4_step(sg, w, cache, backend,
                                        committed, /*n_tokens=*/1,
                                        /*with_mask=*/true,
-                                       /*capture=*/false)) {
+                                       /*capture=*/false,
+                                       /*use_pflash=*/false, pflash_alpha,
+                                       fa_window)) {
                     std::fprintf(stderr, "[mtp] target build failed at step %zu\n",
                                  generated.size());
                     return 1;
@@ -2299,7 +2444,9 @@ int main(int argc, char ** argv) {
                 if (!build_gemma4_step(sg, w, cache, backend,
                                        committed, /*n_tokens=*/1,
                                        /*with_mask=*/true,
-                                       /*capture=*/false)) {
+                                       /*capture=*/false,
+                                       /*use_pflash=*/false, pflash_alpha,
+                                       fa_window)) {
                     std::fprintf(stderr, "[decode] build failed at step %zu\n",
                                  generated.size());
                     return 1;
