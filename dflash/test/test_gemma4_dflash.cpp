@@ -61,11 +61,52 @@
 
 using namespace dflash27b;
 
-// bf16→f32 CUDA conversion kernel (defined in f16_convert.cu)
-extern "C" void dflash27b_launch_bf16_to_f32(const void * src,
-                                             void * dst,
-                                             size_t n_elems,
-                                             cudaStream_t stream);
+// Copy n_tokens rows of width feat_w from a BF16 ring-buffer tensor (src_bf16)
+// starting at ring slot ring_slot0 into a contiguous F32 tensor (dst_f32).
+// Uses ggml_cpy with ggml_view_2d for type conversion on the GPU backend —
+// replaces the former dflash27b_launch_bf16_to_f32 custom kernel (f16_convert.cu),
+// removed per howard0su's review (r3214289240): ggml_cpy does the same thing.
+static void copy_target_feat_bf16_to_f32(
+        ggml_backend_t      backend,
+        const ggml_tensor * src_bf16,   // [feat_w, cap] BF16  (cache.target_feat)
+        ggml_tensor       * dst_f32,    // [feat_w, n_tokens] F32 (pkg.target_feat)
+        int                 ring_slot0,
+        int                 n_tokens,
+        int                 feat_w) {
+    const int cap    = (int)src_bf16->ne[1];
+    const int pre_n  = std::min(n_tokens, cap - ring_slot0);
+    const int post_n = n_tokens - pre_n;
+
+    ggml_init_params ip{};
+    ip.mem_size   = 256 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    ggml_context * tmp_ctx = ggml_init(ip);
+
+    ggml_cgraph * gf = ggml_new_graph(tmp_ctx);
+
+    // Pre-wrap segment: rows [ring_slot0 .. ring_slot0+pre_n-1] → dst rows [0..pre_n-1]
+    {
+        ggml_tensor * s = ggml_view_2d(tmp_ctx, src_bf16, feat_w, pre_n,
+                                       src_bf16->nb[1],
+                                       (size_t)ring_slot0 * src_bf16->nb[1]);
+        ggml_tensor * d = ggml_view_2d(tmp_ctx, dst_f32, feat_w, pre_n,
+                                       dst_f32->nb[1], 0);
+        ggml_build_forward_expand(gf, ggml_cpy(tmp_ctx, s, d));
+    }
+    // Post-wrap segment: rows [0..post_n-1] → dst rows [pre_n..pre_n+post_n-1]
+    if (post_n > 0) {
+        ggml_tensor * s = ggml_view_2d(tmp_ctx, src_bf16, feat_w, post_n,
+                                       src_bf16->nb[1], 0);
+        ggml_tensor * d = ggml_view_2d(tmp_ctx, dst_f32, feat_w, post_n,
+                                       dst_f32->nb[1],
+                                       (size_t)pre_n * dst_f32->nb[1]);
+        ggml_build_forward_expand(gf, ggml_cpy(tmp_ctx, s, d));
+    }
+
+    ggml_backend_graph_compute(backend, gf);
+    ggml_free(tmp_ctx);
+}
 
 // ─── Utilities ────────────────────────────────────────────────────────────
 
@@ -1366,24 +1407,11 @@ int main(int argc, char ** argv) {
 
                     DraftKVPrefillGraph pkg;
                     if (build_draft_kv_prefill(pkg, dw, cache, backend, draft_prefill_n)) {
-                        // Ring-buffer aware bf16→f32 conversion (same as non-daemon path).
-                        const int    cap      = cache.target_feat_cap;
-                        const size_t feat_elt = ggml_element_size(cache.target_feat);
-                        const int    slot0    = draft_prefill_skip % cap;
-                        const int    pre_n    = std::min(draft_prefill_n, cap - slot0);
-                        const int    post_n   = draft_prefill_n - pre_n;
-
-                        dflash27b_launch_bf16_to_f32(
-                            (const char *)cache.target_feat->data + (size_t)slot0 * feat_elt * target_feat_w,
-                            (float *)pkg.target_feat->data,
-                            (size_t)pre_n * target_feat_w, nullptr);
-                        if (post_n > 0) {
-                            dflash27b_launch_bf16_to_f32(
-                                (const char *)cache.target_feat->data,
-                                (float *)pkg.target_feat->data + (size_t)pre_n * target_feat_w,
-                                (size_t)post_n * target_feat_w, nullptr);
-                        }
-                        cudaDeviceSynchronize();
+                        // Ring-buffer aware bf16→f32 conversion via ggml_cpy.
+                        copy_target_feat_bf16_to_f32(backend, cache.target_feat,
+                            pkg.target_feat,
+                            draft_prefill_skip % cache.target_feat_cap,
+                            draft_prefill_n, target_feat_w);
 
                         std::vector<int32_t> pos(draft_prefill_n);
                         for (int pi = 0; pi < draft_prefill_n; pi++) pos[pi] = draft_prefill_skip + pi;
@@ -1712,30 +1740,14 @@ int main(int argc, char ** argv) {
                 return 1;
             }
 
-            // Extract target_feat from ring buffer (bf16 → f32) directly into GPU tensor.
+            // Extract target_feat from ring buffer (bf16 → f32) via ggml_cpy.
             // The ring buffer stores tokens at slot (pos % cap).
             // We want the LAST draft_prefill_n hidden states (positions draft_prefill_skip
-            // through n_prompt-1). Their slots in the ring buffer start at
-            // draft_prefill_skip % target_feat_cap and wrap as normal.
-            {
-                const int    cap      = cache.target_feat_cap;
-                const size_t feat_elt = ggml_element_size(cache.target_feat);
-                const int    slot0    = draft_prefill_skip % cap;
-                const int    pre_n    = std::min(draft_prefill_n, cap - slot0);
-                const int    post_n   = draft_prefill_n - pre_n;
-
-                dflash27b_launch_bf16_to_f32(
-                    (const char *)cache.target_feat->data + (size_t)slot0 * feat_elt * target_feat_w,
-                    (float *)pkg.target_feat->data,
-                    (size_t)pre_n * target_feat_w, nullptr);
-                if (post_n > 0) {
-                    dflash27b_launch_bf16_to_f32(
-                        (const char *)cache.target_feat->data,
-                        (float *)pkg.target_feat->data + (size_t)pre_n * target_feat_w,
-                        (size_t)post_n * target_feat_w, nullptr);
-                }
-                cudaDeviceSynchronize();
-            }
+            // through n_prompt-1).
+            copy_target_feat_bf16_to_f32(backend, cache.target_feat,
+                pkg.target_feat,
+                draft_prefill_skip % cache.target_feat_cap,
+                draft_prefill_n, target_feat_w);
 
             // Positions: [draft_prefill_skip, ..., n_prompt-1]
             {
@@ -1883,16 +1895,10 @@ int main(int argc, char ** argv) {
                             std::fprintf(stderr, "[decode] warmup draft KV prefill build failed\n");
                             return 1;
                         }
-                        {
-                            const int    cap      = cache.target_feat_cap;
-                            const size_t feat_elt = ggml_element_size(cache.target_feat);
-                            const int    slot     = warmup_pos % cap;
-                            dflash27b_launch_bf16_to_f32(
-                                (const char *)cache.target_feat->data + (size_t)slot * feat_elt * target_feat_w_w,
-                                (float *)wpkg.target_feat->data,
-                                (size_t)target_feat_w_w, nullptr);
-                            cudaDeviceSynchronize();
-                        }
+                        copy_target_feat_bf16_to_f32(backend, cache.target_feat,
+                            wpkg.target_feat,
+                            warmup_pos % cache.target_feat_cap,
+                            1, target_feat_w_w);
                         {
                             int32_t p = warmup_pos;
                             ggml_backend_tensor_set(wpkg.positions, &p, 0, sizeof(int32_t));
@@ -1971,26 +1977,11 @@ int main(int argc, char ** argv) {
                         }
 
                         // Copy target_feat for [refill_start, refill_start+keep) from the
-                        // ring buffer (bf16) into rpkg.target_feat (f32).
-                        {
-                            const int    cap      = cache.target_feat_cap;
-                            const size_t feat_elt = ggml_element_size(cache.target_feat);
-                            const int    slot0    = refill_start % cap;
-                            const int    pre_n    = std::min(keep, cap - slot0);
-                            const int    post_n   = keep - pre_n;
-
-                            dflash27b_launch_bf16_to_f32(
-                                (const char *)cache.target_feat->data + (size_t)slot0 * feat_elt * target_feat_w,
-                                (float *)rpkg.target_feat->data,
-                                (size_t)pre_n * target_feat_w, nullptr);
-                            if (post_n > 0) {
-                                dflash27b_launch_bf16_to_f32(
-                                    (const char *)cache.target_feat->data,
-                                    (float *)rpkg.target_feat->data + (size_t)pre_n * target_feat_w,
-                                    (size_t)post_n * target_feat_w, nullptr);
-                            }
-                            cudaDeviceSynchronize();
-                        }
+                        // ring buffer (bf16) into rpkg.target_feat (f32) via ggml_cpy.
+                        copy_target_feat_bf16_to_f32(backend, cache.target_feat,
+                            rpkg.target_feat,
+                            refill_start % cache.target_feat_cap,
+                            keep, target_feat_w);
 
                         // Absolute positions for RoPE — must match training.
                         {
@@ -2175,26 +2166,11 @@ int main(int argc, char ** argv) {
                     }
 
                     // Extract target_feat for positions [committed..committed+commit_n-1]
-                    // from the ring buffer (bf16 → f32).
-                    {
-                        const int    cap      = cache.target_feat_cap;
-                        const size_t feat_elt = ggml_element_size(cache.target_feat);
-                        const int    slot0    = committed % cap;
-                        const int    pre_n    = std::min(commit_n, cap - slot0);
-                        const int    post_n   = commit_n - pre_n;
-
-                        dflash27b_launch_bf16_to_f32(
-                            (const char *)cache.target_feat->data + (size_t)slot0 * feat_elt * target_feat_w,
-                            (float *)cpkg.target_feat->data,
-                            (size_t)pre_n * target_feat_w, nullptr);
-                        if (post_n > 0) {
-                            dflash27b_launch_bf16_to_f32(
-                                (const char *)cache.target_feat->data,
-                                (float *)cpkg.target_feat->data + (size_t)pre_n * target_feat_w,
-                                (size_t)post_n * target_feat_w, nullptr);
-                        }
-                        cudaDeviceSynchronize();
-                    }
+                    // from the ring buffer (bf16 → f32) via ggml_cpy.
+                    copy_target_feat_bf16_to_f32(backend, cache.target_feat,
+                        cpkg.target_feat,
+                        committed % cache.target_feat_cap,
+                        commit_n, target_feat_w);
 
                     {
                         std::vector<int32_t> pos(commit_n);
