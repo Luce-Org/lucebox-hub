@@ -104,16 +104,21 @@ int main() {
     }
 
     // Assertion 7: per-MTP-layer donor KV resolution (NOT global pair).
-    // For Dense 31B (60 target layers, SWA pattern from gemma4_target_graph),
-    // each MTP layer's donor must be the LAST target layer matching its own
-    // SWA/full type. This must be filled by the loader, not hard-coded.
+    // For Dense 31B (60 target layers, SWA pattern from gemma4_target_graph):
+    //   even-indexed target layers = full attention,  last = 58
+    //   odd-indexed  target layers = SWA attention,   last = 59
+    // Each MTP layer's donor_target_layer must be exactly 58 (full) or 59 (SWA)
+    // depending on that layer's own attention type.  A bounds-only check would
+    // accept any value in [0, 60), which misses wrong-type assignments.
     for (size_t il = 0; il < mtp.layers.size(); ++il) {
-        if (mtp.layers[il].donor_target_layer < 0 ||
-            mtp.layers[il].donor_target_layer >= 60) {
-            std::fprintf(stderr, "  layer %zu donor_target_layer=%d out of [0,60)\n",
-                         il, mtp.layers[il].donor_target_layer);
+        const int32_t got  = mtp.layers[il].donor_target_layer;
+        const int32_t want = mtp.layers[il].is_swa ? 59 : 58;  // last SWA / last full-attn
+        if (got != want) {
+            std::fprintf(stderr,
+                         "  layer %zu is_swa=%d donor_target_layer=%d expected %d\n",
+                         il, (int)mtp.layers[il].is_swa, got, want);
             ggml_backend_free(backend);
-            return fail("donor target layer out of bounds");
+            return fail("donor_target_layer does not point to last matching-type target layer");
         }
     }
 

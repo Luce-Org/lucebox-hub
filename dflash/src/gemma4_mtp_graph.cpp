@@ -630,6 +630,13 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
 
         const int64_t n_c   = (int64_t)w.n_centroids;
         const int64_t top_k = (int64_t)w.centroid_top_k;
+        // Validate centroid-head shape and index invariants before any arithmetic.
+        GGML_ASSERT(n_vocab > 0   && "centroid LM head: n_vocab must be > 0");
+        GGML_ASSERT(n_c > 0       && "centroid LM head: n_centroids must be > 0");
+        GGML_ASSERT(n_vocab % n_c == 0
+                    && "centroid LM head: n_vocab must be divisible by n_centroids");
+        GGML_ASSERT(top_k > 0 && top_k <= n_c
+                    && "centroid LM head: top_k must be in [1, n_centroids]");
         // vsc: tokens per centroid slot
         const int64_t vsc   = (int64_t)n_vocab / n_c;
 
