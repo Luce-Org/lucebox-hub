@@ -410,4 +410,53 @@ Open an issue or PR against `Luce-Org/lucebox-hub`. Good first picks:
 Apache 2.0 · [Lucebox](https://lucebox.com) · [Discord](https://discord.gg/yHfswqZmJQ)
 
 Inspired by [z-lab/DFlash](https://arxiv.org/abs/2602.06036), [liranringel/ddtree](https://github.com/liranringel/ddtree), [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
-l-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
+
+---
+
+## Using with OpenAI Codex CLI
+
+The DFlash server natively supports the **Responses API** (`/v1/responses`), which is the
+only wire protocol used by [OpenAI Codex](https://github.com/openai/codex).
+
+### 1. Start the DFlash server
+
+```bash
+python dflash/scripts/server.py \
+  --target models/Qwen3.5-27B-Q4_K_M.gguf \
+  --draft models/Qwen3.5-3B-f16.safetensors \
+  --budget 22 --port 8080
+```
+
+### 2. Configure Codex
+
+Create or edit `~/.codex/config.toml`:
+
+```toml
+model = "luce-dflash"
+model_provider = "dflash"
+
+[model_providers.dflash]
+name = "DFlash"
+base_url = "http://localhost:8080/v1"
+wire_api = "responses"
+supports_websockets = false
+```
+
+No `env_key` is needed — the local server accepts any token.
+
+### 3. Run Codex
+
+```bash
+codex --provider dflash "Explain this codebase"
+```
+
+### Supported features
+
+| Feature | Status |
+|---------|--------|
+| Responses API (`POST /v1/responses`) | ✅ |
+| Function/tool calling | ✅ |
+| Streaming (SSE) | ✅ |
+| Codex models endpoint | ✅ |
+| Reasoning / thinking | ✅ (effort: low / medium) |
+| WebSockets | ❌ (not needed) |

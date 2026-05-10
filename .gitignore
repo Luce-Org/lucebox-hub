@@ -37,6 +37,7 @@ MANIFEST
 # virtualenvs
 venv/
 .venv/
+.conda/
 env/
 .env
 
@@ -64,6 +65,7 @@ checkpoints/
 *.safetensors
 *.bin
 .cache/
+fix-plan.md
 
 # Secrets
 .env.local

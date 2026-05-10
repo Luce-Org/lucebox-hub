@@ -10,6 +10,7 @@ Paths resolve from the repo root by default. Override with env vars:
     DFLASH_BIN_AR    path to build/test_generate
     DFLASH_TOKENIZER HF tokenizer repo (default Qwen/Qwen3.5-27B; matches run.py)
 """
+import argparse
 import json
 import os
 import re
@@ -34,13 +35,13 @@ TMPDIR = Path(tempfile.gettempdir()) / "dflash_bench"
 TMPDIR.mkdir(parents=True, exist_ok=True)
 
 N_GEN = 256
-BUDGET = 22
+BUDGET = 22  # default; overridden by --budget CLI arg
 N_SAMPLE = 10
 
 BENCHES = [
     ("HumanEval", "openai_humaneval", None, "test", lambda x: x["prompt"], None, N_GEN),
     ("GSM8K", "gsm8k", "main", "test", lambda x: f"Question: {x['question']}\nAnswer: ", None, N_GEN),
-    ("Math500", "HuggingFaceH4/MATH-500", None, "test", lambda x: f"Problem: {x['problem']}\nSolution: ", lambda x: x["answer"], 2048),
+    ("Math500", "HuggingFaceH4/MATH-500", None, "test", lambda x: f"Problem: {x['problem']}\nSolution: Put your final answer in \\boxed{{}}.\n", lambda x: x["answer"], 2048),
 ]
 
 
@@ -113,7 +114,7 @@ def _auto_max_ctx(n_prompt, n_gen: int = N_GEN):
     # FATTN_KQ_STRIDE=256. Oversizing max_ctx makes attention stride over
     # unused KV and can cost >20× prefill time (32K prompt + --kv-q4 +
     # max_ctx=131072 → 1035s vs 38s at max_ctx=32768). See scripts/run.py.
-    pad = 64  # covers q_len=16 + ddtree budget up to 22 with margin
+    pad = 64  # covers q_len=16 + ddtree verify overhead with margin
     return ((n_prompt + n_gen + pad + 255) // 256) * 256
 
 
@@ -283,7 +284,18 @@ def score_math(output_bin: Path, gold_answer: str, tok) -> tuple[bool, str]:
 
 
 def main():
-    global DRAFT
+    global DRAFT, BUDGET
+
+    parser = argparse.ArgumentParser(description="DFlash LLM benchmark suite")
+    parser.add_argument("--budget", type=int, default=BUDGET,
+                        help=f"DDTree budget (default {BUDGET})")
+    parser.add_argument("--no-thinking", action="store_true",
+                        help="Wrap prompts in chat template with enable_thinking=False")
+    parser.add_argument("--bench", nargs="+", choices=["HumanEval", "GSM8K", "Math500"],
+                        help="Run only specified benchmarks (default: all)")
+    args = parser.parse_args()
+    BUDGET = args.budget
+
     DRAFT = _resolve_draft()
     _require_file(TARGET, "target GGUF")
     _require_file(TEST_DFLASH, "test_dflash binary")
@@ -294,13 +306,33 @@ def main():
     print(f"[bench] ar bin    = {TEST_GENERATE}", flush=True)
     print(f"[bench] df bin    = {TEST_DFLASH}", flush=True)
     print(f"[bench] tokenizer = {TOKENIZER}", flush=True)
+    print(f"[bench] budget    = {BUDGET}", flush=True)
 
     from datasets import load_dataset
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(TOKENIZER, trust_remote_code=True)
 
+    bench_filter = set(args.bench) if args.bench else None
+
+    if args.no_thinking and not getattr(tok, "chat_template", None):
+        parser.error(
+            f"--no-thinking requires a tokenizer with a chat template, "
+            f"but {TOKENIZER!r} has none. Use a Qwen3 tokenizer or drop --no-thinking."
+        )
+
+    def _wrap_prompt(raw_prompt: str) -> str:
+        if not args.no_thinking:
+            return raw_prompt
+        return tok.apply_chat_template(
+            [{"role": "user", "content": raw_prompt}],
+            tokenize=False, add_generation_prompt=True,
+            enable_thinking=False,
+        )
+
     results = {}
     for name, ds_name, cfg, split, extract, gold_extract, gen in BENCHES:
+        if bench_filter and name not in bench_filter:
+            continue
         print(f"\n[bench] ==== {name} (n={N_SAMPLE}, n_gen={gen}) ====", flush=True)
         ds = load_dataset(ds_name, cfg, split=split)
         ds_selected = ds.shuffle(seed=42).select(range(N_SAMPLE))
@@ -311,7 +343,7 @@ def main():
         n_score_correct, n_scored = 0, 0
         for i, (p, gold) in enumerate(zip(prompt_list, gold_list)):
             path = TMPDIR / f"b_{name}_{i:02d}.bin"
-            n = tokenize(tok, p, path)
+            n = tokenize(tok, _wrap_prompt(p), path)
             if n == 0 or n > 3500:
                 continue
             try:

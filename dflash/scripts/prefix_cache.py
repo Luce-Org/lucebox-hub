@@ -73,13 +73,14 @@ class DaemonStdoutBus:
     """
 
     # Prefixes that are too spammy to print in normal operation.
-    _SUPPRESS_PREFIXES = (
+    _DEFAULT_SUPPRESS_PREFIXES = (
         "[step ", "[timing]", "[dflash]", "[prompt]",
         "[prefill]", "[migrate]", "[dbg ", "  ",
     )
 
-    def __init__(self, stdout):
+    def __init__(self, stdout, verbose: bool = False):
         self.stdout = stdout
+        self._suppress_prefixes = () if verbose else self._DEFAULT_SUPPRESS_PREFIXES
         self._waiters: list[tuple[str, asyncio.Future]] = []
         self._task: asyncio.Task | None = None
 
@@ -110,7 +111,7 @@ class DaemonStdoutBus:
 
             if not matched:
                 # Log line — suppress very noisy prefixes.
-                if decoded and not any(decoded.startswith(p) for p in self._SUPPRESS_PREFIXES):
+                if decoded and not any(decoded.startswith(p) for p in self._suppress_prefixes):
                     print(f"  [daemon] {decoded}", flush=True)
 
     async def await_reply(self, prefix: str, timeout: float = 10.0) -> str:

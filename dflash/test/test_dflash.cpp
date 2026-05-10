@@ -136,6 +136,8 @@ static constexpr int KQ_MASK_PAD = 32;
 static int g_kq_stride_pad = KQ_MASK_PAD;   // overridden to 256 when TBQ KV is active
 static int g_max_ctx_override = 0;           // overridden by --max-ctx=N (default 4096)
 static int g_fa_window       = 2048;         // overridden by DFLASH27B_FA_WINDOW=N
+static int g_draft_swa_window = 0;           // draft SWA window (0 = disabled); --draft-swa=N
+static int g_draft_ctx_max   = 4096;        // draft context cap; --draft-ctx-max=N
 static int align_up(int x, int a) { return ((x + a - 1) / a) * a; }
 
 // F16 encoding for the two values we use: 0 and -inf.
@@ -1551,7 +1553,8 @@ static bool run_target_layer_split_dflash_decode(
         }
 
         constexpr int DRAFT_CTX_MAX = 2048;
-        const int draft_ctx = std::min(committed, std::min(feature_ring.cap, DRAFT_CTX_MAX));
+        const int draft_ctx = std::min(committed, std::min(feature_ring.cap,
+            std::max(DRAFT_CTX_MAX, g_draft_ctx_max)));
         const int draft_start = committed - draft_ctx;
         int mirror_slot0 = 0;
         const bool use_mirror_view =
@@ -1809,6 +1812,15 @@ static int run_target_layer_split_harness(
                     draft_gpu,
                     (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
                         ? "gguf" : "safetensors");
+        if (g_draft_swa_window > 0) {
+            draft_weights.swa_window = g_draft_swa_window;
+            for (int il = 0; il < draft_weights.n_layer - 1; il++) {
+                draft_weights.layers[il].is_swa = true;
+            }
+            std::printf("[target-split] draft SWA layers: %d/%d (window=%d)\n",
+                        draft_weights.n_layer - 1, draft_weights.n_layer,
+                        draft_weights.swa_window);
+        }
         const int cap = std::min(max_ctx, 4096);
         if (!draft_feature_mirror_init(feature_ring, draft_backend,
                                        draft_gpu, draft_gpu, cap)) {
@@ -2005,6 +2017,12 @@ int main(int argc, char ** argv) {
     if (const char * s = std::getenv("DFLASH27B_FA_WINDOW")) {
         g_fa_window = std::max(0, std::atoi(s));
     }
+    if (const char * s = std::getenv("DFLASH27B_DRAFT_SWA")) {
+        g_draft_swa_window = std::max(0, std::atoi(s));
+    }
+    if (const char * s = std::getenv("DFLASH27B_DRAFT_CTX_MAX")) {
+        g_draft_ctx_max = std::max(0, std::atoi(s));
+    }
     const char * target_path = argv[1];
 
     // ---- Architecture detection ------------------------------------------
@@ -2183,6 +2201,12 @@ int main(int argc, char ** argv) {
         else if (std::strncmp(argv[i], "-ctv=", 5) == 0) {
             setenv("DFLASH27B_KV_V", argv[i] + 5, 1);
         }
+        else if (std::strncmp(argv[i], "--draft-swa=", 12) == 0) {
+            g_draft_swa_window = std::max(0, std::atoi(argv[i] + 12));
+        }
+        else if (std::strncmp(argv[i], "--draft-ctx-max=", 16) == 0) {
+            g_draft_ctx_max = std::max(0, std::atoi(argv[i] + 16));
+        }
     }
 
     // The KV type may also have been chosen via -ctk/-ctv, which sets
@@ -2264,10 +2288,10 @@ int main(int argc, char ** argv) {
     if (target_split_dflash) target_split_load_draft = true;
     if (target_gpus.empty()) target_gpus.push_back(target_gpu);
     if (target_gpus.size() == 1) target_gpu = target_gpus[0];
-    std::printf("[cfg] seq_verify=%d fast_rollback=%d ddtree=%d budget=%d temp=%.2f chain_seed=%d fa_window=%d draft_feature_mirror=%d target_gpu=%d draft_gpu=%d\n",
+    std::printf("[cfg] seq_verify=%d fast_rollback=%d ddtree=%d budget=%d temp=%.2f chain_seed=%d fa_window=%d draft_swa=%d draft_ctx_max=%d draft_feature_mirror=%d target_gpu=%d draft_gpu=%d\n",
                 (int)seq_verify, (int)fast_rollback, (int)ddtree_mode,
                 ddtree_budget, ddtree_temp, (int)ddtree_chain_seed, g_fa_window,
-                (int)draft_feature_mirror, target_gpu, draft_gpu);
+                g_draft_swa_window, g_draft_ctx_max, (int)draft_feature_mirror, target_gpu, draft_gpu);
 
     int cuda_device_count = 0;
     cudaGetDeviceCount(&cuda_device_count);
@@ -2342,6 +2366,16 @@ int main(int argc, char ** argv) {
         }
     }
     std::printf("[draft]  loaded\n");
+
+    // Apply --draft-swa=N: mark layers 0..n-2 as SWA, last layer stays full.
+    if (g_draft_swa_window > 0) {
+        dw.swa_window = g_draft_swa_window;
+        for (int il = 0; il < dw.n_layer - 1; il++) {
+            dw.layers[il].is_swa = true;
+        }
+        std::printf("[draft]  SWA layers: %d/%d (window=%d)\n",
+                    dw.n_layer - 1, dw.n_layer, dw.swa_window);
+    }
 
     const int max_ctx = g_max_ctx_override > 0 ? g_max_ctx_override : 4096;
     // Size the ssm_intermediate / conv_input_cache buffers to cover whichever
@@ -2707,9 +2741,18 @@ int main(int argc, char ** argv) {
                     std::printf("[unpark] target restored\n"); std::fflush(stdout);
                 }
                 if (want_draft && draft_parked) {
-                    if (!load_draft_safetensors(draft_path, draft_backend, dw)) {
+                    std::string dp(draft_path);
+                    bool draft_ok = (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
+                        ? load_draft_gguf(draft_path, draft_backend, dw)
+                        : load_draft_safetensors(draft_path, draft_backend, dw);
+                    if (!draft_ok) {
                         std::fprintf(stderr, "[unpark] draft: %s\n", dflash27b_last_error());
                         stream_emit(-1); continue;
+                    }
+                    if (g_draft_swa_window > 0) {
+                        dw.swa_window = g_draft_swa_window;
+                        for (int il = 0; il < dw.n_layer - 1; il++)
+                            dw.layers[il].is_swa = true;
                     }
                     draft_parked = false;
                     std::printf("[unpark] draft restored\n"); std::fflush(stdout);
@@ -2800,6 +2843,11 @@ int main(int argc, char ** argv) {
                         std::fprintf(stderr, "[compress] draft restore: %s\n",
                                      dflash27b_last_error());
                         stream_emit(-1); continue;
+                    }
+                    if (g_draft_swa_window > 0) {
+                        dw.swa_window = g_draft_swa_window;
+                        for (int il = 0; il < dw.n_layer - 1; il++)
+                            dw.layers[il].is_swa = true;
                     }
                     draft_parked = false;
                     std::printf("[compress] draft restored\n"); std::fflush(stdout);
@@ -3451,7 +3499,8 @@ int main(int argc, char ** argv) {
         // window are invisible to the draft but still in the target's KV
         // cache (the target verify uses the full history).
         constexpr int DRAFT_CTX_MAX = 2048;
-        const int draft_ctx   = std::min(committed, DRAFT_CTX_MAX);
+        const int draft_ctx   = std::min(committed,
+            std::max(DRAFT_CTX_MAX, g_draft_ctx_max));
         const int draft_start = committed - draft_ctx;
         int mirror_slot0 = 0;
         const bool use_mirror_view =

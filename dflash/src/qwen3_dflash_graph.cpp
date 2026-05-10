@@ -42,13 +42,11 @@ DraftGraphOutputs build_draft_graph(
 
     const int q_len    = DFLASH27B_DRAFT_BLOCK_SIZE;
     const int ctx_len  = in.ctx_len;
-    const int total_k  = ctx_len + q_len;
     const int n_head   = w.n_head;
     const int n_kv     = w.n_head_kv;
     const int head_dim = w.head_dim;
     const float eps    = DFLASH27B_RMS_EPS;
     const float rope_base = DFLASH27B_ROPE_THETA;
-    (void)ctx_len;  // used only via input tensor shapes
 
     // ── 1. Feature fusion: target_feat = rms_norm(fc @ target_hidden_cat, hidden_norm)
     //    fc:                [5*hidden, hidden]  (ggml: ne[0]=5*hidden, ne[1]=hidden)
@@ -65,6 +63,12 @@ DraftGraphOutputs build_draft_graph(
     for (int il = 0; il < w.n_layer; il++) {
         const DraftLayer & L = w.layers[il];
 
+        // ── SWA: determine effective context for this layer
+        const bool use_swa = L.is_swa && w.swa_window > 0 && ctx_len > w.swa_window;
+        const int eff_ctx     = use_swa ? w.swa_window : ctx_len;
+        const int eff_total_k = eff_ctx + q_len;
+        const int ctx_offset  = use_swa ? (ctx_len - w.swa_window) : 0;
+
         // ── 2a. Attention pre-norm
         ggml_tensor * hn = ggml_rms_norm(ctx, h, eps);
         hn = ggml_mul(ctx, hn, L.attn_norm);
@@ -78,43 +82,56 @@ DraftGraphOutputs build_draft_graph(
 
         // ── 2c. K and V from target_feat AND noise, then concat along sequence
         //     wk, wv: [hidden, kv_dim=1024]
-        ggml_tensor * Kctx = ggml_mul_mat(ctx, L.wk, target_feat); // [kv_dim, ctx_len, 1]
-        ggml_tensor * Kn   = ggml_mul_mat(ctx, L.wk, hn);          // [kv_dim, q_len,   1]
-        ggml_tensor * Vctx = ggml_mul_mat(ctx, L.wv, target_feat);
+        //   For SWA layers: window target_feat to last swa_window positions.
+        ggml_tensor * tf = target_feat;
+        if (use_swa) {
+            tf = ggml_view_3d(ctx, target_feat,
+                w.n_embd, eff_ctx, 1,
+                target_feat->nb[1], target_feat->nb[2],
+                target_feat->nb[1] * ctx_offset);
+        }
+        ggml_tensor * Kctx = ggml_mul_mat(ctx, L.wk, tf);  // [kv_dim, eff_ctx, 1]
+        ggml_tensor * Kn   = ggml_mul_mat(ctx, L.wk, hn);  // [kv_dim, q_len,   1]
+        ggml_tensor * Vctx = ggml_mul_mat(ctx, L.wv, tf);
         ggml_tensor * Vn   = ggml_mul_mat(ctx, L.wv, hn);
 
         // concat along ne[1] (sequence) — ggml_concat second arg dim=1
-        ggml_tensor * K = ggml_concat(ctx, Kctx, Kn, 1);  // [kv_dim, total_k, 1]
+        ggml_tensor * K = ggml_concat(ctx, Kctx, Kn, 1);  // [kv_dim, eff_total_k, 1]
         ggml_tensor * V = ggml_concat(ctx, Vctx, Vn, 1);
 
         // Per-head k_norm
-        K = ggml_reshape_3d(ctx, K, head_dim, n_kv, total_k);
+        K = ggml_reshape_3d(ctx, K, head_dim, n_kv, eff_total_k);
         K = ggml_rms_norm(ctx, K, eps);
         K = ggml_mul     (ctx, K, L.k_norm);
 
-        V = ggml_reshape_3d(ctx, V, head_dim, n_kv, total_k);
+        V = ggml_reshape_3d(ctx, V, head_dim, n_kv, eff_total_k);
 
         // ── 2d. RoPE (NEOX, theta=10M)
-        //   Q: positions_q  [q_len]      values [ctx_len..ctx_len+q_len-1]
-        //   K: positions_k  [total_k]    values [0..total_k-1]
+        //   Q: positions_q  [q_len]           values [ctx_len..ctx_len+q_len-1]
+        //   K: positions_k  [eff_total_k]     — for SWA, starts from ctx_offset
+        ggml_tensor * pk = in.positions_k;
+        if (use_swa) {
+            pk = ggml_view_1d(ctx, in.positions_k, eff_total_k,
+                              ctx_offset * ggml_element_size(in.positions_k));
+        }
         Q = ggml_rope_ext(ctx, Q, in.positions_q, /*freq_factors=*/nullptr,
                           head_dim, GGML_ROPE_TYPE_NEOX, /*n_ctx_orig=*/0,
                           rope_base, /*freq_scale=*/1.0f,
                           /*ext_factor=*/0.0f, /*attn_factor=*/1.0f,
                           /*beta_fast=*/0.0f, /*beta_slow=*/0.0f);
-        K = ggml_rope_ext(ctx, K, in.positions_k, nullptr,
+        K = ggml_rope_ext(ctx, K, pk, nullptr,
                           head_dim, GGML_ROPE_TYPE_NEOX, 0,
                           rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
         // ── 2e. Permute into the layout flash_attn_ext wants
         //   q: [n_embd_k=head_dim, n_batch=q_len, n_head,   ne3]
-        //   k: [n_embd_k=head_dim, n_kv=total_k, n_head_kv, ne3]
-        //   v: [n_embd_v=head_dim, n_kv=total_k, n_head_kv, ne3]  (not transposed)
-        Q = ggml_permute(ctx, Q, 0, 2, 1, 3);  // [head_dim, q_len,    n_head, 1]
+        //   k: [n_embd_k=head_dim, n_kv=eff_total_k, n_head_kv, ne3]
+        //   v: [n_embd_v=head_dim, n_kv=eff_total_k, n_head_kv, ne3]  (not transposed)
+        Q = ggml_permute(ctx, Q, 0, 2, 1, 3);  // [head_dim, q_len,        n_head, 1]
         Q = ggml_cont   (ctx, Q);
-        K = ggml_permute(ctx, K, 0, 2, 1, 3);  // [head_dim, total_k,  n_kv,   1]
+        K = ggml_permute(ctx, K, 0, 2, 1, 3);  // [head_dim, eff_total_k,  n_kv,   1]
         K = ggml_cont   (ctx, K);
-        V = ggml_permute(ctx, V, 0, 2, 1, 3);  // [head_dim, total_k,  n_kv,   1]
+        V = ggml_permute(ctx, V, 0, 2, 1, 3);  // [head_dim, eff_total_k,  n_kv,   1]
         V = ggml_cont   (ctx, V);
 
         // ── 2f. Non-causal flash attention; GQA broadcast handled internally.

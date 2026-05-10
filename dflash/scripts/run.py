@@ -83,6 +83,13 @@ def main():
                     help="Sliding window for FA layers (KV positions). 0 = full "
                          "attention. Default 2048 (set in C++); only kicks in "
                          "once kv_cache > window.")
+    ap.add_argument("--draft-swa", type=int, default=None,
+                    help="Draft SWA window (Qwen3.6 pattern: layers 0..n-2 use "
+                         "sliding window). 0 = disabled. Typical value: 2048.")
+    ap.add_argument("--draft-ctx-max", type=int, default=None,
+                    help="Draft context cap (default 2048). Raise to let the "
+                         "full-attention layer see more context. Requires "
+                         "--draft-swa < this value to activate SWA truncation.")
     ap.add_argument("--max-ctx", type=int, default=0,
                     help="Override max KV context (default: auto-fit "
                          "prompt+n_gen+block, aligned to 256). Passing a "
@@ -130,6 +137,10 @@ def main():
         env["DFLASH27B_KV_TQ3"] = "1"
     if args.fa_window is not None:
         env["DFLASH27B_FA_WINDOW"] = str(args.fa_window)
+    if args.draft_swa is not None:
+        env["DFLASH27B_DRAFT_SWA"] = str(args.draft_swa)
+    if args.draft_ctx_max is not None:
+        env["DFLASH27B_DRAFT_CTX_MAX"] = str(args.draft_ctx_max)
 
     with tempfile.TemporaryDirectory() as tmp:
         in_bin  = os.path.join(tmp, "prompt.bin")

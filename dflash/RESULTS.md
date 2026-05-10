@@ -327,6 +327,132 @@ best short-context throughput default on this 5090 build. Budget 30 produced
 the highest mean AL but lower throughput, so it is a quality-biased experiment
 rather than the base setting.
 
+## RTX 5090 — Q4_K_M, DDTree budget 40, no-thinking (community)
+
+Single RTX 5090 32 GB GDDR7 (sm_120, 1792 GB/s), CUDA 12.8, Windows 11.
+Target: `unsloth/Qwen3.6-27B-GGUF` (`Qwen3.6-27B-Q4_K_M.gguf`, ~15.7 GB).
+Draft:  `z-lab/Qwen3.6-27B-DFlash` safetensors (~3.2 GB).
+Concurrency = 1, greedy decoding, `n_gen=256` (HumanEval/GSM8K), `n_gen=2048` (Math500).
+
+Build: MSVC 14.41, `cmake -DCMAKE_CUDA_ARCHITECTURES=120 -DBUILD_SHARED_LIBS=OFF`,
+BSA enabled.
+Runtime: default KV (auto), DDTree budget 40, `--no-thinking` (chat template
+with `enable_thinking=False`).
+
+Q4_K_M is a direct quant match with the RTX 3090 headline numbers above.
+Budget 40 was swept as optimal for the 5090's 170 SMs + 1792 GB/s bandwidth
+(vs budget 22 on the 3090's 82 SMs + 936 GB/s). Thinking is disabled because
+the DFlash drafter was trained on Qwen3.5 output with thinking disabled; `<think>` tokens
+tank acceptance rate.
+
+### RTX 5090 Q4_K_M headline
+
+| Task      | AR tok/s | DFlash tok/s | AL    | Speedup |
+|-----------|:--------:|:------------:|:-----:|:-------:|
+| HumanEval | 42.34    | **205.02**   | 12.93 | **4.84×** |
+| Math500   | 42.50    | **182.68**   | 9.70  | **4.30×** |
+| GSM8K     | 42.65    | **153.08**   | 8.20  | **3.59×** |
+
+Math500 score: 10/10 (using `\boxed{}` extraction).
+
+### RTX 5090 Q4_K_M per-prompt — HumanEval (10 samples)
+
+| # | n_tok | AR    | DFlash | AL    |
+|:-:|:-----:|:-----:|:------:|:-----:|
+| 01|  94   | 41.74 | 211.11 | 15.17 |
+| 02| 148   | 42.09 | 177.62 |  9.48 |
+| 03| 144   | 42.13 | 247.98 | 15.80 |
+| 04| 130   | 41.42 | 209.79 | 14.00 |
+| 05| 182   | 42.64 | 197.49 | 10.67 |
+| 06| 128   | 42.44 | 226.57 | 14.40 |
+| 07|  61   | 42.93 | 208.07 | 14.33 |
+| 08| 151   | 43.05 | 195.22 | 10.24 |
+| 09| 135   | 42.59 | 167.76 |  9.16 |
+| 10| 105   | 42.39 | 208.57 | 16.00 |
+| **mean** |   | **42.34** | **205.02** | **12.93** |
+
+Peak per-prompt: **247.98 tok/s at AL 15.80** (5.89× over AR).
+
+### RTX 5090 Q4_K_M per-prompt — GSM8K (10 samples)
+
+| # | n_tok | AR    | DFlash | AL    |
+|:-:|:-----:|:-----:|:------:|:-----:|
+| 01|  56   | 42.58 | 176.79 |  9.14 |
+| 02| 122   | 42.43 | 139.01 |  7.11 |
+| 03|  60   | 42.87 | 150.98 |  8.43 |
+| 04|  81   | 42.76 | 187.87 | 10.24 |
+| 05| 113   | 42.83 | 116.41 |  6.16 |
+| 06| 129   | 42.55 | 132.95 |  6.92 |
+| 07| 124   | 42.39 | 176.73 | 10.11 |
+| 08|  61   | 42.77 | 151.45 |  8.00 |
+| 09|  54   | 42.76 | 143.34 |  7.90 |
+| 10| 107   | 42.54 | 155.26 |  8.00 |
+| **mean** |   | **42.65** | **153.08** | **8.20** |
+
+### RTX 5090 Q4_K_M per-prompt — Math500 (10 samples)
+
+| # | n_tok | AR    | DFlash | AL    |
+|:-:|:-----:|:-----:|:------:|:-----:|
+| 01| 276   | 42.42 | 141.11 |  7.64 |
+| 02|  72   | 42.56 | 183.87 |  9.41 |
+| 03|  59   | 42.83 | 194.73 | 10.66 |
+| 04|  69   | 41.75 | 178.42 |  9.89 |
+| 05| 136   | 42.86 | 206.66 | 11.00 |
+| 06|  95   | 42.29 | 150.41 |  8.13 |
+| 07|  62   | 42.39 | 168.75 |  8.71 |
+| 08|  98   | 42.74 | 203.99 | 10.75 |
+| 09|  71   | 42.37 | 203.77 | 10.64 |
+| 10|  76   | 42.79 | 195.07 | 10.12 |
+| **mean** |   | **42.50** | **182.68** | **9.70** |
+
+### RTX 5090 Q4_K_M — 3090 vs 5090 comparison
+
+Both runs use Q4_K_M target, same `bench_llm.py` methodology (10 samples per
+task, seed=42 shuffle, greedy decoding). Budget tuned per-GPU.
+
+| Metric             | 3090 (budget=22) | 5090 (budget=40) | Ratio   |
+|--------------------|:----------------:|:----------------:|:-------:|
+| AR tok/s (HE)      | 37.78            | 42.34            | 1.12×   |
+| DFlash tok/s (HE)  | 129.52           | **205.02**       | **1.58×** |
+| AL (HE)            | 8.31             | 12.93            | 1.56×   |
+| AR tok/s (Math500)  | 37.71            | 42.50            | 1.13×   |
+| DFlash tok/s (Math500) | 110.51        | **182.68**       | **1.65×** |
+| AR tok/s (GSM8K)   | 37.65            | 42.65            | 1.13×   |
+| DFlash tok/s (GSM8K) | 96.15           | **153.08**       | **1.59×** |
+| Mem BW             | 936 GB/s         | 1792 GB/s        | 1.91×   |
+| SMs                | 82               | 170              | 2.07×   |
+| VRAM               | 24 GB            | 32 GB            | 1.33×   |
+
+AR scaling (~1.13×) is modest — the larger model already saturates bandwidth
+on the 3090. DFlash scaling (~1.6×) is super-linear relative to AR because
+higher bandwidth lets more speculative tokens survive per verify step.
+
+The AL difference (12.93 vs 8.31 on HumanEval) reflects two factors: budget 40
+vs 22 (wider tree captures more tokens per step), and `--no-thinking` on the
+5090 run (drafter predicts non-thinking output much better, since it was trained
+on Qwen3.5 output with thinking disabled). The 3090 run also used Qwen3.5 with
+thinking disabled (server default), so the comparison is fair: both runs generate non-thinking output.
+
+### RTX 5090 Q4_K_M DDTree budget sweep
+
+5 HumanEval prompts, `n_gen=256`, `--no-thinking`, same Q4_K_M target/draft as
+the headline numbers above.
+
+| Budget | Mean AL | Mean tok/s |
+|:------:|:-------:|:----------:|
+| 22     | 9.01    | 189.18     |
+| 28     | 9.20    | 186.87     |
+| 32     | 9.75    | 194.95     |
+| 36     | 9.75    | 193.70     |
+| **40** | **10.07** | **197.10** |
+| 48     | 10.07   | 183.99     |
+
+Budget 40 peaks at 197.10 tok/s. AL saturates at 10.07 between budget 40 and
+48, but 48 regresses on throughput (verify cost outpaces accept gain). Budget 28
+also regresses vs 22 — the useful jump is 22→32. The 32–36–40 plateau is within
+~2% (run-to-run noise); 40 is chosen because it has the highest mean and AL is
+at saturation.
+
 ## Laguna-XS.2 target on RTX 3090 (Poolside MoE, Q4_K_M)
 
 Hand-rolled CUDA forward (Path A, ggml-only) for the 40-layer / 256-expert

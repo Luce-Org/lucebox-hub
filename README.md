@@ -40,14 +40,15 @@ Three projects today, more coming. Each one is a self-contained release with its
 
 ## Supported models
 
-All speedups measured on **RTX 3090 24 GB** vs vendored llama.cpp (`-fa 1`, matching KV quant).
+All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant).
 
-| Model | TTFT speedup | Decode speedup |
-|-------|:------------:|:--------------:|
-| Qwen 3.5-0.8B (Megakernel) | — | **~2×** vs F16 |
-| Qwen 3.5-27B Q4_K_M (DFlash + DDTree) | — | **3.43×** vs AR |
-| Qwen 3.6-27B Q4_K_M (DFlash + PFlash) | **10.4×** @ 128K | **~3×** vs AR |
-| Laguna-XS.2 33B-A3B Q4_K_M (DFlash + PFlash) | **5.4×** @ 128K | AR (draft pending) |
+| GPU | Model | TTFT speedup | Decode speedup |
+|-----|-------|:------------:|:--------------:|
+| RTX 3090 | Qwen 3.5-0.8B (Megakernel) | — | **~2×** vs F16 |
+| RTX 3090 | Qwen 3.5-27B Q4_K_M (DFlash + DDTree) | — | **3.43×** vs AR |
+| RTX 3090 | Qwen 3.6-27B Q4_K_M (DFlash + PFlash) | **10.4×** @ 128K | **~3×** vs AR |
+| RTX 3090 | Laguna-XS.2 33B-A3B Q4_K_M (DFlash + PFlash) | **5.4×** @ 128K | AR (draft pending) |
+| RTX 5090 | Qwen 3.6-27B Q4_K_M (DFlash + DDTree) | — | **4.84×** vs AR (205 tok/s) |
 
 ## 01 · Megakernel Qwen3.5 0.8B on RTX 3090
 
@@ -139,7 +140,7 @@ Supported out of the box; the build just needs the right CUDA toolkit. `dflash/C
 | RTX 3090 Ampere | `sm_86` | 12.0 | **reference, all numbers above** |
 | RTX 2080 Ti Turing | `sm_75` | 12.0 | supported, 53 tok/s DFlash verified (FP16 draft) |
 | RTX 4090 Ada | `sm_89` | 12.0 | should work, unverified, pass `-DCMAKE_CUDA_ARCHITECTURES=89` |
-| RTX 5090 Blackwell consumer | `sm_120` | 12.8 | supported, auto-added by CMake |
+| RTX 5090 Blackwell consumer | `sm_120` | 12.8 | **205 tok/s DFlash, 4.84× vs AR** (Q4_K_M, budget=40) |
 | DGX Spark / GB10 | `sm_121` (compute capability 12.1) | 12.9 | supported, auto-added by CMake |
 | Jetson AGX Thor | `sm_110` | 13.0 | supported, auto-added by CMake |
 
@@ -168,9 +169,9 @@ cmake --build build --target test_dflash -j
 ```
 
 **What will NOT auto-port:**
-- **DDTree `budget=22`** tuned for 3090 + Q4_K_M + 24 GB. On cards with more VRAM (5090 32 GB, GB10 128 GB unified), re-sweep, larger tree = more verify throughput until memory bandwidth saturates. `scripts/bench_llm.py` has the sweep hooks.
+- **DDTree `budget=22`** tuned for 3090 + Q4_K_M + 24 GB. On the RTX 5090, budget=40 is optimal (swept). On GB10 (128 GB unified), re-sweep — larger tree = more verify throughput until memory bandwidth saturates. `scripts/bench_llm.py --budget N` has the sweep hooks.
 - **TQ3_0 KV cache + sliding `target_feat` ring** was shaped by 24 GB (fits up to 256K context on a 3090). On GB10 (128 GB unified) / 5090 (32 GB) you can push context further or skip quantization entirely and keep F16 KV.
-- **Perf numbers** (207 tok/s demo, 129.5 HumanEval, 2.8× vs SGLang AWQ) are RTX 3090 @ stock. Blackwell/Ada not yet swept, PRs with `RESULTS.md` entries welcome.
+- **Perf numbers** (207 tok/s demo, 129.5 HumanEval, 2.8× vs SGLang AWQ) are RTX 3090 @ stock. RTX 5090 numbers (205 tok/s HumanEval, 4.84×) are in [RESULTS.md](dflash/RESULTS.md). Ada/GB10/Thor not yet swept, PRs with `RESULTS.md` entries welcome.
 
 [Full writeup →](dflash/README.md) · [Benchmarks →](dflash/RESULTS.md) · [Blog post →](https://lucebox.com/blog/dflash27b)
 

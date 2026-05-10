@@ -220,6 +220,71 @@ What we built:
 - **NIAH single-needle** is the only retrieval task validated end-to-end. Multi-doc QA, long-form code retrieval, etc. still TBD.
 - **sm_80+** required for BSA (RTX 3090 sm_86 is the reference). On sm_75 (Turing) the build auto-disables BSA and falls back to the WMMA path; expect a slower drafter forward at long ctx.
 
+## Operator notes
+
+These are small operational lessons collected while running PFlash
+as the long-context lane of an OpenAI-compatible service in front
+of Lucebox. Nothing here changes the published kernels or the
+in-process daemon protocol — they are tuning hints for production
+operators.
+
+### Queue budget for long-context lanes
+
+PFlash compress on a 64K prompt takes ~24 s end-to-end on a live
+Qwen3.6 lane (RTX 6000 Ada sm_89, Q4_K_M target, Qwen3-0.6B
+drafter). The default queue budget
+(`max_queue_requests=4`, `queue_timeout_s=12.0`) was tuned for
+shorter prompts and produced avoidable timeouts on bursts of long
+prompts.
+
+For PFlash long-context lanes, recommend tuning:
+
+- `max_queue_requests=8`
+- `queue_timeout_s=90.0`
+
+These are operator-side flags on the launcher; they do not change
+PFlash semantics. A short prompt lane should keep the original
+defaults.
+
+### Drafter selection: BF16 Qwen3-0.6B for compress
+
+PFlash compress benefits from a small, fast drafter. The validated
+choice is **Qwen3-0.6B** in **BF16 safetensors** with ~5 attention
+layers. The DFlash drafter for the same target works correctly
+during decode-after-unpark but is heavier than ideal for compress.
+
+Practical guidance:
+
+- Use Qwen3-0.6B BF16 for `compress` (PFlash side).
+- Reuse the larger DFlash drafter for `decode` after unpark
+  (DFlash side).
+
+This dual-drafter setup avoids loading two large drafters
+simultaneously on a 24 GB GPU.
+
+### Apples-to-apples long-context measurement
+
+Reproducible comparison vs Ollama native `/api/chat` on the same
+64K unique-prompt summary task, RTX 6000 Ada sm_89,
+Qwen3.6-27B-Q4_K_M, FP16 drafter, FA_WINDOW=0:
+
+| Backend                                      | TTFT @ 64K |
+|----------------------------------------------|------------|
+| Ollama native, `qwen3.6:27b-q4_K_M`          | 68.614 s   |
+| Lucebox + PFlash compress, OpenAI-compat lane| 23.748 s   |
+
+Speedup ~2.89x measured 2026-05-07. Methodology: warm model, single
+unique prompt (no prefix-cache reuse), `temperature=0`,
+`max_tokens=160`. Ollama via native `/api/chat` (the OpenAI
+endpoint of Ollama returned `content=""` and the response in
+`message.reasoning`, so the comparison was done on the native
+endpoint).
+
+The speedup comes from the in-process compress path published in
+[#70](https://github.com/Luce-Org/lucebox-hub/pull/70); this
+section only documents how to reproduce it cleanly without prompt
+caching artefacts.
+
 ## Citation
 
 ```bibtex
