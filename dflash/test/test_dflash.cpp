@@ -203,6 +203,14 @@ static bool  g_dflash_mtp_seed_priority   = false;
 static bool  g_dflash_mtp_immediate_bonus = false;
 static int   g_dflash_mtp_chain_max       = 15;
 static float g_dflash_mtp_bonus_min_margin = 0.0f;
+// Policy gate that protects against MTP regressing vs the AR baseline on
+// short generations. Linear MTP without the bucket-cached verify path
+// loses to plain AR on n_gen < ~192 because graph build cost is ~81% of
+// decode wall time. `auto` activates MTP only when n_gen >= threshold;
+// `always` and `never` force it on/off regardless.
+enum class MtpPolicy { Auto, Always, Never };
+static MtpPolicy g_dflash_mtp_policy        = MtpPolicy::Always;
+static int       g_dflash_mtp_policy_min_n  = 192;
 
 // ─── MTP/DDTree timing instrumentation ───────────────────────────
 // Activated via --dflash-mtp-timing or DFLASH_MTP_TIMING=1. When disabled
@@ -271,6 +279,25 @@ struct ScopedTimer {
     ScopedTimer(const ScopedTimer &) = delete;
     ScopedTimer & operator=(const ScopedTimer &) = delete;
 };
+
+// Argmax-1 minus argmax-2 of a float vector. Used by the DFlash/MTP
+// hybrid immediate-bonus gate to skip committing the MTP seed when the
+// trunk's top-1 isn't clearly separated from top-2.
+static float top1_top2_margin_f32(const float * x, int n) {
+    if (n <= 1) return 0.0f;
+    float best = -INFINITY;
+    float second = -INFINITY;
+    for (int i = 0; i < n; i++) {
+        const float v = x[i];
+        if (v > best) {
+            second = best;
+            best = v;
+        } else if (v > second) {
+            second = v;
+        }
+    }
+    return best - second;
+}
 
 static int align_up(int x, int a) { return ((x + a - 1) / a) * a; }
 
@@ -403,7 +430,10 @@ struct DDTree {
 static DDTree build_ddtree(const float * top_log_probs,
                            const int32_t * top_token_ids,
                            int L, int K, int budget,
-                           bool chain_seed = true) {
+                           bool chain_seed = true,
+                           const int32_t * extra_chain = nullptr,
+                           int extra_chain_len = 0,
+                           bool extra_chain_priority = false) {
     DDTree tree;
     if (budget <= 0 || L <= 0) {
         tree.parents.push_back(-1);
@@ -438,6 +468,31 @@ static DDTree build_ddtree(const float * top_log_probs,
     tree.parents.push_back(-1);                 // root
     tree.child_maps.emplace_back();             // root's children
 
+    // MTP-seeded chain has priority over the draft top-1 spine. When native
+    // MTP already matched the target's next token, its continuation is the
+    // only part that can reduce future DDTree rounds. Insert it before the
+    // defensive DFlash chain seed so the latter cannot consume the full budget.
+    if (extra_chain_priority && extra_chain && extra_chain_len > 0) {
+        int prev_idx = 0;
+        const int chain_depth = std::min(L, extra_chain_len);
+        for (int d = 1; d <= chain_depth && tree.n_nodes < budget; d++) {
+            const int32_t tok_id = extra_chain[d - 1];
+            auto it = tree.child_maps[prev_idx].find(tok_id);
+            if (it != tree.child_maps[prev_idx].end()) {
+                prev_idx = it->second;
+                continue;
+            }
+            const int cur_idx = tree.n_nodes + 1;
+            tree.token_ids.push_back(tok_id);
+            tree.depths.push_back(d);
+            tree.parents.push_back(prev_idx);
+            tree.child_maps.emplace_back();
+            tree.child_maps[prev_idx][tok_id] = cur_idx;
+            tree.n_nodes++;
+            prev_idx = cur_idx;
+        }
+    }
+
     // Two seeding strategies:
     //   - chain_seed=true: pre-seed full top-1 chain (defensive, guarantees
     //     AL >= chain mode even with flat-softmax draft like Q4_K_M). Compensates
@@ -449,9 +504,29 @@ static DDTree build_ddtree(const float * top_log_probs,
         const int chain_depth = std::min(L, budget);
         float cum_logw = 0.0f;
         int   prev_idx = 0;
-        for (int d = 1; d <= chain_depth; d++) {
+        for (int d = 1; d <= chain_depth && tree.n_nodes < budget; d++) {
             const int32_t tok_id = top_token_ids[(size_t)(d - 1) * K + 0];
             cum_logw += top_log_probs[(size_t)(d - 1) * K + 0];
+
+            // Skip if extra_chain_priority already inserted this node.
+            auto it = tree.child_maps[prev_idx].find(tok_id);
+            if (it != tree.child_maps[prev_idx].end()) {
+                if (K > 1) {
+                    const float sibling_logw = cum_logw
+                        - top_log_probs[(size_t)(d - 1) * K + 0]
+                        + top_log_probs[(size_t)(d - 1) * K + 1];
+                    heap.push({
+                        /*neg_logw*/ -sibling_logw,
+                        /*ranks   */ {1},
+                        /*parent  */ prev_idx,
+                        /*depth   */ d,
+                        /*rank    */ 1,
+                        /*logw    */ sibling_logw,
+                    });
+                }
+                prev_idx = it->second;
+                continue;
+            }
 
             const int cur_idx = tree.n_nodes + 1;
             tree.token_ids.push_back(tok_id);
@@ -489,6 +564,30 @@ static DDTree build_ddtree(const float * top_log_probs,
         });
     }
 
+    // Fallback extra_chain insertion (lower priority than the spine).
+    // Used when extra_chain_priority=false so the MTP seed still gets
+    // a chance to land if there's budget left after the DFlash spine.
+    if (!extra_chain_priority && extra_chain && extra_chain_len > 0) {
+        int prev_idx = 0;
+        const int chain_depth = std::min(L, extra_chain_len);
+        for (int d = 1; d <= chain_depth && tree.n_nodes < budget; d++) {
+            const int32_t tok_id = extra_chain[d - 1];
+            auto it = tree.child_maps[prev_idx].find(tok_id);
+            if (it != tree.child_maps[prev_idx].end()) {
+                prev_idx = it->second;
+                continue;
+            }
+            const int cur_idx = tree.n_nodes + 1;
+            tree.token_ids.push_back(tok_id);
+            tree.depths.push_back(d);
+            tree.parents.push_back(prev_idx);
+            tree.child_maps.emplace_back();
+            tree.child_maps[prev_idx][tok_id] = cur_idx;
+            tree.n_nodes++;
+            prev_idx = cur_idx;
+        }
+    }
+
     while (!heap.empty() && tree.n_nodes < budget) {
         HeapEntry top = heap.top();
         heap.pop();
@@ -496,6 +595,12 @@ static DDTree build_ddtree(const float * top_log_probs,
         const int    depth_minus_1 = top.depth - 1;
         const int    rank          = top.rank;
         const int32_t token_id     = top_token_ids[(size_t)depth_minus_1 * K + rank];
+        // Avoid re-inserting a duplicate child that an extra_chain or chain_seed
+        // already placed under this parent.
+        if (tree.child_maps[top.parent_index].find(token_id) !=
+            tree.child_maps[top.parent_index].end()) {
+            continue;
+        }
 
         const int current_index = tree.n_nodes + 1;  // slot in flat tree
         tree.token_ids.push_back(token_id);
@@ -3263,6 +3368,8 @@ static bool run_mtp_integrated_prompt(const TargetWeights & w,
 }
 
 // CLI entry point: runs MTP integrated decode and prints metrics.
+// Honors --dflash-mtp-policy=auto|always|never: under `auto`, falls back to
+// the AR baseline when n_gen is below the regression threshold (default 192).
 static int run_mtp_integrated_cli(const TargetWeights & w,
                                   ggml_backend_t backend,
                                   int max_ctx,
@@ -3271,6 +3378,29 @@ static int run_mtp_integrated_cli(const TargetWeights & w,
                                   int mtp_draft_n_max,
                                   int decode_pos_offset,
                                   bool step_log) {
+    const bool use_mtp =
+        (g_dflash_mtp_policy == MtpPolicy::Always) ||
+        (g_dflash_mtp_policy == MtpPolicy::Auto &&
+         n_gen >= g_dflash_mtp_policy_min_n);
+    if (g_dflash_mtp_policy == MtpPolicy::Auto && !use_mtp) {
+        std::printf("[mtp-policy] auto: n_gen=%d < min_n=%d, falling back to AR baseline\n",
+                    n_gen, g_dflash_mtp_policy_min_n);
+    }
+
+    if (!use_mtp) {
+        TargetArRunStats ar;
+        if (!run_target_ar_prompt(w, backend, max_ctx, prompt, n_gen,
+                                  decode_pos_offset, ar)) {
+            return 1;
+        }
+        const double tps = ar.out_ids.size() / std::max(1e-9, ar.seconds);
+        std::printf("[mtp-integrated] policy=%s generated=%zu tok/s=%.2f seconds=%.4f "
+                    "mode=baseline-ar\n",
+                    g_dflash_mtp_policy == MtpPolicy::Never ? "never" : "auto-fallback",
+                    ar.out_ids.size(), tps, ar.seconds);
+        return 0;
+    }
+
     MtpIntegratedRunStats st;
     if (!run_mtp_integrated_prompt(w, backend, max_ctx, prompt, n_gen,
                                    mtp_draft_n_max, st, step_log,
@@ -3279,8 +3409,12 @@ static int run_mtp_integrated_cli(const TargetWeights & w,
     }
     const double tps = st.out_ids.size() / std::max(1e-9, st.seconds);
     const double acc = st.draft_n > 0 ? 100.0 * st.accepted / st.draft_n : 0.0;
-    std::printf("[mtp-integrated] generated=%zu draft_n=%d accepted=%d corrected=%d "
-                "acceptance=%.1f%% tok/s=%.2f seconds=%.4f draft_n_max=%d\n",
+    const char * policy_name =
+        g_dflash_mtp_policy == MtpPolicy::Always ? "always" :
+        g_dflash_mtp_policy == MtpPolicy::Auto   ? "auto"   : "never";
+    std::printf("[mtp-integrated] policy=%s generated=%zu draft_n=%d accepted=%d "
+                "corrected=%d acceptance=%.1f%% tok/s=%.2f seconds=%.4f draft_n_max=%d\n",
+                policy_name,
                 st.out_ids.size(), st.draft_n, st.accepted, st.corrected,
                 acc, tps, st.seconds, mtp_draft_n_max);
     return 0;
@@ -3624,6 +3758,21 @@ int main(int argc, char ** argv) {
         }
         else if (std::strncmp(argv[i], "--dflash-mtp-bonus-min-margin=", 30) == 0) {
             g_dflash_mtp_bonus_min_margin = (float)std::atof(argv[i] + 30);
+        }
+        else if (std::strncmp(argv[i], "--dflash-mtp-policy=", 20) == 0) {
+            const char * v = argv[i] + 20;
+            if      (std::strcmp(v, "auto")   == 0) g_dflash_mtp_policy = MtpPolicy::Auto;
+            else if (std::strcmp(v, "always") == 0) g_dflash_mtp_policy = MtpPolicy::Always;
+            else if (std::strcmp(v, "never")  == 0) g_dflash_mtp_policy = MtpPolicy::Never;
+            else {
+                std::fprintf(stderr,
+                             "bad --dflash-mtp-policy value (use auto|always|never): %s\n",
+                             v);
+                return 2;
+            }
+        }
+        else if (std::strncmp(argv[i], "--dflash-mtp-policy-min-n=", 26) == 0) {
+            g_dflash_mtp_policy_min_n = std::max(1, std::atoi(argv[i] + 26));
         }
     }
 
