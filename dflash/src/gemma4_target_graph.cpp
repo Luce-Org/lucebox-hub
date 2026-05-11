@@ -1103,7 +1103,25 @@ GemmaGraphOutputs build_gemma4_graph(
     // the target's token prediction.  Capturing inside the layer loop (pre-norm)
     // caused accept_rate=0 because the draft head was trained on post-norm hiddens.
     // Source: vLLM PR #41745:569-621 + llama.cpp #22738.
-    if (cache.mtp_h_prev_enabled && cache.mtp_h_prev) {
+    if (cache.mtp_h_prev_enabled && cache.mtp_h_prev_capture_mode == 1
+            && cache.mtp_h_prev_batch && n_tokens > 1) {
+        // Approach B: write all n_tokens rows of post-final-norm hidden into
+        // the first n_tokens columns of mtp_h_prev_batch.  The γ>1 driver
+        // then picks the correct column host-side after greedy match; no
+        // extra re-capture forward is needed.
+        const int n_embd_hp = (int)cache.mtp_h_prev_batch->ne[0];
+        GGML_ASSERT(n_tokens <= (int)cache.mtp_h_prev_batch->ne[1]);
+        ggml_tensor * src = out;  // [n_embd, n_tokens]
+        if (src->type != GGML_TYPE_F32) {
+            src = ggml_cast(ctx, src, GGML_TYPE_F32);
+        }
+        // Destination view: first n_tokens columns of mtp_h_prev_batch.
+        ggml_tensor * dst_view = ggml_view_2d(ctx, cache.mtp_h_prev_batch,
+            n_embd_hp, n_tokens,
+            ggml_row_size(cache.mtp_h_prev_batch->type, n_embd_hp),
+            /* offset = */ 0);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, src, dst_view));
+    } else if (cache.mtp_h_prev_enabled && cache.mtp_h_prev) {
         const int n_embd_hp = (int)cache.mtp_h_prev->ne[0];
         // Row to capture from the [n_embd, n_tokens] tensor.  Default (sentinel
         // -1) is the last row, matching the γ=1 contract.  For γ>1 partial

@@ -1172,9 +1172,13 @@ int main(int argc, char ** argv) {
         // Allocate mtp_h_prev tensor: [n_embd_backbone, 1] f32, GPU-resident,
         // persistent across decode steps. Separate context so free_gemma4_cache
         // doesn't free it.
+        // Also allocate mtp_h_prev_batch [n_embd_backbone, 17] for approach B
+        // (batch capture of all verify rows; eliminates per-chain re-capture forward).
         {
+            // Two tensors: mtp_h_prev [n_embd, 1] + mtp_h_prev_batch [n_embd, 17].
+            const int kBatchCols = 17;
             ggml_init_params ep{};
-            ep.mem_size   = ggml_tensor_overhead() + 256;
+            ep.mem_size   = 2 * ggml_tensor_overhead() + 512;
             ep.mem_buffer = nullptr;
             ep.no_alloc   = true;
             mtp_h_prev_ctx = ggml_init(ep);
@@ -1186,6 +1190,10 @@ int main(int argc, char ** argv) {
                                                     GGML_TYPE_F32,
                                                     mtp_w.n_embd_backbone, 1);
             ggml_set_name(cache.mtp_h_prev, "mtp_h_prev");
+            cache.mtp_h_prev_batch = ggml_new_tensor_2d(mtp_h_prev_ctx,
+                                                         GGML_TYPE_F32,
+                                                         mtp_w.n_embd_backbone, kBatchCols);
+            ggml_set_name(cache.mtp_h_prev_batch, "mtp_h_prev_batch");
             mtp_h_prev_buf = ggml_backend_alloc_ctx_tensors(mtp_h_prev_ctx, backend);
             if (!mtp_h_prev_buf) {
                 std::fprintf(stderr, "[mtp] alloc mtp_h_prev failed\n");
@@ -2391,9 +2399,10 @@ int main(int argc, char ** argv) {
                 const int verify_n = K + 1;
                 const int old_committed = committed;
 
-                // mtp_h_prev_row = -1 (sentinel = last row = K).
-                // Correct row refresh happens below if accept_drafts < K.
-                cache.mtp_h_prev_row = -1;
+                // Approach B: capture all K+1 rows in the verify pass so we
+                // can pick the right one host-side after greedy match.
+                cache.mtp_h_prev_row          = -1;  // unused in batch mode
+                cache.mtp_h_prev_capture_mode = 1;   // enable batch capture
 
                 if (!build_gemma4_step(sg, w, cache, backend,
                                        committed, verify_n,
@@ -2506,71 +2515,20 @@ int main(int argc, char ** argv) {
                     first_token_ms = now_ms() - decode_t0;
                 }
 
-                // ── mtp_h_prev refresh (approach A) ───────────────────────
-                // We need h_prev captured at the row corresponding to
-                // verify_in[accept_drafts] = the last accepted token.
-                // The verify ran with mtp_h_prev_row = -1 (captures row K).
-                // If accept_drafts < K, we do a 1-token re-capture.
-                // If accept_drafts == K, row K is the bonus's predecessor — but
-                // the bonus token is at new_committed-1 = old_committed+K, and
-                // verify_in[K] = draft[K-1] at old_committed+K.  Row K in the
-                // verify was the last row; mtp_h_prev already holds the correct
-                // value.  No re-capture needed.
-                if (accept_drafts < K) {
-                    // Re-run a 1-token target forward at position old_committed+accept_drafts
-                    // with capture enabled so mtp_h_prev gets the right hidden state.
-                    // Use mtp_h_prev_row = -1 (n_tokens=1 → only row 0 exists = last row).
-                    cache.mtp_h_prev_row = -1;
-                    if (!build_gemma4_step(sg, w, cache, backend,
-                                           old_committed + accept_drafts, /*n_tokens=*/1,
-                                           /*with_mask=*/true,
-                                           /*capture=*/false,
-                                           /*use_pflash=*/false, pflash_alpha,
-                                           fa_window)) {
-                        std::fprintf(stderr, "[mtp-gt1] h_prev re-capture build failed\n");
-                        ggml_gallocr_free(mtp_galloc);
-                        return 1;
-                    }
-                    // Embed the token at that position (= verify_in[accept_drafts])
-                    if (!embed_token(w, verify_in[accept_drafts], sg.inp_embed, backend)) {
-                        ggml_gallocr_free(mtp_galloc);
-                        return 1;
-                    }
-                    {
-                        int32_t pos_val = old_committed + accept_drafts;
-                        ggml_backend_tensor_set(sg.positions, &pos_val, 0, sizeof(int32_t));
-                    }
-                    if (sg.attn_mask && sg.attn_mask->buffer) {
-                        const int kv_len = old_committed + accept_drafts + 1;
-                        std::vector<uint16_t> mask_buf;
-                        build_causal_mask(mask_buf, kv_len, 1, old_committed + accept_drafts);
-                        ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
-                                                sizeof(uint16_t) * mask_buf.size());
-                    }
-                    if (sg.swa_mask && sg.swa_mask->buffer) {
-                        const SwaView swa_view = compute_swa_view(
-                            old_committed + accept_drafts, 1,
-                            w.swa_window, cache.swa_ctx_alloc);
-                        std::vector<uint16_t> swa_buf;
-                        build_swa_causal_mask(swa_buf,
-                                              /*kv_start*/ old_committed + accept_drafts,
-                                              /*n_tokens*/ 1,
-                                              /*swa_window*/ w.swa_window,
-                                              /*ring_size*/ swa_view.effective_win_len,
-                                              /*kv_end*/ old_committed + accept_drafts + 1);
-                        ggml_backend_tensor_set(sg.swa_mask, swa_buf.data(), 0,
-                                                sizeof(uint16_t) * swa_buf.size());
-                    }
-                    {
-                        auto st = ggml_backend_graph_compute(backend, sg.gf);
-                        if (st != GGML_STATUS_SUCCESS) {
-                            std::fprintf(stderr, "[mtp-gt1] h_prev re-capture compute failed\n");
-                            ggml_gallocr_free(mtp_galloc);
-                            return 1;
-                        }
-                    }
-                    step_graph_free(sg);
+                // ── mtp_h_prev refresh (approach B) ───────────────────────
+                // The verify ran with mtp_h_prev_capture_mode=1, so the target
+                // graph wrote all K+1 rows into mtp_h_prev_batch.  We pick the
+                // column at accept_drafts host-side (21 KB staging copy) and
+                // write it into mtp_h_prev.  No extra GPU forward needed.
+                {
+                    const size_t n_embd_hp = (size_t)cache.mtp_h_prev->ne[0];
+                    const size_t col_bytes = n_embd_hp * sizeof(float);
+                    std::vector<float> staging(n_embd_hp);
+                    ggml_backend_tensor_get(cache.mtp_h_prev_batch, staging.data(),
+                        /* offset = */ (size_t)accept_drafts * col_bytes, col_bytes);
+                    ggml_backend_tensor_set(cache.mtp_h_prev, staging.data(), 0, col_bytes);
                 }
+                cache.mtp_h_prev_capture_mode = 0;  // reset for safety
 
                 // ── Stats ──────────────────────────────────────────────────
                 mtp_gt1_chains++;
@@ -2973,8 +2931,10 @@ int main(int argc, char ** argv) {
         // Null out the pointer in cache before free_gemma4_cache to avoid
         // dangling reference (cache struct is stack-allocated; the pointer
         // would otherwise reference freed memory).
-        cache.mtp_h_prev         = nullptr;
-        cache.mtp_h_prev_enabled = false;
+        cache.mtp_h_prev              = nullptr;
+        cache.mtp_h_prev_batch        = nullptr;
+        cache.mtp_h_prev_enabled      = false;
+        cache.mtp_h_prev_capture_mode = 0;
         if (mtp_h_prev_buf) { ggml_backend_buffer_free(mtp_h_prev_buf); mtp_h_prev_buf = nullptr; }
         if (mtp_h_prev_ctx) { ggml_free(mtp_h_prev_ctx); mtp_h_prev_ctx = nullptr; }
     }

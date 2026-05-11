@@ -622,6 +622,15 @@ struct GemmaTargetCache {
     // Set by the γ>1 driver after greedy match: mtp_h_prev_row = accept_n - 1.
     int           mtp_h_prev_row = -1;
 
+    // Approach B: when mtp_h_prev_capture_mode == 1, the target graph writes
+    // all n_tokens rows of post-final-norm hidden into mtp_h_prev_batch
+    // instead of slicing one row into mtp_h_prev.  After verify, the γ>1
+    // driver picks the column matching accept_drafts and copies it host-side
+    // into mtp_h_prev for the next MTP chain to read.  No re-capture forward.
+    // Width = max gamma + 1 = 17 (matches the --gamma CLI cap of 16).
+    ggml_tensor * mtp_h_prev_batch         = nullptr;  // [n_embd_backbone, 17]
+    int           mtp_h_prev_capture_mode  = 0;         // 0 = single-row, 1 = batch
+
     // Draft KV cache (prefix-direct: projected target features → K/V per layer)
     ggml_context        * draft_kv_ctx = nullptr;
     ggml_backend_buffer_t draft_kv_buf = nullptr;
