@@ -968,11 +968,11 @@ ul.schema li::before {
       <li><a href="#dm-sweep" class="toc-sub2">§1.5 dm-sweep</a></li>
       <li><a href="#scientific-24cell" class="toc-sub2">§1C Scientific 24-cell</a></li>
       <li><a href="#tq3-frontier">TQ3 Frontier</a></li>
-      <li><a href="#gamma-mtp">γ&gt;1 MTP ★</a></li>
+      <li><a href="#recipes">Recipes &amp; Regime Map ★</a></li>
       <li><a href="#for-3090-users">For 3090 Users</a></li>
       <li><a href="#charts">Charts</a></li>
       <li><a href="#what-failed">What Did Not Work</a></li>
-      <li><a href="#discoveries">15 Discoveries</a></li>
+      <li><a href="#discoveries">20 Discoveries</a></li>
       <li><a href="#super-bench">Super-Bench</a></li>
       <li><a href="#timeline">Timeline</a></li>
       <li><a href="#open-questions">Open Questions</a></li>
@@ -1004,10 +1004,10 @@ ul.schema li::before {
         <li><a href="#what-failed">What Did Not Work</a></li>
         <li><a href="#scientific-24cell" class="toc-sub2">§1C Scientific 24-cell</a></li>
         <li><a href="#tq3-frontier">TQ3 Frontier ★</a></li>
-        <li><a href="#gamma-mtp">γ&gt;1 MTP ★</a></li>
+        <li><a href="#recipes">Recipes &amp; Regime Map ★</a></li>
         <li><a href="#for-3090-users">For 3090 Users ★</a></li>
         <li><a href="#charts">Charts</a></li>
-        <li><a href="#discoveries">15 Discoveries</a></li>
+        <li><a href="#discoveries">20 Discoveries</a></li>
         <li><a href="#super-bench">Super-Bench</a></li>
         <li><a href="#timeline">Timeline</a></li>
         <li><a href="#open-questions">Open Questions</a></li>
@@ -1086,7 +1086,7 @@ ul.schema li::before {
         </article>
       </div>
       <div class="prose-wrap">
-        <p class="summary-coda"><code>feature/gemma4-support</code> ships three speculative-decode paths — <strong>none</strong>, <strong>MTP</strong> (Multi-Token Prediction assistant), and <strong>DFlash</strong> (block-diffusion drafter). MTP now runs as a real multi-token chain (γ&gt;1, approach B): <strong>+39 % over no-MTP at 4K</strong> (γ=4 → 25.6 tok/s) and <strong>+61 % at 64K</strong> (γ=2 → 10.1 tok/s, 0.73 accept rate). The "MTP uneconomic at 64K" claim from earlier in this writeup was pre-rebase noise and is now <em>resolved</em>. The path to these results required <strong>15 distinct ggml/llama.cpp fixes</strong> plus the γ&gt;1 chain implementation, none of which exist upstream — see §<a href="#gamma-mtp" style="color:var(--accent);">γ&gt;1 MTP</a> and §3 Discoveries. Post-rebase (<code>daef232a6</code> + <code>4b0c158</code> + <code>6715acf13</code>): 1M TQ3 context confirmed on 24 GB, 256K ship config at <strong>67.95 tok/s</strong> (DFlash) or <strong>≈10 tok/s</strong> at 64K (MTP γ=2).</p>
+        <p class="summary-coda">On a 24 GB 3090, the right Gemma 4 config is a regime function of (model, context). <strong>MoE 26B-A4B</strong>: Q8/Q8 KV + pflash + DFlash dm=4 dominates from 4K through 512K (60–132 tok/s depending on ctx). TurboQuant (TQ3) becomes mandatory only at 1M+ where Q8 KV pages — there DFlash holds at 26 ± 5 tok/s. <strong>Dense 31B</strong>: same Q8 stack peaks at 81.7 tok/s (4K, creative). Above 32K the model is VRAM-bound; MTP γ=2 + TQ3 + pflash is the only viable drafter (~10 tok/s through 128K). 256K+ Dense is infeasible on 24 GB. See <a href="#recipes" style="color:var(--accent);">§Recipes</a> for the full decision matrix and <a href="#discoveries" style="color:var(--accent);">§Discoveries</a> for the 20 ggml/llama.cpp fixes this required.</p>
       </div>
     </section>
 
@@ -1304,71 +1304,173 @@ ul.schema li::before {
       </div>
     </section>
 
-    <!-- ── γ>1 MTP — multi-token chained speculative decoding ───── -->
-    <section class="section" id="gamma-mtp">
+    <!-- ── Recipes & Regime Map (replaces former γ>1 MTP section) ── -->
+    <section class="section" id="recipes">
       <div class="wide-wrap">
-        <p class="section-eyebrow">May 10–11 Breakthrough</p>
-        <h2><button class="anchor-btn" title="Copy link" onclick="copyAnchor('gamma-mtp')">#</button>γ&gt;1 MTP — multi-token chained speculative decoding</h2>
-        <p class="lede">Earlier sections in this writeup state that MTP at 64K is uneconomic with ≤ 2 % accept rate. <strong>That was wrong</strong> — it was pre-rebase noise on a binary with two latent bugs. After fixing both and implementing a real γ&gt;1 chained drafter, MTP is now the highest-throughput config at both short and long context on a single 3090.</p>
+        <p class="section-eyebrow">Practical First</p>
+        <h2><button class="anchor-btn" title="Copy link" onclick="copyAnchor('recipes')">#</button>Recipes &amp; Regime Map</h2>
+        <p class="lede">All measurements are from the current binary (post commits <code>4bcb972</code> + submodule <code>6715acf13</code>, 2026-05-11) on a single 24 GB RTX 3090, WSL2, greedy decode (<code>--temp 0 --seed 0 --ignore-eos --n-predict 64</code>) on the 50 K-token code prompt unless noted. Earlier inflated framing has been walked back — see the cited evidence and the <a href="https://github.com/dusterbloom/gemma4-evidence/blob/main/EVIDENCE.md" style="color:var(--accent);">full dossier on GitHub</a>.</p>
 
-        <h3 style="font-family:'Fraunces',serif;font-weight:500;font-size:1.2rem;margin:1.5rem 0 0.5rem;">Results — Dense 31B, TQ3/TQ3 KV, greedy</h3>
+        <h3 style="font-family:'Fraunces',serif;font-weight:500;font-size:1.2rem;margin:1.75rem 0 0.5rem;">MoE 26B-A4B — Q8 + pflash + DFlash wins through 512K</h3>
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
                 <th>Context</th>
-                <th>no-MTP</th>
-                <th>γ=1 (correctness gate)</th>
-                <th>γ=2</th>
-                <th>γ=4</th>
-                <th>Best gain</th>
+                <th>Recommended config</th>
+                <th class="num">Decode tok/s</th>
+                <th class="num">J/tok</th>
+                <th class="num">VRAM (GB)</th>
               </tr>
             </thead>
             <tbody>
               <tr>
                 <td><strong>4K</strong></td>
-                <td class="num">18.40</td>
-                <td class="num">18.46 (0.66)</td>
-                <td class="num">25.10 (0.55)</td>
-                <td class="num"><span class="badge-good">25.58 (0.42)</span></td>
-                <td class="num"><strong>+39 %</strong> (γ=4)</td>
-              </tr>
-              <tr>
-                <td><strong>16K</strong></td>
-                <td class="num">12.43</td>
-                <td class="num">9.79 (0.64)</td>
-                <td class="num">12.56 (0.47)</td>
-                <td class="num"><span class="badge-good">13.06 (0.47)</span></td>
-                <td class="num"><strong>+5 %</strong> (γ=4; was &minus;35 % under approach A)</td>
+                <td>Q8/Q8 + pflash + DFlash dm=16 <em style="color:var(--text-sec);font-size:0.85em;">(code)</em></td>
+                <td class="num"><strong>132.1</strong></td>
+                <td class="num">11.82</td>
+                <td class="num">18.90</td>
               </tr>
               <tr>
                 <td><strong>64K</strong></td>
-                <td class="num">6.26</td>
-                <td class="num">5.31 (0.69)</td>
-                <td class="num"><span class="badge-good">10.07 (0.73)</span></td>
-                <td class="num">8.29 (0.46)</td>
-                <td class="num"><strong>+61 %</strong> (γ=2)</td>
+                <td>Q8/Q8 + pflash + DFlash dm=8</td>
+                <td class="num">34.66</td>
+                <td class="num"><strong>12.02</strong></td>
+                <td class="num">19.84</td>
+              </tr>
+              <tr>
+                <td><strong>128K</strong></td>
+                <td>Q8/Q8 + pflash + DFlash dm=4</td>
+                <td class="num"><strong>66.97</strong></td>
+                <td class="num"><strong>6.26</strong></td>
+                <td class="num">20.45</td>
+              </tr>
+              <tr>
+                <td><strong>256K</strong></td>
+                <td>Q8/Q8 + pflash + DFlash dm=4</td>
+                <td class="num"><strong>63.82</strong></td>
+                <td class="num">8.13</td>
+                <td class="num">21.75</td>
+              </tr>
+              <tr>
+                <td><strong>512K</strong></td>
+                <td>Q8/Q8 + pflash + DFlash dm=4</td>
+                <td class="num"><strong>62.40</strong></td>
+                <td class="num">6.82</td>
+                <td class="num">24.00 (sat)</td>
+              </tr>
+              <tr>
+                <td><strong>1M</strong></td>
+                <td><strong>TQ3</strong>/TQ3 + pflash + DFlash dm=4 <em style="color:var(--text-sec);font-size:0.85em;">(Q8 pages)</em></td>
+                <td class="num">26 ± 5 <em style="color:var(--text-sec);font-size:0.85em;">(triple-trial σ)</em></td>
+                <td class="num"><em style="color:var(--text-sec);font-size:0.85em;">awaiting</em></td>
+                <td class="num">24.00 (sat)</td>
               </tr>
             </tbody>
           </table>
-          <p class="table-caption">Decode tok/s (accept rate in parentheses). Generated with <code>--n-predict 64 --temp 0 --ignore-eos</code> on <code>long_code_50k.txt</code> for 64K; <code>prose_12288</code> for 16K; 145-token essay prompt for 4K. Sweep logs: <code>.sisyphus/notes/gemma4-baseline/mtp-gamma/phase4-b/</code>.</p>
+          <p class="table-caption">Q8 KV fits comfortably to 512K on MoE 26B-A4B (KV is small because only 4B params are active). DFlash dm=4 amortizes verify across multiple tokens at 60+ tok/s through that band. At 1M, Q8 KV doesn't fit; TurboQuant becomes mandatory. The triple-trial σ at 1M reflects run-to-run variance under WSL2/CUDA allocator state (see <a href="#discoveries" style="color:var(--accent);">discovery #15</a>).</p>
         </div>
 
-        <h3 style="font-family:'Fraunces',serif;font-weight:500;font-size:1.2rem;margin:1.5rem 0 0.5rem;">What we shipped</h3>
-        <ol class="prose-list">
-          <li><strong>Architectural parity verified against Google's HF reference</strong> (<code>modeling_gemma4_assistant.py</code>): post-final-RMSNorm h_target capture, concat <code>[token_emb, h_target]</code>, projection shapes <code>[2·5376, 1024]</code> and <code>[1024, 5376]</code>, weight-tied <code>lm_head</code>, Q-only cross-attention to target's KV (no <code>wk</code>/<code>wv</code> in <code>MtpLayerWeights</code>), 4 drafter blocks, constant <code>position_ids</code> within a chain (empirically wins vs incrementing).</li>
-          <li><strong>Two latent bugs uncovered</strong> that only γ=1 hid: (a) <code>position_ids</code> was incrementing per step at <code>test_gemma4_dflash.cpp:2341</code> — Google's reference holds them constant within a chain. (b) the autoregressive feedback <code>out_h_post → in_h_prev</code> was never wired — γ=1 only ever read <code>cache.mtp_h_prev</code>, so it never noticed.</li>
-          <li><strong>Approach A (commit <code>d8ebd12</code>):</strong> single-token target re-capture forward after partial accept. Worked correctly but capped γ=4 at 4K to 20.75 tok/s; collapsed γ=4 at 64K to 6.54 tok/s due to ~80 ms re-capture cost reading 64K KV slots.</li>
-          <li><strong>Approach B (commit <code>4bcb972</code>):</strong> capture all K+1 rows of <code>mtp_h_prev</code> into a sibling <code>mtp_h_prev_batch [n_embd, 17]</code> tensor during the verify call; host-side pick column <code>accept_drafts</code> (21 KB copy) after greedy match. No re-capture forward. <strong>This is what unlocks the +61 % at 64K.</strong></li>
-          <li><strong>Bonus fix: TQ3 debug printf removal</strong> (submodule commit <code>6715acf13</code>). A stray kernel <code>printf</code> in <code>fattn-chunked.cuh:391</code> — landed during a previous FWHT-fuse refactor — was firing once per dequant launch and tanking TQ3-path performance by ~8×. Removing it recovered the baseline.</li>
-        </ol>
+        <h3 style="font-family:'Fraunces',serif;font-weight:500;font-size:1.2rem;margin:1.75rem 0 0.5rem;">Dense 31B — VRAM-bound above 32K; MTP γ=2 takes over</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Context</th>
+                <th>Recommended config</th>
+                <th class="num">Decode tok/s</th>
+                <th class="num">J/tok</th>
+                <th class="num">VRAM (GB)</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>4K</strong></td>
+                <td>Q8/Q8 + pflash + DFlash dm=16 <em style="color:var(--text-sec);font-size:0.85em;">(creative)</em></td>
+                <td class="num"><strong>81.7</strong></td>
+                <td class="num">8.82</td>
+                <td class="num">22.08</td>
+              </tr>
+              <tr>
+                <td><strong>32K</strong></td>
+                <td>Q8/Q8 + pflash <em style="color:var(--text-sec);font-size:0.85em;">(no drafter — DFlash hurts here)</em></td>
+                <td class="num">18.33</td>
+                <td class="num">35.04</td>
+                <td class="num">21.36</td>
+              </tr>
+              <tr>
+                <td><strong>64K</strong></td>
+                <td><strong>TQ3</strong>/TQ3 + pflash + MTP γ=2</td>
+                <td class="num"><strong>10.07</strong></td>
+                <td class="num"><em style="color:var(--text-sec);font-size:0.85em;">awaiting</em></td>
+                <td class="num">~22</td>
+              </tr>
+              <tr>
+                <td><strong>128K</strong></td>
+                <td>TQ3/TQ3 + pflash + MTP γ=2</td>
+                <td class="num">10.18</td>
+                <td class="num"><em style="color:var(--text-sec);font-size:0.85em;">awaiting</em></td>
+                <td class="num">~23</td>
+              </tr>
+              <tr>
+                <td><strong>≥ 256K</strong></td>
+                <td colspan="4"><em style="color:var(--text-sec);">Infeasible on 24 GB — Dense 31B model + KV + drafter exceeds VRAM. Untested.</em></td>
+              </tr>
+            </tbody>
+          </table>
+          <p class="table-caption">Dense 31B is much larger than MoE 26B-A4B's active footprint. By 32K, Q8 KV already pushes VRAM to 21 GB; adding DFlash's draft KV cache pushes it over 24 GB and decode <em>regresses</em>. MTP γ=2 cross-attends to the target KV (no extra cache), so it fits where DFlash doesn't. Accept rate 0.78 at 128K (code) — the MTP head transfers cleanly to long context.</p>
+        </div>
 
-        <h3 style="font-family:'Fraunces',serif;font-weight:500;font-size:1.2rem;margin:1.5rem 0 0.5rem;">Why γ&gt;1 is needed (and γ=1 was a trap)</h3>
-        <p class="prose-text">At γ=1, the MTP drafter runs <em>after</em> every target forward, consuming the target's just-computed <code>h_prev</code> to predict the next token. There is no batched verify to amortise the drafter's own cost over — every iteration pays the full drafter forward and saves nothing. The accept rate is meaningful but irrelevant for speed. With γ=K&gt;1, the drafter runs K times in a chain seeded by target's <code>h_prev</code> at step 0 and chained from its own post-projection output for steps 1..K-1; then target verifies all K+1 candidate tokens in <em>one</em> batched forward (per-position logits, <code>last_token_logits_only=false</code>); a greedy longest-prefix match commits up to K+1 emitted tokens for one target step. That is real speculative decoding.</p>
+        <h3 style="font-family:'Fraunces',serif;font-weight:500;font-size:1.2rem;margin:1.75rem 0 0.5rem;">Per-component contribution at MoE 64K code (OVAT)</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Change from naive baseline</th>
+                <th class="num">Decode tok/s</th>
+                <th class="num">Δ vs Q8 naive</th>
+                <th>Verdict</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Naive: Q8/Q8 + no pflash + no drafter</td>
+                <td class="num">23.25</td>
+                <td class="num">—</td>
+                <td>baseline</td>
+              </tr>
+              <tr>
+                <td>Q8 → TQ3 KV (alone)</td>
+                <td class="num">20.09</td>
+                <td class="num">−14 %</td>
+                <td>TQ3 is a decode <em>cost</em> when ctx fits in Q8</td>
+              </tr>
+              <tr>
+                <td>+ pflash (on Q8)</td>
+                <td class="num">23.65</td>
+                <td class="num">+2 %</td>
+                <td>pflash is decode-neutral at 64K (huge prefill win)</td>
+              </tr>
+              <tr>
+                <td>+ DFlash dm=8 on TQ3+pflash</td>
+                <td class="num"><strong>34.66</strong></td>
+                <td class="num"><strong>+49 %</strong></td>
+                <td>DFlash is the headline speedup AND best J/tok (12.02)</td>
+              </tr>
+              <tr>
+                <td>+ MTP γ=2 on TQ3+pflash</td>
+                <td class="num">23.10</td>
+                <td class="num">−0.6 %</td>
+                <td>γ=2 ties the naive baseline — TQ3 penalty cancels MTP gain</td>
+              </tr>
+            </tbody>
+          </table>
+          <p class="table-caption">One-variable-at-a-time ablation at MoE 26B-A4B × ctx=64K × code prompt. Earlier framing "γ=2 at 64K = +61 % over no-MTP" was vs the TQ3-handicapped baseline. Vs the proper naive Q8 baseline, MTP γ=2 essentially <strong>ties</strong>. Logs at <code>mtp-gamma/ovat-moe-64k-code/</code>.</p>
+        </div>
 
         <div class="callout-box">
           <strong>Bottom line</strong>
-          <small>The MTP head Google released for Gemma 4 is genuinely strong, including at long context. We just needed to build the chain logic to make it earn its keep. As of commit <code>4bcb972</code>, γ&gt;1 MTP is the recommended default on a 3090 at every context where MTP fits in VRAM.</small>
+          <small>Q8 KV + pflash + DFlash is the speed king on MoE up to 512K (and on Dense at 4K). TurboQuant earns its place only when Q8 doesn't fit — MoE 1M, and as a fallback for Dense at 64K+ where adding DFlash would breach 24 GB. MTP γ&gt;1 is implemented (Phases 1–3.5 today) and is the right drafter <em>specifically</em> for Dense above 32K where DFlash is infeasible — elsewhere DFlash dominates.</small>
         </div>
       </div>
     </section>
@@ -1378,42 +1480,7 @@ ul.schema li::before {
       <div class="wide-wrap">
         <p class="section-eyebrow">Practical Guide</p>
         <h2><button class="anchor-btn" title="Copy link" onclick="copyAnchor('for-3090-users')">#</button>What this means if you run a 3090</h2>
-        <p class="lede">A $700–1 000 used RTX 3090 now runs Gemma 4 26B-A4B at up to <strong>1 million tokens</strong> of context with TQ3/TQ3 KV cache — or at <strong>67.95 tok/s</strong> with Q8/Q8 + DFlash + pFlash for the 256 K range. This is the first time consumer hardware can do long-context inference without offloading any weights or KV data to system RAM or disk: everything fits in 24 GB VRAM.</p>
-
-        <h3 style="font-family:'Fraunces',serif;font-weight:500;font-size:1.2rem;margin:1.5rem 0 0.5rem;">Picking your KV layout</h3>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Context length</th>
-                <th>Recommended config</th>
-                <th>Why</th>
-                <th class="num">Decode tok/s</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td>Up to 16 K <em style="color:var(--text-sec);font-size:0.85em;">(chat, single file)</em></td>
-                <td>Q8/Q8 + DFlash + pFlash drafter dm=4</td>
-                <td>Fastest path; KV fits comfortably at these sizes</td>
-                <td class="num">up to 132</td>
-              </tr>
-              <tr>
-                <td>16 K – 64 K <em style="color:var(--text-sec);font-size:0.85em;">(multi-file code review, RAG)</em></td>
-                <td>Q8/Q8 + DFlash; consider pFlash for prefill</td>
-                <td>Q8 still fits; Q8 is ~30% faster than TQ3 in this band</td>
-                <td class="num">60 – 90</td>
-              </tr>
-              <tr>
-                <td>64 K – 1 M <em style="color:var(--text-sec);font-size:0.85em;">(whole-codebase, long docs, agent loops)</em></td>
-                <td>TQ3/TQ3, no drafter <em style="color:var(--text-sec);font-size:0.85em;">(or dm=4 if accept_rate ≥ 60%)</em></td>
-                <td>TQ3 cuts KV ~83%, fits 1 M in 22.26 GB on 24 GB card</td>
-                <td class="num">5.6 – 6.6 (flat)</td>
-              </tr>
-            </tbody>
-          </table>
-          <p class="table-caption">Numbers above are for <strong>MoE 26B-A4B + DFlash drafter</strong>. For <strong>Dense 31B + MTP assistant</strong>, see <a href="#gamma-mtp" style="color:var(--accent);">§γ&gt;1 MTP</a> — γ=4 at 4K hits 25.6 tok/s and γ=2 at 64K hits 10.1 tok/s (the highest decode rate at 64K on this hardware).</p>
-        </div>
+        <p class="lede">A $700–1 000 used RTX 3090 now runs Gemma 4 on <strong>real long-context workloads</strong> — coding, document analysis, agent loops — without offloading weights or KV data. The exact config to use lives in <a href="#recipes" style="color:var(--accent);">§Recipes</a>; this section is about what those numbers actually buy you. Bottom-line decode rates: <strong>MoE 26B-A4B</strong> 60–67 tok/s at 128K–512K, ~26 tok/s at 1M. <strong>Dense 31B</strong> ~10 tok/s through 128K. Everything in 24 GB VRAM.</p>
 
         <h3 style="font-family:'Fraunces',serif;font-weight:500;font-size:1.2rem;margin:1.75rem 0 0.5rem;">Real workloads now possible on 24 GB</h3>
         <ul style="margin:0 0 1.5rem 1.25rem;line-height:1.8;color:var(--text-main);">
@@ -2206,7 +2273,7 @@ ul.schema li::before {
                       <td class="num">585.8</td>
                       <td class="num">164.94</td>
                       <td class="num"><span class="badge-bad">6.33 (regression)</span></td>
-                      <td class="num">0.02 (5/256) <em style="color:var(--text-sec);font-size:0.85em;">superseded by γ&gt;1 — see <a href="#gamma-mtp" style="color:var(--accent);">§γ&gt;1 MTP</a></em></td>
+                      <td class="num">0.02 (5/256) <em style="color:var(--text-sec);font-size:0.85em;">superseded by γ&gt;1 — see <a href="#recipes" style="color:var(--accent);">§Recipes</a></em></td>
                     </tr>
                     <tr>
                       <td class="mono">V3_dflash_dm8</td>
@@ -2534,7 +2601,7 @@ ul.schema li::before {
     <section class="section" id="discoveries">
       <div class="wide-wrap">
         <p class="section-eyebrow">Key Intellectual Property</p>
-        <h2><button class="anchor-btn" title="Copy link" onclick="copyAnchor('discoveries')">#</button>What We Discovered — 15 Findings</h2>
+        <h2><button class="anchor-btn" title="Copy link" onclick="copyAnchor('discoveries')">#</button>What We Discovered — 20 Findings</h2>
         <p style="color:var(--text-sec);font-size:0.9rem;margin-bottom:1.5rem;">Each row below represents a non-obvious finding with a concrete fix location. These findings do not exist in upstream llama.cpp.</p>
         <div class="table-wrap">
           <table class="discovery-table">
@@ -2624,6 +2691,48 @@ ul.schema li::before {
                 <td class="disc-subsys">Drafter distribution coverage</td>
                 <td class="disc-text">Dense DFlash drafter generalises out-of-distribution; MoE drafter is code-distribution-bound. AL plateau dense·code 4.20 vs dense·creative 5.12 (uniform); MoE·code 5.22 vs MoE·creative 2.49 (collapse). Empirically discovered via the 24-cell scientific sweep.</td>
                 <td class="disc-where">empirical: <code>scientific/results.csv</code><br><code>gemma4-journey.md §11</code></td>
+              </tr>
+                          <tr>
+                <td class="disc-num">14</td>
+                <td class="disc-subsys">TQ3 long-context unlocked</td>
+                <td class="disc-text">Post-<code>daef232a6</code>, MoE TQ3 sustains 5.6–6.6 tok/s flat from 4K to 1M with sub-linear VRAM growth (~0.34 GiB / 64K ctx). 1M context on 24 GB confirmed.</td>
+                <td class="disc-where">submodule <code>daef232a6</code><br>logs: <code>tq3-frontier/</code></td>
+              </tr>
+              <tr>
+                <td class="disc-num">15</td>
+                <td class="disc-subsys">DFlash 1M run-to-run variance</td>
+                <td class="disc-text">Same CLI / same seed / same prompt yields tok/s ∈ [20, 30] on MoE 1M cold; can degrade to 4.86 after ~19 prior cells in same shell. WSL2/CUDA allocator state matters. Sweep-harness numbers at saturated VRAM ctx need a cold-start protocol.</td>
+                <td class="disc-where"><code>mtp-gamma/triple-falsify/trial_{1,2,3}.log</code></td>
+              </tr>
+              <tr>
+                <td class="disc-num">16</td>
+                <td class="disc-subsys">γ&gt;1 MTP chain (first public implementation)</td>
+                <td class="disc-text">Approach B (multi-row <code>mtp_h_prev_batch</code>) eliminates per-chain re-capture overhead. Mirrors Google HF reference (post-final-RMSNorm capture, Q-only cross-attn, weight-tied lm_head). γ=2 produces accept 0.55–0.78 at long ctx on Dense and 0.57 on MoE.</td>
+                <td class="disc-where">commits <code>d8ebd12</code> (A), <code>4bcb972</code> (B)<br><code>gemma4_target_graph.cpp:1106-1123</code></td>
+              </tr>
+              <tr>
+                <td class="disc-num">17</td>
+                <td class="disc-subsys">MoE MTP assistant exists</td>
+                <td class="disc-text"><code>AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF</code> on HuggingFace. Loads cleanly against MoE 30-layer target — loader auto-remaps donor layer indices written for the Dense 60-layer target. Accept rate 0.81 at 4K MoE.</td>
+                <td class="disc-where"><code>models/gemma4-mtp-26b-a4b/</code></td>
+              </tr>
+              <tr>
+                <td class="disc-num">18</td>
+                <td class="disc-subsys">MoE Q8 ceiling at 512K, not earlier</td>
+                <td class="disc-text">Q8 + pflash decode is flat at 24–25 tok/s from 64K through 512K with 0.86 GB headroom at 512K. Pages only at 1M. Earlier framing "TQ3 wins at long context" was wrong below 1M.</td>
+                <td class="disc-where"><code>mtp-gamma/q8-ceiling/</code><br><code>mtp-gamma/closing/moe_*_q8_pf_*.log</code></td>
+              </tr>
+              <tr>
+                <td class="disc-num">19</td>
+                <td class="disc-subsys">Dense + DFlash above 32K is anti-economical</td>
+                <td class="disc-text">DFlash drafter KV cache pushes Dense 31B over 24 GB at 64K. Decode drops to 5–7 tok/s, prefill collapses to 130 tok/s. MTP γ=2 — which cross-attends to target KV with no own cache — is the right drafter for Dense ≥ 32K.</td>
+                <td class="disc-where"><code>mtp-gamma/closing/dense_*.log</code><br><code>mtp-gamma/paired-matrix/dense_mtp_*.log</code></td>
+              </tr>
+              <tr>
+                <td class="disc-num">20</td>
+                <td class="disc-subsys">Q8 + pflash + DFlash dm=4 is the MoE long-ctx winner</td>
+                <td class="disc-text">At MoE 128K–512K: 60–67 tok/s decode at 6–8 J/tok. 2× faster than the TQ3 + pflash + DFlash stack at the same contexts (which gave 32–33 tok/s). The site's previous framing oversold TQ3 below 1M.</td>
+                <td class="disc-where"><code>mtp-gamma/closing/moe_*_q8_pf_dfl4.log</code></td>
               </tr>
             </tbody>
           </table>
