@@ -1,0 +1,25 @@
+extends = ""
+backend = "dflash"
+
+[hardware]
+gpu = "RTX 3090"
+sm = 86
+
+[model]
+target = "models/base-model.gguf"
+
+[runtime]
+ctx = 4096
+kv_k = "q8_0"
+kv_v = "q8_0"
+
+[runtime.spec]
+method = "none"
+
+[expected_floors]
+decode_tok_s = 5.0
+
+[provenance]
+source_log = "tests/configs/fixtures/base.toml"
+measured_at = "2026-01-01"
+hardware_id = "test-device"
