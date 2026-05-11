@@ -38,10 +38,37 @@
 
 #include <cuda_runtime.h>
 
-// ggml-cuda dequantize: Q8_0/F16/BF16 → F32. Replaces the custom
-// f16_convert.cu kernels with ggml's built-in converter dispatch.
+// Half-precision → f32 widen kernel launchers (src/f16_convert.cu).
+// We used to declare ggml_get_to_fp32_cuda here, but that symbol is hidden
+// inside the ggml-cuda.dll's internal namespace on Windows, which broke the
+// test_dflash link (LNK2019). dflash27b ships its own tiny widen kernels
+// instead — equivalent for the BF16 / F16 cases test_dflash uses.
+extern "C" void dflash27b_launch_f16_to_f32(const void * src,
+                                            void * dst,
+                                            size_t n_elems,
+                                            cudaStream_t stream);
+extern "C" void dflash27b_launch_bf16_to_f32(const void * src,
+                                             void * dst,
+                                             size_t n_elems,
+                                             cudaStream_t stream);
+
+// Adapter matching the previous `to_fp32_cuda_t = void (*)(const void *,
+// float *, int64_t, cudaStream_t)` signature so call sites that bind the
+// function pointer keep compiling. Dispatch on ggml_type.
 using to_fp32_cuda_t = void (*)(const void *, float *, int64_t, cudaStream_t);
-to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
+static void dflash27b_to_fp32_bf16(const void * src, float * dst,
+                                   int64_t n_elems, cudaStream_t stream) {
+    dflash27b_launch_bf16_to_f32(src, dst, (size_t)n_elems, stream);
+}
+static void dflash27b_to_fp32_f16(const void * src, float * dst,
+                                  int64_t n_elems, cudaStream_t stream) {
+    dflash27b_launch_f16_to_f32(src, dst, (size_t)n_elems, stream);
+}
+static inline to_fp32_cuda_t dflash27b_get_to_fp32_cuda(ggml_type type) {
+    if (type == GGML_TYPE_BF16) return &dflash27b_to_fp32_bf16;
+    if (type == GGML_TYPE_F16)  return &dflash27b_to_fp32_f16;
+    return nullptr;
+}
 
 #include <algorithm>
 #include <chrono>
@@ -156,6 +183,95 @@ static int g_max_ctx_override = 0;           // overridden by --max-ctx=N (defau
 static int g_fa_window       = 2048;         // overridden by DFLASH27B_FA_WINDOW=N
 static int g_draft_swa_window = 0;           // draft SWA window (0 = disabled); --draft-swa=N
 static int g_draft_ctx_max   = 4096;        // draft context cap; --draft-ctx-max=N
+
+// ─── Native MTP (NextN) runtime flags ─────────────────────────────
+// Linear MTP knobs (this PR ships the linear path only; DFlash/MTP hybrid
+// follows in a separate PR).
+static bool  g_mtp_batch_verify           = true;  // verify accepted chains as target batches
+static bool  g_mtp_fast_rollback          = true;  // skip replay when rollback capture is safe
+static bool  g_mtp_moe_long_fast_rollback = false; // opt-in until MoE long-window parity is proven
+static bool  g_mtp_batch_axis3_abs        = false; // diagnostic: decode-style M-RoPE axis3 in batch verify
+static bool  g_mtp_serial_commit          = false; // exact serial cache commit after batched target verify
+static bool  g_mtp_chain_tree_verify      = false; // diagnostic: tree-aware DeltaNet/conv for linear verify
+static bool  g_mtp_gpu_chain              = true;  // unroll MTP proposals via GPU token get_rows
+static bool  g_mtp_fused_prefill          = false; // experimental: append prompt MTP inside target prefill
+// DFlash/MTP hybrid knobs (parsed here so the CLI surface is stable across
+// PRs; the wiring that consumes them lands in a follow-up PR).
+static bool  g_dflash_mtp_hybrid          = false;
+static bool  g_dflash_mtp_tree_fused      = false;
+static bool  g_dflash_mtp_seed_priority   = false;
+static bool  g_dflash_mtp_immediate_bonus = false;
+static int   g_dflash_mtp_chain_max       = 15;
+static float g_dflash_mtp_bonus_min_margin = 0.0f;
+
+// ─── MTP/DDTree timing instrumentation ───────────────────────────
+// Activated via --dflash-mtp-timing or DFLASH_MTP_TIMING=1. When disabled
+// (default), ScopedTimer is a no-op and stdout is byte-identical to the
+// un-instrumented build. Accumulators are only updated when the flag is on,
+// and the [dflash+mtp-timing] summary line is only printed in that case.
+static bool g_dflash_mtp_timing = false;
+
+struct MtpTimings {
+    enum Slot : int {
+        TARGET_DECODE = 0,
+        MTP_PROP_FIRST,
+        MTP_PROP_FOLLOW,
+        TARGET_VERIFY,
+        ARGMAX_GET,
+        HIDDEN_GET,
+        GRAPH_BUILD_TARGET,
+        GRAPH_BUILD_TREE,
+        GRAPH_BUILD_MTP_CHAIN,
+        GRAPH_COMPUTE,
+        KV_TRIM,
+        NUM_SLOTS,
+    };
+    struct Acc { uint64_t ns_total = 0; uint64_t ns_max = 0; uint64_t count = 0; };
+    Acc slots[NUM_SLOTS];
+
+    void add(int s, uint64_t ns) {
+        if (s < 0 || s >= NUM_SLOTS) return;
+        Acc & a = slots[s];
+        a.ns_total += ns;
+        a.count    += 1;
+        if (ns > a.ns_max) a.ns_max = ns;
+    }
+    static const char * slot_name(int s) {
+        switch (s) {
+            case TARGET_DECODE:         return "target_decode";
+            case MTP_PROP_FIRST:        return "mtp_prop_first";
+            case MTP_PROP_FOLLOW:       return "mtp_prop_follow";
+            case TARGET_VERIFY:         return "target_verify";
+            case ARGMAX_GET:            return "argmax_get";
+            case HIDDEN_GET:            return "hidden_get";
+            case GRAPH_BUILD_TARGET:    return "graph_build_target";
+            case GRAPH_BUILD_TREE:      return "graph_build_tree";
+            case GRAPH_BUILD_MTP_CHAIN: return "graph_build_mtp_chain";
+            case GRAPH_COMPUTE:         return "graph_compute";
+            case KV_TRIM:               return "kv_trim";
+            default:                    return "unknown";
+        }
+    }
+};
+static MtpTimings g_mtp_timings;
+
+struct ScopedTimer {
+    int slot;
+    std::chrono::steady_clock::time_point t0;
+    bool active;
+    explicit ScopedTimer(int s) : slot(s), active(g_dflash_mtp_timing) {
+        if (active) t0 = std::chrono::steady_clock::now();
+    }
+    ~ScopedTimer() {
+        if (!active) return;
+        auto t1 = std::chrono::steady_clock::now();
+        uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        g_mtp_timings.add(slot, ns);
+    }
+    ScopedTimer(const ScopedTimer &) = delete;
+    ScopedTimer & operator=(const ScopedTimer &) = delete;
+};
+
 static int align_up(int x, int a) { return ((x + a - 1) / a) * a; }
 
 // F16 encoding for the two values we use: 0 and -inf.
@@ -509,11 +625,28 @@ struct StepGraph {
     ggml_tensor *   positions_k = nullptr;        // draft only
     ggml_tensor *   hidden_input = nullptr;        // lm-head projection only
 
+    // Optional GPU-side token-id input. When set, the graph performs the
+    // embedding gather inside ggml (get_rows) instead of taking a pre-built
+    // inp_embed. Used by the MTP integrated decode loop so the chain of
+    // proposed tokens never round-trips through the CPU.
+    ggml_tensor *   token_ids = nullptr;
+
     // Output
     ggml_tensor *   logits = nullptr;
     ggml_tensor *   hidden_states = nullptr;       // draft hidden-only output
+    // Final pre-norm hidden of the trunk decoder. Exposed when MTP is wired
+    // so build_qwen35_mtp_graph can consume it as `t_h_pre_norm` without a
+    // CPU readback.
+    ggml_tensor *   pre_norm_hidden = nullptr;
+    // Native MTP / NextN outputs (populated when an MTP block is wired into
+    // this StepGraph; nullptr in plain target-only decode).
+    ggml_tensor *   mtp_logits = nullptr;
+    ggml_tensor *   mtp_hidden = nullptr;
+    ggml_tensor *   mtp_argmax_tokens = nullptr;
     ggml_tensor *   argmax_tokens = nullptr; // [n_tokens] i32, GPU-side argmax of logits
     ggml_tensor *   topk_indices = nullptr;  // [K, n_tokens] i32, GPU-side top-K indices
+    // Per-step argmax outputs for the GPU-unrolled MTP chain (mtp_chain_gpu_step).
+    std::vector<ggml_tensor *> mtp_chain_argmax_tokens;
 
     // Per-delta-net-layer captures (verify only). One entry per delta-net layer.
     // Each entry's tensors are graph views on the gated_delta_net result:
@@ -733,7 +866,7 @@ static bool draft_feature_mirror_sync_range(const TargetCache & cache,
             (const char *)cache.target_feat->data + (size_t)src_slot * src_stride;
         void * dst =
             (char *)mirror.target_feat->data + (size_t)dst_slot * dst_stride;
-        auto bf16_to_f32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+        auto bf16_to_f32 = dflash27b_get_to_fp32_cuda(GGML_TYPE_BF16);
         if (mirror.device == mirror.target_device) {
             cudaSetDevice(mirror.device);
             bf16_to_f32(src, (float *)dst, (int64_t)elems, nullptr);
@@ -779,10 +912,16 @@ static void step_graph_free(StepGraph & sg) {
     sg.target_hidden_cat = sg.positions_k = nullptr;
     sg.hidden_input = nullptr;
     sg.parent_ids = nullptr;
+    sg.token_ids = nullptr;
     sg.logits = nullptr;
     sg.hidden_states = nullptr;
+    sg.pre_norm_hidden = nullptr;
+    sg.mtp_logits = nullptr;
+    sg.mtp_hidden = nullptr;
+    sg.mtp_argmax_tokens = nullptr;
     sg.argmax_tokens = nullptr;
     sg.topk_indices = nullptr;
+    sg.mtp_chain_argmax_tokens.clear();
     sg.delta_captures.clear();
 }
 
@@ -2295,6 +2434,933 @@ static int run_target_layer_split_harness(
     return 0;
 }
 
+// ─── Native MTP / NextN integrated decode mode ──────────────────
+//
+// Single-token forward that drives target + MTP in the SAME ggml_cgraph:
+//
+//   1. trunk target forward consumes the committed token and exposes
+//      `pre_norm_hidden` (no CPU readback).
+//   2. native NextN/MTP forward consumes that pre-norm hidden + the same
+//      token embedding to draft a candidate next token.
+//   3. greedy argmax on both heads is computed device-side.
+//   4. caller decides accept / correct via target_next vs mtp_next.
+//
+// The optional `mtp_hidden_out` lets the caller capture the post-MTP hidden
+// for chain follow-up via mtp_only_step (so a 2-token MTP chain doesn't
+// repeat the target forward). Hidden capture is gated on acceptance so the
+// readback only happens when chain continuation is useful.
+static bool mtp_integrated_step(const TargetWeights & w,
+                                TargetCache & target_cache,
+                                TargetMtpCache & mtp_cache,
+                                ggml_backend_t backend,
+                                StepGraph & sg,
+                                int32_t token,
+                                int kv_start,
+                                int32_t & target_next,
+                                int32_t & mtp_next,
+                                std::vector<float> * mtp_hidden_out = nullptr) {
+    step_graph_free(sg);
+
+    ggml_init_params ip{};
+    ip.mem_size   = 768 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    sg.ctx = ggml_init(ip);
+    if (!sg.ctx) {
+        std::fprintf(stderr, "mtp integrated: ggml_init failed\n");
+        return false;
+    }
+
+    sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, w.n_embd, 1, 1);
+    sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4);
+    ggml_set_name(sg.inp_embed, "mtp_integrated_inp_embed");
+    ggml_set_name(sg.positions, "mtp_integrated_positions");
+    ggml_set_input(sg.inp_embed);
+    ggml_set_input(sg.positions);
+
+    sg.gf = ggml_new_graph_custom(sg.ctx, 8192, false);
+
+    QwenGraphInputs target_in{};
+    target_in.inp_embed = sg.inp_embed;
+    target_in.positions = sg.positions;
+    target_in.n_tokens = 1;
+    target_in.kv_start = kv_start;
+    target_in.expose_pre_norm_hidden = true;
+    target_in.fa_window = g_fa_window;
+
+    QwenGraphOutputs target_out = build_qwen35_graph(sg.ctx, sg.gf, w, target_cache, target_in);
+    if (!target_out.logits || !target_out.pre_norm_hidden) {
+        std::fprintf(stderr, "mtp integrated: target graph failed: %s\n", dflash27b_last_error());
+        return false;
+    }
+    sg.logits = target_out.logits;
+    sg.pre_norm_hidden = target_out.pre_norm_hidden;
+
+    QwenMtpGraphInputs mtp_in{};
+    mtp_in.token_embed = ggml_reshape_2d(sg.ctx, sg.inp_embed, w.n_embd, 1);
+    mtp_in.pre_norm_hidden = target_out.pre_norm_hidden;
+    mtp_in.positions = sg.positions;
+    mtp_in.n_tokens = 1;
+    mtp_in.kv_start = kv_start;
+    mtp_in.fa_window = g_fa_window;
+
+    QwenMtpGraphOutputs mtp_out = build_qwen35_mtp_graph(sg.ctx, sg.gf, w, mtp_cache, mtp_in);
+    if (!mtp_out.logits || !mtp_out.hidden) {
+        std::fprintf(stderr, "mtp integrated: MTP graph failed: %s\n", dflash27b_last_error());
+        return false;
+    }
+    sg.mtp_logits = mtp_out.logits;
+    sg.mtp_hidden = mtp_out.hidden;
+
+    sg.argmax_tokens = ggml_argmax(sg.ctx, target_out.logits);
+    ggml_set_name(sg.argmax_tokens, "mtp_integrated_target_argmax");
+    ggml_set_output(sg.argmax_tokens);
+    ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
+
+    sg.mtp_argmax_tokens = ggml_argmax(sg.ctx, mtp_out.logits);
+    ggml_set_name(sg.mtp_argmax_tokens, "mtp_integrated_mtp_argmax");
+    ggml_set_output(sg.mtp_argmax_tokens);
+    ggml_build_forward_expand(sg.gf, sg.mtp_argmax_tokens);
+
+    if (!sg.alloc) {
+        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    if (!ggml_gallocr_alloc_graph(sg.alloc, sg.gf)) {
+        std::fprintf(stderr, "mtp integrated: graph alloc failed\n");
+        return false;
+    }
+
+    std::vector<float> embed((size_t)w.n_embd);
+    if (!w.embedder.embed(&token, 1, embed.data())) {
+        std::fprintf(stderr, "mtp integrated: CPU embed failed for token %d\n", (int)token);
+        return false;
+    }
+    const int32_t pos4[4] = { kv_start, kv_start, kv_start, kv_start };
+    ggml_backend_tensor_set(sg.inp_embed, embed.data(), 0, sizeof(float) * embed.size());
+    ggml_backend_tensor_set(sg.positions, pos4, 0, sizeof(pos4));
+
+    ggml_status st;
+    { ScopedTimer _tc(MtpTimings::GRAPH_COMPUTE);
+      st = ggml_backend_graph_compute(backend, sg.gf);
+    }
+    if (st != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "mtp integrated: graph compute failed: %d\n", (int)st);
+        return false;
+    }
+
+    { ScopedTimer _tg(MtpTimings::ARGMAX_GET);
+        ggml_backend_tensor_get(sg.argmax_tokens, &target_next, 0, sizeof(target_next));
+        ggml_backend_tensor_get(sg.mtp_argmax_tokens, &mtp_next, 0, sizeof(mtp_next));
+    }
+    if (mtp_hidden_out && mtp_next == target_next) {
+        ScopedTimer _th(MtpTimings::HIDDEN_GET);
+        mtp_hidden_out->assign((size_t)w.n_embd, 0.0f);
+        ggml_backend_tensor_get(sg.mtp_hidden, mtp_hidden_out->data(), 0,
+                                sizeof(float) * (size_t)w.n_embd);
+    } else if (mtp_hidden_out) {
+        mtp_hidden_out->clear();
+    }
+
+    return true;
+}
+
+// MTP-only follow-up step. Given the post-MTP hidden of the previous
+// proposal and the newly-committed token, draft one more candidate without
+// re-running the trunk target. Used to chain MTP proposals after the first
+// integrated step accepted, so a `chain_max=2` config commits two tokens
+// for one target forward when both MTP picks match what target would have
+// chosen.
+static bool mtp_only_step(const TargetWeights & w,
+                          TargetMtpCache & mtp_cache,
+                          ggml_backend_t backend,
+                          StepGraph & sg,
+                          int32_t token,
+                          int kv_start,
+                          const std::vector<float> & hidden_in,
+                          int32_t & mtp_next,
+                          std::vector<float> * hidden_out) {
+    if ((int)hidden_in.size() != w.n_embd) {
+        std::fprintf(stderr, "mtp only: hidden size=%zu expected=%d\n",
+                     hidden_in.size(), w.n_embd);
+        return false;
+    }
+
+    step_graph_free(sg);
+
+    ggml_init_params ip{};
+    ip.mem_size   = 256 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    sg.ctx = ggml_init(ip);
+    if (!sg.ctx) {
+        std::fprintf(stderr, "mtp only: ggml_init failed\n");
+        return false;
+    }
+
+    sg.inp_embed    = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, w.n_embd, 1);
+    sg.hidden_input = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, w.n_embd, 1);
+    sg.positions    = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4);
+    ggml_set_name(sg.inp_embed, "mtp_only_token_embed");
+    ggml_set_name(sg.hidden_input, "mtp_only_hidden");
+    ggml_set_name(sg.positions, "mtp_only_positions");
+    ggml_set_input(sg.inp_embed);
+    ggml_set_input(sg.hidden_input);
+    ggml_set_input(sg.positions);
+
+    sg.gf = ggml_new_graph_custom(sg.ctx, 2048, false);
+
+    QwenMtpGraphInputs mtp_in{};
+    mtp_in.token_embed = sg.inp_embed;
+    mtp_in.pre_norm_hidden = sg.hidden_input;
+    mtp_in.positions = sg.positions;
+    mtp_in.n_tokens = 1;
+    mtp_in.kv_start = kv_start;
+    mtp_in.fa_window = g_fa_window;
+
+    QwenMtpGraphOutputs mtp_out = build_qwen35_mtp_graph(sg.ctx, sg.gf, w, mtp_cache, mtp_in);
+    if (!mtp_out.logits || !mtp_out.hidden) {
+        std::fprintf(stderr, "mtp only: MTP graph failed: %s\n", dflash27b_last_error());
+        return false;
+    }
+    sg.mtp_logits = mtp_out.logits;
+    sg.mtp_hidden = mtp_out.hidden;
+
+    sg.mtp_argmax_tokens = ggml_argmax(sg.ctx, mtp_out.logits);
+    ggml_set_name(sg.mtp_argmax_tokens, "mtp_only_argmax");
+    ggml_set_output(sg.mtp_argmax_tokens);
+    ggml_build_forward_expand(sg.gf, sg.mtp_argmax_tokens);
+
+    if (!sg.alloc) {
+        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    if (!ggml_gallocr_alloc_graph(sg.alloc, sg.gf)) {
+        std::fprintf(stderr, "mtp only: graph alloc failed\n");
+        return false;
+    }
+
+    std::vector<float> embed((size_t)w.n_embd);
+    if (!w.embedder.embed(&token, 1, embed.data())) {
+        std::fprintf(stderr, "mtp only: CPU embed failed for token %d\n", (int)token);
+        return false;
+    }
+    const int32_t pos4[4] = { kv_start, kv_start, kv_start, kv_start };
+    ggml_backend_tensor_set(sg.inp_embed, embed.data(), 0, sizeof(float) * embed.size());
+    ggml_backend_tensor_set(sg.hidden_input, hidden_in.data(), 0, sizeof(float) * hidden_in.size());
+    ggml_backend_tensor_set(sg.positions, pos4, 0, sizeof(pos4));
+
+    ggml_status st;
+    { ScopedTimer _tc(MtpTimings::GRAPH_COMPUTE);
+      st = ggml_backend_graph_compute(backend, sg.gf);
+    }
+    if (st != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "mtp only: graph compute failed: %d\n", (int)st);
+        return false;
+    }
+
+    { ScopedTimer _ta(MtpTimings::ARGMAX_GET);
+      ggml_backend_tensor_get(sg.mtp_argmax_tokens, &mtp_next, 0, sizeof(mtp_next));
+    }
+    if (hidden_out) {
+        ScopedTimer _th(MtpTimings::HIDDEN_GET);
+        hidden_out->assign((size_t)w.n_embd, 0.0f);
+        ggml_backend_tensor_get(sg.mtp_hidden, hidden_out->data(), 0,
+                                sizeof(float) * (size_t)w.n_embd);
+    }
+
+    return true;
+}
+
+// Convenience overload: builds a one-shot StepGraph internally.
+static bool mtp_only_step(const TargetWeights & w,
+                          TargetMtpCache & mtp_cache,
+                          ggml_backend_t backend,
+                          int32_t token,
+                          int kv_start,
+                          const std::vector<float> & hidden_in,
+                          int32_t & mtp_next,
+                          std::vector<float> * hidden_out) {
+    StepGraph sg;
+    const bool ok = mtp_only_step(w, mtp_cache, backend, sg, token, kv_start,
+                                  hidden_in, mtp_next, hidden_out);
+    step_graph_destroy(sg);
+    return ok;
+}
+
+// ─── MTP chain proposal (GPU unrolled) ───────────────────────────
+//
+// When the trunk's tok_embd is GPU-resident (MTP checkpoints upload it),
+// we can chain N MTP proposals inside a single ggml_cgraph by using
+// ggml_get_rows() against the previous step's argmax tensor as the
+// "next token id" input. That removes the per-step CPU embed +
+// backend_tensor_set + graph rebuild that mtp_only_step incurs.
+
+static bool mtp_gpu_get_rows_supported(ggml_type type) {
+    // ggml-cuda's get_rows kernel only handles non-K quants. K-quants
+    // (Q4_K / Q5_K / Q6_K — which is what most published GGUFs ship for
+    // token_embd) fall back to CPU embed via mtp_only_step. Keep this list
+    // tight so we don't trip the runtime assertion in getrows.cu.
+    switch (type) {
+        case GGML_TYPE_F16:
+        case GGML_TYPE_F32:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_I32:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_TQ3_0:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool mtp_chain_gpu_available(const TargetWeights & w) {
+    return g_mtp_gpu_chain && w.tok_embd && w.tok_embd_gpu &&
+           mtp_gpu_get_rows_supported(w.tok_embd->type);
+}
+
+static bool mtp_chain_gpu_step(const TargetWeights & w,
+                               TargetMtpCache & mtp_cache,
+                               ggml_backend_t backend,
+                               StepGraph & sg,
+                               int32_t first_token,
+                               int kv_start,
+                               const std::vector<float> & hidden_in,
+                               int n_steps,
+                               std::vector<int32_t> & out_tokens) {
+    if (n_steps <= 0) {
+        out_tokens.clear();
+        return true;
+    }
+    if ((int)hidden_in.size() != w.n_embd) {
+        std::fprintf(stderr, "mtp gpu chain: hidden size=%zu expected=%d\n",
+                     hidden_in.size(), w.n_embd);
+        return false;
+    }
+    if (!mtp_chain_gpu_available(w)) {
+        return false;
+    }
+    ScopedTimer _follow(MtpTimings::MTP_PROP_FOLLOW);
+    std::chrono::steady_clock::time_point _build_t0;
+    if (g_dflash_mtp_timing) _build_t0 = std::chrono::steady_clock::now();
+
+    step_graph_free(sg);
+
+    ggml_init_params ip{};
+    ip.mem_size   = 1024 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    sg.ctx = ggml_init(ip);
+    if (!sg.ctx) {
+        std::fprintf(stderr, "mtp gpu chain: ggml_init failed\n");
+        return false;
+    }
+
+    sg.token_ids    = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 1);
+    sg.hidden_input = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, w.n_embd, 1);
+    sg.positions    = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_steps);
+    ggml_set_name(sg.token_ids, "mtp_gpu_chain_first_token");
+    ggml_set_name(sg.hidden_input, "mtp_gpu_chain_hidden");
+    ggml_set_name(sg.positions, "mtp_gpu_chain_positions");
+    ggml_set_input(sg.token_ids);
+    ggml_set_input(sg.hidden_input);
+    ggml_set_input(sg.positions);
+
+    sg.gf = ggml_new_graph_custom(sg.ctx, 32768, false);
+
+    ggml_tensor * prev_token_ids = sg.token_ids;
+    ggml_tensor * prev_hidden = sg.hidden_input;
+    sg.mtp_chain_argmax_tokens.clear();
+    sg.mtp_chain_argmax_tokens.reserve((size_t)n_steps);
+
+    for (int i = 0; i < n_steps; i++) {
+        ggml_tensor * token_embed = ggml_get_rows(sg.ctx, w.tok_embd, prev_token_ids);
+        token_embed = ggml_reshape_2d(sg.ctx, token_embed, w.n_embd, 1);
+
+        ggml_tensor * pos_view = ggml_view_1d(sg.ctx, sg.positions, 4,
+                                              (size_t)i * 4 * sizeof(int32_t));
+        QwenMtpGraphInputs mtp_in{};
+        mtp_in.token_embed = token_embed;
+        mtp_in.pre_norm_hidden = prev_hidden;
+        mtp_in.positions = pos_view;
+        mtp_in.n_tokens = 1;
+        mtp_in.kv_start = kv_start + i;
+        mtp_in.fa_window = g_fa_window;
+
+        QwenMtpGraphOutputs mtp_out = build_qwen35_mtp_graph(sg.ctx, sg.gf, w, mtp_cache, mtp_in);
+        if (!mtp_out.logits || !mtp_out.hidden) {
+            std::fprintf(stderr, "mtp gpu chain: MTP graph failed at step %d: %s\n",
+                         i, dflash27b_last_error());
+            return false;
+        }
+
+        ggml_tensor * arg = ggml_argmax(sg.ctx, mtp_out.logits);
+        char name[64];
+        std::snprintf(name, sizeof(name), "mtp_gpu_chain_argmax_%d", i);
+        ggml_set_name(arg, name);
+        ggml_set_output(arg);
+        ggml_build_forward_expand(sg.gf, arg);
+        sg.mtp_chain_argmax_tokens.push_back(arg);
+
+        prev_token_ids = arg;
+        prev_hidden = mtp_out.hidden;
+    }
+
+    if (!sg.alloc) {
+        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    if (!ggml_gallocr_alloc_graph(sg.alloc, sg.gf)) {
+        std::fprintf(stderr, "mtp gpu chain: graph alloc failed\n");
+        return false;
+    }
+    if (g_dflash_mtp_timing) {
+        auto _build_t1 = std::chrono::steady_clock::now();
+        uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(_build_t1 - _build_t0).count();
+        g_mtp_timings.add(MtpTimings::GRAPH_BUILD_MTP_CHAIN, ns);
+    }
+
+    std::vector<int32_t> pos4((size_t)4 * n_steps);
+    for (int i = 0; i < n_steps; i++) {
+        const int p = kv_start + i;
+        pos4[(size_t)i * 4 + 0] = p;
+        pos4[(size_t)i * 4 + 1] = p;
+        pos4[(size_t)i * 4 + 2] = p;
+        pos4[(size_t)i * 4 + 3] = p;
+    }
+    ggml_backend_tensor_set(sg.token_ids, &first_token, 0, sizeof(first_token));
+    ggml_backend_tensor_set(sg.hidden_input, hidden_in.data(), 0,
+                            sizeof(float) * hidden_in.size());
+    ggml_backend_tensor_set(sg.positions, pos4.data(), 0,
+                            sizeof(int32_t) * pos4.size());
+
+    ggml_status st;
+    { ScopedTimer _tc(MtpTimings::GRAPH_COMPUTE);
+      st = ggml_backend_graph_compute(backend, sg.gf);
+    }
+    if (st != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "mtp gpu chain: graph compute failed: %d\n", (int)st);
+        return false;
+    }
+
+    out_tokens.assign((size_t)n_steps, -1);
+    { ScopedTimer _ta(MtpTimings::ARGMAX_GET);
+      for (int i = 0; i < n_steps; i++) {
+          ggml_backend_tensor_get(sg.mtp_chain_argmax_tokens[(size_t)i],
+                                  &out_tokens[(size_t)i], 0, sizeof(int32_t));
+      }
+    }
+    mtp_cache.cur_pos = kv_start + n_steps;
+    return true;
+}
+
+// ─── Target-only AR baseline + native MTP linear loop ────────────
+//
+// run_target_ar_prompt   : greedy AR decode without MTP. Used as the
+//                          parity baseline for run_mtp_baseline_check.
+// run_mtp_integrated_prompt : linear native MTP loop (no DDTree hybrid).
+//                          Per step, one trunk target forward + one NextN
+//                          forward share a single ggml_cgraph. Accepted
+//                          MTP proposals chain via GPU get_rows when
+//                          mtp_chain_gpu_available(w), otherwise via
+//                          mtp_only_step. Falls back to serial verify;
+//                          target-batched verify + fast rollback land
+//                          in the DFlash/MTP hybrid PR.
+struct MtpIntegratedRunStats {
+    std::vector<int32_t> out_ids;
+    int draft_n = 0;
+    int accepted = 0;
+    int corrected = 0;
+    double seconds = 0.0;
+};
+
+struct TargetArRunStats {
+    std::vector<int32_t> out_ids;
+    double seconds = 0.0;
+};
+
+// Greedy single-token target step. Allocates its own per-call ctx + gallocr
+// (one decode/sec, no MTP); cheap baseline for parity vs the integrated path.
+static bool target_only_argmax_step(const TargetWeights & w,
+                                    TargetCache & target_cache,
+                                    ggml_backend_t backend,
+                                    int32_t token,
+                                    int kv_start,
+                                    int32_t & target_next) {
+    ScopedTimer _td(MtpTimings::TARGET_DECODE);
+    ggml_init_params ip{};
+    ip.mem_size   = 512 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) {
+        std::fprintf(stderr, "target only: ggml_init failed\n");
+        return false;
+    }
+
+    ggml_tensor * inp_embed = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w.n_embd, 1, 1);
+    ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
+    ggml_set_name(inp_embed, "target_only_inp_embed");
+    ggml_set_name(positions, "target_only_positions");
+    ggml_set_input(inp_embed);
+    ggml_set_input(positions);
+
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
+
+    QwenGraphInputs target_in{};
+    target_in.inp_embed = inp_embed;
+    target_in.positions = positions;
+    target_in.n_tokens = 1;
+    target_in.kv_start = kv_start;
+    target_in.fa_window = g_fa_window;
+
+    QwenGraphOutputs target_out = build_qwen35_graph(ctx, gf, w, target_cache, target_in);
+    if (!target_out.logits) {
+        std::fprintf(stderr, "target only: target graph failed: %s\n", dflash27b_last_error());
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_tensor * target_argmax = ggml_argmax(ctx, target_out.logits);
+    ggml_set_name(target_argmax, "target_only_argmax");
+    ggml_set_output(target_argmax);
+    ggml_build_forward_expand(gf, target_argmax);
+
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(alloc, gf)) {
+        std::fprintf(stderr, "target only: graph alloc failed\n");
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        return false;
+    }
+
+    std::vector<float> embed((size_t)w.n_embd);
+    if (!w.embedder.embed(&token, 1, embed.data())) {
+        std::fprintf(stderr, "target only: CPU embed failed for token %d\n", (int)token);
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        return false;
+    }
+    const int32_t pos4[4] = { kv_start, kv_start, kv_start, kv_start };
+    ggml_backend_tensor_set(inp_embed, embed.data(), 0, sizeof(float) * embed.size());
+    ggml_backend_tensor_set(positions, pos4, 0, sizeof(pos4));
+
+    ggml_status st;
+    { ScopedTimer _tc(MtpTimings::GRAPH_COMPUTE);
+      st = ggml_backend_graph_compute(backend, gf);
+    }
+    if (st != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "target only: graph compute failed: %d\n", (int)st);
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        return false;
+    }
+
+    { ScopedTimer _ta(MtpTimings::ARGMAX_GET);
+      ggml_backend_tensor_get(target_argmax, &target_next, 0, sizeof(target_next));
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    return true;
+}
+
+static bool run_target_ar_prompt(const TargetWeights & w,
+                                 ggml_backend_t backend,
+                                 int max_ctx,
+                                 const std::vector<int32_t> & prompt,
+                                 int n_gen,
+                                 int decode_pos_offset,
+                                 TargetArRunStats & stats) {
+    stats = TargetArRunStats{};
+    if (prompt.empty()) {
+        std::fprintf(stderr, "target baseline: empty prompt\n");
+        return false;
+    }
+    if (n_gen <= 0) {
+        std::fprintf(stderr, "target baseline: n_gen must be > 0\n");
+        return false;
+    }
+    decode_pos_offset = std::max(0, decode_pos_offset);
+    const int needed_ctx = decode_pos_offset + (int)prompt.size() + n_gen + 4;
+    if (needed_ctx > max_ctx) {
+        std::fprintf(stderr,
+                     "target baseline: max_ctx=%d too small for offset=%d prompt=%zu n_gen=%d\n",
+                     max_ctx, decode_pos_offset, prompt.size(), n_gen);
+        return false;
+    }
+
+    TargetCache target_cache;
+    if (!create_target_cache(w, max_ctx, /*max_verify_tokens=*/0, backend,
+                             target_cache, /*prefill_only=*/true)) {
+        std::fprintf(stderr, "target baseline cache: %s\n", dflash27b_last_error());
+        return false;
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i + 1 < (int)prompt.size(); i++) {
+        const int pos = decode_pos_offset + i;
+        int32_t target_next = -1;
+        if (!target_only_argmax_step(w, target_cache, backend,
+                                     prompt[(size_t)i], pos, target_next)) {
+            free_target_cache(target_cache);
+            return false;
+        }
+        target_cache.cur_pos = pos + 1;
+        target_cache.last_tok = target_next;
+    }
+
+    stats.out_ids.reserve((size_t)n_gen);
+    int32_t current = prompt.back();
+    int kv_pos = decode_pos_offset + (int)prompt.size() - 1;
+    while ((int)stats.out_ids.size() < n_gen) {
+        int32_t target_next = -1;
+        if (!target_only_argmax_step(w, target_cache, backend,
+                                     current, kv_pos, target_next)) {
+            free_target_cache(target_cache);
+            return false;
+        }
+        target_cache.cur_pos = kv_pos + 1;
+        target_cache.last_tok = target_next;
+        stats.out_ids.push_back(target_next);
+        current = target_next;
+        kv_pos++;
+        if (IS_EOS_TOK(target_next, w)) break;
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    stats.seconds = std::chrono::duration<double>(t1 - t0).count();
+
+    free_target_cache(target_cache);
+    return true;
+}
+
+// Linear MTP integrated decode. One trunk target forward + one NextN
+// forward per accepted token, with optional MTP chain proposals on
+// accept. Serial verify only; DDTree hybrid + batched target verify +
+// fast rollback land in the follow-up PR.
+static bool run_mtp_integrated_prompt(const TargetWeights & w,
+                                      ggml_backend_t backend,
+                                      int max_ctx,
+                                      const std::vector<int32_t> & prompt,
+                                      int n_gen,
+                                      int mtp_draft_n_max,
+                                      MtpIntegratedRunStats & stats,
+                                      bool step_log,
+                                      int decode_pos_offset = 0) {
+    stats = MtpIntegratedRunStats{};
+    if (prompt.empty()) {
+        std::fprintf(stderr, "mtp integrated: empty prompt\n");
+        return false;
+    }
+    if (n_gen <= 0) {
+        std::fprintf(stderr, "mtp integrated: n_gen must be > 0\n");
+        return false;
+    }
+    if (w.mtp_layers.empty()) {
+        std::fprintf(stderr, "mtp integrated: target has no nextn/MTP layers\n");
+        return false;
+    }
+    mtp_draft_n_max = std::max(1, mtp_draft_n_max);
+
+    decode_pos_offset = std::max(0, decode_pos_offset);
+    const int needed_ctx = decode_pos_offset + (int)prompt.size() + n_gen + 4;
+    if (needed_ctx > max_ctx) {
+        std::fprintf(stderr,
+                     "mtp integrated: max_ctx=%d too small for offset=%d prompt=%zu n_gen=%d\n",
+                     max_ctx, decode_pos_offset, prompt.size(), n_gen);
+        return false;
+    }
+
+    TargetCache target_cache;
+    if (!create_target_cache(w, max_ctx, /*max_verify_tokens=*/0, backend,
+                             target_cache, /*prefill_only=*/true)) {
+        std::fprintf(stderr, "mtp integrated target cache: %s\n", dflash27b_last_error());
+        return false;
+    }
+    TargetMtpCache mtp_cache;
+    if (!create_target_mtp_cache(w, max_ctx, backend, mtp_cache)) {
+        std::fprintf(stderr, "mtp integrated MTP cache: %s\n", dflash27b_last_error());
+        free_target_cache(target_cache);
+        return false;
+    }
+
+    StepGraph mtp_integrated_sg;
+    StepGraph mtp_only_sg;
+    struct LocalCleanup {
+        StepGraph * a;
+        StepGraph * b;
+        ~LocalCleanup() { if (a) step_graph_destroy(*a); if (b) step_graph_destroy(*b); }
+    } graph_cleanup{&mtp_integrated_sg, &mtp_only_sg};
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Prefill: drive both caches forward up to the last prompt token.
+    for (int i = 0; i + 1 < (int)prompt.size(); i++) {
+        const int pos = decode_pos_offset + i;
+        int32_t target_next = -1;
+        int32_t mtp_next = -1;
+        if (!mtp_integrated_step(w, target_cache, mtp_cache, backend,
+                                 mtp_integrated_sg,
+                                 prompt[(size_t)i], pos,
+                                 target_next, mtp_next)) {
+            free_target_mtp_cache(mtp_cache);
+            free_target_cache(target_cache);
+            return false;
+        }
+        target_cache.cur_pos = pos + 1;
+        mtp_cache.cur_pos = pos + 1;
+    }
+
+    // Decode loop.
+    stats.out_ids.reserve((size_t)n_gen);
+    int32_t current = prompt.back();
+    int kv_pos = decode_pos_offset + (int)prompt.size() - 1;
+    int step = 0;
+    while ((int)stats.out_ids.size() < n_gen) {
+        int32_t target_next = -1;
+        int32_t mtp_next = -1;
+        std::vector<float> mtp_hidden;
+        if (!mtp_integrated_step(w, target_cache, mtp_cache, backend,
+                                 mtp_integrated_sg,
+                                 current, kv_pos,
+                                 target_next, mtp_next, &mtp_hidden)) {
+            free_target_mtp_cache(mtp_cache);
+            free_target_cache(target_cache);
+            return false;
+        }
+
+        stats.draft_n++;
+        const bool accept = (mtp_next == target_next);
+        if (accept) stats.accepted++; else stats.corrected++;
+        const int32_t chosen = accept ? mtp_next : target_next;
+        stats.out_ids.push_back(chosen);
+        if (step_log) {
+            std::printf("[mtp-integrated step=%d draft=0] input=%d mtp=%d target=%d %s chosen=%d\n",
+                        step, (int)current, (int)mtp_next, (int)target_next,
+                        accept ? "ACCEPT" : "CORRECT", (int)chosen);
+        }
+        current = chosen;
+        target_cache.cur_pos = kv_pos + 1;
+        target_cache.last_tok = chosen;
+        mtp_cache.cur_pos = kv_pos + 1;
+        kv_pos++;
+        if (IS_EOS_TOK(chosen, w)) break;
+        if (!accept || (int)stats.out_ids.size() >= n_gen) {
+            step++;
+            continue;
+        }
+
+        // Accepted base: try to chain more MTP proposals via GPU get_rows.
+        // Each accepted proposal is verified against a per-token target
+        // forward (serial verify — batched verify lands in the hybrid PR).
+        const int max_chain_steps = std::min(
+            mtp_draft_n_max - 1,
+            n_gen - (int)stats.out_ids.size());
+        std::vector<int32_t> chain_tokens;
+        bool used_gpu_chain = false;
+        if (max_chain_steps > 0 && mtp_chain_gpu_available(w)) {
+            if (!mtp_chain_gpu_step(w, mtp_cache, backend, mtp_only_sg,
+                                    current, kv_pos, mtp_hidden,
+                                    max_chain_steps, chain_tokens)) {
+                free_target_mtp_cache(mtp_cache);
+                free_target_cache(target_cache);
+                return false;
+            }
+            used_gpu_chain = true;
+        }
+
+        bool serial_hit_eos = false;
+        if (used_gpu_chain) {
+            // Verify chain proposals one by one against target.
+            for (size_t j = 0; j < chain_tokens.size(); j++) {
+                if ((int)stats.out_ids.size() >= n_gen) break;
+                const int32_t mtp_chain_next = chain_tokens[j];
+                int32_t target_chain_next = -1;
+                if (!target_only_argmax_step(w, target_cache, backend,
+                                             current, kv_pos, target_chain_next)) {
+                    free_target_mtp_cache(mtp_cache);
+                    free_target_cache(target_cache);
+                    return false;
+                }
+                target_cache.cur_pos = kv_pos + 1;
+                stats.draft_n++;
+                const bool chain_accept = (mtp_chain_next == target_chain_next);
+                if (chain_accept) stats.accepted++; else stats.corrected++;
+                const int32_t chain_chosen = chain_accept ? mtp_chain_next : target_chain_next;
+                stats.out_ids.push_back(chain_chosen);
+                if (step_log) {
+                    std::printf("[mtp-integrated step=%d draft=%zu] input=%d mtp=%d target=%d %s chosen=%d\n",
+                                step, j + 1, (int)current,
+                                (int)mtp_chain_next, (int)target_chain_next,
+                                chain_accept ? "ACCEPT" : "CORRECT",
+                                (int)chain_chosen);
+                }
+                current = chain_chosen;
+                target_cache.last_tok = chain_chosen;
+                kv_pos++;
+                if (IS_EOS_TOK(chain_chosen, w)) { serial_hit_eos = true; break; }
+                if (!chain_accept) break;
+            }
+        } else if (max_chain_steps > 0) {
+            // CPU-bridged chain fallback (used when GPU get_rows unavailable).
+            for (int k = 1; k < mtp_draft_n_max && (int)stats.out_ids.size() < n_gen; k++) {
+                int32_t mtp_chain_next = -1;
+                std::vector<float> next_hidden;
+                const bool need_next_hidden =
+                    k + 1 < mtp_draft_n_max && (int)stats.out_ids.size() + 1 < n_gen;
+                if (!mtp_only_step(w, mtp_cache, backend, mtp_only_sg,
+                                   current, kv_pos,
+                                   mtp_hidden, mtp_chain_next,
+                                   need_next_hidden ? &next_hidden : nullptr)) {
+                    free_target_mtp_cache(mtp_cache);
+                    free_target_cache(target_cache);
+                    return false;
+                }
+                mtp_cache.cur_pos = kv_pos + 1;
+
+                int32_t target_chain_next = -1;
+                if (!target_only_argmax_step(w, target_cache, backend,
+                                             current, kv_pos, target_chain_next)) {
+                    free_target_mtp_cache(mtp_cache);
+                    free_target_cache(target_cache);
+                    return false;
+                }
+                target_cache.cur_pos = kv_pos + 1;
+
+                stats.draft_n++;
+                const bool chain_accept = (mtp_chain_next == target_chain_next);
+                if (chain_accept) stats.accepted++; else stats.corrected++;
+                const int32_t chain_chosen = chain_accept ? mtp_chain_next : target_chain_next;
+                stats.out_ids.push_back(chain_chosen);
+                if (step_log) {
+                    std::printf("[mtp-integrated step=%d draft=%d] input=%d mtp=%d target=%d %s chosen=%d\n",
+                                step, k, (int)current,
+                                (int)mtp_chain_next, (int)target_chain_next,
+                                chain_accept ? "ACCEPT" : "CORRECT",
+                                (int)chain_chosen);
+                }
+                current = chain_chosen;
+                target_cache.last_tok = chain_chosen;
+                if (need_next_hidden) mtp_hidden.swap(next_hidden);
+                else mtp_hidden.clear();
+                kv_pos++;
+                if (IS_EOS_TOK(chain_chosen, w)) { serial_hit_eos = true; break; }
+                if (!chain_accept) break;
+            }
+        }
+
+        step++;
+        if (serial_hit_eos) break;
+    }
+
+    auto t1 = std::chrono::steady_clock::now();
+    stats.seconds = std::chrono::duration<double>(t1 - t0).count();
+
+    free_target_mtp_cache(mtp_cache);
+    free_target_cache(target_cache);
+    return true;
+}
+
+// CLI entry point: runs MTP integrated decode and prints metrics.
+static int run_mtp_integrated_cli(const TargetWeights & w,
+                                  ggml_backend_t backend,
+                                  int max_ctx,
+                                  const std::vector<int32_t> & prompt,
+                                  int n_gen,
+                                  int mtp_draft_n_max,
+                                  int decode_pos_offset,
+                                  bool step_log) {
+    MtpIntegratedRunStats st;
+    if (!run_mtp_integrated_prompt(w, backend, max_ctx, prompt, n_gen,
+                                   mtp_draft_n_max, st, step_log,
+                                   decode_pos_offset)) {
+        return 1;
+    }
+    const double tps = st.out_ids.size() / std::max(1e-9, st.seconds);
+    const double acc = st.draft_n > 0 ? 100.0 * st.accepted / st.draft_n : 0.0;
+    std::printf("[mtp-integrated] generated=%zu draft_n=%d accepted=%d corrected=%d "
+                "acceptance=%.1f%% tok/s=%.2f seconds=%.4f draft_n_max=%d\n",
+                st.out_ids.size(), st.draft_n, st.accepted, st.corrected,
+                acc, tps, st.seconds, mtp_draft_n_max);
+    return 0;
+}
+
+// Parity gate: runs the AR baseline and the integrated MTP loop on the
+// same prompt, compares the output token-by-token, and emits the lines
+// `[mtp-baseline] baseline ...`, `[mtp-baseline] integrated ...`, and
+// either `compare_ok` or `compare_fail`. Parsed by mtp_baseline_gate.py.
+static int run_mtp_baseline_check(const TargetWeights & w,
+                                  ggml_backend_t backend,
+                                  int max_ctx,
+                                  const std::vector<int32_t> & prompt,
+                                  int n_gen,
+                                  int mtp_draft_n_max,
+                                  int decode_pos_offset,
+                                  bool step_log) {
+    if (prompt.empty()) {
+        std::fprintf(stderr, "mtp baseline: empty prompt\n");
+        return 2;
+    }
+    if (w.mtp_layers.empty()) {
+        std::fprintf(stderr, "mtp baseline: target has no nextn/MTP layers\n");
+        return 1;
+    }
+
+    TargetArRunStats baseline;
+    if (!run_target_ar_prompt(w, backend, max_ctx, prompt, n_gen,
+                              decode_pos_offset, baseline)) {
+        return 1;
+    }
+
+    MtpIntegratedRunStats mtp;
+    if (!run_mtp_integrated_prompt(w, backend, max_ctx, prompt, n_gen,
+                                   mtp_draft_n_max, mtp, step_log,
+                                   decode_pos_offset)) {
+        return 1;
+    }
+
+    const double baseline_tps = baseline.out_ids.size() / std::max(1e-9, baseline.seconds);
+    const double mtp_tps = mtp.out_ids.size() / std::max(1e-9, mtp.seconds);
+    const double ratio = mtp_tps / std::max(1e-9, baseline_tps);
+    const double acceptance = mtp.draft_n > 0 ? 100.0 * mtp.accepted / mtp.draft_n : 0.0;
+
+    size_t mismatch = SIZE_MAX;
+    const size_t n_cmp = std::min(baseline.out_ids.size(), mtp.out_ids.size());
+    for (size_t i = 0; i < n_cmp; i++) {
+        if (baseline.out_ids[i] != mtp.out_ids[i]) { mismatch = i; break; }
+    }
+    if (mismatch == SIZE_MAX && baseline.out_ids.size() != mtp.out_ids.size()) {
+        mismatch = n_cmp;
+    }
+
+    std::printf("[mtp-baseline] baseline generated=%zu tok/s=%.2f seconds=%.4f\n",
+                baseline.out_ids.size(), baseline_tps, baseline.seconds);
+    std::printf("[mtp-baseline] integrated generated=%zu draft_n=%d accepted=%d "
+                "corrected=%d acceptance=%.1f%% tok/s=%.2f seconds=%.4f "
+                "draft_n_max=%d speed_ratio=%.3fx\n",
+                mtp.out_ids.size(), mtp.draft_n, mtp.accepted, mtp.corrected,
+                acceptance, mtp_tps, mtp.seconds,
+                std::max(1, mtp_draft_n_max), ratio);
+
+    if (mismatch != SIZE_MAX) {
+        const int baseline_tok = mismatch < baseline.out_ids.size()
+            ? (int)baseline.out_ids[mismatch] : -999999;
+        const int mtp_tok = mismatch < mtp.out_ids.size()
+            ? (int)mtp.out_ids[mismatch] : -999999;
+        std::fprintf(stderr,
+                     "[mtp-baseline] compare_fail mismatch=%zu baseline=%d integrated=%d "
+                     "baseline_len=%zu integrated_len=%zu\n",
+                     mismatch, baseline_tok, mtp_tok,
+                     baseline.out_ids.size(), mtp.out_ids.size());
+        return 1;
+    }
+
+    std::printf("[mtp-baseline] compare_ok tokens=%zu mismatches=0\n",
+                baseline.out_ids.size());
+    return 0;
+}
+
 // ─── Main ─────────────────────────────────────────────────────────
 
 int main(int argc, char ** argv) {
@@ -2507,6 +3573,95 @@ int main(int argc, char ** argv) {
         else if (std::strncmp(argv[i], "--draft-ctx-max=", 16) == 0) {
             g_draft_ctx_max = std::max(0, std::atoi(argv[i] + 16));
         }
+        // ─── Native MTP (NextN) CLI flags ───────────────────────
+        else if (std::strcmp(argv[i], "--mtp-integrated") == 0) {
+            // Handled below — see the dedicated MTP dispatch block.
+        }
+        else if (std::strcmp(argv[i], "--mtp-baseline-check") == 0) {
+            // Handled below — see the dedicated MTP dispatch block.
+        }
+        else if (std::strncmp(argv[i], "--mtp-draft-n-max=", 18) == 0 ||
+                 std::strncmp(argv[i], "--mtp-draft-n=",     14) == 0) {
+            // Both spellings accepted; parsed later in the MTP dispatch.
+        }
+        else if (std::strncmp(argv[i], "--decode-pos-offset=", 20) == 0) {
+            // Parsed in MTP dispatch.
+        }
+        else if (std::strcmp(argv[i], "--mtp-step-log") == 0) {
+            // Parsed in MTP dispatch.
+        }
+        else if (std::strcmp(argv[i], "--mtp-no-fast-rollback") == 0) {
+            g_mtp_fast_rollback = false;
+        }
+        else if (std::strcmp(argv[i], "--mtp-moe-long-fast-rollback") == 0) {
+            g_mtp_moe_long_fast_rollback = true;
+        }
+        else if (std::strcmp(argv[i], "--mtp-serial-commit") == 0) {
+            g_mtp_serial_commit = true;
+        }
+        else if (std::strcmp(argv[i], "--mtp-no-gpu-chain") == 0) {
+            g_mtp_gpu_chain = false;
+        }
+        else if (std::strcmp(argv[i], "--dflash-mtp-timing") == 0) {
+            g_dflash_mtp_timing = true;
+        }
+        // DFlash/MTP hybrid flags (parsed here for stable CLI surface; the
+        // wiring that consumes them ships in the follow-up PR).
+        else if (std::strcmp(argv[i], "--dflash-mtp-hybrid") == 0) {
+            g_dflash_mtp_hybrid = true;
+        }
+        else if (std::strcmp(argv[i], "--dflash-mtp-tree-fused") == 0) {
+            g_dflash_mtp_tree_fused = true;
+        }
+        else if (std::strcmp(argv[i], "--dflash-mtp-seed-priority") == 0) {
+            g_dflash_mtp_seed_priority = true;
+        }
+        else if (std::strcmp(argv[i], "--dflash-mtp-immediate-bonus") == 0) {
+            g_dflash_mtp_immediate_bonus = true;
+        }
+        else if (std::strncmp(argv[i], "--dflash-mtp-chain-max=", 23) == 0) {
+            g_dflash_mtp_chain_max = std::max(1, std::atoi(argv[i] + 23));
+        }
+        else if (std::strncmp(argv[i], "--dflash-mtp-bonus-min-margin=", 30) == 0) {
+            g_dflash_mtp_bonus_min_margin = (float)std::atof(argv[i] + 30);
+        }
+    }
+
+    // Also accept DFLASH_MTP_TIMING=1 env var so it can be turned on without
+    // changing the CLI surface during long-running benchmarks.
+    if (const char * s = std::getenv("DFLASH_MTP_TIMING")) {
+        if (std::atoi(s) != 0) g_dflash_mtp_timing = true;
+    }
+
+    // Second pass: pick up MTP dispatch flags (kept separate from the main
+    // arg loop so we can early-return into the MTP CLI before constructing
+    // the full DFlash machinery).
+    bool        mtp_integrated_mode      = false;
+    bool        mtp_baseline_check_mode  = false;
+    int         mtp_draft_n_max          = 4;
+    int         mtp_decode_pos_offset    = 0;
+    bool        mtp_step_log             = false;
+    const char * mtp_prompt_path_arg     = nullptr;
+    int         mtp_n_gen_arg            = 0;
+    for (int i = flags_start; i < argc; i++) {
+        if (std::strcmp(argv[i], "--mtp-integrated") == 0) {
+            mtp_integrated_mode = true;
+        } else if (std::strcmp(argv[i], "--mtp-baseline-check") == 0) {
+            mtp_baseline_check_mode = true;
+            mtp_integrated_mode = true; // baseline check implies MTP-side runtime
+        } else if (std::strncmp(argv[i], "--mtp-draft-n-max=", 18) == 0) {
+            mtp_draft_n_max = std::max(1, std::atoi(argv[i] + 18));
+        } else if (std::strncmp(argv[i], "--mtp-draft-n=", 14) == 0) {
+            mtp_draft_n_max = std::max(1, std::atoi(argv[i] + 14));
+        } else if (std::strncmp(argv[i], "--decode-pos-offset=", 20) == 0) {
+            mtp_decode_pos_offset = std::max(0, std::atoi(argv[i] + 20));
+        } else if (std::strcmp(argv[i], "--mtp-step-log") == 0) {
+            mtp_step_log = true;
+        } else if (std::strncmp(argv[i], "--prompt-file=", 14) == 0) {
+            mtp_prompt_path_arg = argv[i] + 14;
+        } else if (std::strncmp(argv[i], "--n-gen=", 8) == 0) {
+            mtp_n_gen_arg = std::max(0, std::atoi(argv[i] + 8));
+        }
     }
 
     // The KV type may also have been chosen via -ctk/-ctv, which sets
@@ -2525,7 +3680,8 @@ int main(int argc, char ** argv) {
         g_kq_stride_pad = 256;
     }
 
-    if (!is_laguna && !daemon_mode && !test_window_mode && (!prompt_path || !out_path)) {
+    if (!is_laguna && !daemon_mode && !test_window_mode && !mtp_integrated_mode &&
+        (!prompt_path || !out_path)) {
         std::fprintf(stderr, "Missing positional arguments for non-daemon mode.\n");
         return 2;
     }
@@ -2668,6 +3824,58 @@ int main(int argc, char ** argv) {
         return 1;
     }
     std::printf("[target] %s\n", dflash27b_last_error());
+
+    // ─── Native MTP dispatch (no DFlash drafter needed) ──────────
+    if (mtp_integrated_mode) {
+        const char * mtp_prompt_path = mtp_prompt_path_arg ? mtp_prompt_path_arg : prompt_path;
+        int mtp_n_gen = mtp_n_gen_arg > 0 ? mtp_n_gen_arg : n_gen;
+        if (!mtp_prompt_path || mtp_n_gen <= 0) {
+            std::fprintf(stderr,
+                         "mtp mode: need a prompt (positional or --prompt-file=) "
+                         "and n_gen (positional or --n-gen=)\n");
+            free_target_weights(w);
+            ggml_backend_free(target_backend);
+            return 2;
+        }
+        std::vector<int32_t> prompt = read_int32_file(mtp_prompt_path);
+        if (prompt.empty()) {
+            std::fprintf(stderr, "mtp mode: failed to read prompt from %s\n",
+                         mtp_prompt_path);
+            free_target_weights(w);
+            ggml_backend_free(target_backend);
+            return 1;
+        }
+        const int max_ctx_eff = g_max_ctx_override > 0 ? g_max_ctx_override : 4096;
+        int rc;
+        if (mtp_baseline_check_mode) {
+            rc = run_mtp_baseline_check(w, target_backend, max_ctx_eff, prompt,
+                                        mtp_n_gen, mtp_draft_n_max,
+                                        mtp_decode_pos_offset, mtp_step_log);
+        } else {
+            rc = run_mtp_integrated_cli(w, target_backend, max_ctx_eff, prompt,
+                                        mtp_n_gen, mtp_draft_n_max,
+                                        mtp_decode_pos_offset, mtp_step_log);
+        }
+
+        // Emit timing summary if --dflash-mtp-timing was set.
+        if (g_dflash_mtp_timing) {
+            std::printf("[dflash+mtp-timing]");
+            for (int s = 0; s < MtpTimings::NUM_SLOTS; s++) {
+                const auto & a = g_mtp_timings.slots[s];
+                if (a.count == 0) continue;
+                std::printf(" %s=%.3fms(n=%llu,max=%.3fms)",
+                            MtpTimings::slot_name(s),
+                            a.ns_total / 1e6,
+                            (unsigned long long)a.count,
+                            a.ns_max / 1e6);
+            }
+            std::printf("\n");
+        }
+
+        free_target_weights(w);
+        ggml_backend_free(target_backend);
+        return rc;
+    }
 
     DraftWeights dw;
     {
@@ -3863,7 +5071,7 @@ int main(int argc, char ** argv) {
 
                 if (!split_gpus) {
                     cudaSetDevice(draft_gpu);
-                    auto bf16_to_f32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+                    auto bf16_to_f32 = dflash27b_get_to_fp32_cuda(GGML_TYPE_BF16);
                     bf16_to_f32(
                         (const char *)cache.target_feat->data + (size_t)slot0 * row_bf16,
                         (float *)draft_sg.target_hidden_cat->data,
@@ -4256,7 +5464,7 @@ int main(int argc, char ** argv) {
                         (size_t)rollback_dfs * cap.ssm_intermediate_states->nb[3];
                     const void * ssm_src =
                         (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
-                    ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type)(
+                    dflash27b_get_to_fp32_cuda(cap.ssm_intermediate_states->type)(
                         ssm_src, (float *)cache.ssm_state[il]->data,
                         (int64_t)ssm_elems, stream);
                     cudaError_t ce = cudaSuccess;  // launch error checked in the conv block below
@@ -4576,7 +5784,7 @@ int main(int argc, char ** argv) {
                         (size_t)rollback_idx * cap.ssm_intermediate_states->nb[3];
                     const void * ssm_src =
                         (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
-                    ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type)(
+                    dflash27b_get_to_fp32_cuda(cap.ssm_intermediate_states->type)(
                         ssm_src, (float *)cache.ssm_state[il]->data,
                         (int64_t)ssm_elems, stream);
                     cudaError_t ce = cudaSuccess;
