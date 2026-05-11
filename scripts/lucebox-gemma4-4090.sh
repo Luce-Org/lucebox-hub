@@ -13,11 +13,16 @@ LLAMA_SERVER="${LUCEBOX_LLAMA_SERVER:-/home/tdamre/src/llama.cpp-mtp-pr22673/bui
 
 HOST="${LUCEBOX_GEMMA4_HOST:-127.0.0.1}"
 PORT="${LUCEBOX_GEMMA4_PORT:-18191}"
-CTX_SIZE="${LUCEBOX_GEMMA4_CTX_SIZE:-2048}"
-DRAFT_CTX_SIZE="${LUCEBOX_GEMMA4_DRAFT_CTX_SIZE:-$CTX_SIZE}"
-CACHE_TYPE_K="${LUCEBOX_GEMMA4_CACHE_TYPE_K:-f16}"
-CACHE_TYPE_V="${LUCEBOX_GEMMA4_CACHE_TYPE_V:-f16}"
-CACHE_RAM="${LUCEBOX_GEMMA4_CACHE_RAM:-}"
+CTX_SIZE="${LUCEBOX_GEMMA4_CTX_SIZE:-40960}"
+DRAFT_CTX_SIZE="${LUCEBOX_GEMMA4_DRAFT_CTX_SIZE:-2048}"
+DRAFT_N_MAX="${LUCEBOX_GEMMA4_DRAFT_N_MAX:-4}"
+BATCH_SIZE="${LUCEBOX_GEMMA4_BATCH_SIZE:-2048}"
+UBATCH_SIZE="${LUCEBOX_GEMMA4_UBATCH_SIZE:-512}"
+CACHE_TYPE_K="${LUCEBOX_GEMMA4_CACHE_TYPE_K:-q8_0}"
+CACHE_TYPE_V="${LUCEBOX_GEMMA4_CACHE_TYPE_V:-q8_0}"
+DRAFT_CACHE_TYPE_K="${LUCEBOX_GEMMA4_DRAFT_CACHE_TYPE_K:-$CACHE_TYPE_K}"
+DRAFT_CACHE_TYPE_V="${LUCEBOX_GEMMA4_DRAFT_CACHE_TYPE_V:-$CACHE_TYPE_V}"
+CACHE_RAM="${LUCEBOX_GEMMA4_CACHE_RAM:-0}"
 RUN_DIR="${LUCEBOX_GEMMA4_RUN_DIR:-$HOME/lucebox-runs}"
 PID_FILE="${LUCEBOX_GEMMA4_PID_FILE:-$RUN_DIR/lucebox-gemma4-mtp-server.pid}"
 LOG_FILE="${LUCEBOX_GEMMA4_LOG_FILE:-$RUN_DIR/lucebox-gemma4-mtp-server-$(date +%Y%m%d-%H%M%S).log}"
@@ -92,13 +97,15 @@ run_foreground() {
         -m "$MODEL" \
         --spec-type mtp \
         --spec-draft-model "$MTP_MODEL" \
-        --spec-draft-n-max 4 \
+        --spec-draft-n-max "$DRAFT_N_MAX" \
         --spec-draft-ngl all \
         --spec-draft-ctx-size "$DRAFT_CTX_SIZE" \
+        --spec-draft-type-k "$DRAFT_CACHE_TYPE_K" \
+        --spec-draft-type-v "$DRAFT_CACHE_TYPE_V" \
         -ngl 999 \
         -c "$CTX_SIZE" \
-        -b 2048 \
-        -ub 512 \
+        -b "$BATCH_SIZE" \
+        -ub "$UBATCH_SIZE" \
         --flash-attn on \
         --cache-type-k "$CACHE_TYPE_K" \
         --cache-type-v "$CACHE_TYPE_V" \
