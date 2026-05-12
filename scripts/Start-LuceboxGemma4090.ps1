@@ -14,7 +14,11 @@ param(
     [string] $CacheTypeV = 'q8_0',
     [string] $DraftCacheTypeK = '',
     [string] $DraftCacheTypeV = '',
-    [string] $CacheRam = '0'
+    [string] $CacheRam = '0',
+    [switch] $NoKvOffload,
+    [int] $GpuClockMin = 2100,
+    [int] $GpuClockMax = 2700,
+    [switch] $SkipGpuClockLock
 )
 
 $ErrorActionPreference = 'Stop'
@@ -68,6 +72,7 @@ function Get-LuceboxEnvPrefix {
         LUCEBOX_GEMMA4_DRAFT_CACHE_TYPE_K = $effectiveDraftCacheTypeK
         LUCEBOX_GEMMA4_DRAFT_CACHE_TYPE_V = $effectiveDraftCacheTypeV
         LUCEBOX_GEMMA4_CACHE_RAM = $CacheRam
+        LUCEBOX_GEMMA4_NO_KV_OFFLOAD = if ($NoKvOffload) { '1' } else { '0' }
     }
     ($pairs.GetEnumerator() | ForEach-Object {
         "$($_.Key)=$(ConvertTo-BashSingleQuoted ([string] $_.Value))"
@@ -76,8 +81,39 @@ function Get-LuceboxEnvPrefix {
 
 $envPrefix = Get-LuceboxEnvPrefix
 
+function Invoke-NvidiaSmi {
+    param([string[]] $Arguments)
+
+    $nvidiaSmi = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
+    if (-not $nvidiaSmi) {
+        Write-Warning 'nvidia-smi.exe was not found; GPU clock control is skipped.'
+        return
+    }
+
+    try {
+        & $nvidiaSmi.Source @Arguments | Out-String | Write-Verbose
+    } catch {
+        Write-Warning "nvidia-smi.exe $($Arguments -join ' ') failed: $($_.Exception.Message)"
+    }
+}
+
+function Set-LuceboxGpuClockLock {
+    if ($SkipGpuClockLock) {
+        return
+    }
+    Invoke-NvidiaSmi @('-lgc', "$GpuClockMin,$GpuClockMax")
+}
+
+function Reset-LuceboxGpuClockLock {
+    if ($SkipGpuClockLock) {
+        return
+    }
+    Invoke-NvidiaSmi @('-rgc')
+}
+
 switch ($Command) {
     'Start' {
+        Set-LuceboxGpuClockLock
         Invoke-LuceboxWsl "rm -f `"`$HOME/lucebox-runs/lucebox-gemma4-mtp-server.pid`""
         $bash = "chmod +x '$scriptPath'; $envPrefix exec '$scriptPath' run"
         $startArgs = New-WslArgumentLine $bash
@@ -87,8 +123,10 @@ switch ($Command) {
     }
     'Stop' {
         Invoke-LuceboxWsl "chmod +x '$scriptPath'; $envPrefix '$scriptPath' stop"
+        Reset-LuceboxGpuClockLock
     }
     'Restart' {
+        Set-LuceboxGpuClockLock
         Invoke-LuceboxWsl "chmod +x '$scriptPath'; $envPrefix '$scriptPath' stop || true"
         $bash = "chmod +x '$scriptPath'; $envPrefix exec '$scriptPath' run"
         $startArgs = New-WslArgumentLine $bash

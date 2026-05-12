@@ -10,7 +10,7 @@ Default workstation paths:
 ```bash
 LUCEBOX_GEMMA4_MODEL=/mnt/c/Users/adyba/Downloads/gemma-4-31B-it-abliterated-Q4_K_M.gguf
 LUCEBOX_GEMMA4_MTP_MODEL=/home/tdamre/models/gemma-4-31B-it-assistant-mtp-f16.gguf
-LUCEBOX_LLAMA_SERVER=/home/tdamre/src/llama.cpp-mtp-pr22673/build-mtp-cuda124-speed-faall/bin/llama-server
+LUCEBOX_LLAMA_SERVER=/home/tdamre/src/llama.cpp-mtp-pr22673/build-mtp-cuda124-speed-mmq/bin/llama-server
 ```
 
 Start from Windows PowerShell:
@@ -18,6 +18,10 @@ Start from Windows PowerShell:
 ```powershell
 .\scripts\Start-LuceboxGemma4090.ps1 -Command Start
 ```
+
+The Windows launcher applies a best-effort `nvidia-smi -lgc 2100,2700` graphics
+clock lock before start/restart and resets it on stop. Use `-SkipGpuClockLock`
+to leave clocks unchanged.
 
 Or from WSL:
 
@@ -40,6 +44,7 @@ LUCEBOX_GEMMA4_CACHE_TYPE_V=q8_0
 LUCEBOX_GEMMA4_DRAFT_CACHE_TYPE_K=q8_0
 LUCEBOX_GEMMA4_DRAFT_CACHE_TYPE_V=q8_0
 LUCEBOX_GEMMA4_CACHE_RAM=0
+LUCEBOX_GEMMA4_NO_KV_OFFLOAD=0
 ```
 
 Verify the reply path and single-stream decode floor:
@@ -64,3 +69,4 @@ Current RTX 4090 measurements:
 - `65536` context, q8_0 K/V, MTP draft 4, `-b 512 -ub 128`: loaded and answered, but only reached `5.58 tok/s`.
 - `65536` context, q8_0 K/V, MTP draft 1, `-b 512 -ub 128`: loaded and answered, but only reached `33.35 tok/s`.
 - Earlier `65536` attempts with the normal `-ub 512` path loaded q8_0 K/V but failed first generation with CUDA OOM in the MTP flash-attention path.
+- After a Docker/WSL/GPU runtime recovery on May 11, the previous `speed-faall` profile degraded to about `3.55 tok/s` at `40960` context even with clocks boosted. The `speed-mmq` build is the best current fallback at about `31.44 tok/s` with q8_0 K/V on GPU; `69632` with `--no-kv-offload` loaded and answered but only reached `19.73 tok/s`.

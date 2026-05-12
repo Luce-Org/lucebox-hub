@@ -9,7 +9,7 @@ set -euo pipefail
 
 MODEL="${LUCEBOX_GEMMA4_MODEL:-/mnt/c/Users/adyba/Downloads/gemma-4-31B-it-abliterated-Q4_K_M.gguf}"
 MTP_MODEL="${LUCEBOX_GEMMA4_MTP_MODEL:-/home/tdamre/models/gemma-4-31B-it-assistant-mtp-f16.gguf}"
-LLAMA_SERVER="${LUCEBOX_LLAMA_SERVER:-/home/tdamre/src/llama.cpp-mtp-pr22673/build-mtp-cuda124-speed-faall/bin/llama-server}"
+LLAMA_SERVER="${LUCEBOX_LLAMA_SERVER:-/home/tdamre/src/llama.cpp-mtp-pr22673/build-mtp-cuda124-speed-mmq/bin/llama-server}"
 
 HOST="${LUCEBOX_GEMMA4_HOST:-127.0.0.1}"
 PORT="${LUCEBOX_GEMMA4_PORT:-18191}"
@@ -23,6 +23,7 @@ CACHE_TYPE_V="${LUCEBOX_GEMMA4_CACHE_TYPE_V:-q8_0}"
 DRAFT_CACHE_TYPE_K="${LUCEBOX_GEMMA4_DRAFT_CACHE_TYPE_K:-$CACHE_TYPE_K}"
 DRAFT_CACHE_TYPE_V="${LUCEBOX_GEMMA4_DRAFT_CACHE_TYPE_V:-$CACHE_TYPE_V}"
 CACHE_RAM="${LUCEBOX_GEMMA4_CACHE_RAM:-0}"
+NO_KV_OFFLOAD="${LUCEBOX_GEMMA4_NO_KV_OFFLOAD:-0}"
 RUN_DIR="${LUCEBOX_GEMMA4_RUN_DIR:-$HOME/lucebox-runs}"
 PID_FILE="${LUCEBOX_GEMMA4_PID_FILE:-$RUN_DIR/lucebox-gemma4-mtp-server.pid}"
 LOG_FILE="${LUCEBOX_GEMMA4_LOG_FILE:-$RUN_DIR/lucebox-gemma4-mtp-server-$(date +%Y%m%d-%H%M%S).log}"
@@ -118,6 +119,9 @@ run_foreground() {
     )
     if [[ -n "$CACHE_RAM" ]]; then
         args+=(--cache-ram "$CACHE_RAM")
+    fi
+    if [[ "$NO_KV_OFFLOAD" == "1" || "$NO_KV_OFFLOAD" == "true" || "$NO_KV_OFFLOAD" == "yes" ]]; then
+        args+=(--no-kv-offload)
     fi
     exec "$LLAMA_SERVER" "${args[@]}" > "$LOG_FILE" 2>&1
 }
