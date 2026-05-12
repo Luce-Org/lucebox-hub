@@ -458,19 +458,6 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
             std::snprintf(name, sizeof(name), "mtp_Vfa_%d", il);
             ggml_set_name(Vfa, name);
         }
-        {
-            // Log per-layer FA types only on the first build of the process.
-            static bool g_mtp_fa_types_done = false;
-            if (!g_mtp_fa_types_done) {
-                std::printf("[mtp-fa-types] layer %d: Qfa=%s Kfa=%s Vfa=%s "
-                            "head_dim_fa=%lld kv_is_tq3=%d need_mask=%d\n",
-                            il, ggml_type_name(Qfa->type), ggml_type_name(Kfa->type),
-                            ggml_type_name(Vfa->type), (long long)head_dim_fa,
-                            (int)kv_is_tq3, (int)((kv_is_tq3 && head_dim_fa >= 512) || needs_kv_pad));
-                if (il == n_layer - 1) g_mtp_fa_types_done = true;
-            }
-        }
-
         // For head_dim==512 (any K type): the MMA dispatcher requires
         // gqa_opt_applies, which requires BOTH K->ne[1] % 256 == 0 AND
         // mask != nullptr. Without mask, BEST_FATTN_KERNEL_NONE → abort
@@ -485,6 +472,13 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
         // needed to exclude the padding tail.
         // For wrap case (F32 K/V after concat): no TQ3_0 issues, no mask needed.
         const bool need_mask = head_dim_fa >= 512 || needs_kv_pad;
+        // Log per-layer FA types on every graph build (no static gate so subsequent
+        // chains are visible; need_mask read from the variable computed above).
+        std::printf("[mtp-fa-types] layer %d: Qfa=%s Kfa=%s Vfa=%s "
+                    "head_dim_fa=%lld kv_is_tq3=%d need_mask=%d\n",
+                    il, ggml_type_name(Qfa->type), ggml_type_name(Kfa->type),
+                    ggml_type_name(Vfa->type), (long long)head_dim_fa,
+                    (int)kv_is_tq3, (int)need_mask);
         const int64_t fa_mask_width = (needs_kv_pad ? kv_view_len_padded : kv_view_len);
         ggml_tensor * fa_mask = nullptr;
         if (need_mask) {
