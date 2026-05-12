@@ -922,6 +922,9 @@ int main(int argc, char ** argv) {
         for (const char * p = s; *p; ++p) lc += (char)std::tolower((unsigned char)*p);
         return lc.rfind("tq3", 0) == 0;
     };
+    // Note: also need to bump g_kq_stride_pad to 256 when head_dim >= 512
+    //       (Dense 31B full-attn). That check is deferred until after target
+    //       weights are loaded — see "head_dim mask-pad gate" below.
     if (kv_env_is_tq3("DFLASH27B_KV_K") || kv_env_is_tq3("DFLASH27B_KV_V")) {
         g_kq_stride_pad = 256;
     }
@@ -1004,6 +1007,19 @@ int main(int argc, char ** argv) {
         std::printf("[target] loaded %d layers, n_embd=%d, vocab=%d  (%.1f ms)\n",
                     w.n_layer, w.n_embd, w.n_vocab, t1 - t0);
         if (mem_diag) print_mem_diag("after-target-load");
+    }
+
+    // head_dim mask-pad gate: the target graph forces `need_256_pad` on K-view
+    // when head_dim >= 512 (full-attn layer in Dense 31B), regardless of KV
+    // dtype. Without bumping g_kq_stride_pad here, the host-built causal mask
+    // is padded to KQ_MASK_PAD (64) while the K view is padded to 256 — the FA
+    // kernel reads mask columns past the populated region, attending to
+    // uninitialised K slots (mask byte often 0x0000 = "attend"). Symptom under
+    // Q4_0/Q8_0 KV: MTP accept rate collapses to ~0.30 vs ~0.78 expected.
+    // TQ3 was unaffected only because the kv_env_is_tq3 gate above already
+    // bumped to 256.
+    if (w.head_dim >= 512) {
+        g_kq_stride_pad = 256;
     }
 
     // ── Load draft weights (optional) ────────────────────────────────────
