@@ -38,13 +38,13 @@ The server listens on `http://127.0.0.1:18191` by default and exposes
 OpenAI-compatible `/v1/chat/completions` plus llama.cpp `/completion`.
 The launcher sets `--reasoning off` so OpenAI chat replies populate
 `message.content` by default. The default launcher profile uses Atomic's
-`--mtp-head` path with TurboQuant `turbo4` K/V and block-size-4 MTP:
+`--mtp-head` path with TurboQuant `turbo4` K/V and block-size-3 MTP:
 
 ```bash
 LUCEBOX_GEMMA4_MTP_STYLE=atomic
-LUCEBOX_GEMMA4_CTX_SIZE=65536
+LUCEBOX_GEMMA4_CTX_SIZE=71680
 LUCEBOX_GEMMA4_DRAFT_CTX_SIZE=2048
-LUCEBOX_GEMMA4_DRAFT_BLOCK_SIZE=4
+LUCEBOX_GEMMA4_DRAFT_BLOCK_SIZE=3
 LUCEBOX_GEMMA4_CACHE_TYPE_K=turbo4
 LUCEBOX_GEMMA4_CACHE_TYPE_V=turbo4
 LUCEBOX_GEMMA4_DRAFT_CACHE_TYPE_K=turbo4
@@ -79,9 +79,11 @@ Current RTX 4090 measurements:
 - The same Atomic q8_0 K/V profile with `--draft-block-size 2` loaded but crashed on the first chat request with `std::runtime_error: Invalid token`. `--draft-block-size 1` is rejected by Atomic because valid values are `2` through `32`.
 - After a Docker/WSL/GPU runtime recovery on May 11, the previous `speed-faall` profile degraded to about `3.55 tok/s` at `40960` context even with clocks boosted. The `speed-mmq` build is the best current fallback at about `31.44 tok/s` with q8_0 K/V on GPU; `69632` with `--no-kv-offload` loaded and answered but only reached `19.73 tok/s`.
 - `65536` context, Atomic TurboQuant `turbo4` K/V, Gemma 4 assistant via `--mtp-head`, `--draft-block-size 3`: loaded and answered at `38.29 tok/s`; MTP accepted `82/88` draft tokens.
-- `65536` context, Atomic TurboQuant `turbo4` K/V, Gemma 4 assistant via `--mtp-head`, `--draft-block-size 4`: loaded and answered at `48.52 tok/s`; MTP accepted `93/102` draft tokens. This is the current best high-context TurboQuant + MTP result but still below the `60 tok/s` gate.
-- The Windows launcher default path for the same `65536`/`turbo4`/MTP block-size-4 recipe started successfully on `http://127.0.0.1:18191` and verified at `44.57 tok/s` with `93/102` MTP draft tokens accepted.
+- `65536` context, Atomic TurboQuant `turbo4` K/V, Gemma 4 assistant via `--mtp-head`, `--draft-block-size 4`: loaded and answered at `48.52 tok/s`; MTP accepted `93/102` draft tokens.
+- The earlier Windows launcher default path for the same `65536`/`turbo4`/MTP block-size-4 recipe started successfully on `http://127.0.0.1:18191` and verified at `44.57 tok/s` with `93/102` MTP draft tokens accepted.
 - `71680` context, Atomic TurboQuant `turbo4` K/V, Gemma 4 assistant via `--mtp-head`, `--draft-block-size 4`, launched successfully from the Windows launcher with about `22.33 GiB` VRAM used and `1.81 GiB` free. A short verifier run reached `43.90 tok/s`, so it is still below the `60 tok/s` gate.
+- `71680` context, Atomic TurboQuant `turbo4` K/V, Gemma 4 assistant via `--mtp-head`, `--draft-block-size 3`, reached `58.10 tok/s` on a 128-token verifier and `59.01 tok/s` on a 512-token verifier, with `335/350` MTP draft tokens accepted on the longer run. This is the best measured 70k launcher recipe so far, but it remains below the requested `70 tok/s` hard gate.
+- Raising the graphics clock floor to `2520 MHz` and testing `--poll 100 --poll-batch 1 --prio 2 --prio-batch 3` did not improve the `71680`/`turbo4`/block-size-3 profile; the 128-token poll/priority run reached `57.67 tok/s`.
 - `71680` context cold-prefill stability probe with a `70035`-token chat prompt completed successfully: prompt processing was `1292.04 tok/s`, decode was `23.51 tok/s`, and MTP accepted `19/31` draft tokens. This confirms the 70k prompt can answer on the Atomic TurboQuant path, but not at the requested decode floor.
 - `71680` context probe with a `65590`-token chat prompt also completed successfully: prompt processing was `1298.25 tok/s`, decode was `29.05 tok/s`, and MTP accepted `21/30` draft tokens.
 - `65536` context, Atomic TurboQuant `turbo4` K/V, `--draft-block-size 6`: loaded and answered at `22.31 tok/s`; acceptance dropped to `78/234`.
