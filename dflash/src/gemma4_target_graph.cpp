@@ -503,12 +503,23 @@ static ggml_tensor * build_full_attn_block(
         cache_v->nb[1], cache_v->nb[2],
         cache_v->nb[1] * win_start);
 
-    // pFlash sparse path supports F16, Q8_0, and Q4_0 K/V — the CUDA dispatch layer
-    // dequantizes to F16 before the S<->H BF16 transpose for these types.
-    // TQ3_0 is excluded because sparse FA does not consume rotated TQ3 K/V
-    // directly; fall back to dense FA for TQ3_0 and other types.
+    // pFlash sparse path supports F16, Q8_0, Q4_0, and (gated) TQ3_0 K/V.
+    // The CUDA dispatch in fattn-sparse.cu:170-197 dequantizes to F16 before
+    // the S<->H BF16 transpose. For TQ3_0 it routes through cpy_tq3_0_f16_kernel
+    // (cpy.cu:429-475) which is compressed-domain — exactly what the graph-level
+    // WHT contract requires (Q is pre-rotated above, O is inverse-rotated below).
+    //
+    // The TQ3 path is gated behind DFLASH_PFLASH_TQ3=1 for A/B rollout. Without
+    // the gate, TQ3 falls back to the dense FA chunked SGEMM driver (which works
+    // but is ~2.3x slower than BF16 MMA pflash on Dense 31B prefill).
+    static const bool s_pflash_tq3 = []() {
+        const char * s = std::getenv("DFLASH_PFLASH_TQ3");
+        return s && (s[0] == '1' || s[0] == 't' || s[0] == 'T' || s[0] == 'y' || s[0] == 'Y');
+    }();
     auto pflash_supports = [](enum ggml_type t) {
-        return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0;
+        if (t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0) return true;
+        if (t == GGML_TYPE_TQ3_0 && s_pflash_tq3) return true;
+        return false;
     };
     const bool can_pflash = use_pflash &&
                             pflash_supports(Kfa->type) &&
