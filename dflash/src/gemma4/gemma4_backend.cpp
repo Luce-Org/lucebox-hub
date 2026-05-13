@@ -8,6 +8,7 @@
 #include "gemma4_backend.h"
 #include "gemma4_runtime_helpers.h"
 
+#include "../common/sampler.h"
 #include "ggml-cuda.h"
 
 #include <algorithm>
@@ -71,12 +72,18 @@ bool Gemma4Backend::init() {
     }
 
     if (args_.draft_method == Gemma4DraftMethod::kMtp) {
-        // Enable h_prev capture; allocate the destination tensor in cache_.
-        // Allocation lives in the draft/MTP runtime port (follow-up PR).
-        cache_.mtp_h_prev_enabled  = true;
+        // Allocate mtp_h_prev + mtp_h_prev_batch tensors and enable h_prev capture.
+        if (!enable_mtp_h_prev(cache_, backend_, target_w_.n_embd, args_.mtp_gamma)) {
+            std::fprintf(stderr, "[gemma4] enable_mtp_h_prev failed\n");
+            return false;
+        }
         cache_.mtp_last_full_layer = -1;
         for (int il = (int)target_w_.swa_layers.size() - 1; il >= 0; --il) {
             if (!target_w_.swa_layers[il]) { cache_.mtp_last_full_layer = il; break; }
+        }
+        if (cache_.mtp_last_full_layer < 0) {
+            std::fprintf(stderr, "[gemma4] error: no full-attention layer found in target\n");
+            return false;
         }
     }
 
@@ -244,6 +251,7 @@ void Gemma4Backend::shutdown() {
         free_gemma4_mtp_assistant(mtp_w_);
         mtp_loaded_ = false;
     }
+    free_mtp_h_prev(cache_);
     free_gemma4_cache(cache_);
     free_gemma4_target_weights(target_w_);
     if (backend_) {
@@ -925,20 +933,245 @@ bool Gemma4Backend::decode_dflash(int n_gen,
     return true;
 }
 
-// ── internal: MTP decode (TODO in runtime follow-up PR) ─────────────────
+// ── internal: MTP decode (γ=1) ──────────────────────────────────────────────
+//
+// Ported from feature/gemma4-support test_gemma4_dflash.cpp lines 2575-2780
+// (the `gamma == 1` branch of the `have_mtp` decode path).
+//
+// Stripped: [mtp] printf scaffolding, g_ignore_eos / IS_EOS_TOK macros
+// (inlined using target_w_.eos_id / eos_chat_id), now_ms() / benchmark
+// counters, stream_emit (tokens returned via out_tokens / io.emit).
 
-bool Gemma4Backend::decode_mtp(int /*n_gen*/,
-                               std::vector<float> & /*last_logits_io*/,
-                               const GenerateRequest & /*req*/,
-                               const DaemonIO & /*io*/,
-                               std::vector<int32_t> & /*out_tokens*/,
+bool Gemma4Backend::decode_mtp(int n_gen,
+                               std::vector<float> & last_logits_io,
+                               const GenerateRequest & req,
+                               const DaemonIO & io,
+                               std::vector<int32_t> & out_tokens,
                                double & out_decode_s) {
-    out_decode_s = 0.0;
-    std::fprintf(stderr,
-                 "[gemma4] MTP decode TODO — port build_mtp_step_graph + "
-                 "γ=1 verify path from feature/gemma4-support "
-                 "test_gemma4_dflash.cpp:~2400-2800\n");
-    return false;
+    out_tokens.clear();
+    out_tokens.reserve(n_gen);
+
+    const int vocab    = target_w_.n_vocab;
+    const int ctx_size = args_.max_ctx;
+
+    // history for repetition penalty — start with the full prompt
+    std::vector<int32_t> history(req.prompt.begin(), req.prompt.end());
+
+    const bool do_sample = req.sampler.temp > 0.0f;
+
+    auto argmax = [](const std::vector<float> & ll) {
+        int best = 0; float bv = ll[0];
+        for (size_t i = 1; i < ll.size(); ++i)
+            if (ll[i] > bv) { bv = ll[i]; best = (int)i; }
+        return best;
+    };
+
+    auto pick = [&](const std::vector<float> & ll) -> int {
+        return do_sample
+            ? sample_logits(ll.data(), (int)ll.size(), req.sampler, history, sampler_rng_)
+            : argmax(ll);
+    };
+
+    // First token sampled from prefill logits.
+    int32_t cur_tok = (int32_t)pick(last_logits_io);
+
+    // ── Initial MTP step graph (attn_pos=0; rebuilt each step) ──────────────
+    MtpStepGraph mtp_g{};
+    if (!build_mtp_step_graph(mtp_w_, cache_, target_w_, mtp_g, /*attn_pos=*/0)) {
+        std::fprintf(stderr, "[gemma4] build_mtp_step_graph failed: %s\n",
+                     dflash27b_last_error());
+        return false;
+    }
+
+    int committed = cache_.cur_pos;
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    // ── MTP SPECULATIVE DECODE LOOP (γ=1) ────────────────────────────────────
+    //
+    // Each iteration:
+    //   1. Run target forward for cur_tok at position committed,
+    //      capturing mtp_h_prev from the last full-attention layer.
+    //   2. Rebuild MTP step graph with current attn_pos = committed+1.
+    //   3. Feed (cur_tok, mtp_h_prev) into MTP graph → draft_tok.
+    //   4. Run target verify forward for draft_tok at position committed+1.
+    //   5. Accept draft_tok if target agrees; otherwise accept target's
+    //      token instead (standard single-draft acceptance).
+
+    while ((int)out_tokens.size() < n_gen) {
+
+        // EOS check (inlined IS_EOS_TOK)
+        if ((target_w_.eos_id      >= 0 && cur_tok == target_w_.eos_id) ||
+            (target_w_.eos_chat_id >= 0 && cur_tok == target_w_.eos_chat_id)) {
+            break;
+        }
+        if (committed >= ctx_size - 2) {
+            break;
+        }
+
+        // ── 1. Target forward for cur_tok (captures mtp_h_prev) ─────────────
+        const int swa_window = target_w_.swa_window > 0 ? target_w_.swa_window : 1024;
+
+        StepGraph sg{};
+        if (!build_gemma4_step(sg, target_w_, cache_, backend_,
+                               committed, /*n_tokens=*/1,
+                               /*with_mask=*/true,
+                               /*capture=*/false,
+                               /*use_pflash=*/false, args_.pflash_alpha,
+                               /*fa_window=*/0)) {
+            std::fprintf(stderr, "[gemma4] mtp target build failed at step %zu\n",
+                         out_tokens.size());
+            free_mtp_step_graph(mtp_g);
+            return false;
+        }
+
+        if (sg.attn_mask && sg.attn_mask->buffer) {
+            const int kv_len = committed + 1;
+            std::vector<uint16_t> mask_buf;
+            build_causal_mask(mask_buf, kv_len, 1, committed);
+            ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
+                                    sizeof(uint16_t) * mask_buf.size());
+        }
+        if (sg.swa_mask && sg.swa_mask->buffer) {
+            const SwaView swa_view = compute_swa_view(committed, 1,
+                                                      swa_window, cache_.swa_ctx_alloc);
+            std::vector<uint16_t> swa_buf;
+            build_swa_causal_mask(swa_buf,
+                                  /*kv_start*/ committed,
+                                  /*n_tokens*/ 1,
+                                  /*swa_window*/ swa_window,
+                                  /*ring_size*/ swa_view.effective_win_len,
+                                  /*kv_end*/ committed + 1);
+            ggml_backend_tensor_set(sg.swa_mask, swa_buf.data(), 0,
+                                    sizeof(uint16_t) * swa_buf.size());
+        }
+        if (!embed_token(target_w_, cur_tok, sg.inp_embed, backend_)) {
+            free_mtp_step_graph(mtp_g);
+            return false;
+        }
+        {
+            int32_t pos_val = committed;
+            ggml_backend_tensor_set(sg.positions, &pos_val, 0, sizeof(int32_t));
+        }
+        {
+            auto st = ggml_backend_graph_compute(backend_, sg.gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "[gemma4] mtp target compute failed\n");
+                step_graph_free(sg);
+                free_mtp_step_graph(mtp_g);
+                return false;
+            }
+        }
+        committed++;
+        cache_.cur_pos = committed;
+
+        // Read target logits to get target's own prediction at position committed-1.
+        std::vector<float> logits_cpu(vocab);
+        ggml_backend_tensor_get(sg.logits, logits_cpu.data(), 0,
+                                sizeof(float) * vocab);
+        const int32_t target_next = (int32_t)pick(logits_cpu);
+
+        step_graph_free(sg);
+
+        // ── 2. Rebuild MTP step graph with attn_pos = committed ──────────────
+        free_mtp_step_graph(mtp_g);
+        if (!build_mtp_step_graph(mtp_w_, cache_, target_w_, mtp_g, committed)) {
+            std::fprintf(stderr, "[gemma4] build_mtp_step_graph failed: %s\n",
+                         dflash27b_last_error());
+            return false;
+        }
+
+        // Allocate MTP graph (build_mtp_step_graph creates the ggml context
+        // but not the backend buffers).
+        ggml_gallocr_t mtp_alloc = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend_));
+        if (!ggml_gallocr_alloc_graph(mtp_alloc, mtp_g.gf)) {
+            std::fprintf(stderr, "[gemma4] mtp gallocr_alloc_graph failed\n");
+            ggml_gallocr_free(mtp_alloc);
+            free_mtp_step_graph(mtp_g);
+            return false;
+        }
+
+        // ── 3. Set MTP inputs and compute ────────────────────────────────────
+        // in_tok_embd: pre-dequantised F32 embedding of cur_tok.
+        if (!embed_token(target_w_, cur_tok, mtp_g.in_tok_embd, backend_)) {
+            std::fprintf(stderr, "[gemma4] mtp embed_token failed for tok=%d\n", cur_tok);
+            ggml_gallocr_free(mtp_alloc);
+            free_mtp_step_graph(mtp_g);
+            return false;
+        }
+        // in_h_prev: captured by target graph into cache_.mtp_h_prev
+        ggml_backend_tensor_copy(cache_.mtp_h_prev, mtp_g.in_h_prev);
+        // in_pos: position of the draft token (= committed, 0-based)
+        {
+            int32_t p = committed;
+            ggml_backend_tensor_set(mtp_g.in_pos, &p, 0, sizeof(int32_t));
+        }
+
+        // Fill the FA mask for TQ3_0 + head_dim>=512 cross-attention layers.
+        // Real positions [0..kv_seq_len-1]: 0x0000 (F16 0.0 = admit).
+        // Padding positions [kv_seq_len..mask_width-1]: 0xFC00 (F16 -inf = exclude).
+        if (mtp_g.fa_mask && mtp_g.fa_mask->buffer) {
+            const int64_t mask_n = mtp_g.fa_mask->ne[0];
+            const int64_t kv_seq = mtp_g.fa_mask_kv_seq_len;
+            std::vector<uint16_t> fa_mask_buf(mask_n);
+            for (int64_t i = 0; i < mask_n; i++) {
+                fa_mask_buf[i] = (i < kv_seq) ? 0x0000u : 0xFC00u;
+            }
+            ggml_backend_tensor_set(mtp_g.fa_mask, fa_mask_buf.data(), 0,
+                                    sizeof(uint16_t) * mask_n);
+        }
+
+        {
+            auto st = ggml_backend_graph_compute(backend_, mtp_g.gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "[gemma4] mtp compute failed\n");
+                ggml_gallocr_free(mtp_alloc);
+                free_mtp_step_graph(mtp_g);
+                return false;
+            }
+        }
+
+        // Read draft token from in-graph argmax.
+        int32_t draft_tok = -1;
+        ggml_backend_tensor_get(mtp_g.out_argmax, &draft_tok, 0, sizeof(int32_t));
+
+        ggml_gallocr_free(mtp_alloc);
+
+        // Emit the current token (already committed by target step above).
+        out_tokens.push_back(cur_tok);
+        history.push_back(cur_tok);
+        if (req.stream) {
+            io.emit(cur_tok);
+        }
+
+        // ── 4+5. Check if draft matches target's token ───────────────────────
+        if (draft_tok == target_next) {
+            // MTP was right: accept draft token as next cur_tok.
+            cur_tok = draft_tok;
+        } else {
+            // MTP was wrong: use target's token.
+            cur_tok = target_next;
+        }
+        cache_.last_tok = cur_tok;
+
+        // EOS check on the new cur_tok before next iteration.
+        if ((target_w_.eos_id      >= 0 && cur_tok == target_w_.eos_id) ||
+            (target_w_.eos_chat_id >= 0 && cur_tok == target_w_.eos_chat_id)) {
+            break;
+        }
+    }
+
+    auto t1 = std::chrono::steady_clock::now();
+    out_decode_s = std::chrono::duration<double>(t1 - t0).count();
+
+    free_mtp_step_graph(mtp_g);
+
+    if (req.stream) {
+        io.emit(-1);
+    }
+
+    return true;
 }
 
 }  // namespace dflash27b

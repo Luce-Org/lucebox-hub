@@ -344,6 +344,83 @@ void draft_step_free(DraftStepGraph & dsg) {
     dsg.logits      = nullptr;
 }
 
+// ─── MTP h_prev static storage ──────────────────────────────────────────────
+//
+// TODO: move to GemmaTargetCache once PR176 lands the ctx/buf fields.
+// These are file-static so they outlive any single graph and survive across
+// decode steps.
+static ggml_context        * s_mtp_h_prev_ctx = nullptr;
+static ggml_backend_buffer_t s_mtp_h_prev_buf = nullptr;
+
+// ─── enable_mtp_h_prev ──────────────────────────────────────────────────────
+
+bool enable_mtp_h_prev(GemmaTargetCache & cache,
+                       ggml_backend_t backend,
+                       int n_embd_backbone,
+                       int gamma_max) {
+    // Already allocated — caller should call free_mtp_h_prev first.
+    if (s_mtp_h_prev_ctx) {
+        return true;
+    }
+
+    // Two tensors: mtp_h_prev [n_embd, 1] + mtp_h_prev_batch [n_embd, gamma_max+1].
+    const int kBatchCols = gamma_max + 1;
+
+    ggml_init_params ep{};
+    ep.mem_size   = 2 * ggml_tensor_overhead() + 512;
+    ep.mem_buffer = nullptr;
+    ep.no_alloc   = true;
+    s_mtp_h_prev_ctx = ggml_init(ep);
+    if (!s_mtp_h_prev_ctx) {
+        std::fprintf(stderr, "[mtp] ggml_init for mtp_h_prev failed\n");
+        return false;
+    }
+
+    cache.mtp_h_prev = ggml_new_tensor_2d(s_mtp_h_prev_ctx,
+                                           GGML_TYPE_F32,
+                                           n_embd_backbone, 1);
+    ggml_set_name(cache.mtp_h_prev, "mtp_h_prev");
+
+    cache.mtp_h_prev_batch = ggml_new_tensor_2d(s_mtp_h_prev_ctx,
+                                                  GGML_TYPE_F32,
+                                                  n_embd_backbone, kBatchCols);
+    ggml_set_name(cache.mtp_h_prev_batch, "mtp_h_prev_batch");
+
+    s_mtp_h_prev_buf = ggml_backend_alloc_ctx_tensors(s_mtp_h_prev_ctx, backend);
+    if (!s_mtp_h_prev_buf) {
+        std::fprintf(stderr, "[mtp] alloc mtp_h_prev failed\n");
+        ggml_free(s_mtp_h_prev_ctx);
+        s_mtp_h_prev_ctx  = nullptr;
+        cache.mtp_h_prev  = nullptr;
+        cache.mtp_h_prev_batch = nullptr;
+        return false;
+    }
+
+    // Zero-initialise mtp_h_prev (1 column).
+    std::vector<float> zeros_f(n_embd_backbone, 0.0f);
+    ggml_backend_tensor_set(cache.mtp_h_prev, zeros_f.data(), 0,
+                            sizeof(float) * n_embd_backbone);
+
+    cache.mtp_h_prev_enabled = true;
+    return true;
+}
+
+// ─── free_mtp_h_prev ────────────────────────────────────────────────────────
+
+void free_mtp_h_prev(GemmaTargetCache & cache) {
+    if (s_mtp_h_prev_buf) {
+        ggml_backend_buffer_free(s_mtp_h_prev_buf);
+        s_mtp_h_prev_buf = nullptr;
+    }
+    if (s_mtp_h_prev_ctx) {
+        ggml_free(s_mtp_h_prev_ctx);
+        s_mtp_h_prev_ctx = nullptr;
+    }
+    cache.mtp_h_prev         = nullptr;
+    cache.mtp_h_prev_batch   = nullptr;
+    cache.mtp_h_prev_enabled = false;
+}
+
 // copy_target_feat_bf16_to_f32: Copy n_tokens columns from the bf16 ring buffer
 // src_bf16 (shape [target_feat_w, ring_cap]) starting at slot start_slot into
 // the f32 tensor dst_f32 (shape [target_feat_w, n_tokens]).

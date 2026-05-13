@@ -204,4 +204,22 @@ bool embed_tokens_batch(const GemmaTargetWeights & w,
                         ggml_tensor * inp_embed,
                         ggml_backend_t backend);
 
+// ─── MTP h_prev allocation / teardown ───────────────────────────────────────
+//
+// Allocates a separate ggml_context + backend buffer holding cache.mtp_h_prev
+// [n_embd_backbone, 1] f32 and cache.mtp_h_prev_batch [n_embd_backbone,
+// gamma_max+1] f32, both zero-initialised.  Sets cache.mtp_h_prev_enabled=true.
+//
+// The ctx/buf are kept in file-static globals inside gemma4_runtime_helpers.cpp
+// because GemmaTargetCache does not (yet) carry mtp_h_prev_ctx / mtp_h_prev_buf
+// fields.  TODO: move to GemmaTargetCache once PR176 lands the ctx/buf fields.
+
+bool enable_mtp_h_prev(GemmaTargetCache & cache,
+                       ggml_backend_t backend,
+                       int n_embd_backbone,
+                       int gamma_max);
+
+// null-safe; frees mtp_h_prev_ctx + buf and nulls the cache tensor pointers.
+void free_mtp_h_prev(GemmaTargetCache & cache);
+
 }  // namespace dflash27b
