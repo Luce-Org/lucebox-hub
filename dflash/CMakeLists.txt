@@ -223,6 +223,7 @@ add_library(dflash27b STATIC
     # Gemma4 MTP step graph (PR10)
     src/gemma4_mtp_graph.cpp
     # Gemma4 backend (PR11b — concrete ModelBackend impl, depends on PR175 interface)
+    src/gemma4/gemma4_runtime_helpers.cpp
     src/gemma4/gemma4_backend.cpp
 )
 # BSA (Block-Sparse Attention) backs the speculative-prefill drafter scoring
