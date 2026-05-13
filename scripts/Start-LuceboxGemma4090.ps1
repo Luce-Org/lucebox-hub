@@ -21,6 +21,7 @@ param(
     [string] $LlamaServer = '',
     [string] $MtpModel = '',
     [string] $GpuLayersDraft = 'all',
+    [string] $DraftOverrideTensor = 'token_embd.weight=CUDA0',
     [string] $CacheRam = '0',
     [switch] $NoKvOffload,
     [int] $Poll = 100,
@@ -89,6 +90,7 @@ function Get-LuceboxEnvPrefix {
         LUCEBOX_GEMMA4_DRAFT_CACHE_TYPE_V = $effectiveDraftCacheTypeV
         LUCEBOX_GEMMA4_MTP_STYLE = $MtpStyle
         LUCEBOX_GEMMA4_GPU_LAYERS_DRAFT = $GpuLayersDraft
+        LUCEBOX_GEMMA4_DRAFT_OVERRIDE_TENSOR = $DraftOverrideTensor
         LUCEBOX_GEMMA4_CACHE_RAM = $CacheRam
         LUCEBOX_GEMMA4_NO_KV_OFFLOAD = if ($NoKvOffload) { '1' } else { '0' }
         LUCEBOX_GEMMA4_POLL = [string] $Poll

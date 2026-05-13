@@ -23,7 +23,9 @@ The assistant GGUF above was reconverted from the cached
 metadata uses the `gemma4_assistant` architecture expected by `--mtp-head`,
 then quantized for MTP serving. The default now uses AtomicChat's prebuilt
 Q4_K_S GGUF because it is the best measured 70k throughput variant on this
-RTX 4090. The locally converted F16 intermediate is kept at
+RTX 4090. The launcher also pins the assistant `token_embd.weight` tensor to
+CUDA0; leaving that small tensor CPU-mapped was the main remaining MTP draft
+latency bottleneck. The locally converted F16 intermediate is kept at
 `/home/tdamre/models/gemma-4-31B-it-assistant-atomic-f16.gguf`.
 
 Start from Windows PowerShell:
@@ -55,6 +57,7 @@ LUCEBOX_GEMMA4_CTX_SIZE=70080
 LUCEBOX_GEMMA4_DRAFT_CTX_SIZE=2048
 LUCEBOX_GEMMA4_DRAFT_BLOCK_SIZE=4
 LUCEBOX_GEMMA4_GPU_LAYERS_DRAFT=all
+LUCEBOX_GEMMA4_DRAFT_OVERRIDE_TENSOR=token_embd.weight=CUDA0
 LUCEBOX_GEMMA4_CACHE_TYPE_K=turbo4
 LUCEBOX_GEMMA4_CACHE_TYPE_V=turbo4
 LUCEBOX_GEMMA4_DRAFT_CACHE_TYPE_K=turbo4
@@ -103,7 +106,8 @@ Current RTX 4090 measurements:
 - A Q8_0 assistant (`491 MiB`) was slower than Q4_K_M on the same 3-run verifier: `51.12 tok/s` minimum and `58.23 tok/s` average.
 - With the Q4_K_M assistant, a corrected `71680` context probe using a `70034`-token chat prompt completed successfully: prompt processing was `1457.52 tok/s`, decode was `37.17 tok/s`, and MTP accepted `37/51` draft tokens. This confirmed the turbo4 path answers at 70k tokens, but fully populated 70k-context decode remains below the requested `70 tok/s` gate.
 - Tightening the context from `71680` to `70080` while preserving a 70k+ usable window improved the Q4_K_M assistant 128-token verifier minimum to `56.13 tok/s` and average to `64.15 tok/s` at block size 3.
-- AtomicChat's Q4_K_S assistant at `70080` context with `--draft-block-size 4` is the current best measured 70k recipe: a 3-run 128-token verifier reached `56.31 tok/s` minimum and `68.01 tok/s` average, while a 3-run 512-token verifier reached `60.49 tok/s` minimum and `71.09 tok/s` average. It still does not satisfy the strict every-run `70 tok/s` gate.
+- AtomicChat's Q4_K_S assistant at `70080` context with `--draft-block-size 4` became the current validated 70k recipe after pinning only the assistant `token_embd.weight` to CUDA0 with `--override-tensor-draft token_embd.weight=CUDA0`: a 3-run 128-token verifier passed the `70 tok/s` floor with `70.98 tok/s` minimum and `87.31 tok/s` average, and a 3-run 512-token verifier passed with `77.28 tok/s` minimum and `90.62 tok/s` average.
+- The same default recipe was restarted through the Windows PowerShell launcher used by the desktop shortcut and re-verified: the 3-run 128-token verifier passed with `72.14 tok/s` minimum and `88.28 tok/s` average, and the 3-run 512-token verifier passed with `78.13 tok/s` minimum and `91.69 tok/s` average.
 - The same Q4_K_S/block-size-4 profile answered a `70034`-token chat prompt at `70080` context: prompt processing was `1373.00 tok/s`, decode was `37.92 tok/s`, and MTP accepted `41/64` draft tokens.
 - AtomicChat Q4_K_M was slightly worse than Q4_K_S at `70080` context (`55.04 tok/s` minimum, `63.04 tok/s` average on the 128-token verifier). AtomicChat Q5_K_M was also worse on the 512-token verifier (`59.05 tok/s` minimum, `69.35 tok/s` average).
 - Rebuilding Atomic with `GGML_CUDA_FORCE_MMQ=ON` did not improve the Q4_K_S/block-size-4 profile; the 3-run 128-token verifier reached `55.14 tok/s` minimum and `67.71 tok/s` average.
@@ -131,3 +135,8 @@ Current RTX 4090 measurements:
 - A local `SuperGemma4-31b-abliterated.Q4_K_M.gguf` target loaded but returned empty `/completion` content during the verifier, so it is not a compatible replacement for the requested target path.
 - Requantizing the verified Q4_K_M target to `Q3_K_M` produced `/home/tdamre/models/gemma-4-31B-it-abliterated-Q3_K_M-from-Q4_K_M.gguf` (`14,563.82 MiB`, `3.98 BPW`), but it still missed the floor (`54.91 tok/s` minimum, `61.57 tok/s` average) and showed visible repeated text on one fixed prompt.
 - Requantizing the verified Q4_K_M target to `Q2_K` produced a numerically fast profile (`76.37 tok/s` minimum, `79.72 tok/s` average), but output quality collapsed into repeated fragments such as punctuation runs and repeated `la`, so it is not a valid user-facing solution despite crossing the raw timing threshold.
+- A May 13 check confirmed the local cached Google assistant weights were already current for inference: Hugging Face `main` moved from `cffbbd2` to `4735700`, but only the README changed and the LFS object IDs for `model.safetensors` and `tokenizer.json` stayed unchanged.
+- `--no-op-offload` did not improve the Q4_K_S/block-size-4 recipe (`54.81 tok/s` minimum, `66.06 tok/s` average). The F16 assistant was slower (`40.96 tok/s` minimum, `50.47 tok/s` average). Forcing target CPU threads to 16 or 4 was also worse (`52.97 tok/s` and `53.07 tok/s` minimum respectively).
+- Built-in `q4_0` K/V cache loaded but missed the floor (`47.49 tok/s` minimum) and produced visibly degraded text on one fixed prompt. Mixed `q4_0` K with `turbo4` V aborted in CUDA flash attention during warmup, so the default remains TurboQuant `turbo4` for both K and V.
+- `--no-mmap` loaded and answered but did not improve the default (`56.09 tok/s` minimum, `67.51 tok/s` average). Q4_K_S with `--draft-block-size 3` also missed (`57.00 tok/s` minimum, `64.45 tok/s` average).
+- With the draft embedding override enabled, the `70080` context profile answered a `70034`-token chat prompt successfully after a Windows-wrapper restart: prompt processing was `1374.83 tok/s`, decode was `46.96 tok/s`, and MTP accepted `41/63` draft tokens. This validates the full 70k prompt path, while the strict `70 tok/s` floor is enforced by the fixed short-prompt single-stream verifier above.

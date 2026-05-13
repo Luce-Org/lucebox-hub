@@ -25,13 +25,19 @@ CACHE_TYPE_V="${LUCEBOX_GEMMA4_CACHE_TYPE_V:-turbo4}"
 DRAFT_CACHE_TYPE_K="${LUCEBOX_GEMMA4_DRAFT_CACHE_TYPE_K:-$CACHE_TYPE_K}"
 DRAFT_CACHE_TYPE_V="${LUCEBOX_GEMMA4_DRAFT_CACHE_TYPE_V:-$CACHE_TYPE_V}"
 GPU_LAYERS_DRAFT="${LUCEBOX_GEMMA4_GPU_LAYERS_DRAFT:-all}"
+DRAFT_OVERRIDE_TENSOR="${LUCEBOX_GEMMA4_DRAFT_OVERRIDE_TENSOR:-token_embd.weight=CUDA0}"
 CACHE_RAM="${LUCEBOX_GEMMA4_CACHE_RAM:-0}"
 NO_KV_OFFLOAD="${LUCEBOX_GEMMA4_NO_KV_OFFLOAD:-0}"
+NO_OP_OFFLOAD="${LUCEBOX_GEMMA4_NO_OP_OFFLOAD:-0}"
+NO_MMAP="${LUCEBOX_GEMMA4_NO_MMAP:-0}"
+MLOCK="${LUCEBOX_GEMMA4_MLOCK:-0}"
 POLL="${LUCEBOX_GEMMA4_POLL:-100}"
 POLL_BATCH="${LUCEBOX_GEMMA4_POLL_BATCH:-1}"
 PRIORITY="${LUCEBOX_GEMMA4_PRIORITY:-2}"
 PRIORITY_BATCH="${LUCEBOX_GEMMA4_PRIORITY_BATCH:-2}"
 THREADS_HTTP="${LUCEBOX_GEMMA4_THREADS_HTTP:-1}"
+THREADS="${LUCEBOX_GEMMA4_THREADS:-}"
+THREADS_BATCH="${LUCEBOX_GEMMA4_THREADS_BATCH:-$THREADS}"
 RUN_DIR="${LUCEBOX_GEMMA4_RUN_DIR:-$HOME/lucebox-runs}"
 PID_FILE="${LUCEBOX_GEMMA4_PID_FILE:-$RUN_DIR/lucebox-gemma4-mtp-server.pid}"
 LOG_FILE="${LUCEBOX_GEMMA4_LOG_FILE:-$RUN_DIR/lucebox-gemma4-mtp-server-$(date +%Y%m%d-%H%M%S).log}"
@@ -124,6 +130,15 @@ run_foreground() {
         --threads-http "$THREADS_HTTP"
         -ngld "$GPU_LAYERS_DRAFT"
     )
+    if [[ -n "$DRAFT_OVERRIDE_TENSOR" && "$DRAFT_OVERRIDE_TENSOR" != "none" && "$DRAFT_OVERRIDE_TENSOR" != "0" && "$DRAFT_OVERRIDE_TENSOR" != "false" ]]; then
+        args+=(--override-tensor-draft "$DRAFT_OVERRIDE_TENSOR")
+    fi
+    if [[ -n "$THREADS" ]]; then
+        args+=(--threads "$THREADS")
+    fi
+    if [[ -n "$THREADS_BATCH" ]]; then
+        args+=(--threads-batch "$THREADS_BATCH")
+    fi
     case "$MTP_STYLE" in
         atomic)
             args+=(--spec-type mtp --mtp-head "$MTP_MODEL" --draft-block-size "$DRAFT_BLOCK_SIZE")
@@ -148,6 +163,15 @@ run_foreground() {
     fi
     if [[ "$NO_KV_OFFLOAD" == "1" || "$NO_KV_OFFLOAD" == "true" || "$NO_KV_OFFLOAD" == "yes" ]]; then
         args+=(--no-kv-offload)
+    fi
+    if [[ "$NO_OP_OFFLOAD" == "1" || "$NO_OP_OFFLOAD" == "true" || "$NO_OP_OFFLOAD" == "yes" ]]; then
+        args+=(--no-op-offload)
+    fi
+    if [[ "$NO_MMAP" == "1" || "$NO_MMAP" == "true" || "$NO_MMAP" == "yes" ]]; then
+        args+=(--no-mmap)
+    fi
+    if [[ "$MLOCK" == "1" || "$MLOCK" == "true" || "$MLOCK" == "yes" ]]; then
+        args+=(--mlock)
     fi
     exec "$LLAMA_SERVER" "${args[@]}" > "$LOG_FILE" 2>&1
 }
