@@ -23,14 +23,14 @@ namespace flashprefill {
 
 #if defined(DFLASH27B_HAVE_FLASHPREFILL) || defined(DFLASH27B_HAVE_SM80_FLASHPREFILL)
 extern "C" {
-void launch_compute_mean_vector_bf16(
+int launch_compute_mean_vector_bf16(
     const void * K, void * mean_K,
     int batch, int seq_len, int n_kv_heads, int head_dim, int block_size,
     int s_K_b, int s_K_n, int s_K_h, int s_K_d,
     int s_mK_b, int s_mK_m, int s_mK_h, int s_mK_d,
     cudaStream_t stream);
 
-void launch_compute_block_score_bf16(
+int launch_compute_block_score_bf16(
     const void * Q, const void * mean_K, float sm_scale,
     void * score, void * score_max,
     int batch, int n_q_heads, int n_k_heads,
@@ -44,7 +44,7 @@ void launch_compute_block_score_bf16(
 #ifdef DFLASH27B_BACKEND_HIP
 // Phase 4 (HIP): mean_Q + tiled rocWMMA GEMM replaces the O(M²) scalar
 // block-score kernel. ~5-10× faster on the score step at 8K-32K context.
-void launch_compute_block_score_gemm_bf16(
+int launch_compute_block_score_gemm_bf16(
     const void* mean_Q, const void* mean_K, float sm_scale,
     void* score,
     int batch, int n_q_heads, int n_k_heads,
@@ -277,33 +277,33 @@ int flash_prefill_forward_bf16(
     if (prof) for (int i=0;i<5;i++) cudaEventCreate(&pE[i]);
     if (prof) cudaEventRecord(pE[0]);
     // 1. mean_K
-    launch_compute_mean_vector_bf16(
-        K, dmK, B, S, Hk, D, BLOCK,
-        s_K_b, s_K_n, s_K_h, s_K_d,
-        s_mK_b, s_mK_m, s_mK_h, s_mK_d, 0);
+    if (launch_compute_mean_vector_bf16(
+            K, dmK, B, S, Hk, D, BLOCK,
+            s_K_b, s_K_n, s_K_h, s_K_d,
+            s_mK_b, s_mK_m, s_mK_h, s_mK_d, 0) != 0) goto err;
 
     if (prof) cudaEventRecord(pE[1]);
     // 2. block scores
 #ifdef DFLASH27B_BACKEND_HIP
     // Phase 4: mean_Q + rocWMMA GEMM replaces the O(M²) scalar kernel.
-    launch_compute_mean_vector_bf16(
-        Q, dmQ, B, S, H, D, BLOCK,
-        s_Q_b, s_Q_n, s_Q_h, s_Q_d,
-        s_mQ_b, s_mQ_m, s_mQ_h, 1, 0);
-    launch_compute_block_score_gemm_bf16(
-        dmQ, dmK, scale, dS,
-        B, H, Hk, M, D,
-        s_mQ_b, s_mQ_m, s_mQ_h,
-        s_mK_b, s_mK_m, s_mK_h,
-        s_S_b,  s_S_m,  s_S_n, s_S_h, 0);
+    if (launch_compute_mean_vector_bf16(
+            Q, dmQ, B, S, H, D, BLOCK,
+            s_Q_b, s_Q_n, s_Q_h, s_Q_d,
+            s_mQ_b, s_mQ_m, s_mQ_h, 1, 0) != 0) goto err;
+    if (launch_compute_block_score_gemm_bf16(
+            dmQ, dmK, scale, dS,
+            B, H, Hk, M, D,
+            s_mQ_b, s_mQ_m, s_mQ_h,
+            s_mK_b, s_mK_m, s_mK_h,
+            s_S_b,  s_S_m,  s_S_n, s_S_h, 0) != 0) goto err;
 #else
-    launch_compute_block_score_bf16(
-        Q, dmK, scale, dS, dM,
-        B, H, Hk, S, D, BLOCK,
-        s_Q_b, s_Q_n, s_Q_h, s_Q_d,
-        s_mK_b, s_mK_m, s_mK_h, s_mK_d,
-        s_S_b, s_S_m, s_S_n, s_S_h,
-        s_S_b, s_S_m, s_S_n, s_S_h, 0);
+    if (launch_compute_block_score_bf16(
+            Q, dmK, scale, dS, dM,
+            B, H, Hk, S, D, BLOCK,
+            s_Q_b, s_Q_n, s_Q_h, s_Q_d,
+            s_mK_b, s_mK_m, s_mK_h, s_mK_d,
+            s_S_b, s_S_m, s_S_n, s_S_h,
+            s_S_b, s_S_m, s_S_n, s_S_h, 0) != 0) goto err;
 #endif
 
     if (prof) cudaEventRecord(pE[2]);

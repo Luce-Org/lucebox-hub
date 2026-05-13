@@ -18,6 +18,7 @@
 //   The causal mask, rowmax, rowsum, alpha-rescale sections are rewritten accordingly.
 
 #include <cstdint>
+#include <cstdio>
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
 #include <rocwmma/rocwmma.hpp>
@@ -60,22 +61,28 @@ __global__ void compute_mean_vector_kernel_bf16(
     Mp[(size_t)dim * s_mK_d] = hip_bfloat16(sum / (float)count);
 }
 
-extern "C" void launch_compute_mean_vector_bf16(
+extern "C" int launch_compute_mean_vector_bf16(
     const void * K, void * mean_K,
     int batch, int seq_len, int n_kv_heads, int head_dim, int block_size,
     int s_K_b, int s_K_n, int s_K_h, int s_K_d,
     int s_mK_b, int s_mK_m, int s_mK_h, int s_mK_d,
     hipStream_t stream)
 {
+    if (head_dim != 128 || block_size != 128) {
+        fprintf(stderr, "[dflash] launch_compute_mean_vector_bf16: unsupported shape "
+                "head_dim=%d block_size=%d (only 128×128 supported)\n",
+                head_dim, block_size);
+        return -1;
+    }
     const int n_k_blocks = (seq_len + block_size - 1) / block_size;
     dim3 grid(n_k_blocks, batch * n_kv_heads, 1);
     dim3 block(head_dim, 1, 1);
-    if (head_dim == 128 && block_size == 128)
-        compute_mean_vector_kernel_bf16<128, 128><<<grid, block, 0, stream>>>(
-            (const hip_bfloat16 *)K, (hip_bfloat16 *)mean_K,
-            batch, seq_len, n_kv_heads,
-            s_K_b, s_K_n, s_K_h, s_K_d,
-            s_mK_b, s_mK_m, s_mK_h, s_mK_d);
+    compute_mean_vector_kernel_bf16<128, 128><<<grid, block, 0, stream>>>(
+        (const hip_bfloat16 *)K, (hip_bfloat16 *)mean_K,
+        batch, seq_len, n_kv_heads,
+        s_K_b, s_K_n, s_K_h, s_K_d,
+        s_mK_b, s_mK_m, s_mK_h, s_mK_d);
+    return 0;
 }
 
 // ---- Kernel 2: compute_block_score ----
@@ -89,6 +96,7 @@ __global__ void compute_block_score_kernel_bf16(
     float * __restrict__ score,
     float * __restrict__ score_max,
     int batch, int n_q_heads, int n_k_heads,
+    int seq_len,
     int q_block_idx_max,
     int k_block_idx_max,
     int s_Q_b, int s_Q_n, int s_Q_h, int s_Q_d,
@@ -105,7 +113,8 @@ __global__ void compute_block_score_kernel_bf16(
     const int kh           = qh * n_k_heads / n_q_heads;
     const int tid          = threadIdx.x;
     const int q_row_global = q_block_idx * BLOCK + tid;
-    if (tid >= BLOCK || q_row_global >= q_block_idx_max * BLOCK) return;
+    // Guard against the last partial block reading past the real sequence boundary.
+    if (tid >= BLOCK || q_row_global >= seq_len) return;
 
     const hip_bfloat16 * Qp = Q + (size_t)b * s_Q_b
                                  + (size_t)q_row_global * s_Q_n
@@ -152,7 +161,7 @@ __global__ void compute_block_score_kernel_bf16(
     }
 }
 
-extern "C" void launch_compute_block_score_bf16(
+extern "C" int launch_compute_block_score_bf16(
     const void * Q, const void * mean_K, float sm_scale,
     void * score, void * score_max,
     int batch, int n_q_heads, int n_k_heads,
@@ -163,19 +172,25 @@ extern "C" void launch_compute_block_score_bf16(
     int s_M_b, int s_M_m, int s_M_n, int s_M_h,
     hipStream_t stream)
 {
+    if (head_dim != 128 || block_size != 128) {
+        fprintf(stderr, "[dflash] launch_compute_block_score_bf16: unsupported shape "
+                "head_dim=%d block_size=%d (only 128×128 supported)\n",
+                head_dim, block_size);
+        return -1;
+    }
     const int M    = (seq_len + block_size - 1) / block_size;
     dim3 grid(M, batch * n_q_heads, 1);
     dim3 block(block_size, 1, 1);
     size_t smem = block_size * sizeof(float);
-    if (head_dim == 128 && block_size == 128)
-        compute_block_score_kernel_bf16<128, 128, 1><<<grid, block, smem, stream>>>(
-            (const hip_bfloat16 *)Q, (const hip_bfloat16 *)mean_K, sm_scale,
-            (float *)score, (float *)score_max,
-            batch, n_q_heads, n_k_heads, M, M,
-            s_Q_b, s_Q_n, s_Q_h, s_Q_d,
-            s_mK_b, s_mK_m, s_mK_h, s_mK_d,
-            s_S_b, s_S_m, s_S_n, s_S_h,
-            s_M_b, s_M_m, s_M_n, s_M_h);
+    compute_block_score_kernel_bf16<128, 128, 1><<<grid, block, smem, stream>>>(
+        (const hip_bfloat16 *)Q, (const hip_bfloat16 *)mean_K, sm_scale,
+        (float *)score, (float *)score_max,
+        batch, n_q_heads, n_k_heads, seq_len, M, M,
+        s_Q_b, s_Q_n, s_Q_h, s_Q_d,
+        s_mK_b, s_mK_m, s_mK_h, s_mK_d,
+        s_S_b, s_S_m, s_S_n, s_S_h,
+        s_M_b, s_M_m, s_M_n, s_M_h);
+    return 0;
 }
 
 // ---- Kernel 2b (Phase 4): compute_block_score_gemm ----
@@ -249,7 +264,7 @@ __global__ void compute_block_score_gemm_kernel(
     }
 }
 
-extern "C" void launch_compute_block_score_gemm_bf16(
+extern "C" int launch_compute_block_score_gemm_bf16(
     const void* mean_Q, const void* mean_K, float sm_scale,
     void* score,
     int batch, int n_q_heads, int n_k_heads,
@@ -259,18 +274,23 @@ extern "C" void launch_compute_block_score_gemm_bf16(
     int s_S_b,  int s_S_m,  int s_S_n, int s_S_h,
     hipStream_t stream)
 {
+    if (head_dim != 128) {
+        fprintf(stderr, "[dflash] launch_compute_block_score_gemm_bf16: unsupported "
+                "head_dim=%d (only 128 supported)\n", head_dim);
+        return -1;
+    }
     const int M16 = (M + 15) / 16;
     dim3 grid(M16, M16, batch * n_q_heads);
     dim3 block(32, 1, 1);
-    if (head_dim == 128)
-        compute_block_score_gemm_kernel<128><<<grid, block, 0, stream>>>(
-            (const hip_bfloat16*)mean_Q,
-            (const hip_bfloat16*)mean_K,
-            (float*)score, sm_scale,
-            M, n_q_heads, n_k_heads,
-            s_mQ_b, s_mQ_m, s_mQ_h,
-            s_mK_b, s_mK_m, s_mK_h,
-            s_S_b,  s_S_m,  s_S_n, s_S_h);
+    compute_block_score_gemm_kernel<128><<<grid, block, 0, stream>>>(
+        (const hip_bfloat16*)mean_Q,
+        (const hip_bfloat16*)mean_K,
+        (float*)score, sm_scale,
+        M, n_q_heads, n_k_heads,
+        s_mQ_b, s_mQ_m, s_mQ_h,
+        s_mK_b, s_mK_m, s_mK_h,
+        s_S_b,  s_S_m,  s_S_n, s_S_h);
+    return 0;
 }
 
 // ---- Kernel 4: sparse_flash_forward (rocWMMA) ----
@@ -608,17 +628,22 @@ __global__ void transpose_kv_kernel(
     }
 }
 
-extern "C" void launch_transpose_kv_bf16(
+extern "C" int launch_transpose_kv_bf16(
     const void * src, void * dst,
     int B, int S, int H, int head_dim,
     hipStream_t stream)
 {
-    if (head_dim != 128) return;   // only D=128 supported
+    if (head_dim != 128) {
+        fprintf(stderr, "[dflash] launch_transpose_kv_bf16: unsupported head_dim=%d "
+                "(only 128 supported)\n", head_dim);
+        return -1;
+    }
     const int threads = 256;
     const int blocks_n = (S + threads - 1) / threads;
     dim3 grid(blocks_n, B * H, 1);
     transpose_kv_kernel<128><<<grid, threads, 0, stream>>>(
         (const hip_bfloat16 *)src, (hip_bfloat16 *)dst, B, S, H);
+    return 0;
 }
 
 // ---- Kernel 3: block_select ----
