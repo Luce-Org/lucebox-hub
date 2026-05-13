@@ -81,9 +81,10 @@ jobs:
           CUDA_HOME: ${{ env.CUDA_PATH }}
           MEGAKERNEL_CUDA_ARCH: sm_75
         # Exercises the documented `uv sync --extra megakernel` flow:
-        # workspace resolves torch from the cu130 index, then setup.py
-        # compiles the CUDAExtension under the workspace's
-        # no-build-isolation-package configuration.
+        # workspace resolves torch from the cu130 index, uv builds an
+        # isolated env from megakernel's [build-system] requires
+        # (setuptools + wheel + torch), then setup.py compiles the
+        # CUDAExtension and uv installs the resulting wheel.
         run: uv sync --extra megakernel
 
       - name: Verify megakernel extension imports

@@ -63,7 +63,7 @@ git clone https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub
 # 2. install via the workspace (Python 3.11, CUDA 12+, PyTorch 2.5+; torch
 #    is pulled from PyTorch's cu130 index automatically). Weights stream
 #    from HF on first run.
-uv sync --extra megakernel          # builds the CUDA extension (--no-build-isolation already wired)
+uv sync --extra megakernel          # builds the CUDA extension; torch is auto-installed first, then setup.py compiles
 
 # 3. run the benchmark (prefill pp520 + decode tg128 vs llama.cpp BF16 + PyTorch HF)
 uv run --directory megakernel python final_bench.py

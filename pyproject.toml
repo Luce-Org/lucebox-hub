@@ -18,7 +18,6 @@ dev = ["pytest>=8"]
 
 [tool.uv]
 package = false
-no-build-isolation-package = ["qwen35-megakernel-bf16"]
 
 [tool.uv.workspace]
 members = ["dflash", "megakernel", "pflash"]

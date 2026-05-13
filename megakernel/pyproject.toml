@@ -17,8 +17,9 @@ dependencies = [
 
 [build-system]
 # `torch` must be importable at build time because setup.py imports
-# torch.utils.cpp_extension to register the CUDAExtension. The workspace
-# root marks this package as `no-build-isolation` so the build sees the
-# torch already installed in the shared `.venv`.
+# torch.utils.cpp_extension to register the CUDAExtension. uv resolves
+# this list using the same indices as the project (so torch comes from
+# the cu130 PyTorch index declared in the workspace root), then builds
+# the wheel in an isolated env before installing.
 requires = ["setuptools>=68", "wheel", "torch"]
 build-backend = "setuptools.build_meta"
