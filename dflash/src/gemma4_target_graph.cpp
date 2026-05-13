@@ -390,6 +390,8 @@ static ggml_tensor * build_swa_attn_block(
 
 // Full (Global) Attention block.
 // Uses proportional RoPE via per-layer rope_freqs (freq_factors) and full context.
+// When use_pflash is true, uses ggml_flash_attn_sparse (block-sparse) instead of
+// ggml_flash_attn_ext for the attention computation.
 static ggml_tensor * build_full_attn_block(
     ggml_context *             ctx,
     ggml_cgraph *              gf,
@@ -406,7 +408,9 @@ static ggml_tensor * build_full_attn_block(
     ggml_type                  kv_v_type,
     bool                       write_kv,
     int                        fa_window,
-    int                        il)
+    int                        il,
+    bool                       use_pflash,
+    float                      pflash_alpha)
 {
     // Full-attention layers use the full head_dim
     const int head_dim  = w.head_dim;
@@ -499,8 +503,35 @@ static ggml_tensor * build_full_attn_block(
         cache_v->nb[1], cache_v->nb[2],
         cache_v->nb[1] * win_start);
 
+    // pFlash sparse path supports F16, Q8_0, Q4_0, and (gated) TQ3_0 K/V.
+    // The CUDA dispatch in fattn-sparse.cu:170-197 dequantizes to F16 before
+    // the S<->H BF16 transpose. For TQ3_0 it routes through cpy_tq3_0_f16_kernel
+    // (cpy.cu:429-475) which is compressed-domain — exactly what the graph-level
+    // WHT contract requires (Q is pre-rotated above, O is inverse-rotated below).
+    //
+    // The TQ3 path is gated behind DFLASH_PFLASH_TQ3=1 for A/B rollout. Without
+    // the gate, TQ3 falls back to the dense FA chunked SGEMM driver (which works
+    // but is ~2.3x slower than BF16 MMA pflash on Dense 31B prefill).
+    static const bool s_pflash_tq3 = []() {
+        const char * s = std::getenv("DFLASH_PFLASH_TQ3");
+        return s && (s[0] == '1' || s[0] == 't' || s[0] == 'T' || s[0] == 'y' || s[0] == 'Y');
+    }();
+    auto pflash_supports = [](enum ggml_type t) {
+        if (t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0) return true;
+        if (t == GGML_TYPE_TQ3_0 && s_pflash_tq3) return true;
+        return false;
+    };
+    const bool can_pflash = use_pflash &&
+                            pflash_supports(Kfa->type) &&
+                            pflash_supports(Vfa->type);
+
     // Gemma4: attn_scale = 1.0 (self.scaling = 1.0, no 1/sqrt(head_dim))
-    ggml_tensor * attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask, 1.0f, 0.0f, 0.0f);
+    ggml_tensor * attn;
+    if (can_pflash) {
+        attn = ggml_flash_attn_sparse(ctx, Qfa, Kfa, Vfa, 1.0f, pflash_alpha);
+    } else {
+        attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask, 1.0f, 0.0f, 0.0f);
+    }
 
     if (out_rotate) {
         attn = ggml_cont(ctx, attn);
@@ -806,7 +837,8 @@ GemmaGraphOutputs build_gemma4_graph(
                                         cache_k, cache_v, attn_mask,
                                         kv_start, n_tokens,
                                         layer_kv_k, layer_kv_v,
-                                        write_kv, in.fa_window, il);
+                                        write_kv, in.fa_window, il,
+                                        in.use_pflash, in.pflash_alpha);
         }
 
         // ── g) Output projection already done inside attn block ────────────────

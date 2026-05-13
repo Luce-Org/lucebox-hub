@@ -647,6 +647,11 @@ struct GemmaGraphInputs {
     bool          capture_layers = false;
     int           fa_window     = 0;
     ggml_tensor * parent_ids    = nullptr;
+    // pFlash: when true, full-attention layers use ggml_flash_attn_sparse
+    // instead of ggml_flash_attn_ext, keeping the single-graph-per-chunk
+    // architecture while enabling block-sparse attention during prefill.
+    bool          use_pflash    = false;
+    float         pflash_alpha  = 0.12f;
     bool          last_token_logits_only = false;
 };
 
