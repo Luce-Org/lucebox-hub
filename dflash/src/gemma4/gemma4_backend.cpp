@@ -348,7 +348,11 @@ bool Gemma4Backend::prefill(const std::vector<int32_t> & prompt,
                                     0, sizeof(float) * vocab);
         }
 
-        step_graph_free(sg);
+        // Note: do NOT step_graph_free(sg) here. build_gemma4_step calls
+        // step_graph_free(sg) at its entry (helpers.cpp:97), so each
+        // iteration's sg is freed by the next build. The single trailing
+        // step_graph_free below owns final cleanup for both the happy path
+        // (last iteration's sg) and the error-break path (partially-built sg).
     }
 
     auto t1 = std::chrono::steady_clock::now();
@@ -477,7 +481,10 @@ bool Gemma4Backend::decode_autoregressive(int n_gen,
                                 sizeof(float) * vocab);
         cur_tok = (int32_t)pick(logits_cpu);
 
-        step_graph_free(sg);
+        // Note: do NOT step_graph_free(sg) here. build_gemma4_step calls
+        // step_graph_free(sg) at its entry (helpers.cpp:97), so the next
+        // iteration's build frees this iteration's sg. Single trailing
+        // step_graph_free below owns final cleanup.
     }
 
     auto t1 = std::chrono::steady_clock::now();
