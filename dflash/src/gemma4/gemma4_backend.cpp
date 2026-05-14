@@ -582,6 +582,14 @@ bool Gemma4Backend::decode_dflash(int n_gen,
     adaptive.init(/*on=*/false, args_.draft_max_block, draft_w_.block_size);
 
     const int mask_tok = draft_w_.mask_token_id;
+    // The DFlash noise block fills positions [1..q_len-1] with mask_tok. If the
+    // draft loader ever ships a sentinel (-1) mask token, downstream behavior
+    // is undefined — the embedding table get_rows would read out of bounds.
+    // Catch that at decode entry rather than later when the embedder fails
+    // with a less actionable error.
+    GGML_ASSERT(mask_tok >= 0 && "DFlash drafter mask_token_id must be set "
+                                  "(see Gemma4DraftWeights::mask_token_id; "
+                                  "Finding S10)");
     const int swa_window = target_w_.swa_window > 0 ? target_w_.swa_window : 1024;
 
     std::vector<int32_t> noise_ids(draft_w_.block_size);
@@ -789,7 +797,13 @@ bool Gemma4Backend::decode_dflash(int n_gen,
         for (int i = 0; i < q_len; i++) {
             draft_tok[i] = argmax_f32(draft_logits_buf.data() + (size_t)i * vocab, vocab);
         }
-        draft_tok[0] = cur_tok;  // pin first token (it was cur_tok, not a prediction)
+        // Pin draft_tok[0] to the *id stream* value (cur_tok). The pin patches
+        // only the token-id sequence used by acceptance; the noise embedding
+        // at noise_embed_buf row 0 was already cur_tok-embedded above (line
+        // 697: noise_ids[0] = cur_tok), so the embedding is consistent.
+        // The mask_tok assert at function entry guards against an
+        // uninitialized sentinel breaking the rest of the row fill.
+        draft_tok[0] = cur_tok;
 
         // ── 6. Target verify: batched forward on draft_tok[0..q_len-1] ───────
         {
