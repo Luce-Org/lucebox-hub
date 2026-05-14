@@ -99,27 +99,31 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
     const int n_layer         = (int)w.layers.size();
     const int n_vocab         = (int)target.tok_embd->ne[1];
 
-    // Validate layer 0 donor KV slot (each layer validates its own in the loop).
-    {
-        const int32_t donor_il_0 = w.layers[0].donor_target_layer;
-        if (donor_il_0 < 0 || donor_il_0 >= (int)target_cache.layer_to_kv_idx.size()) {
-            set_last_error("build_mtp_step_graph: invalid donor_target_layer for MTP layer 0");
-            return false;
-        }
-        const int kv_slot_0 = target_cache.layer_to_kv_idx[donor_il_0];
-        const int kv_read_slot_0 = (kv_slot_0 >= 0) ? kv_slot_0
-            : ((donor_il_0 < (int)target_cache.layer_to_donor_kv.size())
-                ? target_cache.layer_to_donor_kv[donor_il_0] : -1);
-        if (kv_read_slot_0 < 0 || kv_read_slot_0 >= (int)target_cache.attn_k.size()) {
-            set_last_error("build_mtp_step_graph: donor KV slot unresolvable for MTP layer 0");
-            return false;
-        }
-    }
+    // Donor KV slot validation runs inside the per-layer loop below; layer 0
+    // is no special case (the loop iterates il=0..n_layer-1). The previously
+    // hoisted layer-0 pre-check was identical to the il==0 iteration and
+    // only ran one bounds check earlier, which is not worth duplicating.
 
     // ── Allocate ggml context ─────────────────────────────────────────────────
-    // Conservative tensor overhead: 3 inputs + ~80 ops per layer + outputs.
-    // Extras vs original: K/V casts, GQA block-broadcast views/materialization,
-    // Q permute/cont, explicit KQ mask, Vt materialization.
+    // Conservative ggml-tensor overhead estimate. Each MTP layer emits
+    // roughly the following named ops (≈80 total in the worst case):
+    //   RMS-norm (in, out)               : 6
+    //   Q proj + Q-norm + RoPE           : 5
+    //   K/V cache views (with TQ3 wrap)  : 8
+    //   K/V casts (TQ3 → F16 → F32)      : 6
+    //   GQA block-broadcast view + cont  : 4
+    //   Q permute + cont                 : 2
+    //   FA inputs + FA + FA mask         : 6
+    //   attn output, wo                  : 3
+    //   post-attn-norm + residual        : 4
+    //   FFN (gate, up, geglu, down)      : 6
+    //   ffn-norm + residual              : 4
+    //   set_name / set_input ceremony    : ≈25
+    //   Reserve / rounding               : ≈3
+    // Plus 3 inputs (in_tok_embd, in_h_prev, in_pos) and ~20 ops for the
+    // pre-projection, output_norm, post-projection, LM head, argmax tail.
+    // Final term `(n_layer * 80 + 20 + 3)`. Over-allocation is benign;
+    // under-allocation aborts in ggml_init.
     const size_t n_tensors_est = (size_t)(3 + n_layer * 80 + 20);
     ggml_init_params ip{};
     ip.mem_size   = n_tensors_est * ggml_tensor_overhead() + 1024 * 1024;
