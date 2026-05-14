@@ -1018,12 +1018,15 @@ bool Gemma4Backend::decode_mtp(int n_gen,
                                /*fa_window=*/0)) {
             std::fprintf(stderr, "[gemma4] mtp target build failed at step %zu\n",
                          out_tokens.size());
+            ggml_gallocr_free(mtp_alloc);
             free_mtp_step_graph(mtp_g);
             return false;
         }
 
         set_step_masks(sg, cache_, /*kv_start*/ committed, /*n_tokens*/ 1, swa_window);
         if (!embed_token(target_w_, cur_tok, sg.inp_embed, backend_)) {
+            step_graph_free(sg);
+            ggml_gallocr_free(mtp_alloc);
             free_mtp_step_graph(mtp_g);
             return false;
         }
@@ -1036,6 +1039,7 @@ bool Gemma4Backend::decode_mtp(int n_gen,
             if (st != GGML_STATUS_SUCCESS) {
                 std::fprintf(stderr, "[gemma4] mtp target compute failed\n");
                 step_graph_free(sg);
+                ggml_gallocr_free(mtp_alloc);
                 free_mtp_step_graph(mtp_g);
                 return false;
             }
@@ -1056,6 +1060,7 @@ bool Gemma4Backend::decode_mtp(int n_gen,
         if (!build_mtp_step_graph(mtp_w_, cache_, target_w_, mtp_g, committed)) {
             std::fprintf(stderr, "[gemma4] build_mtp_step_graph failed: %s\n",
                          dflash27b_last_error());
+            ggml_gallocr_free(mtp_alloc);
             return false;
         }
 
