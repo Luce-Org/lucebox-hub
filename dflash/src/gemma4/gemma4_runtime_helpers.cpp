@@ -90,8 +90,8 @@ bool gemma4_step(StepGraph & sg,
                        int n_tokens,
                        bool with_mask,
                        bool capture,
-                       bool use_pflash,
-                       float pflash_alpha,
+                       bool use_sparse_fa,
+                       float sparse_fa_alpha,
                        int fa_window,
                        bool last_token_logits_only) {
     step_graph_free(sg);
@@ -148,8 +148,8 @@ bool gemma4_step(StepGraph & sg,
     gi.kv_start               = kv_start;
     gi.capture_layers         = capture;
     gi.fa_window              = fa_window;
-    gi.use_pflash             = use_pflash;
-    gi.pflash_alpha           = pflash_alpha;
+    gi.use_sparse_fa             = use_sparse_fa;
+    gi.sparse_fa_alpha           = sparse_fa_alpha;
     gi.last_token_logits_only = last_token_logits_only;
 
     GemmaGraphOutputs go = build_gemma4_graph(sg.ctx, sg.gf, w, cache, gi);

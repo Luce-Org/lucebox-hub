@@ -10,7 +10,7 @@
 //   - kDFlash:  block-diffusion DFlash draft + tree-verify (DDTree)
 //   - kMtp:     single-step MTP assistant + γ=1 verify (γ>1 follow-up)
 //
-// All three paths share the same prefill (chunked, optional pflash).
+// All three paths share the same prefill (chunked, optional sparse-FA dispatch).
 
 #pragma once
 
@@ -41,8 +41,8 @@ struct Gemma4BackendConfig {
 
     int  max_ctx       = 16384;
     int  chunk         = 2048;
-    bool use_pflash    = false;
-    float pflash_alpha = 0.12f;
+    bool use_sparse_fa    = false;
+    float sparse_fa_alpha = 0.12f;
 
     // DFlash draft tuning
     int  draft_kv_cap_override = 0;       // 0 = default cap

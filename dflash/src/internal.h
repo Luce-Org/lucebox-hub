@@ -694,11 +694,11 @@ struct GemmaGraphInputs {
     bool          capture_layers = false;
     int           fa_window     = 0;
     ggml_tensor * parent_ids    = nullptr;
-    // pFlash: when true, full-attention layers use ggml_flash_attn_sparse
+    // use_sparse_fa: when true, full-attention layers use ggml_flash_attn_sparse
     // instead of ggml_flash_attn_ext, keeping the single-graph-per-chunk
     // architecture while enabling block-sparse attention during prefill.
-    bool          use_pflash    = false;
-    float         pflash_alpha  = 0.12f;
+    bool          use_sparse_fa    = false;
+    float         sparse_fa_alpha  = 0.12f;
     bool          last_token_logits_only = false;
 };
 
@@ -710,7 +710,7 @@ struct GemmaGraphOutputs {
 // extra_q8_layers: additional layer indices to force Q8_0 KV regardless of the
 //   global kv type (e.g. MTP donor layers that need to avoid TQ3_0/FWHT mismatch).
 // enable_dflash_capture_overrides: when true and TQ3_0 KV is selected, force
-//   Q8_0 on the capture layers feeding the DFlash draft so they ride the pflash
+//   Q8_0 on the capture layers feeding the DFlash draft so they ride the sparse-FA path
 //   sparse fast path (which excludes TQ3).
 bool create_gemma4_cache(const GemmaTargetWeights & w, int max_ctx,
                          ggml_backend_t backend, GemmaTargetCache & out,

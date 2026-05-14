@@ -138,9 +138,9 @@ void Gemma4Backend::print_ready_banner() const {
         case Gemma4DraftMethod::kNone:   method = "none";   break;
     }
     std::printf("[gemma4-daemon] ready n_layer=%d n_embd=%d vocab=%d max_ctx=%d "
-                "draft=%s pflash=%d\n",
+                "draft=%s sparse_fa=%d\n",
                 target_w_.n_layer, target_w_.n_embd, target_w_.n_vocab,
-                args_.max_ctx, method, (int)args_.use_pflash);
+                args_.max_ctx, method, (int)args_.use_sparse_fa);
     std::fflush(stdout);
 }
 
@@ -199,7 +199,7 @@ GenerateResult Gemma4Backend::restore_and_generate(int /*slot*/,
     return r;
 }
 
-// ── handle_compress / free_drafter (pflash compress lands with the runtime PR) ──
+// ── handle_compress / free_drafter (PFlash compress lands with the runtime PR) ──
 
 bool Gemma4Backend::handle_compress(const std::string & /*line*/,
                                     const DaemonIO & /*io*/) {
@@ -400,7 +400,7 @@ bool Gemma4Backend::prefill(const std::vector<int32_t> & prompt,
         if (!gemma4_step(sg, target_w_, cache_, backend_,
                                cs, chunk_n, need_mask,
                                /*capture=*/true,
-                               args_.use_pflash, args_.pflash_alpha,
+                               args_.use_sparse_fa, args_.sparse_fa_alpha,
                                /*fa_window=*/0,
                                /*last_token_logits_only=*/true)) {
             std::fprintf(stderr, "[gemma4] prefill build failed at %d\n", cs);
@@ -515,7 +515,7 @@ bool Gemma4Backend::decode_autoregressive(int n_gen,
                                committed, /*n_tokens=*/1,
                                /*with_mask=*/true,
                                /*capture=*/false,
-                               /*use_pflash=*/false, args_.pflash_alpha,
+                               /*use_sparse_fa=*/false, args_.sparse_fa_alpha,
                                /*fa_window=*/0)) {
             std::fprintf(stderr, "[gemma4] AR build failed at step %d\n", s);
             ok = false;
@@ -683,7 +683,7 @@ bool Gemma4Backend::decode_dflash(int n_gen,
                                    committed, /*n_tokens=*/1,
                                    /*with_mask=*/true,
                                    /*capture=*/true,
-                                   /*use_pflash=*/false, args_.pflash_alpha,
+                                   /*use_sparse_fa=*/false, args_.sparse_fa_alpha,
                                    /*fa_window=*/0)) {
                 std::fprintf(stderr, "[gemma4] dflash warmup build failed at step %zu\n",
                              out_tokens.size());
@@ -839,7 +839,7 @@ bool Gemma4Backend::decode_dflash(int n_gen,
             if (!gemma4_step(sg, target_w_, cache_, backend_,
                                    committed, q_len,
                                    /*with_mask=*/true, /*capture=*/true,
-                                   /*use_pflash=*/false, args_.pflash_alpha,
+                                   /*use_sparse_fa=*/false, args_.sparse_fa_alpha,
                                    /*fa_window=*/0)) {
                 std::fprintf(stderr, "[gemma4] verify build failed\n");
                 return false;
@@ -1036,7 +1036,7 @@ bool Gemma4Backend::decode_mtp(int n_gen,
                                committed, /*n_tokens=*/1,
                                /*with_mask=*/true,
                                /*capture=*/false,
-                               /*use_pflash=*/false, args_.pflash_alpha,
+                               /*use_sparse_fa=*/false, args_.sparse_fa_alpha,
                                /*fa_window=*/0)) {
             std::fprintf(stderr, "[gemma4] mtp target build failed at step %zu\n",
                          out_tokens.size());

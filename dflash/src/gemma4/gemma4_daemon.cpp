@@ -19,8 +19,8 @@ int run_gemma4_daemon(const Gemma4DaemonArgs & args) {
     bargs.draft_method = args.draft_method;
     bargs.max_ctx      = args.max_ctx;
     bargs.chunk        = args.chunk;
-    bargs.use_pflash   = args.use_pflash;
-    bargs.pflash_alpha = args.pflash_alpha;
+    bargs.use_sparse_fa   = args.use_sparse_fa;
+    bargs.sparse_fa_alpha = args.sparse_fa_alpha;
     bargs.draft_kv_cap_override          = args.draft_kv_cap_override;
     bargs.draft_max_block                = args.draft_max_block;
     bargs.draft_enable_capture_overrides = args.draft_enable_capture_overrides;

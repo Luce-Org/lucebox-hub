@@ -186,8 +186,8 @@ bool gemma4_step(StepGraph & sg,
                        int n_tokens,
                        bool with_mask,
                        bool capture,
-                       bool use_pflash            = false,
-                       float pflash_alpha         = 0.12f,
+                       bool use_sparse_fa            = false,
+                       float sparse_fa_alpha         = 0.12f,
                        int fa_window              = 0,
                        bool last_token_logits_only = false);
 

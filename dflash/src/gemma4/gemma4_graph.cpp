@@ -35,11 +35,11 @@ namespace dflash27b {
 
 static constexpr float EPS = GEMMA4_RMS_EPS;
 
-// DFLASH_PFLASH_TQ3=1 opts the pFlash sparse-FA dispatch into TQ3_0 K/V at
+// DFLASH_SPARSE_FA_TQ3=1 opts the sparse-FA dispatch into TQ3_0 K/V at
 // runtime. Read once at the first graph build; everything else is just a
 // `bool` check. (Previously evaluated per-layer inside build_full_attn_block.)
-static const bool s_pflash_tq3 = []() {
-    const char * s = std::getenv("DFLASH_PFLASH_TQ3");
+static const bool s_sparse_fa_tq3 = []() {
+    const char * s = std::getenv("DFLASH_SPARSE_FA_TQ3");
     return s && (s[0] == '1' || s[0] == 't' || s[0] == 'T' || s[0] == 'y' || s[0] == 'Y');
 }();
 
@@ -398,7 +398,7 @@ static ggml_tensor * build_swa_attn_block(
 
 // Full (Global) Attention block.
 // Uses proportional RoPE via per-layer rope_freqs (freq_factors) and full context.
-// When use_pflash is true, uses ggml_flash_attn_sparse (block-sparse) instead of
+// When use_sparse_fa is true, uses ggml_flash_attn_sparse (block-sparse) instead of
 // ggml_flash_attn_ext for the attention computation.
 static ggml_tensor * build_full_attn_block(
     ggml_context *             ctx,
@@ -417,8 +417,8 @@ static ggml_tensor * build_full_attn_block(
     bool                       write_kv,
     int                        fa_window,
     int                        il,
-    bool                       use_pflash,
-    float                      pflash_alpha)
+    bool                       use_sparse_fa,
+    float                      sparse_fa_alpha)
 {
     // Full-attention layers use the full head_dim
     const int head_dim  = w.head_dim;
@@ -511,29 +511,29 @@ static ggml_tensor * build_full_attn_block(
         cache_v->nb[1], cache_v->nb[2],
         cache_v->nb[1] * win_start);
 
-    // pFlash sparse path supports F16, Q8_0, Q4_0, and (gated) TQ3_0 K/V.
+    // sparse-FA path supports F16, Q8_0, Q4_0, and (gated) TQ3_0 K/V.
     // The CUDA dispatch in fattn-sparse.cu:170-197 dequantizes to F16 before
     // the S<->H BF16 transpose. For TQ3_0 it routes through cpy_tq3_0_f16_kernel
     // (cpy.cu:429-475) which is compressed-domain — exactly what the graph-level
     // WHT contract requires (Q is pre-rotated above, O is inverse-rotated below).
     //
-    // The TQ3 path is gated behind DFLASH_PFLASH_TQ3=1 for A/B rollout. Without
+    // The TQ3 path is gated behind DFLASH_SPARSE_FA_TQ3=1 for A/B rollout. Without
     // the gate, TQ3 falls back to the dense FA chunked SGEMM driver (which works
-    // but is ~2.3x slower than BF16 MMA pflash on Dense 31B prefill).
-    // (Env read hoisted to file-scope s_pflash_tq3 above.)
-    auto pflash_supports = [](enum ggml_type t) {
+    // but is ~2.3x slower than BF16 MMA PFlash on Dense 31B prefill).
+    // (Env read hoisted to file-scope s_sparse_fa_tq3 above.)
+    auto sparse_fa_supports = [](enum ggml_type t) {
         if (t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0) return true;
-        if (t == GGML_TYPE_TQ3_0 && s_pflash_tq3) return true;
+        if (t == GGML_TYPE_TQ3_0 && s_sparse_fa_tq3) return true;
         return false;
     };
-    // F5 v2: gate pFlash (ggml_flash_attn_sparse) to decode-only.
+    // F5 v2: gate ggml_flash_attn_sparse (sparse FA) to decode-only.
     // Rationale: deps/llama.cpp/ggml/src/ggml-cuda/fattn.cu:572-576 (BEST_FATTN_KERNEL_NONE
     // abort) — the CUDA dispatcher has no sparse-FA kernel for head_dim=512 with a causal
     // mask. During prefill (n_tokens > 1) we need a mask, so prefill MUST route through
     // dense FA (ggml_flash_attn_ext). Sparse FA is maskless and only safe when n_tokens == 1
     // (decode), where "attend to all KV positions" matches the kernel's implicit semantics.
     // Prefill speedup is from TQ3 KV bandwidth + cleaner forward graph, NOT from sparse FA.
-    // Gate pFlash to decode-only (n_tokens == 1) when TQ3_0 KV is active.
+    // Gate sparse-FA dispatch to decode-only (n_tokens == 1) when TQ3_0 KV is active.
     // Reason: ggml_flash_attn_sparse has no mask argument; if its TQ3 sparse
     // path can't handle a shape it delegates to ggml_cuda_flash_attn_ext,
     // which then calls ggml_cuda_get_best_fattn_kernel — and that function
@@ -543,15 +543,15 @@ static ggml_tensor * build_full_attn_block(
     // prefill / verify, fall through to the dense FA path below which passes
     // attn_mask explicitly and lets CHUNKED handle TQ3 correctly.
     const bool tq3_kv = (Kfa->type == GGML_TYPE_TQ3_0 || Vfa->type == GGML_TYPE_TQ3_0);
-    const bool can_pflash = use_pflash &&
-                            pflash_supports(Kfa->type) &&
-                            pflash_supports(Vfa->type) &&
+    const bool can_sparse_fa = use_sparse_fa &&
+                            sparse_fa_supports(Kfa->type) &&
+                            sparse_fa_supports(Vfa->type) &&
                             (!tq3_kv || n_tokens == 1);
 
     // Gemma4: attn_scale = 1.0 (self.scaling = 1.0, no 1/sqrt(head_dim))
     ggml_tensor * attn;
-    if (can_pflash) {
-        attn = ggml_flash_attn_sparse(ctx, Qfa, Kfa, Vfa, 1.0f, pflash_alpha);
+    if (can_sparse_fa) {
+        attn = ggml_flash_attn_sparse(ctx, Qfa, Kfa, Vfa, 1.0f, sparse_fa_alpha);
     } else {
         attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask, 1.0f, 0.0f, 0.0f);
     }
@@ -652,7 +652,7 @@ bool create_gemma4_cache(const GemmaTargetWeights & w,
     // Narrow workaround (mirrors vLLM's kv-cache-dtype-skip-layers):
     // when DFlash draft is wired up, force Q8_0 KV on the small subset of
     // full-attn layers whose hidden states are CAPTURED for the draft.
-    // This unblocks the pflash sparse fast path for the layers the draft
+    // This unblocks the sparse-FA fast path for the layers the draft
     // actually depends on, without touching the other 8/10 full-attn
     // layers (avoids the MoE regression we saw when forcing ALL full-attn
     // -> Q8).
@@ -1000,7 +1000,7 @@ GemmaGraphOutputs build_gemma4_graph(
                                         kv_start, n_tokens,
                                         layer_kv_k, layer_kv_v,
                                         write_kv, in.fa_window, il,
-                                        in.use_pflash, in.pflash_alpha);
+                                        in.use_sparse_fa, in.sparse_fa_alpha);
         }
 
         // ── h) Post-attention norm + residual ──────────────────────────────────
