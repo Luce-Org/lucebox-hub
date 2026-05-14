@@ -521,9 +521,20 @@ static ggml_tensor * build_full_attn_block(
         if (t == GGML_TYPE_TQ3_0 && s_pflash_tq3) return true;
         return false;
     };
+    // Gate pFlash to decode-only (n_tokens == 1) when TQ3_0 KV is active.
+    // Reason: ggml_flash_attn_sparse has no mask argument; if its TQ3 sparse
+    // path can't handle a shape it delegates to ggml_cuda_flash_attn_ext,
+    // which then calls ggml_cuda_get_best_fattn_kernel — and that function
+    // routes TQ3 to BEST_FATTN_KERNEL_CHUNKED only when `mask != nullptr`
+    // (fattn.cu:438-466). Without a mask the dispatcher returns
+    // BEST_FATTN_KERNEL_NONE and aborts at fattn.cu:572-576. For multi-token
+    // prefill / verify, fall through to the dense FA path below which passes
+    // attn_mask explicitly and lets CHUNKED handle TQ3 correctly.
+    const bool tq3_kv = (Kfa->type == GGML_TYPE_TQ3_0 || Vfa->type == GGML_TYPE_TQ3_0);
     const bool can_pflash = use_pflash &&
                             pflash_supports(Kfa->type) &&
-                            pflash_supports(Vfa->type);
+                            pflash_supports(Vfa->type) &&
+                            (!tq3_kv || n_tokens == 1);
 
     // Gemma4: attn_scale = 1.0 (self.scaling = 1.0, no 1/sqrt(head_dim))
     ggml_tensor * attn;
