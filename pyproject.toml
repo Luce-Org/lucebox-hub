@@ -18,6 +18,17 @@ dev = ["pytest>=8"]
 
 [tool.uv]
 package = false
+# Megakernel's CUDAExtension links against torch's C++ libs, so the build
+# and runtime envs must share the same torch wheel. uv's default isolated
+# build env resolves `[build-system] requires` independently of the
+# project's `[tool.uv.sources]` mapping, pulling torch from PyPI instead
+# of the cu130 index below. That produces an ABI-incompatible .so
+# (undefined symbol `_ZNR5torch7Library4_def...` on import). Skip
+# isolation here and require a two-pass install:
+#   1. `uv sync`                  → populates the main venv with cu130
+#                                    torch + setuptools (via dflash deps)
+#   2. `uv sync --extra megakernel` → compiles setup.py against that env
+no-build-isolation-package = ["qwen35-megakernel-bf16"]
 
 [tool.uv.workspace]
 members = ["dflash", "megakernel", "pflash"]

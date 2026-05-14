@@ -76,15 +76,22 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j$(nproc)
 
+      - name: Populate venv with cu130 torch + setuptools
+        # First pass: install the workspace's default deps. dflash declares
+        # torch (which uv pulls from the pytorch-cu130 index per
+        # [tool.uv.sources]) and pflash drags in setuptools. Megakernel is
+        # in the optional `megakernel` extra so its build does NOT run yet.
+        run: uv sync
+
       - name: Build megakernel via uv sync (sm_75)
         env:
           CUDA_HOME: ${{ env.CUDA_PATH }}
           MEGAKERNEL_CUDA_ARCH: sm_75
-        # Exercises the documented `uv sync --extra megakernel` flow:
-        # workspace resolves torch from the cu130 index, uv builds an
-        # isolated env from megakernel's [build-system] requires
-        # (setuptools + wheel + torch), then setup.py compiles the
-        # CUDAExtension and uv installs the resulting wheel.
+        # Second pass: builds megakernel against the venv populated above.
+        # `no-build-isolation-package = ["qwen35-megakernel-bf16"]` (set in
+        # the root pyproject.toml) forces setup.py to import the main env's
+        # cu130 torch — same wheel that runtime will use, so the resulting
+        # .so links against an ABI we can actually load.
         run: uv sync --extra megakernel
 
       - name: Verify megakernel extension imports
