@@ -8,11 +8,14 @@
 #include "gemma4_backend.h"
 #include "gemma4_runtime_helpers.h"
 
+#include "../common/ddtree.h"
 #include "../common/sampler.h"
+#include "../pflash_ggml_adapter.h"
 #include "ggml-cuda.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -58,6 +61,12 @@ bool Gemma4Backend::init() {
         std::fprintf(stderr, "[gemma4] ggml_backend_cuda_init failed\n");
         return false;
     }
+
+#ifdef DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL
+    if (args_.use_sparse_fa) {
+        pflash_register_ggml_kernel();
+    }
+#endif
 
     if (!load_gemma4_target_gguf(args_.target_path, backend_, target_w_)) {
         std::fprintf(stderr, "[gemma4] load_gemma4_target_gguf: %s\n",
@@ -117,6 +126,11 @@ bool Gemma4Backend::init() {
             return false;
         }
         draft_loaded_ = true;
+        // Inject target's tok_embd into draft (tied LM head — see
+        // gemma4_dflash_graph.cpp comments at line 777). The draft safetensors
+        // do not ship a tok_embd of their own; build_gemma4_draft_graph's
+        // final ggml_mul_mat(w.tok_embd, out) would dereference NULL otherwise.
+        draft_w_.tok_embd = target_w_.tok_embd;
         if (!create_draft_kv_cache(draft_w_, backend_, cache_,
                                    args_.draft_kv_cap_override)) {
             std::fprintf(stderr, "[gemma4] create_draft_kv_cache: %s\n",
@@ -345,15 +359,79 @@ static bool run_draft_kv_prefill(GemmaTargetCache        & cache,
 // (helpers.cpp) — those are unchanged.
 //
 // See dflash/docs/gemma4-pr-split/pr13-slop-audit.md (Finding S4).
+static int ddtree_slot_depth(const DDTree & tree, int slot) {
+    return slot == 0 ? 0 : tree.depths[slot - 1];
+}
+
+static void build_tree_full_mask(std::vector<uint16_t> & out,
+                                 const DDTree & tree,
+                                 int kv_start) {
+    const int N      = 1 + tree.n_nodes;
+    const int kv_len = kv_start + N;
+    const int kv_pad = align_up(kv_len, g_kq_stride_pad);
+    const int q_pad  = align_up(N, KQ_MASK_PAD);
+    out.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
+
+    for (int q = 0; q < N; q++) {
+        for (int k = 0; k < kv_start; k++) {
+            out[(size_t)q * kv_pad + k] = F16_ZERO;
+        }
+        for (int j = 0; j < N; j++) {
+            if (tree.visibility[(size_t)q * N + j]) {
+                out[(size_t)q * kv_pad + kv_start + j] = F16_ZERO;
+            }
+        }
+    }
+}
+
+static void build_tree_swa_mask(std::vector<uint16_t> & out,
+                                const DDTree & tree,
+                                int kv_start,
+                                int swa_window,
+                                int ring_size,
+                                int kv_end) {
+    const int N      = 1 + tree.n_nodes;
+    const int kv_pad = align_up(ring_size, g_kq_stride_pad);
+    const int q_pad  = align_up(N, KQ_MASK_PAD);
+    out.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
+
+    const int latest_slot = ((kv_end - 1) % ring_size + ring_size) % ring_size;
+    for (int q = 0; q < N; q++) {
+        const int abs_q = kv_start + ddtree_slot_depth(tree, q);
+        const int q_lo  = std::max(0, abs_q - swa_window + 1);
+
+        for (int k_view = 0; k_view < ring_size; k_view++) {
+            const int offset_back = (latest_slot - k_view + ring_size) % ring_size;
+            const int abs_k       = (kv_end - 1) - offset_back;
+            const bool valid_past = (abs_k >= q_lo && abs_k < kv_start && abs_k >= 0);
+            if (valid_past) {
+                out[(size_t)q * kv_pad + k_view] = F16_ZERO;
+            }
+        }
+
+        for (int j = 0; j < N; j++) {
+            if (tree.visibility[(size_t)q * N + j]) {
+                const int slot = (kv_start + j) % ring_size;
+                out[(size_t)q * kv_pad + slot] = F16_ZERO;
+            }
+        }
+    }
+}
+
 static void set_step_masks(StepGraph         & sg,
                            GemmaTargetCache  & cache,
                            int                 kv_start,
                            int                 n_tokens,
-                           int                 swa_window) {
+                           int                 swa_window,
+                           const DDTree      * tree = nullptr) {
     if (sg.attn_mask && sg.attn_mask->buffer) {
-        const int kv_len = kv_start + n_tokens;
         std::vector<uint16_t> mask_buf;
-        build_causal_mask(mask_buf, kv_len, n_tokens, kv_start);
+        if (tree) {
+            build_tree_full_mask(mask_buf, *tree, kv_start);
+        } else {
+            const int kv_len = kv_start + n_tokens;
+            build_causal_mask(mask_buf, kv_len, n_tokens, kv_start);
+        }
         ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
                                 sizeof(uint16_t) * mask_buf.size());
     }
@@ -361,15 +439,99 @@ static void set_step_masks(StepGraph         & sg,
         const SwaView swa_view = compute_swa_view(kv_start, n_tokens,
                                                    swa_window, cache.swa_ctx_alloc);
         std::vector<uint16_t> swa_buf;
-        build_swa_causal_mask(swa_buf,
-                              /*kv_start*/ kv_start,
-                              /*n_tokens*/ n_tokens,
-                              /*swa_window*/ swa_window,
-                              /*ring_size*/ swa_view.effective_win_len,
-                              /*kv_end*/ kv_start + n_tokens);
+        if (tree) {
+            build_tree_swa_mask(swa_buf,
+                                *tree,
+                                /*kv_start*/ kv_start,
+                                /*swa_window*/ swa_window,
+                                /*ring_size*/ swa_view.effective_win_len,
+                                /*kv_end*/ kv_start + n_tokens);
+        } else {
+            build_swa_causal_mask(swa_buf,
+                                  /*kv_start*/ kv_start,
+                                  /*n_tokens*/ n_tokens,
+                                  /*swa_window*/ swa_window,
+                                  /*ring_size*/ swa_view.effective_win_len,
+                                  /*kv_end*/ kv_start + n_tokens);
+        }
         ggml_backend_tensor_set(sg.swa_mask, swa_buf.data(), 0,
                                 sizeof(uint16_t) * swa_buf.size());
     }
+}
+
+static bool copy_tensor_slice(ggml_tensor * t,
+                              size_t dst_off,
+                              size_t src_off,
+                              size_t nbytes,
+                              const char * what) {
+    if (dst_off == src_off || nbytes == 0) return true;
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+    // Synchronous copy: subsequent ggml graph runs on non-blocking backend
+    // streams that are not ordered after async copies on the null stream.
+    // Use cudaMemcpy so the next graph cannot read stale/uncompacted data.
+    cudaError_t ce = cudaMemcpy((char *)t->data + dst_off,
+                                (const char *)t->data + src_off,
+                                nbytes, cudaMemcpyDeviceToDevice);
+    if (ce != cudaSuccess) {
+        std::fprintf(stderr, "[gemma4] %s copy failed: %s\n",
+                     what, cudaGetErrorString(ce));
+        return false;
+    }
+#else
+    std::vector<uint8_t> tmp(nbytes);
+    ggml_backend_tensor_get(t, tmp.data(), src_off, nbytes);
+    ggml_backend_tensor_set(t, tmp.data(), dst_off, nbytes);
+#endif
+    return true;
+}
+
+static bool compact_gemma4_tree_path(GemmaTargetCache & cache,
+                                     const GemmaTargetWeights & w,
+                                     int committed,
+                                     const std::vector<int> & accepted,
+                                     int commit_n) {
+    for (int d = 1; d < commit_n; d++) {
+        const int src_dfs = accepted[d];
+        if (src_dfs == d) continue;
+
+        if (cache.target_feat && cache.target_feat_cap > 0) {
+            const int src_slot = (committed + src_dfs) % cache.target_feat_cap;
+            const int dst_slot = (committed + d)       % cache.target_feat_cap;
+            const size_t src_off = (size_t)src_slot * cache.target_feat->nb[1];
+            const size_t dst_off = (size_t)dst_slot * cache.target_feat->nb[1];
+            if (!copy_tensor_slice(cache.target_feat, dst_off, src_off,
+                                   (size_t)cache.target_feat->nb[1],
+                                   "target_feat compact")) {
+                return false;
+            }
+        }
+
+        for (int il = 0; il < w.n_layer; il++) {
+            const int kv_idx = (il < (int)cache.layer_to_kv_idx.size())
+                                   ? cache.layer_to_kv_idx[il] : -1;
+            if (kv_idx < 0) continue;
+            ggml_tensor * ck = cache.attn_k[kv_idx];
+            ggml_tensor * cv = cache.attn_v[kv_idx];
+            const bool is_swa = (il < (int)w.swa_layers.size()) && w.swa_layers[il];
+            const int ctx_slots = (int)ck->ne[1];
+            const int src_slot = is_swa ? ((committed + src_dfs) % ctx_slots)
+                                        : (committed + src_dfs);
+            const int dst_slot = is_swa ? ((committed + d) % ctx_slots)
+                                        : (committed + d);
+            const int n_kv = (int)ck->ne[2];
+            for (int h = 0; h < n_kv; h++) {
+                const size_t k_src_off = (size_t)src_slot * ck->nb[1] + (size_t)h * ck->nb[2];
+                const size_t k_dst_off = (size_t)dst_slot * ck->nb[1] + (size_t)h * ck->nb[2];
+                const size_t v_src_off = (size_t)src_slot * cv->nb[1] + (size_t)h * cv->nb[2];
+                const size_t v_dst_off = (size_t)dst_slot * cv->nb[1] + (size_t)h * cv->nb[2];
+                if (!copy_tensor_slice(ck, k_dst_off, k_src_off, (size_t)ck->nb[1], "KV-K compact") ||
+                    !copy_tensor_slice(cv, v_dst_off, v_src_off, (size_t)cv->nb[1], "KV-V compact")) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
 }
 
 // ── internal: prefill ────────────────────────────────────────────────────
@@ -407,7 +569,6 @@ bool Gemma4Backend::prefill(const std::vector<int32_t> & prompt,
             ok = false;
             break;
         }
-
         if (!embed_tokens_batch(target_w_, prompt.data() + cs, chunk_n,
                                 sg.inp_embed, backend_)) {
             std::fprintf(stderr, "[gemma4] embed_tokens_batch failed\n");
@@ -456,6 +617,8 @@ bool Gemma4Backend::prefill(const std::vector<int32_t> & prompt,
 
 // ── internal: AR decode ─────────────────────────────────────────────────
 
+static bool is_gemma4_eos(const GemmaTargetWeights & w, int32_t tok);
+
 bool Gemma4Backend::decode_autoregressive(int n_gen,
                                           std::vector<float> & last_logits_io,
                                           const GenerateRequest & req,
@@ -493,8 +656,7 @@ bool Gemma4Backend::decode_autoregressive(int n_gen,
 
     for (int s = 0; s < n_gen; ++s) {
         // EOS check
-        if ((target_w_.eos_id      >= 0 && cur_tok == target_w_.eos_id) ||
-            (target_w_.eos_chat_id >= 0 && cur_tok == target_w_.eos_chat_id)) {
+        if (!args_.ignore_eos && is_gemma4_eos(target_w_, cur_tok)) {
             break;
         }
 
@@ -588,6 +750,11 @@ static int argmax_f32(const float * x, int n) {
     return best;
 }
 
+static bool is_gemma4_eos(const GemmaTargetWeights & w, int32_t tok) {
+    return (w.eos_id >= 0 && tok == w.eos_id) ||
+           (w.eos_chat_id >= 0 && tok == w.eos_chat_id);
+}
+
 bool Gemma4Backend::decode_dflash(int n_gen,
                                   std::vector<float> & last_logits_io,
                                   const GenerateRequest & req,
@@ -601,6 +768,8 @@ bool Gemma4Backend::decode_dflash(int n_gen,
     const int vocab          = target_w_.n_vocab;
     const int ctx_size       = args_.max_ctx;
     const int target_feat_w  = draft_w_.n_target_layers * draft_w_.target_hidden;
+    const int ddtree_budget  = std::max(0, args_.ddtree_budget);
+    const bool ddtree_enabled = ddtree_budget > 0;
     const int dkv_cap        = (cache_.draft_kv_cap > 0)
                                    ? cache_.draft_kv_cap
                                    : (cache_.draft_k.empty() ? 0 : (int)cache_.draft_k[0]->ne[2]);
@@ -650,12 +819,19 @@ bool Gemma4Backend::decode_dflash(int n_gen,
     // noise_embed_buf uses draft_w_.n_embd (= target_w_.n_embd; shared embedding table)
     std::vector<float>   noise_embed_buf((size_t)draft_w_.n_embd * draft_w_.block_size);
     std::vector<int32_t> draft_tok(draft_w_.block_size);
-    std::vector<int32_t> target_tok(draft_w_.block_size);
+    const int verify_cap = draft_w_.block_size;
+    std::vector<int32_t> target_tok(verify_cap);
     std::vector<float>   draft_logits_buf((size_t)vocab * draft_w_.block_size);
-    std::vector<float>   verify_logits_buf((size_t)vocab * draft_w_.block_size);
+    std::vector<float>   verify_logits_buf((size_t)vocab * verify_cap);
+    std::vector<float>   ddtree_top_log_probs;
+    std::vector<int32_t> ddtree_top_token_ids;
 
     int committed         = cache_.cur_pos;
     int total_draft_steps = 0;
+    int total_accepted    = 0;
+
+    // Persistent tree verify graph — gallocr reuse across DDTree iterations
+    StepGraph tree_sg{};
 
     auto t0 = std::chrono::steady_clock::now();
 
@@ -667,8 +843,7 @@ bool Gemma4Backend::decode_dflash(int n_gen,
         q_len = std::min(q_len, std::max(1, ctx_size - committed - 1));
 
         // EOS check (inlined IS_EOS_TOK)
-        if ((target_w_.eos_id      >= 0 && cur_tok == target_w_.eos_id) ||
-            (target_w_.eos_chat_id >= 0 && cur_tok == target_w_.eos_chat_id)) {
+        if (!args_.ignore_eos && is_gemma4_eos(target_w_, cur_tok)) {
             break;
         }
         if (committed >= ctx_size - CTX_HEADROOM_DFLASH) {
@@ -833,6 +1008,144 @@ bool Gemma4Backend::decode_dflash(int n_gen,
         // uninitialized sentinel breaking the rest of the row fill.
         draft_tok[0] = cur_tok;
 
+        if (ddtree_enabled) {
+            const int tree_budget = std::min(ddtree_budget,
+                                             std::max(0, ctx_size - committed - 1));
+            const int L = q_len - 1;
+            const int ddtree_K = (tree_budget > L) ? 8 : 1;
+            if (tree_budget <= 0) {
+                draft_step_free(dsg);
+                break;
+            }
+            ddtree_top_log_probs.resize((size_t)std::max(0, L) * ddtree_K);
+            ddtree_top_token_ids.resize((size_t)std::max(0, L) * ddtree_K);
+
+            if (L > 0) {
+                if (ddtree_K == 1) {
+                    for (int i = 0; i < L; i++) {
+                        ddtree_top_log_probs[i] = 0.0f;
+                        ddtree_top_token_ids[i] = draft_tok[i + 1];
+                    }
+                } else {
+                    extract_draft_topk(draft_logits_buf.data() + (size_t)vocab,
+                                       L, vocab, ddtree_K,
+                                       ddtree_top_log_probs.data(),
+                                       ddtree_top_token_ids.data(),
+                                       args_.ddtree_temp);
+                }
+            }
+
+            DDTree tree = build_ddtree(ddtree_top_log_probs.data(),
+                                       ddtree_top_token_ids.data(),
+                                       L, ddtree_K, tree_budget,
+                                       args_.ddtree_chain_seed);
+            const int N_actual = 1 + tree.n_nodes;
+            if ((int)target_tok.size() < N_actual) target_tok.resize(N_actual);
+
+            // Build (or reuse) persistent tree verify graph at the full
+            // budget+1 padding shape so gallocr reservation is reused across
+            // iterations (semantic equivalence of padding slots is enforced
+            // by the mask + position logic in build_gemma4_step_tree).
+            const int n_max = tree_budget + 1;
+            if (!build_gemma4_step_tree(tree_sg, target_w_, cache_, backend_,
+                                        committed, swa_window, n_max, tree,
+                                        /*capture_layers=*/true)) {
+                std::fprintf(stderr, "[gemma4] ddtree verify build failed\n");
+                return false;
+            }
+
+            // Embed: fill N_actual tree slots; padding slots stay zero
+            {
+                std::vector<int32_t> flat_tokens(n_max, 0);
+                flat_tokens[0] = cur_tok;
+                for (int i = 0; i < tree.n_nodes; i++) {
+                    flat_tokens[i + 1] = tree.token_ids[i];
+                }
+                if (!embed_tokens_batch(target_w_, flat_tokens.data(), n_max,
+                                        tree_sg.inp_embed, backend_)) {
+                    return false;
+                }
+            }
+
+            // ── positions & masks are set inside build_gemma4_step_tree ───
+
+            auto st = ggml_backend_graph_compute(backend_, tree_sg.gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "[gemma4] ddtree verify compute failed: %d\n", (int)st);
+                return false;
+            }
+
+            // Read in-graph argmax (only N_actual valid entries)
+            {
+                std::vector<int32_t> posterior(N_actual);
+                ggml_backend_tensor_get(tree_sg.argmax_tokens, posterior.data(), 0,
+                                        sizeof(int32_t) * N_actual);
+                for (int i = 0; i < N_actual; i++) target_tok[i] = posterior[i];
+            }
+
+            int next_token = -1;
+            std::vector<int> accepted =
+                follow_verified_tree(tree, target_tok.data(), next_token, nullptr);
+
+            const int accept_depth = (int)accepted.size();
+            int commit_n = accept_depth;
+            if (commit_n > n_gen - (int)out_tokens.size()) {
+                commit_n = n_gen - (int)out_tokens.size();
+            }
+
+            bool hit_eos = false;
+            int emitted_n = 0;
+            for (int i = 0; i < commit_n; i++) {
+                const int dfs_idx = accepted[i];
+                const int32_t tok = (dfs_idx == 0) ? cur_tok : tree.token_ids[dfs_idx - 1];
+                out_tokens.push_back(tok);
+                emitted_n++;
+                if (req.stream) io.emit(tok);
+                if (!args_.ignore_eos && is_gemma4_eos(target_w_, tok)) {
+                    hit_eos = true;
+                    break;
+                }
+            }
+            commit_n = emitted_n;
+
+            if (!compact_gemma4_tree_path(cache_, target_w_, committed,
+                                          accepted, commit_n)) {
+                return false;
+            }
+
+            if (!run_draft_kv_prefill(cache_, draft_w_, backend_,
+                                       /*start_pos=*/ committed,
+                                       /*n_tokens=*/  commit_n,
+                                       target_feat_w,
+                                       /*tag=*/       "ddtree commit")) {
+                return false;
+            }
+            cache_.draft_kv_pos = std::min(dkv_cap, cache_.draft_kv_pos + commit_n);
+
+            committed      += commit_n;
+            cache_.cur_pos  = committed;
+            // next_token (from follow_verified_tree) is the prediction beyond
+            // the FULL accepted path. If we truncated early (commit_n <
+            // accept_depth from in-loop EOS or n_gen cap), use the verified
+            // target argmax at the actually-committed leaf instead — same
+            // pattern the chain path uses (`target_tok[commit_n - 1]`).
+            if (commit_n < accept_depth && commit_n > 0) {
+                cur_tok = target_tok[accepted[commit_n - 1]];
+            } else {
+                cur_tok = next_token;
+            }
+            cache_.last_tok = cur_tok;
+
+            total_draft_steps++;
+            total_accepted += commit_n;
+            adaptive.observe(accept_depth, q_len, total_draft_steps);
+
+            draft_step_free(dsg);
+
+            if (hit_eos) break;
+            continue;
+        }
+
         // ── 6. Target verify: batched forward on draft_tok[0..q_len-1] ───────
         {
             StepGraph sg{};
@@ -895,8 +1208,7 @@ bool Gemma4Backend::decode_dflash(int n_gen,
         for (int i = 0; i < commit_n; i++) {
             out_tokens.push_back(draft_tok[i]);
             if (req.stream) io.emit(draft_tok[i]);
-            if ((target_w_.eos_id      >= 0 && draft_tok[i] == target_w_.eos_id) ||
-                (target_w_.eos_chat_id >= 0 && draft_tok[i] == target_w_.eos_chat_id)) {
+            if (!args_.ignore_eos && is_gemma4_eos(target_w_, draft_tok[i])) {
                 hit_eos = true;
                 break;
             }
@@ -923,6 +1235,7 @@ bool Gemma4Backend::decode_dflash(int n_gen,
         cache_.last_tok = cur_tok;
 
         total_draft_steps++;
+        total_accepted += commit_n;
         adaptive.observe(accept_n, q_len, total_draft_steps);
 
         if (hit_eos) break;
@@ -934,6 +1247,17 @@ bool Gemma4Backend::decode_dflash(int n_gen,
     if (req.stream) {
         io.emit(-1);
     }
+    if (total_draft_steps > 0) {
+        // Goes to stderr: the daemon protocol owns stdout (line-oriented
+        // `ok`/`err` responses); a stray `[spec]` line on stdout corrupts
+        // client parsing for `generate` / bare-prompt requests.
+        const double avg_accept = (double)total_accepted / (double)total_draft_steps;
+        std::fprintf(stderr, "[spec] draft_steps=%d total_accepted=%d avg_accept=%.2f\n",
+                     total_draft_steps, total_accepted, avg_accept);
+        std::fflush(stderr);
+    }
+
+    step_graph_free(tree_sg);
 
     return true;
 }
@@ -1020,8 +1344,7 @@ bool Gemma4Backend::decode_mtp(int n_gen,
     while ((int)out_tokens.size() < n_gen) {
 
         // EOS check (inlined IS_EOS_TOK)
-        if ((target_w_.eos_id      >= 0 && cur_tok == target_w_.eos_id) ||
-            (target_w_.eos_chat_id >= 0 && cur_tok == target_w_.eos_chat_id)) {
+        if (!args_.ignore_eos && is_gemma4_eos(target_w_, cur_tok)) {
             break;
         }
         if (committed >= ctx_size - CTX_HEADROOM_MTP) {
@@ -1160,8 +1483,7 @@ bool Gemma4Backend::decode_mtp(int n_gen,
         cache_.last_tok = cur_tok;
 
         // EOS check on the new cur_tok before next iteration.
-        if ((target_w_.eos_id      >= 0 && cur_tok == target_w_.eos_id) ||
-            (target_w_.eos_chat_id >= 0 && cur_tok == target_w_.eos_chat_id)) {
+        if (!args_.ignore_eos && is_gemma4_eos(target_w_, cur_tok)) {
             break;
         }
     }

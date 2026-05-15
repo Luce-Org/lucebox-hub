@@ -48,6 +48,10 @@ struct Gemma4BackendConfig {
     int  draft_kv_cap_override = 0;       // 0 = default cap
     int  draft_max_block       = 16;
     bool draft_enable_capture_overrides = false;
+    int  ddtree_budget         = 0;       // 0 = disabled; keep chain verify
+    float ddtree_temp          = 1.0f;
+    bool ddtree_chain_seed     = true;
+    bool ignore_eos            = false;
 
     // MTP tuning
     int  mtp_gamma = 1;                   // γ chain length (>1 is follow-up)

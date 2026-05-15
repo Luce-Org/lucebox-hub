@@ -398,6 +398,14 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     target_link_libraries(dflash27b PRIVATE hip::host)
 endif()
 
+# OpenMP for parallel CPU top-K in ddtree.cpp (#pragma omp parallel for
+# in extract_draft_topk). Without this the pragma is a no-op and the
+# per-position top-K runs serially on a 262K-vocab scan.
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(dflash27b PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
      target_compile_options(dflash27b PRIVATE
          $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter -Wno-unused-function>
@@ -489,6 +497,19 @@ if(DFLASH27B_TESTS)
         add_executable(smoke_gemma4_draft_forward test/gemma4/smoke_gemma4_draft_forward.cpp)
         target_include_directories(smoke_gemma4_draft_forward PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_gemma4_draft_forward PRIVATE dflash27b ggml ggml-cuda)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/gemma4/test_gemma4_dflash_backend.cpp")
+        add_executable(test_gemma4_dflash test/gemma4/test_gemma4_dflash_backend.cpp)
+        target_include_directories(test_gemma4_dflash PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_gemma4_dflash PRIVATE dflash27b ggml ggml-cuda)
+    endif()
+    # Fat driver: inline AR + speculative-decode loop with explicit prefill
+    # timing. Useful for bench runs comparing AR vs spec, and for measuring
+    # the prefill / sparse-FA path which the thin driver does not instrument.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/gemma4/test_gemma4_dflash.cpp")
+        add_executable(test_gemma4_dflash_fat test/gemma4/test_gemma4_dflash.cpp)
+        target_include_directories(test_gemma4_dflash_fat PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_gemma4_dflash_fat PRIVATE dflash27b ggml ggml-cuda)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/gemma4/test_mtp_loader.cpp")
         add_executable(test_mtp_loader test/gemma4/test_mtp_loader.cpp)
@@ -583,6 +604,7 @@ if(DFLASH27B_TESTS)
         smoke_target_forward
         test_generate
         test_dflash
+        test_gemma4_dflash
     )
     foreach(_t IN LISTS _dflash_internal_h_cuda_tests)
         if(TARGET ${_t})

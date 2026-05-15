@@ -24,6 +24,10 @@ int run_gemma4_daemon(const Gemma4DaemonArgs & args) {
     bargs.draft_kv_cap_override          = args.draft_kv_cap_override;
     bargs.draft_max_block                = args.draft_max_block;
     bargs.draft_enable_capture_overrides = args.draft_enable_capture_overrides;
+    bargs.ddtree_budget                  = args.ddtree_budget;
+    bargs.ddtree_temp                    = args.ddtree_temp;
+    bargs.ddtree_chain_seed              = args.ddtree_chain_seed;
+    bargs.ignore_eos                     = args.ignore_eos;
     bargs.mtp_gamma                      = args.mtp_gamma;
 
     Gemma4Backend backend(bargs);

@@ -9,6 +9,8 @@
 
 #include "gemma4_internal.h"
 
+#include "../common/ddtree.h"
+
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -38,14 +40,15 @@ static inline int align_up(int x, int a) { return ((x + a - 1) / a) * a; }
 // Freed and reallocated via gemma4_step / step_graph_free.
 
 struct StepGraph {
-    ggml_context   * ctx        = nullptr;
-    ggml_cgraph    * gf         = nullptr;
-    ggml_gallocr_t   alloc      = nullptr;
-    ggml_tensor    * inp_embed  = nullptr;
-    ggml_tensor    * positions  = nullptr;
-    ggml_tensor    * attn_mask  = nullptr;
-    ggml_tensor    * swa_mask   = nullptr;
-    ggml_tensor    * logits     = nullptr;
+    ggml_context   * ctx          = nullptr;
+    ggml_cgraph    * gf           = nullptr;
+    ggml_gallocr_t   alloc        = nullptr;
+    ggml_tensor    * inp_embed    = nullptr;
+    ggml_tensor    * positions    = nullptr;
+    ggml_tensor    * attn_mask    = nullptr;
+    ggml_tensor    * swa_mask     = nullptr;
+    ggml_tensor    * logits       = nullptr;
+    ggml_tensor    * argmax_tokens = nullptr;  // [N] i32; populated by tree step
 };
 
 void step_graph_free(StepGraph & sg);
@@ -190,6 +193,34 @@ bool gemma4_step(StepGraph & sg,
                        float sparse_fa_alpha         = 0.12f,
                        int fa_window              = 0,
                        bool last_token_logits_only = false);
+
+// Tree-aware target step for DDTree speculative verification.
+//
+// Unlike gemma4_step (dense-causal FA), this builds a graph where each slot
+// sees only its tree ancestors via a visibility-based custom attention mask.
+// Sibling nodes share RoPE positions (committed + tree.depths[i-1]) so they
+// are indistinguishable to their common ancestor and do NOT see each other.
+//
+// Padding: N = n_max = ddtree_budget + 1 (fixed for gallocr reuse).
+// Only the first N_actual = 1 + tree.n_nodes have valid data; the remaining
+// (n_max - N_actual) padding slots get zero embeddings and all-NEG_INF masks
+// so their logits are never used.
+//
+// Output: sg.argmax_tokens [N_actual] i32 — per-slot argmax ready for
+// follow_verified_tree(). The caller reads only N_actual values.
+//
+// gallocr is allocated once on first call and reused across calls with the
+// same n_max (graph topology is identical). Call step_graph_free() only
+// when done with the tree verify loop.
+bool build_gemma4_step_tree(StepGraph & sg,
+                            const GemmaTargetWeights & w,
+                            GemmaTargetCache & cache,
+                            ggml_backend_t backend,
+                            int committed,
+                            int swa_window,
+                            int n_max,
+                            const DDTree & tree,
+                            bool capture_layers);
 
 // ─── Token embedding ─────────────────────────────────────────────────────────
 

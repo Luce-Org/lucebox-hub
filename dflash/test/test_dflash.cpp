@@ -798,6 +798,18 @@ int main(int argc, char ** argv) {
             ddtree_budget = std::atoi(argv[i] + 16);
             if (ddtree_budget <= 0) ddtree_budget = 64;
         }
+        else if (std::strcmp(argv[i], "--budget") == 0) {
+            if (i + 1 < argc) {
+                ddtree_budget = std::atoi(argv[++i]);
+                ddtree_mode = ddtree_budget > 0;
+                if (ddtree_mode) fast_rollback = true;
+            }
+        }
+        else if (std::strncmp(argv[i], "--budget=", 9) == 0) {
+            ddtree_budget = std::atoi(argv[i] + 9);
+            ddtree_mode = ddtree_budget > 0;
+            if (ddtree_mode) fast_rollback = true;
+        }
         else if (std::strncmp(argv[i], "--ddtree-temp=", 14) == 0) {
             ddtree_temp = (float)std::atof(argv[i] + 14);
             if (ddtree_temp <= 0.0f) ddtree_temp = 1.0f;
@@ -1021,10 +1033,30 @@ int main(int argc, char ** argv) {
             const int v = std::atoi(mg);
             if (v > 0) gargs.mtp_gamma = v;
         }
+        if (ddtree_mode) {
+            gargs.ddtree_budget     = ddtree_budget;
+            gargs.ddtree_temp       = ddtree_temp;
+            gargs.ddtree_chain_seed = ddtree_chain_seed;
+        }
+        if (const char * b = std::getenv("DFLASH_GEMMA4_DDTREE_BUDGET")) {
+            const int v = std::atoi(b);
+            if (v >= 0) gargs.ddtree_budget = v;
+        } else if (const char * b = std::getenv("DFLASH_DDTREE_BUDGET")) {
+            const int v = std::atoi(b);
+            if (v >= 0) gargs.ddtree_budget = v;
+        }
+        if (const char * t = std::getenv("DFLASH_GEMMA4_DDTREE_TEMP")) {
+            const float v = (float)std::atof(t);
+            if (v > 0.0f) gargs.ddtree_temp = v;
+        }
+        if (const char * cs = std::getenv("DFLASH_GEMMA4_DDTREE_CHAIN_SEED")) {
+            gargs.ddtree_chain_seed = std::atoi(cs) != 0;
+        }
         std::fprintf(stderr,
             "[test_dflash] arch=gemma4 -> dispatching to run_gemma4_daemon "
-            "(max_ctx=%d chunk=%d stream_fd=%d sparse_fa=%d draft_method=%d)\n",
-            max_ctx_eff, chunk, stream_fd, (int)gargs.use_sparse_fa, (int)gargs.draft_method);
+            "(max_ctx=%d chunk=%d stream_fd=%d sparse_fa=%d draft_method=%d ddtree_budget=%d)\n",
+            max_ctx_eff, chunk, stream_fd, (int)gargs.use_sparse_fa,
+            (int)gargs.draft_method, gargs.ddtree_budget);
         return dflash27b::run_gemma4_daemon(gargs);
     }
 

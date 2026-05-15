@@ -21,12 +21,13 @@ namespace dflash27b {
 void step_graph_free(StepGraph & sg) {
     if (sg.ctx) { ggml_free(sg.ctx); sg.ctx = nullptr; }
     if (sg.alloc) { ggml_gallocr_free(sg.alloc); sg.alloc = nullptr; }
-    sg.gf        = nullptr;
-    sg.inp_embed = nullptr;
-    sg.positions = nullptr;
-    sg.attn_mask = nullptr;
-    sg.swa_mask  = nullptr;
-    sg.logits    = nullptr;
+    sg.gf           = nullptr;
+    sg.inp_embed    = nullptr;
+    sg.positions    = nullptr;
+    sg.attn_mask    = nullptr;
+    sg.swa_mask     = nullptr;
+    sg.logits       = nullptr;
+    sg.argmax_tokens = nullptr;
 }
 
 // ─── build_causal_mask ──────────────────────────────────────────────────────
@@ -162,6 +163,199 @@ bool gemma4_step(StepGraph & sg,
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     }
     return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
+}
+
+// ─── build_gemma4_step_tree ────────────────────────────────────────────────
+//
+// Builds a DDTree-aware target verify graph.  Unlike gemma4_step (which
+// assumes dense-causal attention), this constructs a per-slot attention mask
+// from tree.visibility so that each tree node attends only to its ancestor
+// chain.  Sibling nodes share RoPE positions (committed + tree.depths[i-1])
+// and are blocked from attending to each other.
+//
+// Padding: the graph is built for N = n_max (= ddtree_budget + 1) slots
+// regardless of the actual tree size N_actual = 1 + tree.n_nodes.  Padding
+// slots get zero embedding and all-NEG_INF masks so their logits are
+// harmless.  Fixed N means gallocr reuses the same allocation every call.
+
+bool build_gemma4_step_tree(StepGraph & sg,
+                            const GemmaTargetWeights & w,
+                            GemmaTargetCache & cache,
+                            ggml_backend_t backend,
+                            int committed,
+                            int swa_window,
+                            int n_max,
+                            const DDTree & tree,
+                            bool capture_layers) {
+    const int N_actual = 1 + tree.n_nodes;
+    const int N        = n_max;   // fixed graph width for gallocr reuse
+    GGML_ASSERT(N_actual <= N);
+
+    // ── Free ctx/gf/textures but keep gallocr for backend-buffer reuse ──
+    //    (matches Qwen35 build_target_step_tree pattern)
+    if (sg.ctx) {
+        ggml_free(sg.ctx);
+        sg.ctx          = nullptr;
+        sg.gf           = nullptr;
+        sg.inp_embed    = nullptr;
+        sg.positions    = nullptr;
+        sg.attn_mask    = nullptr;
+        sg.swa_mask     = nullptr;
+        sg.logits       = nullptr;
+        sg.argmax_tokens = nullptr;
+    }
+
+    // ── Build ctx / tensors / graph (rebuilt every call; gallocr reused) ──
+    {
+        ggml_init_params ip{};
+        ip.mem_size   = 512 * 1024 * 1024;
+        ip.mem_buffer = nullptr;
+        ip.no_alloc   = true;
+        sg.ctx = ggml_init(ip);
+        if (!sg.ctx) return false;
+
+        sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, w.n_embd, N, 1);
+        ggml_set_name(sg.inp_embed, "tree_inp_embed");
+        ggml_set_input(sg.inp_embed);
+
+        sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, N);
+        ggml_set_name(sg.positions, "tree_positions");
+        ggml_set_input(sg.positions);
+
+        // attn_mask: full-context mask with tree visibility pattern
+        {
+            const int kv_len = committed + N;
+            const int kv_pad = align_up(kv_len, g_kq_stride_pad);
+            const int q_pad  = align_up(N, KQ_MASK_PAD);
+            sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
+            ggml_set_name(sg.attn_mask, "tree_attn_mask");
+            ggml_set_input(sg.attn_mask);
+            ggml_set_output(sg.attn_mask);
+        }
+
+        // swa_mask: ring-buffer mask for SWA layers, tree-aware
+        {
+            const SwaView swa_view = compute_swa_view(committed, N,
+                                                       swa_window, cache.swa_ctx_alloc);
+            const int swa_kv_pad = align_up(swa_view.effective_win_len, g_kq_stride_pad);
+            const int q_pad      = align_up(N, KQ_MASK_PAD);
+            sg.swa_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, swa_kv_pad, q_pad);
+            ggml_set_name(sg.swa_mask, "tree_swa_mask");
+            ggml_set_input(sg.swa_mask);
+            ggml_set_output(sg.swa_mask);
+        }
+
+        sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+
+        GemmaGraphInputs gi{};
+        gi.inp_embed              = sg.inp_embed;
+        gi.positions              = sg.positions;
+        gi.attn_mask              = sg.attn_mask;
+        gi.swa_mask               = sg.swa_mask;
+        gi.n_tokens               = N;
+        gi.kv_start               = committed;
+        gi.capture_layers         = capture_layers;
+        gi.fa_window              = 0;
+        gi.use_sparse_fa          = false;
+        gi.sparse_fa_alpha        = 0.0f;
+        gi.last_token_logits_only = false;
+
+        GemmaGraphOutputs go = build_gemma4_graph(sg.ctx, sg.gf, w, cache, gi);
+        if (!go.logits) return false;
+        sg.logits = go.logits;
+        ggml_set_output(sg.logits);
+
+        // In-graph argmax — like Qwen35 build_target_step_tree
+        sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
+        ggml_set_name(sg.argmax_tokens, "tree_verify_argmax");
+        ggml_set_output(sg.argmax_tokens);
+        ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
+
+        if (!sg.alloc) {
+            sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        }
+        if (!ggml_gallocr_alloc_graph(sg.alloc, sg.gf)) {
+            return false;
+        }
+    }
+
+    // ── Set tree positions (every call; tree can vary) ─────────────────
+    {
+        std::vector<int32_t> pos(N, committed);
+        for (int i = 1; i < N_actual; i++) {
+            pos[i] = committed + tree.depths[i - 1];
+        }
+        // Padding slots: keep pos = committed (harmless)
+        ggml_backend_tensor_set(sg.positions, pos.data(), 0,
+                                sizeof(int32_t) * N);
+    }
+
+    // ── Set tree attention mask ──────────────────────────────────────
+    {
+        const int kv_len = committed + N;
+        const int kv_pad = align_up(kv_len, g_kq_stride_pad);
+        const int q_pad  = align_up(N, KQ_MASK_PAD);
+        std::vector<uint16_t> mask_buf((size_t)kv_pad * q_pad, F16_NEG_INF);
+
+        // Rows 0..N_actual-1: ancestor-only visibility
+        for (int q = 0; q < N_actual; q++) {
+            // Past committed KV: all visible
+            for (int k = 0; k < committed; k++) {
+                mask_buf[(size_t)q * kv_pad + k] = F16_ZERO;
+            }
+            // Tree self-visibility
+            for (int j = 0; j < N_actual; j++) {
+                if (tree.visibility[(size_t)q * N_actual + j]) {
+                    mask_buf[(size_t)q * kv_pad + committed + j] = F16_ZERO;
+                }
+            }
+        }
+        // Rows N_actual..N-1: stay all NEG_INF (padding)
+
+        ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
+                                sizeof(uint16_t) * mask_buf.size());
+    }
+
+    // ── Set tree SWA mask ────────────────────────────────────────────
+    {
+        const SwaView swa_view = compute_swa_view(committed, N,
+                                                   swa_window, cache.swa_ctx_alloc);
+        const int ring_size = swa_view.effective_win_len;
+        const int kv_end    = committed + N;
+        const int kv_pad    = align_up(ring_size, g_kq_stride_pad);
+        const int q_pad     = align_up(N, KQ_MASK_PAD);
+        std::vector<uint16_t> swa_buf((size_t)kv_pad * q_pad, F16_NEG_INF);
+
+        const int latest_slot = ((kv_end - 1) % ring_size + ring_size) % ring_size;
+        for (int q = 0; q < N_actual; q++) {
+            const int abs_q = committed + (q == 0 ? 0 : tree.depths[q - 1]);
+            const int q_lo  = std::max(0, abs_q - swa_window + 1);
+
+            // Past KV in SWA window
+            for (int k_view = 0; k_view < ring_size; k_view++) {
+                const int offset_back = (latest_slot - k_view + ring_size) % ring_size;
+                const int abs_k       = (kv_end - 1) - offset_back;
+                const bool valid_past = (abs_k >= q_lo && abs_k < committed && abs_k >= 0);
+                if (valid_past) {
+                    swa_buf[(size_t)q * kv_pad + k_view] = F16_ZERO;
+                }
+            }
+
+            // Tree self-visibility (ring-aware)
+            for (int j = 0; j < N_actual; j++) {
+                if (tree.visibility[(size_t)q * N_actual + j]) {
+                    const int slot = (committed + j) % ring_size;
+                    swa_buf[(size_t)q * kv_pad + slot] = F16_ZERO;
+                }
+            }
+        }
+        // Padding rows stay NEG_INF
+
+        ggml_backend_tensor_set(sg.swa_mask, swa_buf.data(), 0,
+                                sizeof(uint16_t) * swa_buf.size());
+    }
+
+    return true;
 }
 
 // ─── embed_token ────────────────────────────────────────────────────────────

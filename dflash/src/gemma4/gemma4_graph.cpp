@@ -154,10 +154,7 @@ static ggml_tensor * build_moe_ffn(ggml_context * ctx,
             (size_t)n_ff_exp * 2 * n_expert_used * elt,
             (size_t)n_ff_exp * elt);
 
-        // GeGLU activation (views are non-contiguous; ggml_gelu requires contiguous)
-        g_half = ggml_cont(ctx, g_half);
-        u_half = ggml_cont(ctx, u_half);
-        ggml_tensor * activated = ggml_mul(ctx, ggml_gelu(ctx, g_half), u_half);
+        ggml_tensor * activated = ggml_geglu_split(ctx, g_half, u_half);
 
         // Scale by routing weights [1, n_expert_used, n_tokens]
         activated = ggml_mul(ctx, activated, weights);

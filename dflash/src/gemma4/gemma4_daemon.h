@@ -32,6 +32,10 @@ struct Gemma4DaemonArgs {
     int  draft_kv_cap_override          = 0;
     int  draft_max_block                = 16;
     bool draft_enable_capture_overrides = false;
+    int  ddtree_budget                  = 0;     // 0 = disabled; preserve chain verify
+    float ddtree_temp                   = 1.0f;
+    bool ddtree_chain_seed              = true;
+    bool ignore_eos                     = false;
     int  mtp_gamma                      = 1;
 
     int  stream_fd = -1;                // server.py writable pipe end
