@@ -1,9 +1,19 @@
 /**
- * BF16 Prefill: cuBLAS bf16 GEMM + standalone recurrence kernel.
- * Weights bf16, activations bf16, state f32. No quantization, no conversion.
+ * Prefill: cuBLAS GEMM + standalone recurrence kernel.
+ * Supports Pascal (sm_6x), Volta/Turing (sm_70-75), and Ampere+ (sm_80+).
+ * BF16 for sm_80+, F16 for sm_6x-sm_75. Accumulation always f32.
  */
 
 #include "half_type.h"
+
+// ── Pascal (sm_6x) compatibility shims ──
+#if TARGET_SM >= 70
+#define SHFL_SYNC(mask, val, lane)    __shfl_sync((mask), (val), (lane))
+#define SHFL_DOWN_SYNC(mask, val, d)  __shfl_down_sync((mask), (val), (d))
+#else
+#define SHFL_SYNC(mask, val, lane)    __shfl((val), (lane))
+#define SHFL_DOWN_SYNC(mask, val, d)  __shfl_down((val), (d))
+#endif
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #if TARGET_SM >= 80
@@ -40,10 +50,10 @@ constexpr int LAYER_TYPE[24] = {0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1}
 struct PFLayerWeights { int layer_type; int _pad[3]; void *ptrs[14]; };
 
 __device__ __forceinline__ float pf_warp_sum(float v) {
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffff, v, o); return v;
+    for (int o = 16; o > 0; o >>= 1) v += SHFL_DOWN_SYNC(0xffffffff, v, o); return v;
 }
 __device__ __forceinline__ float pf_warp_max(float v) {
-    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffff, v, o)); return v;
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, SHFL_DOWN_SYNC(0xffffffff, v, o)); return v;
 }
 __device__ __forceinline__ float pf_silu(float x) { return x / (1.0f + expf(-x)); }
 
@@ -173,8 +183,8 @@ pf_deltanet_recurrence(
         __syncthreads();
 
         // L2 normalize
-        if(wid==0){float sq=0;for(int i=lid;i<DN_KEY;i+=32)sq+=s_q[i]*s_q[i];sq=pf_warp_sum(sq);float n=rsqrtf(sq+1e-6f)*Q_SCALE;n=__shfl_sync(0xffffffff,n,0);for(int i=lid;i<DN_KEY;i+=32)s_q[i]*=n;}
-        if(wid==1){float sq=0;for(int i=lid;i<DN_KEY;i+=32)sq+=s_k[i]*s_k[i];sq=pf_warp_sum(sq);float n=rsqrtf(sq+1e-6f);n=__shfl_sync(0xffffffff,n,0);for(int i=lid;i<DN_KEY;i+=32)s_k[i]*=n;}
+        if(wid==0){float sq=0;for(int i=lid;i<DN_KEY;i+=32)sq+=s_q[i]*s_q[i];sq=pf_warp_sum(sq);float n=rsqrtf(sq+1e-6f)*Q_SCALE;n=SHFL_SYNC(0xffffffff,n,0);for(int i=lid;i<DN_KEY;i+=32)s_q[i]*=n;}
+        if(wid==1){float sq=0;for(int i=lid;i<DN_KEY;i+=32)sq+=s_k[i]*s_k[i];sq=pf_warp_sum(sq);float n=rsqrtf(sq+1e-6f);n=SHFL_SYNC(0xffffffff,n,0);for(int i=lid;i<DN_KEY;i+=32)s_k[i]*=n;}
         __syncthreads();
 
         if(tid==0){s_beta=1.f/(1.f+expf(-beta_proj[t*DN_HEADS+h]));float x=alpha_proj[t*DN_HEADS+h]+dt_b;float sp=(x>20.f)?x:logf(1.f+expf(x));s_decay=expf(-expf(a_log_val)*sp);}
@@ -187,7 +197,7 @@ pf_deltanet_recurrence(
             int j = wid * CPW + jj;
             float kv = 0;
             for (int ii = 0; ii < RPL; ii++) kv += sreg[jj*RPL+ii] * s_k[lid+ii*32];
-            kv = pf_warp_sum(kv); kv = __shfl_sync(0xffffffff, kv, 0);
+            kv = pf_warp_sum(kv); kv = SHFL_SYNC(0xffffffff, kv, 0);
             float delta = (s_v[j] - decay * kv) * beta;
             float attn = 0;
             for (int ii = 0; ii < RPL; ii++) {
@@ -233,7 +243,7 @@ __global__ void pf_qk_norm_rope(
         int pos = idx / FA_Q_HEADS, head = idx % FA_Q_HEADS;
         half_t *qh = q + pos * FA_QPROJ_SIZE + head * FA_HEAD_DIM * 2;
         float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float v = H2F(qh[i]); ss += v*v; }
-        ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = __shfl_sync(0xffffffff,sc,0);
+        ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = SHFL_SYNC(0xffffffff,sc,0);
         for (int i = lid; i < FA_HEAD_DIM; i += 32) {
             float normed = H2F(qh[i])*sc*(1.f+H2F(qnw[i]));
             if (i < FA_ROT_DIM) {
@@ -252,7 +262,7 @@ __global__ void pf_qk_norm_rope(
         half_t *kc = k_cache + head*max_seq*FA_HEAD_DIM + pos*FA_HEAD_DIM;
         half_t *vc = v_cache + head*max_seq*FA_HEAD_DIM + pos*FA_HEAD_DIM;
         float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float v = H2F(kh[i]); ss += v*v; }
-        ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = __shfl_sync(0xffffffff,sc,0);
+        ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = SHFL_SYNC(0xffffffff,sc,0);
         for (int i = lid; i < FA_HEAD_DIM; i += 32) {
             float normed = H2F(kh[i])*sc*(1.f+H2F(knw[i])); float fk;
             if (i < FA_ROT_DIM) {
@@ -285,7 +295,7 @@ __global__ void pf_causal_attn(const half_t *q, const half_t *k,
         const half_t *kv=k+kp*FA_KV_SIZE+kvh*FA_HEAD_DIM;
         const half_t *vv=v+kp*FA_KV_SIZE+kvh*FA_HEAD_DIM;
         float sc=0; for(int e=0;e<EPL;e++) sc+=ql[e]*H2F(kv[lid*EPL+e]);
-        sc=pf_warp_sum(sc)*scale; sc=__shfl_sync(0xffffffff,sc,0);
+        sc=pf_warp_sum(sc)*scale; sc=SHFL_SYNC(0xffffffff,sc,0);
         float om=mx; mx=fmaxf(mx,sc); float ed=expf(om-mx); se=se*ed+expf(sc-mx);
         float wt=expf(sc-mx); for(int e=0;e<EPL;e++) oa[e]=oa[e]*ed+wt*H2F(vv[lid*EPL+e]);
     }
@@ -322,11 +332,11 @@ __global__ void pf_lm_head(const half_t *hidden, const half_t *w,
     for(int m=rs+wid;m<re;m+=nw){const half_t *wr=w+m*HIDDEN;float s=0;
         for(int k=lid*8;k<HIDDEN;k+=32*8){for(int i=0;i<8;i++)s+=H2F(wr[k+i])*H2F(s_h[k+i]);}
         s=pf_warp_sum(s);if(lid==0&&s>lm){lm=s;li=m;}}
-    lm=__shfl_sync(0xffffffff,lm,0);li=__shfl_sync(0xffffffff,li,0);
+    lm=SHFL_SYNC(0xffffffff,lm,0);li=SHFL_SYNC(0xffffffff,li,0);
     __shared__ float wm[32]; __shared__ int wi[32];
     if(lid==0){wm[wid]=lm;wi[wid]=li;}__syncthreads();
     if(wid==0){float mv=(lid<nw)?wm[lid]:-1e30f;int mi=(lid<nw)?wi[lid]:-1;
-        for(int o=16;o>0;o>>=1){float ov=__shfl_down_sync(0xffffffff,mv,o);int oi=__shfl_down_sync(0xffffffff,mi,o);if(ov>mv){mv=ov;mi=oi;}}
+        for(int o=16;o>0;o>>=1){float ov=SHFL_DOWN_SYNC(0xffffffff,mv,o);int oi=SHFL_DOWN_SYNC(0xffffffff,mi,o);if(ov>mv){mv=ov;mi=oi;}}
         if(lid==0){bmv[blockIdx.x]=mv;bmi[blockIdx.x]=mi;}}
 }
 __global__ void pf_lm_reduce(const float *bmv, const int *bmi, int *out, int nb) {
@@ -1053,7 +1063,7 @@ __global__ void pf_qk_norm_rope_fused(
         int pos = idx / FA_Q_HEADS, head = idx % FA_Q_HEADS;
         half_t *qh = qkv_fused + pos * STRIDE + head * FA_HEAD_DIM * 2;
         float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float v = H2F(qh[i]); ss += v*v; }
-        ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = __shfl_sync(0xffffffff,sc,0);
+        ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = SHFL_SYNC(0xffffffff,sc,0);
         for (int i = lid; i < FA_HEAD_DIM; i += 32) {
             float normed = H2F(qh[i])*sc*(1.f+H2F(qnw[i]));
             if (i < FA_ROT_DIM) {
@@ -1072,7 +1082,7 @@ __global__ void pf_qk_norm_rope_fused(
         half_t *kc = k_cache + head*max_seq*FA_HEAD_DIM + pos*FA_HEAD_DIM;
         half_t *vc = v_cache + head*max_seq*FA_HEAD_DIM + pos*FA_HEAD_DIM;
         float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float v = H2F(kh[i]); ss += v*v; }
-        ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = __shfl_sync(0xffffffff,sc,0);
+        ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = SHFL_SYNC(0xffffffff,sc,0);
         for (int i = lid; i < FA_HEAD_DIM; i += 32) {
             float normed = H2F(kh[i])*sc*(1.f+H2F(knw[i])); float fk;
             if (i < FA_ROT_DIM) {
@@ -1107,7 +1117,7 @@ __global__ void pf_causal_attn_fused(const half_t *qkv_fused, half_t *out, int S
         const half_t *kv=qkv_fused+kp*STRIDE+K_COL+kvh*FA_HEAD_DIM;
         const half_t *vv=qkv_fused+kp*STRIDE+V_COL+kvh*FA_HEAD_DIM;
         float sc=0; for(int e=0;e<EPL;e++) sc+=ql[e]*H2F(kv[lid*EPL+e]);
-        sc=pf_warp_sum(sc)*scale; sc=__shfl_sync(0xffffffff,sc,0);
+        sc=pf_warp_sum(sc)*scale; sc=SHFL_SYNC(0xffffffff,sc,0);
         float om=mx; mx=fmaxf(mx,sc); float ed=expf(om-mx); se=se*ed+expf(sc-mx);
         float wt=expf(sc-mx); for(int e=0;e<EPL;e++) oa[e]=oa[e]*ed+wt*H2F(vv[lid*EPL+e]);
     }
@@ -1463,7 +1473,7 @@ pf_deltanet_recurrence_split(
             #pragma unroll
             for (int ii = 0; ii < RPL; ii++) kv += sreg[jj*RPL+ii] * s_k[lid + ii*32];
             kv = pf_warp_sum(kv);
-            kv = __shfl_sync(0xffffffff, kv, 0);
+            kv = SHFL_SYNC(0xffffffff, kv, 0);
             float delta = (s_v[j_local] - decay * kv) * beta;
             float attn = 0;
             #pragma unroll

@@ -32,11 +32,15 @@ import re
 _sm_match = re.search(r"sm_(\d+)", arch)
 target_sm = int(_sm_match.group(1)) if _sm_match else 86
 
-num_blocks = _int_env("MEGAKERNEL_NUM_BLOCKS", 82)
+# Pascal (sm_6x) has far fewer SMs (16–28) and no tensor cores.
+# Use smaller block counts and disable WMMA paths.
+is_pascal = target_sm >= 60 and target_sm < 70
+
+num_blocks = _int_env("MEGAKERNEL_NUM_BLOCKS", 28 if is_pascal else 82)
 block_size = _int_env("MEGAKERNEL_BLOCK_SIZE", 512)
-lm_num_blocks = _int_env("MEGAKERNEL_LM_NUM_BLOCKS", 512)
+lm_num_blocks = _int_env("MEGAKERNEL_LM_NUM_BLOCKS", 256 if is_pascal else 512)
 lm_block_size = _int_env("MEGAKERNEL_LM_BLOCK_SIZE", 256)
-dn_phase2_wmma = _int_env("MEGAKERNEL_DN_PHASE2_WMMA", 0)
+dn_phase2_wmma = _int_env("MEGAKERNEL_DN_PHASE2_WMMA", 0 if is_pascal else 0)
 
 sources = [
     "torch_bindings.cpp",

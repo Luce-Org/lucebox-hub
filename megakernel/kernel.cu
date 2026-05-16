@@ -1,13 +1,33 @@
 /**
  * Fused single-kernel decode for Qwen3.5-0.8B (hybrid DeltaNet + Full Attention).
- * ALL BF16: weights bf16, activations bf16, accumulation f32.
+ * Supports Pascal (sm_6x), Volta/Turing (sm_70-75), and Ampere+ (sm_80+).
+ * BF16 for sm_80+, F16 for sm_6x-sm_75. Accumulation always f32.
  * DeltaNet state: f32 (recurrence needs precision).
  *
- * Optimized for: NVIDIA RTX 3090 (sm_86, 82 SMs)
- * Model:         Qwen/Qwen3.5-0.8B (bf16 weights)
+ * Pascal-specific adaptations (via TARGET_SM guards):
+ *   - __shfl / __shfl_down instead of __shfl_sync / __shfl_down_sync
+ *   - membar.gl instead of fence.acq_rel.gpu
+ *   - __ldg() instead of ld.global.cg / ld.global.L1::no_allocate
+ *   - No tensor cores, no WMMA, no cp.async
  */
 
 #include "half_type.h"
+
+// ── Pascal (sm_6x) compatibility shims ──
+// Pascal lacks the _sync suffixed warp shuffle and the fence.acq_rel.gpu
+// PTX instruction.  Provide thin wrappers so the same source compiles for
+// both Pascal and Volta+.
+#if TARGET_SM >= 70
+// Volta+: native _sync shuffles and fence.acq_rel.gpu
+#define SHFL_SYNC(mask, val, lane)    __shfl_sync((mask), (val), (lane))
+#define SHFL_DOWN_SYNC(mask, val, d)  __shfl_down_sync((mask), (val), (d))
+#define GPU_MEMORY_FENCE()            asm volatile("fence.acq_rel.gpu;" ::: "memory")
+#else
+// Pascal: no mask argument, no _sync suffix; membar.gl for global fence
+#define SHFL_SYNC(mask, val, lane)    __shfl((val), (lane))
+#define SHFL_DOWN_SYNC(mask, val, d)  __shfl_down((val), (d))
+#define GPU_MEMORY_FENCE()            asm volatile("membar.gl;" ::: "memory")
+#endif
 #include <cuda_runtime.h>
 
 // =============================================================================
@@ -124,11 +144,11 @@ struct AtomicGridSync {
         __syncthreads();
         if (threadIdx.x == 0) {
             unsigned int my_gen = local_gen;
-            asm volatile("fence.acq_rel.gpu;" ::: "memory");
+            GPU_MEMORY_FENCE();
             unsigned int arrived = atomicAdd(counter, 1);
             if (arrived == nblocks - 1) {
                 *counter = 0;
-                asm volatile("fence.acq_rel.gpu;" ::: "memory");
+                GPU_MEMORY_FENCE();
                 atomicAdd(generation, 1);
             } else {
                 volatile unsigned int *vgen = (volatile unsigned int *)generation;
@@ -146,7 +166,7 @@ struct AtomicGridSync {
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2)
-        val += __shfl_down_sync(0xffffffff, val, offset);
+        val += SHFL_DOWN_SYNC(0xffffffff, val, offset);
     return val;
 }
 
@@ -163,11 +183,16 @@ __device__ __forceinline__ float fast_silu(float x) { return x * fast_sigmoid(x)
 __device__ __forceinline__ uint4 load_128bit(const uint4 *ptr) {
     uint4 out;
 #if TARGET_SM >= 80
+    // Ampere+: bypass L1 to avoid read-for-ownership pollution
     asm volatile("ld.global.L1::no_allocate.v4.b32 {%0, %1, %2, %3}, [%4];"
                  : "=r"(out.x), "=r"(out.y), "=r"(out.z), "=r"(out.w) : "l"(ptr));
-#else
+#elif TARGET_SM >= 70
+    // Volta/Turing: .cg (cache global) for read-only coalesced access
     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
                  : "=r"(out.x), "=r"(out.y), "=r"(out.z), "=r"(out.w) : "l"(ptr));
+#else
+    // Pascal: no .cg cache modifier — use __ldg (cached read-only)
+    out = __ldg(ptr);
 #endif
     return out;
 }
@@ -461,7 +486,7 @@ __device__ void full_attention_layer(
             half_t *vc = v_cache + h * max_seq_len * FA_HEAD_DIM + position * FA_HEAD_DIM;
             float ss = 0; for (int i = lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) ss += kh[i]*kh[i];
             ss = warp_reduce_sum(ss); float sc = rsqrtf(ss / float(FA_HEAD_DIM) + RMS_EPS);
-            sc = __shfl_sync(0xffffffff, sc, 0);
+            sc = SHFL_SYNC(0xffffffff, sc, 0);
             for (int i = lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) {
                 float normed = kh[i] * sc * (1.0f + H2F(__ldg(w.k_norm_weight + i)));
                 if (i < FA_ROTARY_DIM) {
@@ -486,7 +511,7 @@ __device__ void full_attention_layer(
             if (warp_id == 0) {
                 float ss = 0; for (int i = lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) ss += qh_ptr[i]*qh_ptr[i];
                 ss = warp_reduce_sum(ss); float sc = rsqrtf(ss / float(FA_HEAD_DIM) + RMS_EPS);
-                sc = __shfl_sync(0xffffffff, sc, 0);
+                sc = SHFL_SYNC(0xffffffff, sc, 0);
                 for (int i = lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) {
                     float normed = qh_ptr[i]*sc*(1.0f+H2F(__ldg(w.q_norm_weight+i)));
                     if (i < FA_ROTARY_DIM) {
@@ -527,7 +552,7 @@ __device__ void full_attention_layer(
                 float score = 0;
                 for (int e = 0; e < EPL; e++) score += q_local[e] * H2F(__ldg(k_pos + lane_id*EPL+e));
                 score = warp_reduce_sum(score) * attn_scale;
-                score = __shfl_sync(0xffffffff, score, 0);
+                score = SHFL_SYNC(0xffffffff, score, 0);
                 float old_max = max_score; max_score = fmaxf(max_score, score);
                 float exp_diff = fast_exp(old_max - max_score);
                 sum_exp = sum_exp * exp_diff + fast_exp(score - max_score);
@@ -663,12 +688,12 @@ __device__ void deltanet_layer(
         if (warp_id == 0) {
             float sq = 0; for (int i = lane_id; i < DN_KEY_DIM; i += WARP_SIZE) sq += s_q[i]*s_q[i];
             sq = warp_reduce_sum(sq); float n = rsqrtf(sq+1e-6f)*Q_SCALE;
-            n = __shfl_sync(0xffffffff,n,0); for (int i = lane_id; i < DN_KEY_DIM; i += WARP_SIZE) s_q[i] *= n;
+            n = SHFL_SYNC(0xffffffff,n,0); for (int i = lane_id; i < DN_KEY_DIM; i += WARP_SIZE) s_q[i] *= n;
         }
         if (warp_id == 1) {
             float sq = 0; for (int i = lane_id; i < DN_KEY_DIM; i += WARP_SIZE) sq += s_k[i]*s_k[i];
             sq = warp_reduce_sum(sq); float n = rsqrtf(sq+1e-6f);
-            n = __shfl_sync(0xffffffff,n,0); for (int i = lane_id; i < DN_KEY_DIM; i += WARP_SIZE) s_k[i] *= n;
+            n = SHFL_SYNC(0xffffffff,n,0); for (int i = lane_id; i < DN_KEY_DIM; i += WARP_SIZE) s_k[i] *= n;
         }
         __syncthreads();
 
@@ -701,7 +726,7 @@ __device__ void deltanet_layer(
                 stk += sv * s_k[i]; sqv += sv * s_q[i];
             }
             stk = warp_reduce_sum(stk); sqv = warp_reduce_sum(sqv);
-            stk = __shfl_sync(0xffffffff,stk,0); sqv = __shfl_sync(0xffffffff,sqv,0);
+            stk = SHFL_SYNC(0xffffffff,stk,0); sqv = SHFL_SYNC(0xffffffff,sqv,0);
             float error_j = (s_v[j] - decay * stk) * beta;
             float o_j = decay * sqv + error_j * kq;
             if (lane_id == 0) out_head[j] = o_j;
@@ -795,8 +820,8 @@ __global__ void lm_head_kernel(
         }
         if (lane_id == 0 && sum > local_max) { local_max = sum; local_max_idx = m; }
     }
-    local_max = __shfl_sync(0xffffffff, local_max, 0);
-    local_max_idx = __shfl_sync(0xffffffff, local_max_idx, 0);
+    local_max = SHFL_SYNC(0xffffffff, local_max, 0);
+    local_max_idx = SHFL_SYNC(0xffffffff, local_max_idx, 0);
 
     __shared__ float wm[32]; __shared__ int wi[32];
     if (lane_id == 0) { wm[warp_id] = local_max; wi[warp_id] = local_max_idx; }
@@ -805,8 +830,8 @@ __global__ void lm_head_kernel(
         float mv = (lane_id < num_warps) ? wm[lane_id] : -INFINITY;
         int mi = (lane_id < num_warps) ? wi[lane_id] : -1;
         for (int o = WARP_SIZE/2; o > 0; o /= 2) {
-            float ov = __shfl_down_sync(0xffffffff, mv, o);
-            int oi = __shfl_down_sync(0xffffffff, mi, o);
+            float ov = SHFL_DOWN_SYNC(0xffffffff, mv, o);
+            int oi = SHFL_DOWN_SYNC(0xffffffff, mi, o);
             if (ov > mv) { mv = ov; mi = oi; }
         }
         if (lane_id == 0) { block_max_vals[blockIdx.x] = mv; block_max_idxs[blockIdx.x] = mi; }
