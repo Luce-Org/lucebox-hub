@@ -1,16 +1,23 @@
-# Lucebox Harness
-
-<p align="center">
-  <img src="assets/hero.png" alt="Lucebox client harness experiments on RTX 3090" width="600">
+<p align="left">
+  <a href="../README.md">← lucebox-hub</a>
 </p>
 
-Use this folder for two things:
+<p align="center">
+  <img src="assets/hero.png" alt="Lucebox client harness experiments on RTX 3090" width="600" />
+</p>
 
-- launch Lucebox through a real client: Claude Code, Codex, OpenCode, Hermes,
-  Pi, OpenClaw, or Open WebUI
-- test a Lucebox change against the HTTP protocols those clients use
+<h1 align="center">Lucebox Harness</h1>
 
-The defaults are tuned for an RTX 3090 / 24 GB setup. Paths and server settings
+<p align="center">
+  <strong>Client launchers and regression tests for Lucebox server compatibility.</strong><br/>
+  Run Lucebox from Claude Code, Codex, OpenCode, Hermes, Pi, OpenClaw, or Open WebUI.<br/>
+  RTX 3090 / 24 GB defaults are included for each client.
+</p>
+
+---
+
+Use this folder to launch Lucebox through a real client, or to test a server
+change against the HTTP protocols those clients use. Paths and server settings
 can be overridden with environment variables.
 
 ## Run a client
