@@ -353,16 +353,24 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
     }
 
     const int snap_pos = prefix_snapshots_[slot].cur_pos;
+    cache_.cur_pos = snap_pos;
 
-    // If there are additional prompt tokens beyond the snapshot, prefill them
+    // Daemon receives the FULL prompt; slice off the cached prefix and prefill
+    // only the delta at KV positions [snap_pos, snap_pos + delta.size()).
     int committed = snap_pos;
-    if (!req.prompt.empty()) {
-        // The prompt here is the diff (tokens beyond the snapshot)
-        committed = do_prefill(req.prompt, io, req.snap_pos, req.snap_slot);
+    const int prompt_len = (int)req.prompt.size();
+    if (prompt_len > snap_pos) {
+        std::vector<int32_t> delta(req.prompt.begin() + snap_pos, req.prompt.end());
+        committed = do_prefill(delta, io, req.snap_pos, req.snap_slot, /*kv_offset=*/snap_pos);
         if (committed < 0) {
             result.error = "prefill";
             return result;
         }
+    } else if (prompt_len > 0 && prompt_len < snap_pos) {
+        // Cached more than the request — should never happen in practice.
+        result.error = "snapshot_longer_than_prompt";
+        io.emit(-1);
+        return result;
     }
 
     // Decode
@@ -385,7 +393,8 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
 
 int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                const DaemonIO & io,
-                               int snap_pos, int snap_slot) {
+                               int snap_pos, int snap_slot,
+                               int kv_offset) {
     (void)io;
 
     const int hidden = w_.n_embd;
@@ -395,21 +404,26 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     }
     const int prompt_len = (int)tokens.size();
 
-    // Migrate to full-mode KV cache if needed
-    migrate_prefill_cache(w_, cfg_.device.max_ctx,
-                          cfg_.ddtree_mode
-                              ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
-                              : dw_.block_size,
-                          target_backend_, cache_);
+    // Skip KV-cache migration when resuming from a snapshot — the cache was
+    // already migrated when the snapshot was taken; re-running migrate would
+    // clobber the restored state.
+    if (kv_offset == 0) {
+        migrate_prefill_cache(w_, cfg_.device.max_ctx,
+                              cfg_.ddtree_mode
+                                  ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
+                                  : dw_.block_size,
+                              target_backend_, cache_);
+    }
 
     // Chunked prefill
     std::vector<float> embed_buf((size_t)hidden * prefill_ubatch);
-    int committed = 0;
+    int committed = kv_offset;
     for (int start = 0; start < prompt_len;) {
-        if (snap_pos >= 0 && snap_slot >= 0 && snap_pos == start) {
-            cache_.cur_pos = start;
+        const int kv_pos = kv_offset + start;
+        if (snap_pos >= 0 && snap_slot >= 0 && snap_pos == kv_pos) {
+            cache_.cur_pos = kv_pos;
             if (snapshot_save(snap_slot)) {
-                std::printf("[snap] inline slot=%d cur_pos=%d\n", snap_slot, start);
+                std::printf("[snap] inline slot=%d cur_pos=%d\n", snap_slot, kv_pos);
                 std::fflush(stdout);
             }
             snap_pos = -1;
@@ -417,19 +431,19 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
 
         int n_tokens = std::min(prefill_ubatch, prompt_len - start);
-        if (snap_pos > start && snap_pos < start + n_tokens) {
-            n_tokens = snap_pos - start;
+        if (snap_pos > kv_pos && snap_pos < kv_pos + n_tokens) {
+            n_tokens = snap_pos - kv_pos;
         }
         const bool with_mask = (cfg_.kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1);
 
         if (!build_target_step(sg_, w_, cache_, target_backend_,
-                               /*kv_start=*/start, /*n_tokens=*/n_tokens,
+                               /*kv_start=*/kv_pos, /*n_tokens=*/n_tokens,
                                with_mask, /*capture=*/true,
                                /*capture_delta_intermediate=*/false,
                                cfg_.fa_window,
                                /*last_token_logits_only=*/(start + n_tokens < prompt_len),
                                cfg_.kq_stride_pad)) {
-            std::fprintf(stderr, "prefill build @%d\n", start);
+            std::fprintf(stderr, "prefill build @%d\n", kv_pos);
             return -1;
         }
 
@@ -443,7 +457,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         // Positions (M-RoPE)
         std::vector<int32_t> pos_buf((size_t)4 * n_tokens, 0);
         for (int i = 0; i < n_tokens; i++) {
-            const int p = start + i;
+            const int p = kv_pos + i;
             pos_buf[4 * i + 0] = p;
             pos_buf[4 * i + 1] = p;
             pos_buf[4 * i + 2] = p;
@@ -454,11 +468,11 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
 
         // Mask
         if (sg_.attn_mask) {
-            const int win_start = (cfg_.fa_window > 0 && start > cfg_.fa_window)
-                                      ? (start - cfg_.fa_window) : 0;
-            const int kv_len = start + n_tokens - win_start;
+            const int win_start = (cfg_.fa_window > 0 && kv_pos > cfg_.fa_window)
+                                      ? (kv_pos - cfg_.fa_window) : 0;
+            const int kv_len = kv_pos + n_tokens - win_start;
             std::vector<uint16_t> mask_buf;
-            build_causal_mask(mask_buf, kv_len, n_tokens, start, cfg_.kq_stride_pad, win_start);
+            build_causal_mask(mask_buf, kv_len, n_tokens, kv_pos, cfg_.kq_stride_pad, win_start);
             ggml_backend_tensor_set(sg_.attn_mask, mask_buf.data(), 0,
                                     sizeof(uint16_t) * mask_buf.size());
         }
@@ -466,7 +480,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         // Compute
         auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
         if (st != GGML_STATUS_SUCCESS) {
-            std::fprintf(stderr, "prefill compute @%d failed\n", start);
+            std::fprintf(stderr, "prefill compute @%d failed\n", kv_pos);
             return -1;
         }
 
@@ -476,7 +490,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         ggml_backend_tensor_get(sg_.argmax_tokens, &last_tok, argmax_off, sizeof(int32_t));
         cache_.last_tok = last_tok;
 
-        committed = start + n_tokens;
+        committed = kv_pos + n_tokens;
         cache_.cur_pos = committed;
 
         if (snap_pos >= 0 && snap_slot >= 0 && committed == snap_pos) {
@@ -491,10 +505,10 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         // Sync feature mirror if active
         if (feature_mirror_.target_feat && !draft_parked_) {
             draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
-                                            feature_mirror_, start, n_tokens);
+                                            feature_mirror_, kv_pos, n_tokens);
         }
 
-        start = committed;
+        start += n_tokens;
     }
 
     return committed;

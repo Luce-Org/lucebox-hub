@@ -146,9 +146,12 @@ private:
 
     // ── Internal helpers ─────────────────────────────────────────────
     // Prefill a prompt and return the number of tokens committed to KV.
+    // kv_offset > 0 resumes from a restored snapshot: tokens are placed at
+    // KV positions [kv_offset, kv_offset + tokens.size()) instead of [0, N).
     int do_prefill(const std::vector<int32_t> & tokens,
                    const DaemonIO & io,
-                   int snap_pos = -1, int snap_slot = -1);
+                   int snap_pos = -1, int snap_slot = -1,
+                   int kv_offset = 0);
 
     // Speculative decode loop: draft → verify → accept until EOS/max.
     bool do_spec_decode(int committed, int n_gen,
