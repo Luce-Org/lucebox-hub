@@ -14,7 +14,7 @@ Thanks for considering a contribution. Lucebox is a hub of self-contained optimi
 
 - Closed-source dependencies. Everything here has to be reproducible from public sources.
 
-## Luce DFash Setup
+## Luce DFlash Setup
 
 ### dflash
 
