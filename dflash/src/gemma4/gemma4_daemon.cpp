@@ -1,29 +1,47 @@
-// Gemma4 daemon entry point: loads model, creates backend, runs daemon loop.
+// Gemma4 daemon entry point.
+//
+// Thin wrapper: constructs a Gemma4Backend and hands off to the generic
+// daemon loop (daemon_loop.cpp from #175). All model-specific logic lives
+// in gemma4_backend.cpp (#11b); protocol plumbing lives in daemon_loop.cpp.
 
 #include "gemma4_daemon.h"
-#include "gemma4_backend.h"
-#include "common/daemon_loop.h"
+#include "../common/daemon_loop.h"
 
 #include <cstdio>
 
 namespace dflash27b {
 
 int run_gemma4_daemon(const Gemma4DaemonArgs & args) {
-    Gemma4BackendConfig cfg;
-    cfg.model_path = args.model_path;
-    cfg.device     = args.device;
-    cfg.stream_fd  = args.stream_fd;
-    cfg.chunk      = args.chunk;
+    Gemma4BackendConfig bargs;
+    bargs.target_path  = args.target_path;
+    bargs.draft_path   = args.draft_path;
+    bargs.mtp_path     = args.mtp_path;
+    bargs.draft_method = args.draft_method;
+    bargs.max_ctx      = args.max_ctx;
+    bargs.chunk        = args.chunk;
+    bargs.use_sparse_fa   = args.use_sparse_fa;
+    bargs.sparse_fa_alpha = args.sparse_fa_alpha;
+    bargs.draft_kv_cap_override          = args.draft_kv_cap_override;
+    bargs.draft_max_block                = args.draft_max_block;
+    bargs.draft_enable_capture_overrides = args.draft_enable_capture_overrides;
+    bargs.ddtree_budget                  = args.ddtree_budget;
+    bargs.ddtree_temp                    = args.ddtree_temp;
+    bargs.ddtree_chain_seed              = args.ddtree_chain_seed;
+    bargs.ignore_eos                     = args.ignore_eos;
+    bargs.mtp_gamma                      = args.mtp_gamma;
 
-    Gemma4Backend backend(cfg);
+    Gemma4Backend backend(bargs);
     if (!backend.init()) {
-        std::fprintf(stderr, "[gemma4-daemon] init failed\n");
+        std::fprintf(stderr, "[gemma4-daemon] backend init failed\n");
         return 1;
     }
 
-    DaemonLoopArgs da;
-    da.stream_fd = args.stream_fd;
-    return run_daemon(backend, da);
+    DaemonLoopArgs dargs;
+    dargs.stream_fd = args.stream_fd;
+    dargs.chunk     = args.chunk;
+    dargs.max_ctx   = args.max_ctx;
+
+    return run_daemon(backend, dargs);
 }
 
 }  // namespace dflash27b
