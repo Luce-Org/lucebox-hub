@@ -7,6 +7,7 @@
 #include "attn_masks.h"
 #include "common/sampler.h"
 #include "common/io_utils.h"
+#include "common/restore_delta.h"
 #include "qwen3/qwen3_drafter.h"
 
 #include "ggml-cuda.h"
@@ -375,7 +376,7 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
     const int prompt_len = (int)req.prompt.size();
     if (prompt_len > snap_pos) {
         auto t_prefill_start = std::chrono::steady_clock::now();
-        std::vector<int32_t> delta(req.prompt.begin() + snap_pos, req.prompt.end());
+        std::vector<int32_t> delta = restore_prompt_delta(req.prompt, snap_pos);
         committed = do_prefill(delta, io, req.snap_pos, req.snap_slot, /*kv_offset=*/snap_pos);
         if (committed < 0) {
             result.error = "prefill";
