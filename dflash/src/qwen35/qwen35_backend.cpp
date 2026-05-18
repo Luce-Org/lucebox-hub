@@ -677,12 +677,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     const DaemonIO & io) {
     const int hidden = w_.n_embd;
 
-    // First token = prefill's last-position argmax. do_prefill already read it
-    // into cache_.last_tok using the correct per-chunk offset. Re-reading
-    // sg_.argmax_tokens here with a hardcoded ubatch indexed it by
-    // `committed % 512`, which overruns the decode-step argmax tensor for any
-    // prompt longer than that tensor (issue #191: ggml "tensor read out of
-    // bounds" -> daemon abort on the first real-sized request).
+    // First token: use the argmax that do_prefill already sampled and stored.
+    // Reading sg_.argmax_tokens with a computed offset is fragile: when
+    // restore_and_generate calls do_prefill with kv_offset != 0, committed
+    // reflects total KV position but the last chunk size was
+    // delta.size() % ubatch, making (committed % 512) wrong and causing an
+    // out-of-bounds tensor read.  cache_.last_tok is always correct.
     int32_t last_tok = cache_.last_tok;
 
     // Check if we can use speculative decode:
