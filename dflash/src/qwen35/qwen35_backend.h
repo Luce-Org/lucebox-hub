@@ -31,6 +31,18 @@
 
 namespace dflash27b {
 
+// ── Per-request speculator selection ────────────────────────────────────
+//
+// DFlash vs MTP performance (bench 2026-05-19, Qwen3.6-27B Q4_K_M, RTX 3090):
+//   Code/math ≤16K  : DFlash wins 1.75-2.57× (HumanEval 174 tok/s vs MTP 64)
+//   Agent/chat       : MTP wins by 4-14% (accept 69% vs DFlash 29% post-PFlash)
+//   Long ctx >4K     : MTP robust; DFlash accept collapses after PFlash compression
+//
+// auto_select threshold: prompt.size() > 4096 tokens → MTP; else → DFlash.
+// Threshold is intentionally coarse; telemetry-guided tuning comes later.
+
+enum class SpeculatorMode { AUTO, DFLASH, MTP };
+
 // ── Configuration passed at construction ────────────────────────────────
 
 struct Qwen35Config {
@@ -171,6 +183,14 @@ private:
     // mtp_head_kv capture on this — otherwise a zeroed head_kv would round-trip
     // as a "valid" snapshot.
     bool head_kv_warm_ = false;
+
+    // ── Speculator dispatch helpers ──────────────────────────────────
+    // Resolve the effective SpeculatorMode for a request. Falls back to
+    // auto_select() when req.speculator is empty / "auto".
+    SpeculatorMode resolve_speculator(const GenerateRequest & req) const;
+
+    // Heuristic: prompt.size() > 4096 → MTP (long/agent), else → DFlash.
+    SpeculatorMode auto_select(const GenerateRequest & req) const;
 
     // ── Internal helpers ─────────────────────────────────────────────
     // Prefill a prompt and return the number of tokens committed to KV.

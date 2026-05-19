@@ -173,6 +173,21 @@ static void parse_inline_snap(const std::string & line,
     }
 }
 
+// Parse optional speculator override: ` speculator=<name>`.
+// Recognised values: "dflash", "mtp", "auto". Unknown values are ignored
+// (treated as "auto") so older clients sending no speculator= token are
+// unaffected, and future token names are forward-compatible.
+static std::string parse_speculator(const std::string & line) {
+    size_t p = line.find(" speculator=");
+    if (p == std::string::npos) return "";
+    const std::string tail = line.substr(p + 12);
+    // Extract up to the next space or end-of-string.
+    const size_t end = tail.find(' ');
+    const std::string val = (end == std::string::npos) ? tail : tail.substr(0, end);
+    if (val == "dflash" || val == "mtp" || val == "auto") return val;
+    return "";  // unrecognised — treat as "auto"
+}
+
 // ── Main loop ───────────────────────────────────────────────────────────
 
 int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
@@ -286,11 +301,12 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
                 continue;
             }
             GenerateRequest req;
-            req.prompt    = std::move(prompt);
-            req.n_gen     = n_gen;
-            req.sampler   = sampler;
-            req.do_sample = do_sample;
-            req.stream    = false;
+            req.prompt     = std::move(prompt);
+            req.n_gen      = n_gen;
+            req.sampler    = sampler;
+            req.do_sample  = do_sample;
+            req.stream     = false;
+            req.speculator = parse_speculator(line);
 
             auto result = backend.generate(req, io);
             if (!result.ok) {
@@ -341,13 +357,14 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
             parse_inline_snap(line, snap_pos, snap_slot);
 
             GenerateRequest req;
-            req.prompt    = std::move(prompt);
-            req.n_gen     = n_gen;
-            req.sampler   = sampler;
-            req.do_sample = do_sample;
-            req.stream    = true;
-            req.snap_pos  = snap_pos;
-            req.snap_slot = snap_slot;
+            req.prompt     = std::move(prompt);
+            req.n_gen      = n_gen;
+            req.sampler    = sampler;
+            req.do_sample  = do_sample;
+            req.stream     = true;
+            req.snap_pos   = snap_pos;
+            req.snap_slot  = snap_slot;
+            req.speculator = parse_speculator(line);
 
             auto result = backend.restore_and_generate(slot, req, io);
             if (!result.ok) {
@@ -390,13 +407,14 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
             parse_inline_snap(line, snap_pos, snap_slot);
 
             GenerateRequest req;
-            req.prompt    = std::move(prompt);
-            req.n_gen     = n_gen;
-            req.sampler   = sampler;
-            req.do_sample = do_sample;
-            req.stream    = true;
-            req.snap_pos  = snap_pos;
-            req.snap_slot = snap_slot;
+            req.prompt     = std::move(prompt);
+            req.n_gen      = n_gen;
+            req.sampler    = sampler;
+            req.do_sample  = do_sample;
+            req.stream     = true;
+            req.snap_pos   = snap_pos;
+            req.snap_slot  = snap_slot;
+            req.speculator = parse_speculator(line);
 
             auto result = backend.generate(req, io);
             if (!result.ok) {

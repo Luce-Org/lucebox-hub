@@ -628,6 +628,9 @@ class ChatRequest(BaseModel):
     tool_choice: Any | None = None  # "auto" | "none" | {"function": {...}}
     chat_template_kwargs: dict | None = None
     stream_options: dict | None = None  # e.g. {"include_usage": true}
+    # Per-request speculator override. Accepted values: "dflash", "mtp", "auto".
+    # Send via extra_body: {"speculator": "dflash"} or top-level in the request body.
+    speculator: str | None = None
 
 
 class AnthropicMessage(BaseModel):
@@ -649,6 +652,7 @@ class AnthropicMessagesRequest(BaseModel):
     frequency_penalty: float | None = None
     stop_sequences: list[str] | None = None
     chat_template_kwargs: dict | None = None
+    speculator: str | None = None  # "dflash" | "mtp" | "auto"
 
 
 # ─── Responses API schemas (Codex wire protocol) ──────────────────
@@ -711,16 +715,26 @@ class ResponsesCreateRequest(BaseModel):
 
 
 def _samp_suffix(req) -> str:
-    # Render ` samp=temp,top_p,top_k,rep_pen[,seed]` tail when the request asks for
-    # non-greedy decoding. Empty string keeps the daemon protocol greedy-compatible.
+    """Render sampling + speculator suffix tokens for the daemon command line.
+
+    Always appends ` speculator=<name>` when req.speculator is set to a
+    recognised value ("dflash", "mtp", "auto"). Older daemons that don't
+    understand the token ignore it (parse_speculator returns "" on unknown).
+    """
+    out = ""
+    # Sampling tail (non-greedy only).
     t  = float(getattr(req, "temperature", 0.0) or 0.0)
-    if t <= 0.0:
-        return ""
-    tp = float(getattr(req, "top_p", 1.0) or 1.0)
-    tk = int(getattr(req, "top_k", 0) or 0)
-    rp = float(getattr(req, "frequency_penalty", 0.0) or 0.0) + 1.0
-    seed = int(getattr(req, "seed", 0) or 0)
-    return f" samp={t:.4f},{tp:.4f},{tk},{rp:.4f},{seed}"
+    if t > 0.0:
+        tp = float(getattr(req, "top_p", 1.0) or 1.0)
+        tk = int(getattr(req, "top_k", 0) or 0)
+        rp = float(getattr(req, "frequency_penalty", 0.0) or 0.0) + 1.0
+        seed = int(getattr(req, "seed", 0) or 0)
+        out += f" samp={t:.4f},{tp:.4f},{tk},{rp:.4f},{seed}"
+    # Per-request speculator override (dual-speculator mode).
+    spec = (getattr(req, "speculator", None) or "").strip().lower()
+    if spec in ("dflash", "mtp", "auto"):
+        out += f" speculator={spec}"
+    return out
 
 
 def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max_ctx: int,
@@ -796,14 +810,24 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                f"--max-ctx={max_ctx}",
                f"--stream-fd={stream_fd_val}"]
     elif mtp_gguf is not None:
-        # MTP mode: no --draft (MTP head lives inside target or mtp_gguf),
-        # no DFlash flags. Daemon dispatches to MTP code path via --mtp-gguf.
-        cmd = [bin_abs, str(target), "--daemon",
-               f"--max-ctx={max_ctx}",
-               f"--stream-fd={stream_fd_val}",
-               f"--mtp-gguf={mtp_gguf}",
-               f"--gamma={mtp_gamma}",
-               "--draft-source", mtp_draft_source]
+        # MTP mode (or dual-speculator when draft is also provided).
+        # When draft != None, both DFlash drafter and MTP heads are loaded
+        # simultaneously; the backend dispatches per-request via speculator= token.
+        if draft is not None:
+            cmd = [bin_abs, str(target), str(draft), "--daemon",
+                   f"--max-ctx={max_ctx}",
+                   f"--stream-fd={stream_fd_val}",
+                   f"--mtp-gguf={mtp_gguf}",
+                   f"--gamma={mtp_gamma}",
+                   "--draft-source", mtp_draft_source,
+                   "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}"]
+        else:
+            cmd = [bin_abs, str(target), "--daemon",
+                   f"--max-ctx={max_ctx}",
+                   f"--stream-fd={stream_fd_val}",
+                   f"--mtp-gguf={mtp_gguf}",
+                   f"--gamma={mtp_gamma}",
+                   "--draft-source", mtp_draft_source]
         if mtp_draft_source == "mtp_topk":
             cmd.append(f"--draft-topk={mtp_draft_topk}")
         if extra_daemon_args:
@@ -2694,7 +2718,10 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--target", type=Path, default=DEFAULT_TARGET)
-    ap.add_argument("--draft",  type=Path, default=DEFAULT_DRAFT_ROOT)
+    ap.add_argument("--draft",  type=Path, default=DEFAULT_DRAFT_ROOT,
+                    help="DFlash draft model (GGUF or safetensors). "
+                         "Can be combined with --mtp-gguf for dual-speculator mode "
+                         "where the backend selects DFlash or MTP per-request.")
     ap.add_argument("--bin",    type=Path, default=DEFAULT_BIN)
     ap.add_argument("--budget", type=int,  default=DEFAULT_BUDGET)
     ap.add_argument("--verify-mode", choices=["ddtree", "fast", "seq", "replay"],
@@ -2755,12 +2782,13 @@ def main():
     ap.add_argument("--peer-access", action="store_true",
                     help="Pass --peer-access to test_dflash (prefer P2P memcpy when available)")
     # ── MTP (Multi-Token Prediction) speculator ──────────────────────────────
-    # When --mtp-gguf is set, the daemon runs MTP-head speculation instead of
-    # DFlash+DDTree. --draft is ignored (the MTP head is in the same GGUF as
-    # target, or a separate fused GGUF).
+    # When --mtp-gguf is set, the daemon loads MTP heads for γ-chain speculation.
+    # --draft may also be provided to enable dual-speculator mode: both DFlash
+    # and MTP are loaded simultaneously; the backend selects per-request based
+    # on prompt length (auto) or an explicit speculator= field in the request.
     ap.add_argument("--mtp-gguf", type=Path, default=None,
-                    help="Path to MTP-fused GGUF. When set, daemon runs MTP "
-                         "speculation; --draft and DFlash flags are ignored.")
+                    help="Path to MTP-fused GGUF. When set together with --draft, "
+                         "both speculators are loaded and dispatched per-request.")
     ap.add_argument("--mtp-gamma", type=int, default=3,
                     help="MTP chain depth (default 3; recommended D=3 per matrix bench)")
     ap.add_argument("--mtp-draft-source", choices=["chain", "mtp_topk"], default="chain",
@@ -2813,12 +2841,22 @@ def main():
         # --prefix-cache-slots behave the same as on the qwen35 path.
         draft = None
     elif args.mtp_gguf is not None:
-        # MTP mode: --draft is ignored; MTP head lives in the target (or in --mtp-gguf
-        # if separate). Prefix/full cache may stay enabled; PrefixSnapshot
-        # now carries native-head KV alongside backbone KV.
+        # MTP mode: --mtp-gguf is required; --draft is optional.
+        # When --draft is also provided both are loaded simultaneously
+        # (dual-speculator mode) and the backend dispatches per-request.
         if not args.mtp_gguf.is_file():
             raise SystemExit(f"--mtp-gguf not found at {args.mtp_gguf}")
-        draft = None
+        if args.draft is not None and args.draft != DEFAULT_DRAFT_ROOT:
+            # Explicit --draft provided alongside --mtp-gguf: resolve it.
+            draft_candidate = resolve_draft(args.draft) if args.draft.is_dir() else args.draft
+            if draft_candidate.is_file():
+                draft = draft_candidate
+                print(f"  [cfg] dual-speculator: DFlash draft={draft} + MTP={args.mtp_gguf}")
+            else:
+                print(f"  [cfg] --draft path not found ({args.draft}); MTP-only mode")
+                draft = None
+        else:
+            draft = None
     else:
         draft = resolve_draft(args.draft) if args.draft.is_dir() else args.draft
         if not draft.is_file():

@@ -1633,30 +1633,35 @@ int main(int argc, char ** argv) {
         }
         const int max_ctx_eff = g_max_ctx_override > 0 ? g_max_ctx_override : 4096;
         // ---- MTP daemon path: load once, serve requests via daemon protocol ----
+        // When --draft is also provided, both DFlash drafter and MTP heads are
+        // loaded simultaneously (dual-speculator mode). The backend selects the
+        // active speculator per-request via resolve_speculator().
         if (daemon_mode) {
             std::fprintf(stderr,
                 "[test_dflash] arch=qwen35+mtp daemon -> dispatching to run_qwen35_daemon "
-                "(mtp=%s gamma=%d max_ctx=%d stream_fd=%d)\n",
-                mtp_gguf_path, mtp_gamma, max_ctx_eff, stream_fd);
+                "(mtp=%s gamma=%d draft=%s max_ctx=%d stream_fd=%d)\n",
+                mtp_gguf_path, mtp_gamma,
+                draft_path ? draft_path : "none",
+                max_ctx_eff, stream_fd);
             dflash27b::Qwen35DaemonArgs qargs;
             qargs.target_path       = target_path;
-            qargs.draft_path        = nullptr;   // MTP mode: no DFlash draft
+            qargs.draft_path        = draft_path;  // nullptr = MTP-only; set = dual-speculator
             qargs.device.gpu        = target_gpu;
             qargs.device.max_ctx    = max_ctx_eff;
-            qargs.draft_gpu         = target_gpu;
+            qargs.draft_gpu         = draft_gpu;
             qargs.stream_fd         = stream_fd;
             qargs.chunk             = 512;
             qargs.fa_window         = g_fa_window;
             qargs.kq_stride_pad     = g_kq_stride_pad;
-            qargs.draft_swa_window  = 0;
-            qargs.draft_ctx_max     = 0;
-            qargs.fast_rollback     = false;
-            qargs.seq_verify        = false;
+            qargs.draft_swa_window  = g_draft_swa_window;
+            qargs.draft_ctx_max     = g_draft_ctx_max;
+            qargs.fast_rollback     = fast_rollback;
+            qargs.seq_verify        = seq_verify;
             qargs.ddtree_mode       = ddtree_budget > 0 && ddtree_mode;
             qargs.ddtree_budget     = ddtree_budget;
             qargs.ddtree_temp       = ddtree_temp;
             qargs.ddtree_chain_seed = ddtree_chain_seed;
-            qargs.use_feature_mirror = false;
+            qargs.use_feature_mirror = draft_feature_mirror;
             qargs.mtp_gguf_path     = mtp_gguf_path;
             qargs.mtp_gamma         = mtp_gamma;
             qargs.mtp_draft_source  = mtp_draft_source;

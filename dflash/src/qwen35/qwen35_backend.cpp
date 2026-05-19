@@ -64,7 +64,8 @@ bool Qwen35Backend::init() {
     }
     std::printf("[target] %s\n", dflash27b_last_error());
 
-    // Load draft (skipped in MTP mode — mtp_gguf_path replaces the draft)
+    // Load draft when a DFlash draft path is provided. In dual-speculator mode
+    // (both draft_path and mtp_gguf_path set) both are loaded simultaneously.
     if (cfg_.draft_path) {
         std::string dp(cfg_.draft_path);
         bool draft_ok = (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
@@ -86,9 +87,9 @@ bool Qwen35Backend::init() {
     }
 
     // Create KV cache.
-    // MTP mode: size for max(gamma+1, ddtree_budget+1) verify tokens so the
-    // speculative verify batch fits even without a DFlash draft block size.
-    // DFlash mode: existing logic uses dw_.block_size.
+    // When MTP is active size for max(gamma+1, ddtree_budget+1).
+    // When DFlash is active size for dw_.block_size (or ddtree_budget+1).
+    // In dual-speculator mode take the larger of the two so both paths fit.
     int max_verify_tokens = 0;
     if (cfg_.mtp_gguf_path) {
         const int mtp_gamma_eff = std::max(1, cfg_.mtp_gamma);
@@ -97,10 +98,16 @@ bool Qwen35Backend::init() {
         // Ensure at least DFLASH27B_DRAFT_BLOCK_SIZE so internal buffers
         // allocated by create_target_cache are sized conservatively.
         max_verify_tokens = std::max(max_verify_tokens, DFLASH27B_DRAFT_BLOCK_SIZE);
-    } else {
-        max_verify_tokens = cfg_.ddtree_mode
+    }
+    if (cfg_.draft_path) {
+        int dflash_verify = cfg_.ddtree_mode
             ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
             : dw_.block_size;
+        max_verify_tokens = std::max(max_verify_tokens, dflash_verify);
+    }
+    if (max_verify_tokens == 0) {
+        // Fallback: no speculator configured (pure AR path).
+        max_verify_tokens = DFLASH27B_DRAFT_BLOCK_SIZE;
     }
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true)) {
@@ -126,6 +133,12 @@ bool Qwen35Backend::init() {
         if (!init_mtp_()) {
             return false;
         }
+    }
+
+    // Log the dual-speculator config so the boot banner confirms both are loaded.
+    if (cfg_.draft_path && cfg_.mtp_gguf_path) {
+        std::printf("[speculators] dual-mode: DFlash+MTP both loaded (auto_select threshold=4096 tokens)\n");
+        std::fflush(stdout);
     }
 
     return true;
@@ -256,16 +269,30 @@ bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & i
             skip_park = true;
     }
 
-    // Parse: "compress <path> <keep_x1000> <drafter_gguf> [nopark]"
+    // Parse: "compress <path> <keep_x1000> <drafter_gguf> [drafter_arch] [nopark]"
+    // drafter_arch is optional; when absent we default to qwen3-0.6b for
+    // backwards compatibility with callers that emit the 3-arg form.
     char ppath[1024];
     int  keep_x1000 = 0;
     char drafter_path[1024] = {0};
-    const int n = std::sscanf(line.c_str() + 9, "%1023s %d %1023s",
-                               ppath, &keep_x1000, drafter_path);
+    char drafter_arch_str[64] = {0};
+    const int n = std::sscanf(line.c_str() + 9, "%1023s %d %1023s %63s",
+                               ppath, &keep_x1000, drafter_path, drafter_arch_str);
     if (n < 2) {
         std::fprintf(stderr, "[compress] bad args\n");
         io.emit(-1);
         return false;
+    }
+    // The 4th token might be "nopark" (legacy 3-arg form with nopark suffix).
+    // Only treat it as arch if it parses successfully via parse_drafter_arch.
+    DrafterArch arch = DrafterArch::Qwen3_0p6b;
+    if (n >= 4 && drafter_arch_str[0] && std::strcmp(drafter_arch_str, "nopark") != 0) {
+        if (!parse_drafter_arch(drafter_arch_str, arch)) {
+            std::fprintf(stderr,
+                "[compress] unknown drafter_arch '%s' — falling back to qwen3-0.6b\n",
+                drafter_arch_str);
+            arch = DrafterArch::Qwen3_0p6b;
+        }
     }
 
     const char * dpath = (n >= 3 && drafter_path[0])
@@ -295,8 +322,9 @@ bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & i
     // creates the backend + loads weights; subsequent calls reuse them.
     if (!drafter_loaded_) {
         // drafter_ctx_.backend == nullptr → load_drafter creates its own
-        std::fprintf(stderr, "[compress] loading drafter from %s ...\n", dpath);
-        if (!load_drafter(dpath, /*gpu_layers=*/999, drafter_ctx_)) {
+        std::fprintf(stderr, "[compress] loading drafter (arch=%s) from %s ...\n",
+                     drafter_arch_name(arch), dpath);
+        if (!load_drafter(dpath, /*gpu_layers=*/999, arch, drafter_ctx_)) {
             std::fprintf(stderr, "[compress] drafter init failed: %s\n",
                          dflash27b_last_error());
             io.emit(-1);
@@ -413,6 +441,33 @@ void Qwen35Backend::shutdown() {
     }
 }
 
+// ── Speculator dispatch helpers ─────────────────────────────────────────
+
+SpeculatorMode Qwen35Backend::auto_select(const GenerateRequest & req) const {
+    const bool has_dflash = cfg_.draft_path != nullptr && !draft_parked_;
+    const bool has_mtp    = supports_mtp();
+    if (!has_dflash && !has_mtp) return SpeculatorMode::DFLASH;  // AR fallback
+    if (!has_mtp)    return SpeculatorMode::DFLASH;
+    if (!has_dflash) return SpeculatorMode::MTP;
+    // Threshold: 4096 tokens. Code/math ≤4K → DFlash wins 1.75-2.57×;
+    // longer/agent → MTP (DFlash accept collapses post-PFlash compression).
+    return ((int)req.prompt.size() > 4096) ? SpeculatorMode::MTP : SpeculatorMode::DFLASH;
+}
+
+SpeculatorMode Qwen35Backend::resolve_speculator(const GenerateRequest & req) const {
+    const bool has_dflash = cfg_.draft_path != nullptr && !draft_parked_;
+    const bool has_mtp    = supports_mtp();
+
+    if (req.speculator == "dflash") {
+        if (has_dflash) return SpeculatorMode::DFLASH;
+        std::fprintf(stderr, "[generate] speculator=dflash requested but DFlash not loaded; falling back to auto\n");
+    } else if (req.speculator == "mtp") {
+        if (has_mtp) return SpeculatorMode::MTP;
+        std::fprintf(stderr, "[generate] speculator=mtp requested but MTP not loaded; falling back to auto\n");
+    }
+    return auto_select(req);
+}
+
 // ── Generate (speculative decode) ───────────────────────────────────────
 
 GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
@@ -432,9 +487,16 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
     reset_recurrent_state(cache_);
     head_kv_warm_ = false;  // R5: invalidate any prior warm state
 
+    const SpeculatorMode chosen = resolve_speculator(req);
+    const char * spec_name = (chosen == SpeculatorMode::MTP) ? "mtp" : "dflash";
+    std::fprintf(stderr, "[generate] speculator=%s (req=%s prompt_tokens=%d)\n",
+                 spec_name,
+                 req.speculator.empty() ? "auto" : req.speculator.c_str(),
+                 (int)req.prompt.size());
+
     // MTP path: delegate to common orchestrator. Cache was already sized in
     // init_mtp_() — no per-request migrate (idempotent no-op).
-    if (supports_mtp()) {
+    if (chosen == SpeculatorMode::MTP) {
         // Post-warm callback only flips the head_kv_warm_ flag (idempotent —
         // may fire twice on a mid-prompt snap: once after partial warm, once
         // after full warm). The snapshot itself + ack are taken by the
@@ -491,6 +553,13 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
         sampler_rng_.seed(sampler_.seed);
     }
 
+    const SpeculatorMode chosen = resolve_speculator(req);
+    const char * spec_name = (chosen == SpeculatorMode::MTP) ? "mtp" : "dflash";
+    std::fprintf(stderr, "[generate] speculator=%s (req=%s prompt_tokens=%d) [RESTORE slot=%d]\n",
+                 spec_name,
+                 req.speculator.empty() ? "auto" : req.speculator.c_str(),
+                 (int)req.prompt.size(), slot);
+
     const int snap_pos = snap.cur_pos;
     cache_.cur_pos = snap_pos;
 
@@ -505,7 +574,7 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
     // partial-WARM when prompt_len > snap_pos (delta prefill + range-warm).
     // Both gate on the same tok/shape contract; failure falls through to the
     // cold-restart fallback below.
-    if (supports_mtp() && mtp_module_ && prompt_len >= snap_pos &&
+    if (chosen == SpeculatorMode::MTP && mtp_module_ && prompt_len >= snap_pos &&
         snap.prefill_next_tok >= 0 && !snap.mtp_head_kv.empty()) {
         const auto & w = mtp_module_->weights();
         const bool tok_match = (snap.prefill_next_tok == cache_.last_tok);
@@ -582,7 +651,7 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
         return result;
     }
 
-    if (supports_mtp() && mtp_module_ && !mtp_head_kv_restored && prompt_len >= snap_pos) {
+    if (chosen == SpeculatorMode::MTP && mtp_module_ && !mtp_head_kv_restored && prompt_len >= snap_pos) {
         // Cold-restart fallback: covers BOTH (a) prompt_len == snap_pos with
         // perfect-WARM head_kv restore having failed (shape mismatch, tok
         // mismatch, or restore_head_kv error) AND (b) prompt_len > snap_pos
@@ -621,7 +690,7 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
     // Decode
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
-        bool ok = supports_mtp()
+        bool ok = (chosen == SpeculatorMode::MTP)
             ? do_mtp_decode_(committed, req.n_gen, result.tokens, io)
             : do_spec_decode(committed, req.n_gen, result.tokens, out_io);
         if (!ok) {

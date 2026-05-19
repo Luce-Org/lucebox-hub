@@ -48,6 +48,11 @@ struct DaemonIO {
 
 // ─── Generate request/result ────────────────────────────────────────────
 
+// Per-request speculator selector.
+// "auto"   : backend picks based on prompt length heuristic (default).
+// "dflash" : force DFlash speculative decode.
+// "mtp"    : force MTP γ-chain decode.
+// Unrecognised values are treated as "auto".
 struct GenerateRequest {
     std::vector<int32_t>       prompt;
     int                        n_gen       = 0;
@@ -62,6 +67,8 @@ struct GenerateRequest {
     // immediately. This is the primary mechanism for client-disconnect
     // cancellation in the native HTTP server.
     TokenCallback              on_token;
+    // Per-request speculator override: "dflash", "mtp", or "auto" (default).
+    std::string                speculator;  // empty == "auto"
 };
 
 struct GenerateResult {

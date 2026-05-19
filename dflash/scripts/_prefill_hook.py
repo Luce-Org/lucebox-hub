@@ -59,6 +59,7 @@ class PrefillConfig:
     keep_ratio: float                                  # 0.015..0.125
     drafter_gguf: Optional[Path]                       # drafter weights (Qwen3-0.6B BF16 GGUF)
     drafter_tokenizer_id: str                          # HF repo ID for drafter vocab
+    drafter_arch: str = "qwen3-0.6b"                   # daemon arch selector: qwen3-0.6b | qwen35-0.8b
     skip_park: bool = False                            # skip park/unpark on >=32 GB GPUs
 
     @property
@@ -93,6 +94,9 @@ def add_cli_flags(ap) -> None:
     ap.add_argument("--prefill-drafter-tokenizer", default="Qwen/Qwen3-0.6B",
                     help="HF repo ID for the drafter tokenizer "
                          "(default Qwen/Qwen3-0.6B).")
+    ap.add_argument("--prefill-drafter-arch", default="qwen3-0.6b",
+                    choices=["qwen3-0.6b", "qwen35-0.8b"],
+                    help="Daemon-side drafter architecture (default qwen3-0.6b).")
     ap.add_argument("--prefill-skip-park", action="store_true", default=False,
                     help="Skip park/unpark/free-drafter on GPUs with enough VRAM "
                          "to hold target + draft + scorer simultaneously (e.g. "
@@ -115,6 +119,7 @@ def config_from_args(args) -> PrefillConfig:
         keep_ratio=args.prefill_keep_ratio,
         drafter_gguf=args.prefill_drafter,
         drafter_tokenizer_id=args.prefill_drafter_tokenizer,
+        drafter_arch=getattr(args, 'prefill_drafter_arch', 'qwen3-0.6b'),
         skip_park=getattr(args, 'prefill_skip_park', False),
     )
 
@@ -165,8 +170,12 @@ def compress_text_via_daemon(
         # on the unpark restore and crashes with ggml shape assertions.
         keep_x1000 = int(round(cfg.keep_ratio * 1000))
         nopark_tok = " nopark" if skip_park else ""
+        # Drafter arch is the 4th positional token before the optional " nopark"
+        # so the daemon's sscanf %s grabs it. Default qwen3-0.6b keeps backward
+        # compat with the legacy 3-arg form.
+        arch_tok = f" {cfg.drafter_arch}" if cfg.drafter_arch and cfg.drafter_arch != "qwen3-0.6b" else ""
         daemon_stdin.write(
-            f"compress {path} {keep_x1000} {cfg.drafter_gguf}{nopark_tok}\n".encode("utf-8"))
+            f"compress {path} {keep_x1000} {cfg.drafter_gguf}{arch_tok}{nopark_tok}\n".encode("utf-8"))
         daemon_stdin.flush()
         compressed_ids = _drain_until_sentinel(r_pipe)
 
