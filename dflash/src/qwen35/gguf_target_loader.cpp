@@ -278,7 +278,13 @@ bool load_target_gguf_partial(const std::string & path,
     std::string err;
     const uint32_t n_embd = get_u32_or(gctx, "qwen35.embedding_length",    0);
     const uint32_t n_ff   = get_u32_or(gctx, "qwen35.feed_forward_length", 0);
-    const uint32_t n_layer= get_u32_or(gctx, "qwen35.block_count",         0);
+    const uint32_t n_block_raw = get_u32_or(gctx, "qwen35.block_count",    0);
+    // Qwen3.6 MTP GGUFs append `nextn_predict_layers` extra blocks holding the
+    // NextN heads (e.g. block_count=65 = 63 backbone + 2 MTP heads). The qwen36
+    // MTP loader picks those up separately; here we treat n_layer as backbone
+    // layers only so the divisibility check + tensor binding ignore the heads.
+    const uint32_t n_nextn = get_u32_or(gctx, "qwen35.nextn_predict_layers", 0);
+    const uint32_t n_layer = n_block_raw > n_nextn ? n_block_raw - n_nextn : n_block_raw;
     const uint32_t n_head = get_u32_or(gctx, "qwen35.attention.head_count",0);
     const uint32_t n_headkv=get_u32_or(gctx, "qwen35.attention.head_count_kv",0);
     const uint32_t kl     = get_u32_or(gctx, "qwen35.attention.key_length",   0);
@@ -363,9 +369,16 @@ bool load_target_gguf_partial(const std::string & path,
 
     TargetLoadPlan plan = plan_in;
     if (plan.layer_begin < 0) plan.layer_begin = 0;
-    if (plan.layer_end < 0) plan.layer_end = (int)n_layer;
+    // Default layer_end to ALL gguf blocks (n_block_raw), not just backbone
+    // (n_layer). MTP variants append NextN head blocks past n_layer; the MTP
+    // loader binds them by name in the same meta_ctx the backbone loader
+    // populates, so they MUST be loaded onto the GPU here. Filtering them out
+    // (the old "plan.layer_end = n_layer" default) made `find_tensor` succeed
+    // descriptor-wise but with t->data==nullptr — the MTP path then failed
+    // with "missing required tensor: blk.{n_layer}.attn_q.weight".
+    if (plan.layer_end < 0) plan.layer_end = (int)n_block_raw;
     if (plan.layer_begin > plan.layer_end ||
-        plan.layer_end > (int)n_layer) {
+        plan.layer_end > (int)n_block_raw) {
         char buf[160];
         std::snprintf(buf, sizeof(buf),
             "invalid target load layer range [%d,%d) for n_layer=%u",
@@ -552,6 +565,18 @@ bool load_target_gguf_partial(const std::string & path,
     size_t total = 0;
     size_t tok_embd_off = 0, tok_embd_sz = 0;
     ggml_type tok_embd_type = GGML_TYPE_COUNT;
+    // F32 norm/SSM weights are the easiest way to spot a corrupt GGUF: any
+    // NaN in them poisons every later layer's logits to NaN, and the only
+    // user-visible symptom is the cryptic "prefill produced invalid token"
+    // emitted N seconds later by test_dflash's argmax check. Unsloth's
+    // Qwen3.6-27B-MTP-Q4_K_M.gguf (May 2026) ships with ~349 corrupt F32
+    // tensors (NaN in attn_norm / post_attention_norm / ssm_alpha / ssm_beta
+    // / ssm_conv1d / *_q_norm / *_k_norm), so we fail-fast here with the
+    // exact tensor name + count instead of letting the GPU graph silently
+    // produce nan-everywhere logits. CPU-side mmap scan, no extra GPU work.
+    int corrupt_f32_count = 0;
+    std::string first_corrupt_name;
+    size_t first_corrupt_nan = 0;
     for (int64_t tid = 0; tid < n_tensors; tid++) {
         const char * tname = gguf_get_tensor_name(gctx, tid);
         ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
@@ -573,8 +598,38 @@ bool load_target_gguf_partial(const std::string & path,
         if (!should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output)) {
             continue;
         }
+        if (gguf_get_tensor_type(gctx, tid) == GGML_TYPE_F32) {
+            const float * fp = (const float *)((const uint8_t *)mm.addr + off);
+            const size_t n_elem = sz / sizeof(float);
+            size_t n_nan = 0;
+            for (size_t i = 0; i < n_elem; i++) {
+                // Bit-level NaN test: any float whose exponent is all-1 and
+                // mantissa is non-zero. Faster + portable vs std::isnan.
+                uint32_t u;
+                std::memcpy(&u, fp + i, sizeof(u));
+                if ((u & 0x7F800000u) == 0x7F800000u && (u & 0x007FFFFFu) != 0u) n_nan++;
+            }
+            if (n_nan > 0) {
+                if (corrupt_f32_count == 0) {
+                    first_corrupt_name = tname;
+                    first_corrupt_nan  = n_nan;
+                }
+                corrupt_f32_count++;
+            }
+        }
         ggml_backend_tensor_set(t, (const uint8_t *)mm.addr + off, 0, sz);
         total += sz;
+    }
+    if (corrupt_f32_count > 0) {
+        char buf[384];
+        std::snprintf(buf, sizeof(buf),
+            "GGUF has %d F32 weight tensor(s) with NaN values (first: '%s' with %zu NaN). "
+            "This GGUF is corrupt — every NaN in a norm/SSM weight propagates to all "
+            "downstream logits. Re-download or use a different quantization.",
+            corrupt_f32_count, first_corrupt_name.c_str(), first_corrupt_nan);
+        set_last_error(buf);
+        gguf_free(gctx);
+        return false;
     }
 
     // ── 4b. Read NVFP4 per-tensor weight scales (optional; 1.0 for non-NVFP4).

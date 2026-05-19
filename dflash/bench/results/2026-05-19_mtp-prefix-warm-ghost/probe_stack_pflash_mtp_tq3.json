@@ -1,0 +1,724 @@
+{
+  "command": "probe",
+  "url": "http://127.0.0.1:18080",
+  "install_results": [],
+  "clients": [
+    {
+      "client": "claude_code",
+      "protocol": "anthropic_messages",
+      "package": "@anthropic-ai/claude-code",
+      "package_smoke": null,
+      "ok": true,
+      "probes": [
+        {
+          "name": "/health",
+          "ok": true,
+          "status": 200,
+          "required": true,
+          "seconds": 0.015,
+          "usage": null,
+          "body_tail": "{\"status\": \"ok\"}"
+        },
+        {
+          "name": "/v1/models",
+          "ok": true,
+          "status": 200,
+          "required": true,
+          "seconds": 0.001,
+          "usage": null,
+          "body_tail": "{\"object\": \"list\", \"data\": [{\"id\": \"luce-dflash\", \"object\": \"model\", \"owned_by\": \"luce\", \"created\": 1700000000, \"context_length\": 32768, \"max_context_length\": 32768}]}"
+        },
+        {
+          "name": "anthropic.messages_stream",
+          "ok": true,
+          "status": 200,
+          "seconds": 1.15,
+          "first_token_seconds": 0.409,
+          "events": 6,
+          "text_deltas": 1,
+          "generated_ok": true,
+          "generated_chars": 129,
+          "generated_text_tail": "The user wants me to reply with a specific string: \"lucebox-stream-ok two\".\nI should output exactly that string and nothing else.",
+          "expected_substring": "lucebox",
+          "expected_substring_seen": true
+        },
+        {
+          "name": "anthropic.messages",
+          "ok": true,
+          "status": 200,
+          "required": false,
+          "seconds": 0.684,
+          "usage": {
+            "input_tokens": 78,
+            "output_tokens": 31
+          },
+          "body_tail": "{\"id\": \"msg_9d4158cfca5e421abce8e81e\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"luce-dflash\", \"content\": [{\"type\": \"text\", \"text\": \"Thinking Process:\\n\\n1.  **Analyze the Request:**\\n    *   Goal: Check a local model server.\\n    *   Constraint\"}], \"stop_reason\": \"end_turn\", \"stop_sequence\": null, \"usage\": {\"input_tokens\": 78, \"output_tokens\": 31}}",
+          "generated_ok": true,
+          "generated_chars": 108,
+          "generated_text_tail": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Goal: Check a local model server.\n    *   Constraint",
+          "expected_substring": "lucebox",
+          "expected_substring_seen": false
+        }
+      ],
+      "started_ms": 1779187499093,
+      "ended_ms": 1779187500943
+    },
+    {
+      "client": "codex",
+      "protocol": "responses",
+      "package": "@openai/codex",
+      "package_smoke": null,
+      "ok": true,
+      "probes": [
+        {
+          "name": "codex.models",
+          "ok": true,
+          "status": 200,
+          "seconds": 0.001,
+          "body_tail": "{\"models\": [{\"slug\": \"luce-dflash\", \"display_name\": \"luce-dflash\", \"description\": \"Local DFlash speculative-decoding server\", \"default_reasoning_level\": \"low\", \"supported_reasoning_levels\": [{\"effort\": \"low\", \"description\": \"No thinking\"}, {\"effort\": \"medium\", \"description\": \"Thinking enabled\"}], \"shell_type\": \"shell_command\", \"visibility\": \"list\", \"supported_in_api\": true, \"priority\": 1, \"context_window\": 32768, \"supports_reasoning_summaries\": false, \"supports_parallel_tool_calls\": false}]}"
+        },
+        {
+          "name": "responses.non_stream",
+          "ok": true,
+          "status": 200,
+          "required": true,
+          "seconds": 0.743,
+          "usage": {
+            "input_tokens": 92,
+            "output_tokens": 31,
+            "total_tokens": 123
+          },
+          "body_tail": "{\"id\": \"resp_b8ee863b67ec4aa984e0232e\", \"object\": \"response\", \"created_at\": 1779187500, \"status\": \"completed\", \"model\": \"luce-dflash\", \"output\": [{\"type\": \"message\", \"id\": \"msg_c401f116b8ba48f7bd1202e2\", \"status\": \"completed\", \"role\": \"assistant\", \"content\": [{\"type\": \"output_text\", \"text\": \"Here's a thinking process:\\n\\n1.  **Analyze User Input:**\\n   - **Function:** `clamp(x, lo, hi)`\", \"annotations\": []}]}], \"output_text\": \"Here's a thinking process:\\n\\n1.  **Analyze User Input:**\\n   - **Function:** `clamp(x, lo, hi)`\", \"usage\": {\"input_tokens\": 92, \"output_tokens\": 31, \"total_tokens\": 123}}",
+          "generated_ok": true,
+          "generated_chars": 93,
+          "generated_text_tail": "Here's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Function:** `clamp(x, lo, hi)`",
+          "expected_substring": "lucebox",
+          "expected_substring_seen": false
+        },
+        {
+          "name": "responses.stream",
+          "ok": true,
+          "status": 200,
+          "seconds": 0.74,
+          "first_event_seconds": 0.047,
+          "events": 35,
+          "event_types": [
+            "response.completed",
+            "response.content_part.added",
+            "response.content_part.done",
+            "response.created",
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.output_text.delta",
+            "response.output_text.done"
+          ],
+          "generated_ok": true,
+          "generated_chars": 94,
+          "generated_text_tail": "\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Function:** `clamp(x, lo, hi)`",
+          "expected_substring": "lucebox",
+          "expected_substring_seen": false
+        }
+      ],
+      "started_ms": 1779187500943,
+      "ended_ms": 1779187502427
+    },
+    {
+      "client": "hermes",
+      "protocol": "openai_chat",
+      "package": "https://github.com/NousResearch/hermes-agent",
+      "package_smoke": null,
+      "ok": true,
+      "probes": [
+        {
+          "name": "/health",
+          "ok": true,
+          "status": 200,
+          "required": true,
+          "seconds": 0.001,
+          "usage": null,
+          "body_tail": "{\"status\": \"ok\"}"
+        },
+        {
+          "name": "/v1/models",
+          "ok": true,
+          "status": 200,
+          "required": true,
+          "seconds": 0.0,
+          "usage": null,
+          "body_tail": "{\"object\": \"list\", \"data\": [{\"id\": \"luce-dflash\", \"object\": \"model\", \"owned_by\": \"luce\", \"created\": 1700000000, \"context_length\": 32768, \"max_context_length\": 32768}]}"
+        },
+        {
+          "name": "chat.stream",
+          "ok": true,
+          "status": 200,
+          "seconds": 0.737,
+          "first_token_seconds": 0.047,
+          "events": 31,
+          "token_deltas": 28,
+          "generated_ok": true,
+          "generated_chars": 94,
+          "generated_text_tail": "\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Function:** `clamp(x, lo, hi)`",
+          "expected_substring": "lucebox",
+          "expected_substring_seen": false,
+          "tail": [
+            {
+              "id": "chatcmpl-6193df5627f240b697972262",
+              "object": "chat.completion.chunk",
+              "created": 1779187502,
+              "model": "luce-dflash",
+              "choices": [
+                {
+                  "index": 0,
+                  "delta": {
+                    "content": "x, lo, hi)`"
+                  },
+                  "finish_reason": null
+                }
+              ]
+            },
+            {
+              "id": "chatcmpl-6193df5627f240b697972262",
+              "object": "chat.completion.chunk",
+              "created": 1779187502,
+              "model": "luce-dflash",
+              "choices": [
+                {
+                  "index": 0,
+                  "delta": {},
+                  "finish_reason": "stop"
+                }
+              ]
+            },
+            {
+              "id": "chatcmpl-6193df5627f240b697972262",
+              "object": "chat.completion.chunk",
+              "created": 1779187502,
+              "model": "luce-dflash",
+              "choices": [],
+              "usage": {
+                "prompt_tokens": 89,
+                "completion_tokens": 31,
+                "total_tokens": 120
+              }
+            }
+          ]
+        },
+        {
+          "name": "chat.non_stream",
+          "ok": true,
+          "status": 200,
+          "required": false,
+          "seconds": 0.741,
+          "usage": {
+            "prompt_tokens": 90,
+            "completion_tokens": 31,
+            "total_tokens": 121
+          },
+          "body_tail": "{\"id\": \"chatcmpl-dc135bfb20044d8fa89ac533\", \"object\": \"chat.completion\", \"created\": 1779187503, \"model\": \"luce-dflash\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"Here's a thinking process:\\n\\n1.  **Analyze User Input:**\\n   - **Function:** `clamp(x, lo, hi)`\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 90, \"completion_tokens\": 31, \"total_tokens\": 121}}",
+          "generated_ok": true,
+          "generated_chars": 93,
+          "generated_text_tail": "Here's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Function:** `clamp(x, lo, hi)`",
+          "expected_substring": "lucebox",
+          "expected_substring_seen": false
+        },
+        {
+          "name": "chat.tools_accepted",
+          "ok": true,
+          "status": 200,
+          "required": true,
+          "seconds": 0.382,
+          "usage": {
+            "prompt_tokens": 30,
+            "completion_tokens": 15,
+            "total_tokens": 45
+          },
+          "body_tail": "{\"id\": \"chatcmpl-eb09902644d3411d84a284d3\", \"object\": \"chat.completion\", \"created\": 1779187503, \"model\": \"luce-dflash\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"Here's a thinking process:\\n\\n1.  **Analyze User\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 30, \"completion_tokens\": 15, \"total_tokens\": 45}}"
+        }
+      ],
+      "started_ms": 1779187502427,
+      "ended_ms": 1779187504289
+    },
+    {
+      "client": "openclaw",
+      "protocol": "openai_chat",
+      "package": "openclaw",
+      "package_smoke": null,
+      "ok": true,
+      "probes": [
+        {
+          "name": "/health",
+          "ok": true,
+          "status": 200,
+          "required": true,
+          "seconds": 0.001,
+          "usage": null,
+          "body_tail": "{\"status\": \"ok\"}"
+        },
+        {
+          "name": "/v1/models",
+          "ok": true,
+          "status": 200,
+          "required": true,
+          "seconds": 0.001,
+          "usage": null,
+          "body_tail": "{\"object\": \"list\", \"data\": [{\"id\": \"luce-dflash\", \"object\": \"model\", \"owned_by\": \"luce\", \"created\": 1700000000, \"context_length\": 32768, \"max_context_length\": 32768}]}"
+        },
+        {
+          "name": "chat.stream",
+          "ok": true,
+          "status": 200,
+          "seconds": 0.75,
+          "first_token_seconds": 0.051,
+          "events": 31,
+          "token_deltas": 28,
+          "generated_ok": true,
+          "generated_chars": 94,
+          "generated_text_tail": "\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Function:** `clamp(x, lo, hi)`",
+          "expected_substring": "lucebox",
+          "expected_substring_seen": false,
+          "tail": [
+            {
+              "id": "chatcmpl-5f8c16c7803349d59c0fe937",
+              "object": "chat.completion.chunk",
+              "created": 1779187504,
+              "model": "luce-dflash",
+              "choices": [
+                {
+                  "index": 0,
+                  "delta": {
+                    "content": "x, lo, hi)`"
+                  },
+                  "finish_reason": null
+                }
+              ]
+            },
+            {
+              "id": "chatcmpl-5f8c16c7803349d59c0fe937",
+              "object": "chat.completion.chunk",
+              "created": 1779187504,
+              "model": "luce-dflash",
+              "choices": [
+                {
+                  "index": 0,
+                  "delta": {},
+                  "finish_reason": "stop"
+                }
+              ]
+            },
+            {
+              "id": "chatcmpl-5f8c16c7803349d59c0fe937",
+              "object": "chat.completion.chunk",
+              "created": 1779187504,
+              "model": "luce-dflash",
+              "choices": [],
+              "usage": {
+                "prompt_tokens": 89,
+                "completion_tokens": 31,
+                "total_tokens": 120
+              }
+            }
+          ]
+        },
+        {
+          "name": "chat.non_stream",
+          "ok": true,
+          "status": 200,
+          "required": false,
+          "seconds": 0.743,
+          "usage": {
+            "prompt_tokens": 90,
+            "completion_tokens": 31,
+            "total_tokens": 121
+          },
+          "body_tail": "{\"id\": \"chatcmpl-32a70177bda144aebfbc7d3b\", \"object\": \"chat.completion\", \"created\": 1779187505, \"model\": \"luce-dflash\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"Here's a thinking process:\\n\\n1.  **Analyze User Input:**\\n   - **Function:** `clamp(x, lo, hi)`\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 90, \"completion_tokens\": 31, \"total_tokens\": 121}}",
+          "generated_ok": true,
+          "generated_chars": 93,
+          "generated_text_tail": "Here's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Function:** `clamp(x, lo, hi)`",
+          "expected_substring": "lucebox",
+          "expected_substring_seen": false
+        },
+        {
+          "name": "chat.tools_accepted",
+          "ok": true,
+          "status": 200,
+          "required": true,
+          "seconds": 0.337,
+          "usage": {
+            "prompt_tokens": 30,
+            "completion_tokens": 9,
+            "total_tokens": 39
+          },
+          "body_tail": "{\"id\": \"chatcmpl-2dd9e0de27194944b86c63d9\", \"object\": \"chat.completion\", \"created\": 1779187505, \"model\": \"luce-dflash\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"The lucebox system is ready.\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 30, \"completion_tokens\": 9, \"total_tokens\": 39}}"
+        }
+      ],
+      "started_ms": 1779187504289,
+      "ended_ms": 1779187506120
+    },
+    {
+      "client": "openwebui",
+      "protocol": "openwebui",
+      "package": "open-webui",
+      "package_smoke": null,
+      "ok": true,
+      "probes": [
+        {
+          "name": "/health",
+          "ok": true,
+          "status": 200,
+          "required": true,
+          "seconds": 0.001,
+          "usage": null,
+          "body_tail": "{\"status\": \"ok\"}"
+        },
+        {
+          "name": "/v1/models",
+          "ok": true,
+          "status": 200,
+          "required": true,
+          "seconds": 0.0,
+          "usage": null,
+          "body_tail": "{\"object\": \"list\", \"data\": [{\"id\": \"luce-dflash\", \"object\": \"model\", \"owned_by\": \"luce\", \"created\": 1700000000, \"context_length\": 32768, \"max_context_length\": 32768}]}"
+        },
+        {
+          "name": "chat.stream",
+          "ok": true,
+          "status": 200,
+          "seconds": 0.742,
+          "first_token_seconds": 0.047,
+          "events": 31,
+          "token_deltas": 28,
+          "generated_ok": true,
+          "generated_chars": 94,
+          "generated_text_tail": "\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Function:** `clamp(x, lo, hi)`",
+          "expected_substring": "lucebox",
+          "expected_substring_seen": false,
+          "tail": [
+            {
+              "id": "chatcmpl-642c6cc7b6ea4770bd7e730f",
+              "object": "chat.completion.chunk",
+              "created": 1779187506,
+              "model": "luce-dflash",
+              "choices": [
+                {
+                  "index": 0,
+                  "delta": {
+                    "content": "x, lo, hi)`"
+                  },
+                  "finish_reason": null
+                }
+              ]
+            },
+            {
+              "id": "chatcmpl-642c6cc7b6ea4770bd7e730f",
+              "object": "chat.completion.chunk",
+              "created": 1779187506,
+              "model": "luce-dflash",
+              "choices": [
+                {
+                  "index": 0,
+                  "delta": {},
+                  "finish_reason": "stop"
+                }
+              ]
+            },
+            {
+              "id": "chatcmpl-642c6cc7b6ea4770bd7e730f",
+              "object": "chat.completion.chunk",
+              "created": 1779187506,
+              "model": "luce-dflash",
+              "choices": [],
+              "usage": {
+                "prompt_tokens": 90,
+                "completion_tokens": 31,
+                "total_tokens": 121
+              }
+            }
+          ]
+        },
+        {
+          "name": "chat.non_stream",
+          "ok": true,
+          "status": 200,
+          "required": false,
+          "seconds": 0.737,
+          "usage": {
+            "prompt_tokens": 91,
+            "completion_tokens": 31,
+            "total_tokens": 122
+          },
+          "body_tail": "{\"id\": \"chatcmpl-ca03adbaa719414db798cc89\", \"object\": \"chat.completion\", \"created\": 1779187506, \"model\": \"luce-dflash\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"Here's a thinking process:\\n\\n1.  **Analyze User Input:**\\n   - **Function:** `clamp(x, lo, hi)`\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 91, \"completion_tokens\": 31, \"total_tokens\": 122}}",
+          "generated_ok": true,
+          "generated_chars": 93,
+          "generated_text_tail": "Here's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Function:** `clamp(x, lo, hi)`",
+          "expected_substring": "lucebox",
+          "expected_substring_seen": false
+        },
+        {
+          "name": "chat.tools_accepted",
+          "ok": true,
+          "status": 200,
+          "required": true,
+          "seconds": 0.333,
+          "usage": {
+            "prompt_tokens": 31,
+            "completion_tokens": 9,
+            "total_tokens": 40
+          },
+          "body_tail": "{\"id\": \"chatcmpl-efe2300036ce4d1581be1efe\", \"object\": \"chat.completion\", \"created\": 1779187507, \"model\": \"luce-dflash\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"The lucebox system is ready.\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 31, \"completion_tokens\": 9, \"total_tokens\": 40}}"
+        },
+        {
+          "name": "openwebui.model_metadata",
+          "ok": true,
+          "status": 200,
+          "seconds": 0.001,
+          "body_tail": "{\"object\": \"list\", \"data\": [{\"id\": \"luce-dflash\", \"object\": \"model\", \"owned_by\": \"luce\", \"created\": 1700000000, \"context_length\": 32768, \"max_context_length\": 32768}]}"
+        }
+      ],
+      "started_ms": 1779187506120,
+      "ended_ms": 1779187507935
+    },
+    {
+      "client": "opencode",
+      "protocol": "openai_chat",
+      "package": "opencode-ai",
+      "package_smoke": null,
+      "ok": true,
+      "probes": [
+        {
+          "name": "/health",
+          "ok": true,
+          "status": 200,
+          "required": true,
+          "seconds": 0.0,
+          "usage": null,
+          "body_tail": "{\"status\": \"ok\"}"
+        },
+        {
+          "name": "/v1/models",
+          "ok": true,
+          "status": 200,
+          "required": true,
+          "seconds": 0.0,
+          "usage": null,
+          "body_tail": "{\"object\": \"list\", \"data\": [{\"id\": \"luce-dflash\", \"object\": \"model\", \"owned_by\": \"luce\", \"created\": 1700000000, \"context_length\": 32768, \"max_context_length\": 32768}]}"
+        },
+        {
+          "name": "chat.stream",
+          "ok": true,
+          "status": 200,
+          "seconds": 0.738,
+          "first_token_seconds": 0.046,
+          "events": 31,
+          "token_deltas": 28,
+          "generated_ok": true,
+          "generated_chars": 94,
+          "generated_text_tail": "\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Function:** `clamp(x, lo, hi)`",
+          "expected_substring": "lucebox",
+          "expected_substring_seen": false,
+          "tail": [
+            {
+              "id": "chatcmpl-c1ea9e270d7d431aab017dae",
+              "object": "chat.completion.chunk",
+              "created": 1779187507,
+              "model": "luce-dflash",
+              "choices": [
+                {
+                  "index": 0,
+                  "delta": {
+                    "content": "x, lo, hi)`"
+                  },
+                  "finish_reason": null
+                }
+              ]
+            },
+            {
+              "id": "chatcmpl-c1ea9e270d7d431aab017dae",
+              "object": "chat.completion.chunk",
+              "created": 1779187507,
+              "model": "luce-dflash",
+              "choices": [
+                {
+                  "index": 0,
+                  "delta": {},
+                  "finish_reason": "stop"
+                }
+              ]
+            },
+            {
+              "id": "chatcmpl-c1ea9e270d7d431aab017dae",
+              "object": "chat.completion.chunk",
+              "created": 1779187507,
+              "model": "luce-dflash",
+              "choices": [],
+              "usage": {
+                "prompt_tokens": 90,
+                "completion_tokens": 31,
+                "total_tokens": 121
+              }
+            }
+          ]
+        },
+        {
+          "name": "chat.non_stream",
+          "ok": true,
+          "status": 200,
+          "required": false,
+          "seconds": 0.739,
+          "usage": {
+            "prompt_tokens": 91,
+            "completion_tokens": 31,
+            "total_tokens": 122
+          },
+          "body_tail": "{\"id\": \"chatcmpl-30956ac89c0c483b916554e7\", \"object\": \"chat.completion\", \"created\": 1779187508, \"model\": \"luce-dflash\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"Here's a thinking process:\\n\\n1.  **Analyze User Input:**\\n   - **Function:** `clamp(x, lo, hi)`\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 91, \"completion_tokens\": 31, \"total_tokens\": 122}}",
+          "generated_ok": true,
+          "generated_chars": 93,
+          "generated_text_tail": "Here's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Function:** `clamp(x, lo, hi)`",
+          "expected_substring": "lucebox",
+          "expected_substring_seen": false
+        },
+        {
+          "name": "chat.tools_accepted",
+          "ok": true,
+          "status": 200,
+          "required": true,
+          "seconds": 0.334,
+          "usage": {
+            "prompt_tokens": 31,
+            "completion_tokens": 9,
+            "total_tokens": 40
+          },
+          "body_tail": "{\"id\": \"chatcmpl-11c0a937ca2249698937bab4\", \"object\": \"chat.completion\", \"created\": 1779187509, \"model\": \"luce-dflash\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"The lucebox system is ready.\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 31, \"completion_tokens\": 9, \"total_tokens\": 40}}"
+        }
+      ],
+      "started_ms": 1779187507935,
+      "ended_ms": 1779187509747
+    },
+    {
+      "client": "pi",
+      "protocol": "openai_chat",
+      "package": "@mariozechner/pi-coding-agent",
+      "package_smoke": null,
+      "ok": true,
+      "probes": [
+        {
+          "name": "/health",
+          "ok": true,
+          "status": 200,
+          "required": true,
+          "seconds": 0.001,
+          "usage": null,
+          "body_tail": "{\"status\": \"ok\"}"
+        },
+        {
+          "name": "/v1/models",
+          "ok": true,
+          "status": 200,
+          "required": true,
+          "seconds": 0.0,
+          "usage": null,
+          "body_tail": "{\"object\": \"list\", \"data\": [{\"id\": \"luce-dflash\", \"object\": \"model\", \"owned_by\": \"luce\", \"created\": 1700000000, \"context_length\": 32768, \"max_context_length\": 32768}]}"
+        },
+        {
+          "name": "chat.stream",
+          "ok": true,
+          "status": 200,
+          "seconds": 0.741,
+          "first_token_seconds": 0.047,
+          "events": 31,
+          "token_deltas": 28,
+          "generated_ok": true,
+          "generated_chars": 94,
+          "generated_text_tail": "\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Function:** `clamp(x, lo, hi)`",
+          "expected_substring": "lucebox",
+          "expected_substring_seen": false,
+          "tail": [
+            {
+              "id": "chatcmpl-657bd21a6a4e4db0bcbeba67",
+              "object": "chat.completion.chunk",
+              "created": 1779187509,
+              "model": "luce-dflash",
+              "choices": [
+                {
+                  "index": 0,
+                  "delta": {
+                    "content": "x, lo, hi)`"
+                  },
+                  "finish_reason": null
+                }
+              ]
+            },
+            {
+              "id": "chatcmpl-657bd21a6a4e4db0bcbeba67",
+              "object": "chat.completion.chunk",
+              "created": 1779187509,
+              "model": "luce-dflash",
+              "choices": [
+                {
+                  "index": 0,
+                  "delta": {},
+                  "finish_reason": "stop"
+                }
+              ]
+            },
+            {
+              "id": "chatcmpl-657bd21a6a4e4db0bcbeba67",
+              "object": "chat.completion.chunk",
+              "created": 1779187509,
+              "model": "luce-dflash",
+              "choices": [],
+              "usage": {
+                "prompt_tokens": 90,
+                "completion_tokens": 31,
+                "total_tokens": 121
+              }
+            }
+          ]
+        },
+        {
+          "name": "chat.non_stream",
+          "ok": true,
+          "status": 200,
+          "required": false,
+          "seconds": 0.746,
+          "usage": {
+            "prompt_tokens": 91,
+            "completion_tokens": 31,
+            "total_tokens": 122
+          },
+          "body_tail": "{\"id\": \"chatcmpl-19129e7e5ab14f1da1f8aa0f\", \"object\": \"chat.completion\", \"created\": 1779187510, \"model\": \"luce-dflash\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"Here's a thinking process:\\n\\n1.  **Analyze User Input:**\\n   - **Function:** `clamp(x, lo, hi)`\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 91, \"completion_tokens\": 31, \"total_tokens\": 122}}",
+          "generated_ok": true,
+          "generated_chars": 93,
+          "generated_text_tail": "Here's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Function:** `clamp(x, lo, hi)`",
+          "expected_substring": "lucebox",
+          "expected_substring_seen": false
+        },
+        {
+          "name": "chat.tools_accepted",
+          "ok": true,
+          "status": 200,
+          "required": true,
+          "seconds": 0.394,
+          "usage": {
+            "prompt_tokens": 31,
+            "completion_tokens": 15,
+            "total_tokens": 46
+          },
+          "body_tail": "{\"id\": \"chatcmpl-95a2fdbeb6ef4c22a0e6d27d\", \"object\": \"chat.completion\", \"created\": 1779187511, \"model\": \"luce-dflash\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"Here's a thinking process:\\n\\n1.  **Analyze User\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 31, \"completion_tokens\": 15, \"total_tokens\": 46}}"
+        }
+      ],
+      "started_ms": 1779187509747,
+      "ended_ms": 1779187511629
+    }
+  ],
+  "ok": true,
+  "gpu": {
+    "gpus": [
+      {
+        "name": "NVIDIA GeForce RTX 3090",
+        "memory_used_mib": 20795,
+        "memory_total_mib": 24576,
+        "gpu_util_percent": 89
+      }
+    ]
+  }
+}
