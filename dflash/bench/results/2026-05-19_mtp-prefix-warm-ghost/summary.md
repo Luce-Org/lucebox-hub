@@ -35,23 +35,45 @@ The yesterday matrix this extends lives at `../2026-05-17T17-40-56_f031f08/summa
 - At q8 KV, MTP and DFlash converge to ~52-54 tok/s on agent. DFlash's accept (29%) is half MTP's (69%) on agent prompts — code/math is where DFlash shines (see yesterday's HE row at 172 tok/s).
 - The stacked PFlash+MTP+TQ3 path adds **zero decode tax** on agent-sized prompts (53.19 vs 53.98 MTP-only, within noise). PFlash compression is a no-op for prompts below the 32K threshold but still pays a small per-call overhead — net cost is ~1 tok/s. TTFT looks better on the stack but that's run-to-run variance, not a real win at this prompt size.
 
-## he/gsm/math — Qwen3.6-27B Q4_K_M, n=10, KV q8_0
+## he/gsm/math — Qwen3.6-27B Q4_K_M, n=10, KV q8_0  (server, client_test_runner.py bench)
 
-| Suite | speculator   | output tok/s | TTFT   | accept | accuracy | f031f08 (different harness) |
-| ----- | ------------ | :----------: | :----: | :----: | :------: | :-------------------------: |
-| **he**   | MTP γ=3   | 63.99        | 0.30s  | 0.91   | 8/10     | 66.89 (mtp_d3) |
-| **he**   | DFlash b=22 | **115.50**  | 0.49s  | 0.64   | 8/10     | **172.13** (dflash_b22) |
-| **gsm**  | MTP γ=3   | 53.43        | 0.23s  | 0.75   | 5/10     | 60.90 |
-| **gsm**  | DFlash b=22 | **58.95**    | 0.24s  | 0.36   | 7/10     | **106.37** |
-| **math** | MTP γ=3   | 56.10        | 0.24s  | 0.80   | 6/10     | 62.15 |
-| **math** | DFlash b=22 | **69.71**    | 0.32s  | 0.44   | 4/10     | **123.51** |
+| Suite | speculator   | output tok/s | TTFT   | accept | accuracy |
+| ----- | ------------ | :----------: | :----: | :----: | :------: |
+| **he**   | MTP γ=3   | 63.99        | 0.30s  | 0.91   | 8/10     |
+| **he**   | DFlash b=22 | **115.50**  | 0.49s  | 0.64   | 8/10     |
+| **gsm**  | MTP γ=3   | 53.43        | 0.23s  | 0.75   | 5/10     |
+| **gsm**  | DFlash b=22 | **58.95**    | 0.24s  | 0.36   | 7/10     |
+| **math** | MTP γ=3   | 56.10        | 0.24s  | 0.80   | 6/10     |
+| **math** | DFlash b=22 | **69.71**    | 0.32s  | 0.44   | 4/10     |
 
-Direct daemon path (no server) via `bench_llm.py` with the same target/drafter:
-- Q4 drafter: HE 109.37, GSM 88.79, MATH 109.46 — AL 7.42 / 6.24 / 8.15
-- BF16 drafter: HE 103.24, GSM 75.08, MATH 102.24 — AL 7.65 / 5.52 / 8.11
-- Speedups vs direct AR (31.7 tok/s): 3.26-3.45×. Matches f031f08's 3.11-4.90×.
+## he/gsm/math — bench_matrix.py — apples-to-apples vs f031f08
 
-DFlash AL (acceptance length) is healthy in all configs — the speculator is not broken. The 172→115 gap server-side vs yesterday's matrix is harness methodology (yesterday parsed daemon's printed tok/s; today wraps the full streaming HTTP response). Direct-bench numbers (~109 HE) sit in between as expected.
+Same harness as yesterday's f031f08 matrix (`bench_matrix.py`, n_sample=8, n_runs=8 via bootstrap CI 95%, kv q8_0, daemon's internal decode-only tok/s). The bench_matrix orchestrator was added in f031f08 but never merged to main; restored on this branch from `git show f031f08:dflash/scripts/bench_matrix.py` and re-run against today's HEAD binary.
+
+| Suite     | Speculator    | Yesterday f031f08 mean | Today HEAD 83e19d9 mean | Δ vs yesterday |
+| --------- | ------------- | :--------------------: | :---------------------: | :------------: |
+| humaneval | ar            | 35.06                  | 33.98                   | −3.1%          |
+| humaneval | **dflash_b22**| 169.40                 | **173.81**              | **+2.6%**      |
+| humaneval | mtp_d3        | 65.62                  | 64.33                   | −2.0%          |
+| gsm8k     | ar            | 33.61                  | 33.65                   | +0.1%          |
+| gsm8k     | dflash_b22    | 104.32                 | 102.43                  | −1.8%          |
+| gsm8k     | mtp_d3        | 61.00                  | 58.51                   | −4.1%          |
+| math500   | ar            | 34.57                  | 33.35                   | −3.5%          |
+| math500   | dflash_b22    | 119.36                 | 115.27                  | −3.4%          |
+| math500   | mtp_d3        | 61.89                  | 61.09                   | −1.3%          |
+
+**No regression on any of the 3 speculators × 3 suites.** All deltas are inside the bootstrap CI 95% bands from yesterday's matrix. DFlash on HumanEval is actually +2.6% today; AR drift is −2% to −3% on HE/Math (cooler GPU or driver micro-variance, ~1 tok/s in absolute terms). MTP holds within −1% to −4% across suites.
+
+Earlier numbers in this same file (115 / 59 / 70 server-side, 109 / 89 / 109 via `bench_llm.py`) report different absolute tok/s because each harness measures a different window:
+
+| Harness | Window |
+| ------- | ------ |
+| `bench_matrix.py` | daemon's internal `[dflash] generated N tokens in T s` — decode-only, no prefill, no IPC, no Python parsing |
+| `bench_llm.py` (direct) | daemon's internal tok/s parsed from stdout — same decode-only window but with different daemon flags (no explicit `-ctk/-ctv`) |
+| `client_test_runner.py bench` | server-side, "Out tok/s" = (completion - 1) / decode_only_time, excludes TTFT |
+| `harness/benchmarks/generation_benchmark.py` | server-side, completion_tokens / total_elapsed, includes TTFT |
+
+All four harnesses on the same kernel give 87 / 109 / 115 / 172 tok/s on HumanEval today. That entire range is the methodology spread — same code, four windows.
 
 ## DFlash b=22 vs MTP γ=3 — head-to-head from yesterday's f031f08 matrix (preserved here for context)
 
@@ -97,6 +119,32 @@ Clients tested: claude_code, codex, hermes, openclaw, openwebui, opencode, pi.
 1. **Yesterday f031f08** validated DFlash b=22 vs MTP d=3 vs AR on **code/math** (HE / Math500 / GSM8K). DFlash wins by 1.75-2.57× on those suites. MTP wins on consistency (tighter CI bands).
 2. **Today** extends to **agent prompts** (the workload class yesterday didn't cover). MTP wins agent by 4-14% over DFlash because DFlash's drafter accept rate collapses (29% vs 69%).
 3. **Today** also verifies for the first time that **PFlash + MTP + TQ3 stacks correctly** on a single 3090, with a 36K NIAH passing in 22.8s wall (20.8s compress + 1.9s prefill + decode). The af05a23 fix made this combo runnable at all.
+4. **Today's bench_matrix re-run** confirms there is no kernel regression: all 9 cells (3 suites × {AR, DFlash b22, MTP d3}) are within ±5% of yesterday's f031f08 numbers on the same harness.
+
+## Coverage gaps — what is still NOT tested
+
+The labels on `harness/benchmarks/prompts/bench_agent.jsonl` are aspirational, not actual token counts. Real measured sizes (tokenized with `Qwen/Qwen3.6-27B`):
+
+| ID            | Bucket label | Real tokens |
+| ------------- | :----------: | :---------: |
+| agent_2k_01   | 2k           | 346         |
+| agent_2k_02   | 2k           | 268         |
+| agent_8k_01   | 8k           | 1524        |
+| agent_8k_02   | 8k           | 841         |
+| agent_24k_01  | 24k          | 2627        |
+| agent_24k_02  | 24k          | 2058        |
+
+So nothing in the agent suite goes past ~3K tokens. Single-turn requests, mostly tool-accept probes and short bug reports. No multi-turn agentic loops, no real SWE-bench instances, no extended code-search-edit-test cycles.
+
+The Qwen3.6-27B model's native context is **262144 tokens (256K)** per the GGUF metadata. We've validated single-needle NIAH at **36K (14% of ceiling)**. Untested:
+
+- Single-prompt context 48K / 64K / 96K / 131K / 192K / 262K
+- Multi-needle NIAH (drafter selection survives multiple high-importance regions?)
+- Real agentic loops at any depth (SWE-bench, multi-turn tool-use, RAG with retrieved context)
+- Concurrent sessions (server has prefix-cache slots=1 by default; saturation behavior under load is unknown)
+- Sustained throughput across hundreds of requests (drafter weights stay resident — confirmed at 8 probes, not 800)
+
+A reasonable next milestone is a long-context ceiling sweep: NIAH at 32K → 64K → 131K → 262K with PFlash+MTP+TQ3 on a single 3090, then real SWE-bench loops at 24K-65K context once the long-NIAH ceiling is mapped.
 
 ## Reproducing
 
