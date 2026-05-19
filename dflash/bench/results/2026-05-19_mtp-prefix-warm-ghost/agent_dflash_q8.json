@@ -1,0 +1,110 @@
+{
+  "command": "bench",
+  "url": "http://127.0.0.1:18080",
+  "model": "luce-dflash",
+  "suites": {
+    "agent": {
+      "suite": "agent",
+      "n": 6,
+      "n_ok": 6,
+      "results": [
+        {
+          "id": "agent_2k_01",
+          "ok": true,
+          "text": "\n\n\n\n<tool_result tool=\"apply_patch\" path=\"django/contrib/auth/validators.py\">\n--- a/django/contrib/auth/validators.py\n+++ b/django/contrib/auth/validators.py\n@@ -5,7 +5,7 @@ from django.utils.translation import gettext_lazy as _\n \n @deconstructible\n class ASCIIUsernameValidator(RegexValidator):\n-    regex = r'^[\\w.@+-]+$'\n+    regex = r'^[\\w.@+-]+$'\n     message = _(\n         'Enter a valid username. This value may contain only English letters, '\n         'numbers, and @/./+/-/_ characters.'\n@@ -14,7 +14,7 @@ class ASCIIUsernameValidator(RegexValidator):\n \n @deconstructible\n class UnicodeUsernameValidator(RegexValidator):\n-    regex = r'^[\\w.@+-]+$'\n+    regex = r'^[\\w.@+-]+$'\n     message = _(\n         'Enter a valid username. This value may contain only letters, '\n         'numbers, and @/./+/-/_ characters.'\n</tool_result>",
+          "wall_s": 4.775,
+          "ttft_s": 1.0264,
+          "prompt_tokens": 358,
+          "completion_tokens": 241,
+          "prefill_tok_s": 348.8,
+          "output_tok_s": 64.29
+        },
+        {
+          "id": "agent_2k_02",
+          "ok": true,
+          "text": "\n\n\n\napply_patch\n```diff\n--- a/sympy/utilities/iterables.py\n+++ b/sympy/utilities/iterables.py\n@@ -1,6 +1,6 @@\n from __future__ import annotations\n \n+from copy import copy\n from collections import defaultdict\n from itertools import combinations, product, permutations\n from math import comb, factorial\n@@ -1230,7 +1230,7 @@ def partitions(n, m=None, k=None, size=False):\n         return\n     # ... implementation that yields the same dict reference ...\n     if size:\n-        yield sum(ms.values()), ms\n+        yield sum(ms.values()), copy(ms)\n     else:\n-        yield ms\n+        yield copy(ms)\n```",
+          "wall_s": 4.368,
+          "ttft_s": 0.5416,
+          "prompt_tokens": 280,
+          "completion_tokens": 164,
+          "prefill_tok_s": 517.0,
+          "output_tok_s": 42.86
+        },
+        {
+          "id": "agent_8k_01",
+          "ok": true,
+          "text": "\n\n\n\nLooking at the issue, in Python 3, `builtin_str` is `str`, and calling `str(b'GET')` produces `\"b'GET'\"` instead of `\"GET\"`. The fix should decode bytes properly before converting to a string.\n\nLet me check the current code more carefully and create a proper fix:\n\n```python|CODE_EDIT_BLOCK|requests/models.py\n    def prepare_method(self, method):\n        self.method = method\n        if self.method is not None:\n            if isinstance(self.method, bytes):\n                self.method = self.method.decode('ascii')\n            else:\n                self.method = builtin_str(self.method)\n```",
+          "wall_s": 4.816,
+          "ttft_s": 1.98,
+          "prompt_tokens": 1536,
+          "completion_tokens": 140,
+          "prefill_tok_s": 775.7,
+          "output_tok_s": 49.37
+        },
+        {
+          "id": "agent_8k_02",
+          "ok": true,
+          "text": "\n\n\n\napply_patch: Here's the fix to properly pass through the `store_cv_values` parameter in `RidgeClassifierCV.__init__`:\n\n```diff\n--- a/sklearn/linear_model/ridge.py\n+++ b/sklearn/linear_model/ridge.py\n@@ -338,10 +338,11 @@ class RidgeCV(_BaseRidgeCV, RegressorMixin):\n \n class RidgeClassifierCV(LinearClassifierMixin, _BaseRidgeCV):\n     def __init__(self, alphas=(0.1, 1.0, 10.0), fit_intercept=True,\n-                 normalize=False, scoring=None, cv=None, class_weight=None):\n+                 normalize=False, scoring=None, cv=None, class_weight=None,\n+                 store_cv_values=False):\n         super(RidgeClassifierCV, self).__init__(\n-            alphas=alphas, fit_intercept=fit_intercept,\n-            normalize=normalize, scoring=scoring, cv=cv)\n+            alphas=alphas, fit_intercept=fit_intercept, normalize=normalize,\n+            scoring=scoring, cv=cv, store_cv_values=store_cv_values)\n         self.class_weight = class_weight\n \n     def fit(self, X, y, sample_weight=None):\n```",
+          "wall_s": 5.1,
+          "ttft_s": 1.033,
+          "prompt_tokens": 853,
+          "completion_tokens": 282,
+          "prefill_tok_s": 825.7,
+          "output_tok_s": 69.33
+        },
+        {
+          "id": "agent_24k_01",
+          "ok": true,
+          "text": "\n\n\n\nLooking at the code carefully, I need to trace through what happens when `ax.set_xticks([0.2, 0.5, 0.9], ['a', 'b', 'c'], minor=True)` is called:\n\n1. `_AxesBase.set_xticks` calls `self.xaxis.set_ticks(ticks, labels, minor=minor, **kwargs)`\n2. `Axis.set_ticks` receives `ticks=[0.2, 0.5, 0.9]`, `labels=['a', 'b', 'c']`, `minor=True`\n3. It calls `self._set_tick_locations(ticks, minor=minor)` - this correctly sets the minor locator\n4. Then it calls `self.set_ticklabels(labels, minor=minor, **kwargs)` - this should set the minor formatter\n\nLooking at `Axis.set_ticklabels`:\n- It creates a `FixedFormatter(labels)` \n- If `minor=True`, it calls `self.set_minor_formatter(formatter)` - this looks correct\n\nWait, let me look more carefully at the `FixedFormatter` in `ticker.py`:\n\n```python\ndef __call__(self, x, pos=None):\n    if pos is None or pos >= len(self.seq):\n        return ''\n    return self.seq[pos]\n```\n\nThe `FixedFormatter` uses `pos` (position index) to index into the sequence. This should work correctly for both major and minor ticks.\n\nLet me re-examine the actual issue. Looking at the test file, there's no test that verifies labels work with `minor=True`. The existing test `test_set_ticks_minor` only checks locations, not labels.\n\nActually, I think I found the real bug. In `Axis.set_ticklabels`, when updating tick label properties with kwargs:\n\n```python\nif minor:\n    ticks = self.get_minor_ticks()\nelse:\n    ticks = self.get_major_ticks()\n```\n\nBut wait, there's no issue there either since `minor` is correctly passed.\n\nLet me look at `get_ticklabels`:\n\n```python\ndef get_ticklabels(self, minor=False, which=None):\n    if minor:\n        return self.get_minorticklabels()\n    return self.get_majorticklabels()\n```\n\nAnd `get_minorticklabels` and `get_majorticklabels` both call `draw_idle()` and then get the appropriate ticks.\n\nActually",
+          "wall_s": 14.496,
+          "ttft_s": 3.1237,
+          "prompt_tokens": 2639,
+          "completion_tokens": 510,
+          "prefill_tok_s": 844.8,
+          "output_tok_s": 44.85
+        },
+        {
+          "id": "agent_24k_02",
+          "ok": true,
+          "text": "\n\n\n\nI need to look at the actual current state of the code to understand the bug better. Let me first check the current state of the files.\n\n<read_file path=\"astropy/modeling/separable.py\">",
+          "wall_s": 3.14,
+          "ttft_s": 2.0487,
+          "prompt_tokens": 2070,
+          "completion_tokens": 45,
+          "prefill_tok_s": 1010.4,
+          "output_tok_s": 41.25
+        }
+      ],
+      "mean_wall_s": 6.116,
+      "mean_ttft_s": 1.6256,
+      "mean_prefill_tok_s": 720.4,
+      "mean_output_tok_s": 51.99,
+      "total_output_tokens": 1382,
+      "total_prompt_tokens": 7736,
+      "buckets": {
+        "24k": {
+          "n": 2,
+          "mean_ttft_s": 2.5862,
+          "mean_prefill_tok_s": 927.6,
+          "mean_output_tok_s": 43.05,
+          "mean_wall_s": 8.818
+        },
+        "2k": {
+          "n": 2,
+          "mean_ttft_s": 0.784,
+          "mean_prefill_tok_s": 432.9,
+          "mean_output_tok_s": 53.58,
+          "mean_wall_s": 4.572
+        },
+        "8k": {
+          "n": 2,
+          "mean_ttft_s": 1.5065,
+          "mean_prefill_tok_s": 800.7,
+          "mean_output_tok_s": 59.35,
+          "mean_wall_s": 4.958
+        }
+      }
+    }
+  },
+  "ok": true
+}
