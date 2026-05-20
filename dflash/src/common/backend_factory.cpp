@@ -50,6 +50,10 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
         cfg.ddtree_temp        = args.ddtree_temp;
         cfg.ddtree_chain_seed  = args.ddtree_chain_seed;
         cfg.use_feature_mirror = args.use_feature_mirror;
+        cfg.mtp_gguf_path    = args.mtp_gguf_path;
+        cfg.mtp_gamma        = args.mtp_gamma;
+        cfg.mtp_draft_source = args.mtp_draft_source;
+        cfg.mtp_draft_topk   = args.mtp_draft_topk;
 
         auto backend = std::make_unique<Qwen35Backend>(cfg);
         if (!backend->init()) {

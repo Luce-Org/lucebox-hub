@@ -138,6 +138,12 @@ static void print_usage(const char * prog) {
         "  --prefill-skip-park         Skip park/unpark (for >=32GB GPUs)\n"
         "  --lazy-draft                Park decode draft when idle to save VRAM\n"
         "\n"
+        "MTP speculative decoding (mutually exclusive with --draft):\n"
+        "  --mtp-gguf <path>           MTP drafter GGUF path\n"
+        "  --mtp-gamma <int>           Speculation chain depth (default: 0 = disabled)\n"
+        "  --mtp-draft-source <chain|mtp_topk>  Draft strategy (default: chain)\n"
+        "  --mtp-draft-topk <int>      Top-k for mtp_topk mode (default: 1)\n"
+        "\n"
         "Disk KV cache:\n"
         "  --kv-cache-dir <path>       Directory for ondisk KV cache (enables feature)\n"
         "  --kv-cache-budget <MB>      Max disk usage in MB (default: 4096)\n"
@@ -278,6 +284,14 @@ int main(int argc, char ** argv) {
                 sconfig.chat_template_path = path;
                 std::fprintf(stderr, "[server] loaded chat template from %s (%ld bytes)\n", path, n);
             }
+        } else if (std::strcmp(argv[i], "--mtp-gguf") == 0 && i + 1 < argc) {
+            bargs.mtp_gguf_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--mtp-gamma") == 0 && i + 1 < argc) {
+            bargs.mtp_gamma = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--mtp-draft-source") == 0 && i + 1 < argc) {
+            bargs.mtp_draft_source = argv[++i];
+        } else if (std::strcmp(argv[i], "--mtp-draft-topk") == 0 && i + 1 < argc) {
+            bargs.mtp_draft_topk = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--kv-cache-dir") == 0 && i + 1 < argc) {
             sconfig.disk_cache_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--kv-cache-budget") == 0 && i + 1 < argc) {
@@ -405,6 +419,12 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  fa_window       = %d\n", bargs.fa_window);
     std::fprintf(stderr, "[server] │  ddtree          = %s\n", bargs.ddtree_mode ? "ON" : "off");
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
+    if (bargs.mtp_gguf_path) {
+        std::fprintf(stderr, "[server] │  mtp_gguf        = %s\n", bargs.mtp_gguf_path);
+        std::fprintf(stderr, "[server] │  mtp_gamma       = %d\n", bargs.mtp_gamma);
+        std::fprintf(stderr, "[server] │  mtp_draft_src   = %s\n",
+                     bargs.mtp_draft_source ? bargs.mtp_draft_source : "chain (default)");
+    }
     std::fprintf(stderr, "[server] │  cors            = %s\n", sconfig.enable_cors ? "ON" : "off");
     std::fprintf(stderr, "[server] │  cache_type_k    = %s\n",
 #ifdef GGML_USE_HIP

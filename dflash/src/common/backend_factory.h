@@ -51,6 +51,13 @@ struct BackendArgs {
     float           ddtree_temp      = 1.0f;
     bool            ddtree_chain_seed = true;
     bool            use_feature_mirror = false;
+
+    // MTP (Multi-Token Prediction) speculator — mutually exclusive with --draft.
+    // When mtp_gguf_path is set, the backend ignores draft_path.
+    const char * mtp_gguf_path    = nullptr;
+    int          mtp_gamma        = 0;        // 0 = MTP loaded but not active; >0 = chain depth
+    const char * mtp_draft_source = nullptr;  // "chain" (default) | "mtp_topk"
+    int          mtp_draft_topk   = 1;
 };
 
 // ─── Factory function ───────────────────────────────────────────────────
