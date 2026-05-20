@@ -2822,12 +2822,24 @@ def main():
                     help="Disk budget in bytes for persisted full-cache artifacts. "
                          "0 disables budget trimming.")
     ap.add_argument("--daemon", action="store_true")
+    ap.add_argument("--target-backend", choices=["cuda", "hip"], default="cuda",
+                    help="Backend for the target test_dflash daemon placement env.")
+    ap.add_argument("--target-visible-devices", default=None,
+                    help="Visible device list for the target backend, e.g. 0,1.")
+    ap.add_argument("--draft-backend", choices=["cuda", "hip"], default="cuda",
+                    help="Backend for draft placement. Different-backend draft "
+                         "requires --draft-ipc-bin.")
+    ap.add_argument("--draft-visible-devices", default=None,
+                    help="Visible device list for the draft backend. For mixed "
+                         "CUDA/HIP placement this is exported alongside the "
+                         "target backend's visible-device env.")
     ap.add_argument("--target-gpu", type=int, default=None,
-                    help="Visible CUDA device id for test_dflash (sets DFLASH_TARGET_GPU)")
+                    help="Backend-local target device id for test_dflash (sets DFLASH_TARGET_GPU)")
     ap.add_argument("--draft-gpu", type=int, default=None,
-                    help="Visible CUDA device id for draft (sets DFLASH_DRAFT_GPU)")
+                    help="Backend-local draft device id (sets DFLASH_DRAFT_GPU)")
     ap.add_argument("--target-gpus", type=str, default=None,
-                    help="Comma-separated target GPU ids for target-layer sharding (passes --target-gpus)")
+                    help="Comma-separated backend-local target GPU ids for target-layer sharding "
+                         "(passes --target-gpus)")
     # nargs='?' so Compose can use a bare `--target-layer-split` line before another
     # flag; const="" means "use test_dflash defaults" (we do not forward an empty value).
     ap.add_argument("--target-layer-split", nargs="?", const="", default=None,
@@ -2838,6 +2850,14 @@ def main():
                     help="Pass --draft-feature-mirror to test_dflash (safe cross-GPU feature path)")
     ap.add_argument("--peer-access", action="store_true",
                     help="Pass --peer-access to test_dflash (prefer P2P memcpy when available)")
+    ap.add_argument("--draft-ipc-bin", type=Path, default=None,
+                    help="Path to a test_dflash binary built for the remote draft backend.")
+    ap.add_argument("--draft-ipc-gpu", type=int, default=None,
+                    help="GPU id passed to the remote draft IPC daemon.")
+    ap.add_argument("--draft-ipc-work-dir", type=Path, default=None,
+                    help="Work directory for host-file IPC with the remote draft daemon.")
+    ap.add_argument("--draft-ipc-ring-cap", type=int, default=None,
+                    help="Feature-ring capacity for the remote draft daemon.")
     ap.add_argument("--no-thinking", action="store_true",
                     help="Server-level guard: prevent any request from enabling thinking mode "
                          "via chat_template_kwargs. Useful on hardware (e.g. gfx1151/Strix Halo) "
@@ -2856,7 +2876,10 @@ def main():
     if args.fa_window is not None:
         os.environ["DFLASH27B_FA_WINDOW"] = str(args.fa_window)
 
-    placement = resolve_server_placement(args)
+    try:
+        placement = resolve_server_placement(args)
+    except ValueError as exc:
+        raise SystemExit(f"invalid placement config: {exc}") from exc
     placement.apply_env(os.environ)
 
     if args.prefill_compression != "off":
@@ -2875,9 +2898,14 @@ def main():
     # DFlash/DDTree flags on archs that lack a spec-decode draft. Same
     # binary serves every arch.
     arch = _arch_from_gguf(args.target)
+    if args.draft_ipc_bin and arch in _LAGUNA_ARCHES:
+        raise SystemExit("draft IPC placement is only supported on the qwen35/qwen36 server path")
 
     if not args.bin.is_file():
         raise SystemExit(f"binary not found at {args.bin} (arch={arch})")
+    if placement.draft_ipc_bin:
+        if not args.draft_ipc_bin.is_file():
+            raise SystemExit(f"draft IPC binary not found at {args.draft_ipc_bin}")
 
     if arch in _LAGUNA_ARCHES:
         # No DFlash draft model exists for laguna yet; test_dflash'́s
