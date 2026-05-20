@@ -178,10 +178,12 @@ struct SuccessStubTarget : public dflash::common::DFlashTarget {
     bool verify_tree(const std::vector<int32_t> &, const dflash::common::DDTree &,
                      int, std::vector<int32_t> &, std::vector<float> *) override { return false; }
 
+    int  restore_kv_at_chain_calls = 0;
+
     bool snapshot_kv()  override { return true; }
     bool restore_kv()   override { return true; }
     bool restore_kv_at_dfs(const std::vector<int> &) override { return false; }
-    bool restore_kv_at_chain(int) override { return false; }  // force slow path
+    bool restore_kv_at_chain(int) override { restore_kv_at_chain_calls++; return false; }  // force slow path
     void capture_topology_for_chain(int, int) override {}
     void enable_chain_capture(bool) override {}
 
@@ -370,8 +372,9 @@ static void t6_eos_termination() {
     assert(res.ok);
     const auto & st = runner.stats();
     assert(st.eos_hits >= 1);
-    // Emitted far fewer than 100 tokens.
-    assert(st.total_emitted <= 10);
+    // EOS is the first token emitted (bonus=42=eos): runner stops immediately.
+    // total_emitted must be exactly 1, not the n_gen=100 cap or any loose bound.
+    assert(st.total_emitted == 1);
     std::puts("T6 eos_termination PASS");
 }
 
@@ -399,8 +402,9 @@ static void t7_partial_accept_rollback() {
     // Exactly 2 tokens emitted (1 accepted + 1 bonus = 2, capped by n_gen=2).
     assert(st.total_accepted >= 1);
     assert(st.total_emitted >= 1);
-    // Restore path was hit (accept_n < g_actual -> fallback through restore_kv).
+    // Restore path was hit (accept_n < g_actual -> restore_kv_at_chain called).
     assert(tgt.verify_calls >= 1);
+    assert(tgt.restore_kv_at_chain_calls >= 1);
     std::puts("T7 partial_accept_rollback PASS");
 }
 

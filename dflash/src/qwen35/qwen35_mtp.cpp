@@ -1285,7 +1285,7 @@ bool Qwen35MtpModule::warm_head_kv(const int32_t * prompt_tokens,
     const int rope_n_rot = std::min(64, key_len);
     const float rope_theta = 1e7f;
 
-    if (n_prompt > state_->n_ctx) {
+    if (n_prompt >= state_->n_ctx) {
         std::fprintf(stderr,
             "[qwen35_mtp] warm_head_kv: n_prompt=%d exceeds head_kv capacity n_ctx=%d\n",
             n_prompt, state_->n_ctx);

@@ -773,7 +773,9 @@ static int run_qwen35_mtp_harness(const char * target_path,
             } else {
                 std::fprintf(stderr,
                     "qwen35-mtp prefill chunk hidden seq missing: "
-                    "expected %d tokens, got %d\n", n, n_chunk);
+                    "expected %d tokens, got %d — aborting warm\n", n, n_chunk);
+                all_prefill_hidden.clear();  // prevent warm_head_kv on bad buffer
+                break;
             }
         }
     }
