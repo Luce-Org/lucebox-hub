@@ -12,7 +12,7 @@
 #pragma once
 
 #include "common/model_backend.h"
-#include "common/device_placement.h"
+#include "placement/placement_config.h"
 #include "qwen3_drafter_model.h"
 #include "qwen3_drafter.h"
 #include "common/sampler.h"

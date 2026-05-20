@@ -2,7 +2,7 @@
 
 #pragma once
 
-#include "device_placement.h"
+#include "placement/placement_config.h"
 #include <string>
 
 namespace dflash27b {

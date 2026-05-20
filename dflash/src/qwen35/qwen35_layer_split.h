@@ -13,7 +13,7 @@
 
 #pragma once
 
-#include "common/device_placement.h"
+#include "placement/placement_config.h"
 
 #include <string>
 

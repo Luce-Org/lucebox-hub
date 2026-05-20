@@ -11,7 +11,7 @@
 #pragma once
 
 #include "model_backend.h"
-#include "device_placement.h"
+#include "placement/placement_config.h"
 
 #include <memory>
 #include <string>
@@ -30,6 +30,7 @@ struct BackendArgs {
 
     // Device placement
     DevicePlacement device;
+    PlacementBackend draft_backend = PlacementBackend::Auto;
     int             draft_gpu    = 0;
 
     // I/O — only used when running under daemon_loop (legacy). The new

@@ -6,7 +6,7 @@
 #pragma once
 
 #include "common/model_backend.h"
-#include "common/device_placement.h"
+#include "placement/placement_config.h"
 #include "gemma4_internal.h"
 #include "common/sampler.h"
 

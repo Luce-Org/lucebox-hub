@@ -14,14 +14,98 @@
 #include "http_server.h"
 #include "common/backend_factory.h"
 #include "common/gguf_inspect.h"
+#include "common/peer_access.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <vector>
 
 using namespace dflash27b;
+
+static bool parse_int_list(const char * value, std::vector<int> & out) {
+    out.clear();
+    if (!value || !*value) return false;
+    const char * p = value;
+    while (*p) {
+        char * end = nullptr;
+        long v = std::strtol(p, &end, 10);
+        if (end == p) return false;
+        out.push_back((int)v);
+        if (*end == '\0') return true;
+        if (*end != ',') return false;
+        p = end + 1;
+        if (!*p) return false;
+    }
+    return !out.empty();
+}
+
+static bool parse_double_list(const char * value, std::vector<double> & out) {
+    out.clear();
+    if (!value || !*value) return false;
+    const char * p = value;
+    while (*p) {
+        char * end = nullptr;
+        double v = std::strtod(p, &end);
+        if (end == p) return false;
+        out.push_back(v);
+        if (*end == '\0') return true;
+        if (*end != ',') return false;
+        p = end + 1;
+        if (!*p) return false;
+    }
+    return !out.empty();
+}
+
+static bool parse_backend_arg(const char * value, PlacementBackend & out) {
+    return value && parse_placement_backend(value, out);
+}
+
+static bool validate_server_placement(const BackendArgs & bargs) {
+    const PlacementBackend compiled = compiled_placement_backend();
+    if (!placement_backend_supported(bargs.device.backend)) {
+        std::fprintf(stderr,
+            "[server] --target-backend=%s is unsupported in this binary "
+            "(compiled backend: %s)\n",
+            placement_backend_name(bargs.device.backend),
+            placement_backend_name(compiled));
+        return false;
+    }
+    if (!placement_backend_supported(bargs.draft_backend)) {
+        std::fprintf(stderr,
+            "[server] --draft-backend=%s is unsupported in this binary "
+            "(compiled backend: %s)\n",
+            placement_backend_name(bargs.draft_backend),
+            placement_backend_name(compiled));
+        return false;
+    }
+    const PlacementBackend target = bargs.device.backend == PlacementBackend::Auto
+        ? compiled : bargs.device.backend;
+    const PlacementBackend draft = bargs.draft_backend == PlacementBackend::Auto
+        ? target : bargs.draft_backend;
+    if (target != draft) {
+        std::fprintf(stderr,
+            "[server] mixed target/draft backends are not implemented in the "
+            "native server yet (target=%s draft=%s)\n",
+            placement_backend_name(target), placement_backend_name(draft));
+        return false;
+    }
+    if (!bargs.device.layer_split_gpus.empty()) {
+        std::fprintf(stderr,
+            "[server] target layer split is not implemented in the native "
+            "server yet (--target-gpus was provided)\n");
+        return false;
+    }
+    if (!bargs.device.layer_split_weights.empty()) {
+        std::fprintf(stderr,
+            "[server] --target-layer-split requires native target layer split "
+            "support, which is not implemented yet\n");
+        return false;
+    }
+    return true;
+}
 
 static void print_usage(const char * prog) {
     std::fprintf(stderr,
@@ -35,6 +119,11 @@ static void print_usage(const char * prog) {
         "  --max-tokens <N>     Default max output tokens (default: 4096)\n"
         "  --gpu <N>            Target GPU device (default: 0)\n"
         "  --draft-gpu <N>      Draft GPU device (default: 0)\n"
+        "  --target-backend <auto|cuda|hip>  Target backend (default: auto)\n"
+        "  --draft-backend <auto|cuda|hip>   Draft backend (default: auto)\n"
+        "  --target-gpus <ids>  Reserved target layer-split GPU list (comma-separated)\n"
+        "  --target-layer-split <weights>  Reserved layer-split weights\n"
+        "  --peer-access        Enable peer access for multi-GPU placement\n"
         "  --chunk <N>          Chunked-prefill chunk size (default: 512)\n"
         "  --fa-window <N>     Flash-attention sliding window (default: 0=full)\n"
         "  --model-name <name>  Model name for /v1/models (default: dflash)\n"
@@ -86,6 +175,28 @@ int main(int argc, char ** argv) {
             bargs.device.gpu = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--draft-gpu") == 0 && i + 1 < argc) {
             bargs.draft_gpu = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--target-backend") == 0 && i + 1 < argc) {
+            if (!parse_backend_arg(argv[++i], bargs.device.backend)) {
+                std::fprintf(stderr, "[server] bad --target-backend value\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--draft-backend") == 0 && i + 1 < argc) {
+            if (!parse_backend_arg(argv[++i], bargs.draft_backend)) {
+                std::fprintf(stderr, "[server] bad --draft-backend value\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--target-gpus") == 0 && i + 1 < argc) {
+            if (!parse_int_list(argv[++i], bargs.device.layer_split_gpus)) {
+                std::fprintf(stderr, "[server] bad --target-gpus value\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--target-layer-split") == 0 && i + 1 < argc) {
+            if (!parse_double_list(argv[++i], bargs.device.layer_split_weights)) {
+                std::fprintf(stderr, "[server] bad --target-layer-split value\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--peer-access") == 0) {
+            bargs.device.peer_access = true;
         } else if (std::strcmp(argv[i], "--chunk") == 0 && i + 1 < argc) {
             bargs.chunk = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--fa-window") == 0 && i + 1 < argc) {
@@ -128,6 +239,8 @@ int main(int argc, char ** argv) {
             return 2;
         }
     }
+
+    if (!validate_server_placement(bargs)) return 2;
 
     // Sync max_ctx: if --max-ctx was not provided, use the backend's default.
     // This prevents the HTTP server from accepting prompts larger than the
@@ -187,6 +300,7 @@ int main(int argc, char ** argv) {
     }
 
     // Create backend.
+    g_peer_access_opt_in = bargs.device.peer_access;
     std::fprintf(stderr, "[server] creating backend...\n");
     auto backend = create_backend(bargs);
     if (!backend) {
@@ -204,8 +318,14 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  model_name      = %s\n", sconfig.model_name.c_str());
     std::fprintf(stderr, "[server] │  max_ctx         = %d\n", sconfig.max_ctx);
     std::fprintf(stderr, "[server] │  max_tokens      = %d\n", sconfig.max_tokens);
+    std::fprintf(stderr, "[server] │  target_backend = %s\n",
+                 placement_backend_name(bargs.device.backend));
     std::fprintf(stderr, "[server] │  gpu             = %d\n", bargs.device.gpu);
+    std::fprintf(stderr, "[server] │  draft_backend  = %s\n",
+                 placement_backend_name(bargs.draft_backend));
     std::fprintf(stderr, "[server] │  draft_gpu       = %d\n", bargs.draft_gpu);
+    std::fprintf(stderr, "[server] │  peer_access     = %s\n",
+                 bargs.device.peer_access ? "ON" : "off");
     std::fprintf(stderr, "[server] │  chunk           = %d\n", bargs.chunk);
     std::fprintf(stderr, "[server] │  fa_window       = %d\n", bargs.fa_window);
     std::fprintf(stderr, "[server] │  ddtree          = %s\n", bargs.ddtree_mode ? "ON" : "off");

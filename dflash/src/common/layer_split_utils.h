@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "device_placement.h"
+#include "placement/placement_config.h"
 
 #include <string>
 #include <utility>
