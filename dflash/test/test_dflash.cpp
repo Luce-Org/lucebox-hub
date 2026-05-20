@@ -729,7 +729,7 @@ static int run_qwen36_mtp_harness(const char * target_path,
     if (gamma > 0) {
         mtp_module = std::make_unique<mtp::Qwen36MtpModule>();
         std::string err;
-        if (!mtp_module->init(mtp_gguf_path, backend.tensor_context(), target, err)) {
+        if (!mtp_module->init(mtp_gguf_path, target, err)) {
             std::fprintf(stderr, "qwen36-mtp init failed: %s\n", err.c_str());
             return 1;
         }

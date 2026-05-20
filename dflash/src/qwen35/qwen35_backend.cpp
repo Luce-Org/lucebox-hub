@@ -1110,9 +1110,9 @@ bool Qwen35Backend::init_mtp_() {
 
     mtp_module_ = std::make_unique<mtp::Qwen36MtpModule>();
     std::string err;
-    // Use the two-arg init that shares the backbone ggml_context so MTP
-    // tensors are mapped from the same memory arena as the target weights.
-    if (!mtp_module_->init(cfg_.mtp_gguf_path, tensor_context(), target, err)) {
+    // Use the 3-arg init so MTP tensors are loaded from the MTP GGUF's own
+    // context (blk.64.* live there, not in the backbone ctx).
+    if (!mtp_module_->init(cfg_.mtp_gguf_path, target, err)) {
         std::fprintf(stderr, "[mtp] init failed: %s\n", err.c_str());
         mtp_module_.reset();
         return false;
