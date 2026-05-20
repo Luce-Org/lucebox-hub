@@ -149,6 +149,7 @@ GenerateResult warm_and_decode(ModelBackend * backend,
 
     if (!inner_res.ok) {
         result.error = "warm_and_decode: chain runner failed: " + inner_res.error;
+        io.emit(-1);
         return result;
     }
 

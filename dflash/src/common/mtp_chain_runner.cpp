@@ -260,7 +260,28 @@ GenerateResult MtpChainRunner::run(const GenerateRequest & req,
         stats_.total_accepted += accept_n;
         stats_.total_emitted  += emitted;
 
-        running_hidden = std::move(next_hidden);
+        // ── Thread h_prev for next iteration ──────────────────────────
+        // ExternalDrafter: on partial accept (accept_n < g_actual) the
+        // drafter-internal next_hidden was produced after the REJECTED
+        // suffix, not at the committed boundary.  Use the target-captured
+        // hidden at row accept_n instead (cubic review finding P1).
+        // On full accept next_hidden is already correct (last row == last
+        // accepted position), so the same set_capture_row path is safe.
+        // NativeHeads: next_hidden is always empty; this block is skipped.
+        if (mtp_.flavor() == MtpFlavor::ExternalDrafter && !next_hidden.empty()) {
+            auto & ext = static_cast<IExternalDrafterMtp &>(mtp_);
+            const int H = mtp_.hidden_size();
+            ext.set_capture_row(accept_n);
+            std::vector<float> boundary_hidden((size_t)H);
+            if (ext.consume_captured_hidden(boundary_hidden.data(), H)) {
+                running_hidden = std::move(boundary_hidden);
+            } else {
+                // consume failed (e.g. stub); fall back to drafter output
+                running_hidden = std::move(next_hidden);
+            }
+        } else {
+            running_hidden = std::move(next_hidden);
+        }
     }
 
     if (hit_eos) stats_.eos_hits++;
