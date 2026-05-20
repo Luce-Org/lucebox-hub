@@ -7,7 +7,7 @@
 // KV cache on any reject. Identical verify path for both flavors;
 // only the propose step dispatches on flavor().
 //
-// Peer to dflash_spec_decode.h (PR #197): same pattern, MTP-specific.
+// Follows the same γ-loop pattern as common/dflash_spec_decode.h.
 
 #pragma once
 

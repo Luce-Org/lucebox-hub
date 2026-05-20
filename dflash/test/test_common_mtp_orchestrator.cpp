@@ -1,11 +1,9 @@
 // Unit test driving the extraction of MTP orchestration from
 // qwen35_backend.cpp into dflash/src/common/mtp_orchestrator.
 //
-// Howard's PR #214 review (CHANGES_REQUESTED) asked for MTP logic to live
-// in /common so any ModelBackend that supports MTP can leverage it. This
-// test pins the public surface of the new common helper and proves it
-// handles the trivial guard cases — null backend, no MTP support — before
-// any real backend is wired through it.
+// Pins the public surface of the common helper and proves it handles the
+// trivial guard cases — null backend, no MTP support — before any real
+// backend is wired through it.
 //
 // T5-T10: MtpChainRunner state machine (gamma propagation, EOS, partial
 //         accept, n_gen termination, step failure, stats accounting).
@@ -138,7 +136,7 @@ struct FullStubBackend : public StubBackend {
 // Also supports: snapshot_kv (succeeds), restore_kv (succeeds),
 // restore_kv_at_chain (returns false to force slow rollback path),
 // is_eos (returns true for eos_token_id when set).
-struct SuccessStubTarget : public dflash27b::DFlashTarget {
+struct SuccessStubTarget : public dflash::common::DFlashTarget {
     int     argmax_token  = 42;    // returned as last_tok and as the bonus token
     int     accept_n      = 0;     // how many candidates to "accept" in all_argmax
     int     eos_token_id  = -1;    // token for which is_eos returns true
@@ -177,7 +175,7 @@ struct SuccessStubTarget : public dflash27b::DFlashTarget {
         return true;
     }
 
-    bool verify_tree(const std::vector<int32_t> &, const dflash27b::DDTree &,
+    bool verify_tree(const std::vector<int32_t> &, const dflash::common::DDTree &,
                      int, std::vector<int32_t> &, std::vector<float> *) override { return false; }
 
     bool snapshot_kv()  override { return true; }
@@ -218,8 +216,8 @@ struct DraftStubMtpModule : public StubMtpModule {
     int warm_head_kv_calls = 0;
 
     bool step_batch(int32_t, int,
-                    std::vector<dflash27b::mtp::StepOutput> & out) override {
-        dflash27b::mtp::StepOutput so;
+                    std::vector<dflash::common::mtp::StepOutput> & out) override {
+        dflash::common::mtp::StepOutput so;
         so.draft_token = draft_token;
         out.push_back(so);
         return true;
@@ -234,7 +232,7 @@ struct DraftStubMtpModule : public StubMtpModule {
 // MTP module whose step_chain always returns false (simulate module failure).
 struct FailStepChainMtpModule : public StubMtpModule {
     bool step_chain(int32_t, int, int,
-                    std::vector<dflash27b::mtp::StepOutput> &) override {
+                    std::vector<dflash::common::mtp::StepOutput> &) override {
         return false;
     }
 };
@@ -245,8 +243,8 @@ struct LiveStubBackend : public StubBackend {
     DraftStubMtpModule mtp_mod;
     SuccessStubTarget  target;
     LiveStubBackend() { supports_mtp_value = true; }
-    dflash27b::mtp::IMtpModule * mtp() override { return &mtp_mod; }
-    dflash27b::DFlashTarget *    dflash_target() override { return &target; }
+    dflash::common::mtp::IMtpModule * mtp() override { return &mtp_mod; }
+    dflash::common::DFlashTarget *    dflash_target() override { return &target; }
 };
 
 }  // namespace
@@ -323,12 +321,12 @@ static void t5_gamma_propagation() {
     mod1.effective_gamma_value = 1;
     SuccessStubTarget tgt1;
     tgt1.accept_n = 0;
-    dflash27b::SamplerCfg sampler;
-    dflash27b::mtp::MtpChainRunner runner1(mod1, tgt1, sampler);
-    dflash27b::GenerateRequest req1;
+    dflash::common::SamplerCfg sampler;
+    dflash::common::mtp::MtpChainRunner runner1(mod1, tgt1, sampler);
+    dflash::common::GenerateRequest req1;
     req1.n_gen = 1;
     req1.stream = false;
-    dflash27b::DaemonIO io;
+    dflash::common::DaemonIO io;
     auto res1 = runner1.run(req1, io, /*last_prefill_token=*/10, /*committed_pos=*/4, /*gamma=*/1);
     assert(res1.ok);
     const int proposed_g1 = runner1.stats().total_proposed;
@@ -337,8 +335,8 @@ static void t5_gamma_propagation() {
     mod2.effective_gamma_value = 2;
     SuccessStubTarget tgt2;
     tgt2.accept_n = 0;
-    dflash27b::mtp::MtpChainRunner runner2(mod2, tgt2, sampler);
-    dflash27b::GenerateRequest req2;
+    dflash::common::mtp::MtpChainRunner runner2(mod2, tgt2, sampler);
+    dflash::common::GenerateRequest req2;
     req2.n_gen = 2;
     req2.stream = false;
     auto res2 = runner2.run(req2, io, /*last_prefill_token=*/10, /*committed_pos=*/4, /*gamma=*/2);
@@ -362,12 +360,12 @@ static void t6_eos_termination() {
     tgt.eos_token_id = 42;
     tgt.accept_n     = 0;
 
-    dflash27b::SamplerCfg sampler;
-    dflash27b::mtp::MtpChainRunner runner(mod, tgt, sampler);
-    dflash27b::GenerateRequest req;
+    dflash::common::SamplerCfg sampler;
+    dflash::common::mtp::MtpChainRunner runner(mod, tgt, sampler);
+    dflash::common::GenerateRequest req;
     req.n_gen  = 100;   // large; EOS should stop it early
     req.stream = false;
-    dflash27b::DaemonIO io;
+    dflash::common::DaemonIO io;
     auto res = runner.run(req, io, /*last_prefill_token=*/10, /*committed_pos=*/4, /*gamma=*/1);
     assert(res.ok);
     const auto & st = runner.stats();
@@ -389,12 +387,12 @@ static void t7_partial_accept_rollback() {
     tgt.accept_n     = 1;
     tgt.argmax_token = 55;  // bonus token
 
-    dflash27b::SamplerCfg sampler;
-    dflash27b::mtp::MtpChainRunner runner(mod, tgt, sampler);
-    dflash27b::GenerateRequest req;
+    dflash::common::SamplerCfg sampler;
+    dflash::common::mtp::MtpChainRunner runner(mod, tgt, sampler);
+    dflash::common::GenerateRequest req;
     req.n_gen  = 2;
     req.stream = false;
-    dflash27b::DaemonIO io;
+    dflash::common::DaemonIO io;
     auto res = runner.run(req, io, /*last_prefill_token=*/10, /*committed_pos=*/4, /*gamma=*/2);
     assert(res.ok);
     const auto & st = runner.stats();
@@ -416,12 +414,12 @@ static void t8_n_gen_termination() {
     tgt.eos_token_id = -1;  // no EOS
     tgt.accept_n     = 0;
 
-    dflash27b::SamplerCfg sampler;
-    dflash27b::mtp::MtpChainRunner runner(mod, tgt, sampler);
-    dflash27b::GenerateRequest req;
+    dflash::common::SamplerCfg sampler;
+    dflash::common::mtp::MtpChainRunner runner(mod, tgt, sampler);
+    dflash::common::GenerateRequest req;
     req.n_gen  = 5;
     req.stream = false;
-    dflash27b::DaemonIO io;
+    dflash::common::DaemonIO io;
     auto res = runner.run(req, io, /*last_prefill_token=*/10, /*committed_pos=*/4, /*gamma=*/1);
     assert(res.ok);
     assert((int)res.tokens.size() == 5);
@@ -439,12 +437,12 @@ static void t9_propose_failure() {
     mod.effective_gamma_value = 1;
     SuccessStubTarget tgt;
 
-    dflash27b::SamplerCfg sampler;
-    dflash27b::mtp::MtpChainRunner runner(mod, tgt, sampler);
-    dflash27b::GenerateRequest req;
+    dflash::common::SamplerCfg sampler;
+    dflash::common::mtp::MtpChainRunner runner(mod, tgt, sampler);
+    dflash::common::GenerateRequest req;
     req.n_gen  = 4;
     req.stream = false;
-    dflash27b::DaemonIO io;
+    dflash::common::DaemonIO io;
     auto res = runner.run(req, io, /*last_prefill_token=*/10, /*committed_pos=*/4, /*gamma=*/1);
     assert(!res.ok);
     assert(res.error.find("propose") != std::string::npos
@@ -463,12 +461,12 @@ static void t10_stats_accounting() {
     tgt.argmax_token = 33;
     tgt.eos_token_id = -1;
 
-    dflash27b::SamplerCfg sampler;
-    dflash27b::mtp::MtpChainRunner runner(mod, tgt, sampler);
-    dflash27b::GenerateRequest req;
+    dflash::common::SamplerCfg sampler;
+    dflash::common::mtp::MtpChainRunner runner(mod, tgt, sampler);
+    dflash::common::GenerateRequest req;
     req.n_gen  = 6;
     req.stream = false;
-    dflash27b::DaemonIO io;
+    dflash::common::DaemonIO io;
     auto res = runner.run(req, io, /*last_prefill_token=*/10, /*committed_pos=*/4, /*gamma=*/2);
     assert(res.ok);
     const auto & st = runner.stats();
@@ -483,11 +481,11 @@ static void t10_stats_accounting() {
 static void t11_reset_chain_before_drive() {
     LiveStubBackend b;
     b.mtp_mod.effective_gamma_value = 1;
-    dflash27b::GenerateRequest req;
+    dflash::common::GenerateRequest req;
     req.prompt = {1, 2, 3};
     req.n_gen  = 2;
-    dflash27b::DaemonIO io;
-    auto res = dflash27b::common::mtp::warm_and_decode(&b, req, io);
+    dflash::common::DaemonIO io;
+    auto res = dflash::common::mtp::warm_and_decode(&b, req, io);
     // reset_chain() is called once by the orchestrator before drive.
     assert(b.mtp_mod.reset_chain_calls >= 1);
     // Result should succeed (prefill passes, chain runs).
@@ -502,11 +500,11 @@ static void t11_reset_chain_before_drive() {
 static void t12_set_initial_hidden_plumbing() {
     LiveStubBackend b;
     b.mtp_mod.effective_gamma_value = 1;
-    dflash27b::GenerateRequest req;
+    dflash::common::GenerateRequest req;
     req.prompt = {5, 6, 7, 8};
     req.n_gen  = 1;
-    dflash27b::DaemonIO io;
-    auto res = dflash27b::common::mtp::warm_and_decode(&b, req, io);
+    dflash::common::DaemonIO io;
+    auto res = dflash::common::mtp::warm_and_decode(&b, req, io);
     assert(res.ok);
     // The orchestrator calls set_initial_hidden once (if last_hidden() != null).
     // SuccessStubTarget::last_hidden() returns non-null after verify_batch,
@@ -525,11 +523,11 @@ static void t13_gamma_derived_from_module() {
     b.mtp_mod.draft_token           = 88;
     b.target.accept_n               = 0;
     b.target.argmax_token           = 55;
-    dflash27b::GenerateRequest req;
+    dflash::common::GenerateRequest req;
     req.prompt = {1, 2};
     req.n_gen  = 3;
-    dflash27b::DaemonIO io;
-    auto res = dflash27b::common::mtp::warm_and_decode(&b, req, io);
+    dflash::common::DaemonIO io;
+    auto res = dflash::common::mtp::warm_and_decode(&b, req, io);
     assert(res.ok);
     // At least some tokens generated; can't directly inspect the runner's
     // stats from here, but success proves the orchestrator read effective_gamma
@@ -545,11 +543,11 @@ static void t13_gamma_derived_from_module() {
 static void t14_zero_gamma_rejected() {
     LiveStubBackend b;
     b.mtp_mod.effective_gamma_value = 0;  // backend forgot to set gamma
-    dflash27b::GenerateRequest req;
+    dflash::common::GenerateRequest req;
     req.prompt = {1, 2, 3};
     req.n_gen  = 4;
-    dflash27b::DaemonIO io;
-    auto res = dflash27b::common::mtp::warm_and_decode(&b, req, io);
+    dflash::common::DaemonIO io;
+    auto res = dflash::common::mtp::warm_and_decode(&b, req, io);
     assert(!res.ok);
     assert(res.error.find("effective_gamma") != std::string::npos
         || res.error.find("gamma") != std::string::npos);
@@ -559,7 +557,7 @@ static void t14_zero_gamma_rejected() {
 // ─── T15: Qwen35MtpModule::attach(nullptr) returns false without crash ────
 
 static void t15_attach_null_returns_false() {
-    dflash27b::mtp::Qwen35MtpModule mod;
+    dflash::common::mtp::Qwen35MtpModule mod;
     // No init() — module is not loaded. attach(nullptr) must return false.
     bool ok = mod.attach(nullptr);
     assert(!ok);
@@ -571,7 +569,7 @@ static void t15_attach_null_returns_false() {
 //          Post attach_weights_for_test: max_gamma() == 8 (production ceiling).
 
 static void t16_set_effective_gamma_clamping() {
-    dflash27b::mtp::Qwen35MtpModule mod;
+    dflash::common::mtp::Qwen35MtpModule mod;
 
     // Pre-init: max_gamma()==0, so effective_gamma stays 0 after any set call.
     mod.set_effective_gamma(5);
@@ -580,7 +578,7 @@ static void t16_set_effective_gamma_clamping() {
     assert(mod.effective_gamma() == 0);
 
     // Inject minimal weights so loaded==true; max_gamma() returns 8.
-    dflash27b::mtp::Qwen35MtpWeights w;
+    dflash::common::mtp::Qwen35MtpWeights w;
     w.n_embd  = 4;
     w.n_vocab = 16;
     w.n_heads = 1;
@@ -608,9 +606,9 @@ static void t16_set_effective_gamma_clamping() {
 // ─── T17: step_batch returns false when not attached ─────────────────────
 
 static void t17_step_batch_not_attached() {
-    dflash27b::mtp::Qwen35MtpModule mod;
+    dflash::common::mtp::Qwen35MtpModule mod;
     // No init/attach — state.loaded==false.
-    std::vector<dflash27b::mtp::StepOutput> out;
+    std::vector<dflash::common::mtp::StepOutput> out;
     bool ok = mod.step_batch(0, 0, out);
     assert(!ok);
     assert(out.empty());
@@ -620,7 +618,7 @@ static void t17_step_batch_not_attached() {
 // ─── T18: shutdown() is idempotent ────────────────────────────────────────
 
 static void t18_shutdown_idempotent() {
-    dflash27b::mtp::Qwen35MtpModule mod;
+    dflash::common::mtp::Qwen35MtpModule mod;
     // Two shutdown calls without init; should not crash.
     mod.shutdown();
     mod.shutdown();
@@ -632,7 +630,7 @@ static void t18_shutdown_idempotent() {
 // ─── T19: reset_chain() before attach() is a safe no-op ──────────────────
 
 static void t19_reset_chain_before_attach() {
-    dflash27b::mtp::Qwen35MtpModule mod;
+    dflash::common::mtp::Qwen35MtpModule mod;
     // reset_chain() checks state_->loaded; before init it should be safe.
     mod.reset_chain();
     mod.reset_chain();

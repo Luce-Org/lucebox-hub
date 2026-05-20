@@ -142,11 +142,6 @@ GenerateResult MtpChainRunner::run(const GenerateRequest & req,
             result.error = "mtp.propose";
             return result;
         }
-        if ((int)drafts.size() < g_iter) {
-            // Module returned fewer drafts than requested (e.g. NativeHeads
-            // num_heads < γ). Shrink the verify candidate accordingly.
-            // No-op if drafts.size() == g_iter.
-        }
         const int g_actual = (int)drafts.size();
         stats_.total_proposed += g_actual;
 

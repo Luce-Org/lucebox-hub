@@ -20,7 +20,7 @@
 // rope_theta=1e7 (qwen35.rope.freq_base from GGUF). For γ_max=1 the draft
 // position is base_pos + 0 = base_pos.
 //
-// Phase A fallback: define MTP_PHASE_A_FALLBACK to bypass the TRMBlock and
+// Fallback mode: define MTP_PHASE_A_FALLBACK to bypass the TRMBlock and
 // use only eh_proj+shared_head_norm+lm_head (useful if a smaller/synthetic GGUF
 // lacks the transformer-block tensors). The default path requires all attn/ffn
 // tensors to be non-null.
@@ -76,7 +76,7 @@ namespace {
 
 // RMSNorm: out[i] = x[i] / rms(x) * weight[i]
 // All operations in-place on a separate output buffer.
-static void rmsnorm_cpu(const float * x,
+void rmsnorm_cpu(const float * x,
                         const float * weight,
                         float * out,
                         int n,
@@ -92,7 +92,7 @@ static void rmsnorm_cpu(const float * x,
 
 // Read a ggml_tensor's data as a flat float array. Returns false if the
 // tensor is null or its type is not GGML_TYPE_F32.
-static bool tensor_to_floats(const ggml_tensor * t,
+bool tensor_to_floats(const ggml_tensor * t,
                               std::vector<float> & out) {
     if (!t) return false;
     const size_t n = ggml_nelements(t);
@@ -136,7 +136,7 @@ static bool tensor_to_floats(const ggml_tensor * t,
 
 // Matrix-vector multiply: y = A @ x
 // A is [rows x cols] stored row-major (rows = out_dim, cols = in_dim).
-static void matvec_cpu(const float * A,
+void matvec_cpu(const float * A,
                        const float * x,
                        float * y,
                        int rows,
@@ -150,7 +150,7 @@ static void matvec_cpu(const float * A,
 }
 
 // Argmax over a float vector; returns index of max element.
-static int32_t argmax(const float * logits, int n) {
+int32_t argmax(const float * logits, int n) {
     int32_t best = 0;
     for (int i = 1; i < n; i++) {
         if (logits[i] > logits[best]) best = i;
@@ -162,7 +162,7 @@ static int32_t argmax(const float * logits, int n) {
 // entries from `logits` (length n_vocab), sorted DESCENDING by logprob.
 // Uses partial_sort over (logprob, id) pairs — O(n_vocab + K log K) is
 // trivial vs the per-head TRMBlock forward and avoids a full sort.
-static void emit_topk_logprobs(const float * logits, int n_vocab, int K,
+void emit_topk_logprobs(const float * logits, int n_vocab, int K,
                                mtp::StepOutput & out) {
     K = std::min(K, n_vocab);
     if (K <= 0) return;
@@ -197,7 +197,7 @@ static void emit_topk_logprobs(const float * logits, int n_vocab, int K,
 // (total dim = n_heads_total * n_per_head) using corresponding weight slice.
 // Weight tensor `w` has shape [n_per_head] (same weight shared across all heads
 // when called for Q-norm / K-norm).
-static void per_head_rmsnorm(float * x,
+void per_head_rmsnorm(float * x,
                              const float * w,
                              int n_heads_total,
                              int n_per_head,
@@ -214,7 +214,7 @@ static void per_head_rmsnorm(float * x,
 }
 
 // SiLU: silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
-static inline float silu(float x) {
+inline float silu(float x) {
     return x / (1.0f + std::exp(-x));
 }
 
@@ -222,7 +222,7 @@ static inline float silu(float x) {
 // [n_heads * head_dim] buffer. Only the first `n_rot` elements of each head
 // are rotated (n_rot <= head_dim). The remaining elements pass through.
 // freq_base: rope theta (e.g. 1e7). position: absolute sequence position.
-static void rope_cpu(float * x,
+void rope_cpu(float * x,
                      int n_heads,
                      int head_dim,
                      int n_rot,        // number of dims to rotate (e.g. 64)
@@ -255,7 +255,7 @@ static void rope_cpu(float * x,
 // Attends over slots [0, n_slots).  No explicit causal mask is needed because
 // the caller passes only the slots representing positions <= the current
 // draft position.  Score = (Q · K) / sqrt(head_dim).
-static void range_attention(const float * q,
+void range_attention(const float * q,
                             const float * k_cache,
                             const float * v_cache,
                             float * out,
@@ -300,7 +300,7 @@ static void range_attention(const float * q,
     }
 }
 
-static bool append_tensor(std::vector<ggml_tensor *> & tensors,
+bool append_tensor(std::vector<ggml_tensor *> & tensors,
                           ggml_tensor * t) {
     if (!t || t->data) return true;
     if (std::find(tensors.begin(), tensors.end(), t) == tensors.end()) {
@@ -309,7 +309,7 @@ static bool append_tensor(std::vector<ggml_tensor *> & tensors,
     return true;
 }
 
-static bool materialize_mtp_tensors(const std::string & gguf_path,
+bool materialize_mtp_tensors(const std::string & gguf_path,
                                     const Qwen35MtpWeights & weights,
                                     ggml_backend_buffer_type_t target_buft,
                                     ggml_backend_buffer_t & out_buf,
@@ -415,7 +415,7 @@ static bool materialize_mtp_tensors(const std::string & gguf_path,
     return true;
 }
 
-static ggml_context * load_gguf_tensor_context(const std::string & gguf_path,
+ggml_context * load_gguf_tensor_context(const std::string & gguf_path,
                                                std::string & out_error) {
     ggml_context * ctx = nullptr;
     gguf_init_params gp{};
@@ -456,9 +456,8 @@ struct Qwen35MtpModule::State {
     bool              loaded    = false;
     bool              attached  = false;
 
-    // Phase A bootstrap: last_hidden is zeroed on init / reset_chain.
-    // Once Qwen35Backend integration (Phase B) is complete this will
-    // carry the backbone's post-norm hidden from the last committed step.
+    // last_hidden is zeroed on init / reset_chain; carries the backbone's
+    // post-norm hidden from the last committed step once set_initial_hidden is called.
     std::vector<float> last_hidden;   // length == weights.n_embd when loaded
 
     // set_initial_hidden state: stash pointer + dim from the backbone caller.
@@ -621,7 +620,7 @@ bool Qwen35MtpModule::init(const std::string & gguf_path,
                     return false;
                 }
                 for (int h = 0; h < gamma_max; h++) {
-                    // Head KV stored as F16 on device (Phase B+).  CUDA
+                    // Head KV stored as F16 on device.  CUDA
                     // ggml_flash_attn_ext takes F16 K/V natively (fattn.cu
                     // accepts F16/BF16/quant K/V; F32 K/V are auto-cast
                     // up-front) and ggml_cpy F32 -> F16 is supported inside
@@ -655,7 +654,7 @@ bool Qwen35MtpModule::init(const std::string & gguf_path,
     }
 
     state_->loaded = true;
-    // Zero the Phase A bootstrap hidden.
+    // Zero the bootstrap hidden.
     state_->last_hidden.assign(state_->weights.n_embd, 0.0f);
     // Clear initial_hidden state for this init.
     state_->initial_hidden_ptr = nullptr;
@@ -759,7 +758,7 @@ void Qwen35MtpModule::shutdown() {
 // RoPE: standard (not M-RoPE) at n_rot=rope_dimension_count, theta=1e7.
 // KV: single-slot, attending only to the new K/V (trivial for γ_max=1).
 //
-// When MTP_PHASE_A_FALLBACK is defined, skips the TRMBlock (Phase A path).
+// When MTP_PHASE_A_FALLBACK is defined, skips the TRMBlock (fallback path).
 
 bool Qwen35MtpModule::step_batch(int32_t current_token,
                                  int base_pos,
@@ -1574,7 +1573,7 @@ Qwen35MtpStepGraph * Qwen35MtpModule::get_or_build_step_graph_(int head_idx) {
 }
 
 // Per-call cgraph on the backbone backend; cached per (head_idx, draft_pos)
-// in state_->step_sg_cache (Phase B+).  When the bound target exposes its
+// in state_->step_sg_cache.  When the bound target exposes its
 // lm_head_weight() the graph also fuses the LM-head matmul + argmax so we
 // skip the hidden -> host -> separate-cgraph round trip per call.
 bool Qwen35MtpModule::step_batch_gpu_(int32_t current_token,
@@ -1756,10 +1755,10 @@ bool Qwen35MtpModule::step_batch_gpu_(int32_t current_token,
     return true;
 }
 
-// Phase A autoregressive chain draft.  Reuses head 0 (the only NextN head on
+// Autoregressive chain draft.  Reuses head 0 (the only NextN head on
 // the Qwen3.6-27B GGUF) `chain_depth` times, feeding the head's own
-// post-shared_head_norm hidden back as h_prev for the next iteration.  The
-// per-iter graph is rebuilt on each call — Phase B (R1) will cache it.
+// post-shared_head_norm hidden back as h_prev for the next iteration.
+// Per-iter step graphs are cached in state_->step_sg_cache.
 //
 // CPU stub path (no backend / no kv_ctx): degrade gracefully to the default
 // `step_batch`+clamp.  Unit tests exercising the CPU forward at depth=1
@@ -1795,11 +1794,11 @@ bool Qwen35MtpModule::step_chain(int32_t current_token,
     }
 
     // ── GPU multi-iter chain ─────────────────────────────────────────
-    // Phase B+: per-iter step graphs are pulled from state_->step_sg_cache
-    // via get_or_build_step_graph_().  First-pass at each draft_pos is a
-    // build; subsequent calls are a pure tensor_set + compute.  When the
-    // bound target exposes lm_head_weight() the fused argmax output is read
-    // from the graph directly so we skip the projection-cgraph round trip.
+    // Per-iter step graphs are pulled from state_->step_sg_cache via
+    // get_or_build_step_graph_().  First-pass at each draft_pos is a build;
+    // subsequent calls are a pure tensor_set + compute.  When the bound
+    // target exposes lm_head_weight() the fused argmax output is read from
+    // the graph directly so we skip the projection-cgraph round trip.
     out.reserve(chain_depth);
 
     ggml_backend_t backend = state_->target->backend();

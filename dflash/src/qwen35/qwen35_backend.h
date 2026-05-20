@@ -116,13 +116,12 @@ public:
     bool supports_dflash_spec_decode() const override { return true; }
     DFlashTarget * dflash_target() override;
 
-    // Test/bench integration hooks for native-head MTP. These keep the
-    // Qwen3.6 MTP harness on the backend-owned target/cache/context without
-    // exposing the frozen common interfaces.
+    // Test-only: not part of the ModelBackend interface. Used by test_dflash
+    // harness for direct decode-cache + tensor-context introspection.
     bool ensure_decode_cache(int max_verify_tokens);
     ggml_context * tensor_context() const;
 
-    // MTP speculator accessors (ModelBackend interface).
+    // MTP module accessors (ModelBackend interface).
     bool                   supports_mtp() const override { return mtp_module_ != nullptr; }
     mtp::IMtpModule *      mtp()                override { return mtp_module_.get(); }
 

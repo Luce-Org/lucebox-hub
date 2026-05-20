@@ -11,8 +11,6 @@
 
 #pragma once
 
-#include "ddtree.h"
-
 #include <cstdint>
 #include <vector>
 
@@ -21,6 +19,8 @@ typedef struct ggml_backend * ggml_backend_t;
 struct ggml_tensor;
 
 namespace dflash::common {
+
+struct DDTree;  // forward — see common/ddtree.h
 
 struct DFlashTarget {
     virtual ~DFlashTarget() = default;

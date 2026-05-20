@@ -1,16 +1,15 @@
-// qwen35_mtp_loader.cpp — Discovery loader for unsloth Qwen3.6 MTP GGUFs.
+// qwen35_mtp_loader.cpp — Discovery loader for Qwen3.6 -MTP-GGUF files.
 //
-// PR 2 (this commit): introspection only. Reads the GGUF header, parses
-// NextN metadata (`<arch>.nextn_predict_layers`), and probes for the
-// per-MTP-block NextN tensors named per dflash/deps/llama.cpp's
-// LLM_TENSOR_NEXTN_* schema. Populates Qwen35MtpWeights pointers from
-// the ggml_context built by ggml_init_from_file.
+// Parses the GGUF tensor inventory for a Qwen3.6 MTP assistant model
+// (Unsloth-style -MTP-GGUF, one or more MTP heads sharing the backbone's
+// embedding + LM-head weights). Resolves donor layers and head dimensions
+// from the GGUF metadata, populates MtpDrafterWeights for the runtime
+// graph, and returns a ggml_context that owns the head tensors.
 //
-// Real weight materialization onto a CUDA backend, plus the MTP forward
-// graph, are deferred to PR 2b. The skeleton proves the abstraction
-// (foundation interfaces in src/common/mtp_*) accommodates Qwen3.6's
-// NativeHeads design, gates compile against the unsloth tensor layout,
-// and gives a clear plug-in point for the forward.
+// The architecture string in general.architecture is 'qwen35' — same as
+// the backbone. The MTP heads live at blk.<n_layer>.* (one past the last
+// backbone block), and discovery is keyed off the nextn_predict_layers
+// metadata field.
 
 #include "qwen35_mtp.h"
 
@@ -44,12 +43,6 @@ bool load_qwen35_mtp_weights(const std::string & gguf_path,
                              std::string & out_error) {
     out_error.clear();
 
-    // PR 2 skeleton: open the GGUF file to read metadata + tensor list,
-    // bind pointers in the caller's ctx. The real impl will also copy
-    // bytes onto the CUDA backend and own the lifecycle through a
-    // backend buffer; for now we rely on the caller's ctx already
-    // containing the tensors (e.g., the same ctx used by Qwen35Backend
-    // when loading the backbone).
     struct gguf_init_params gp{};
     gp.no_alloc = true;
     gp.ctx      = nullptr;

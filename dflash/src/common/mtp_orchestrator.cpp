@@ -53,6 +53,7 @@ GenerateResult warm_and_decode(ModelBackend * backend,
     // Capture state is owned by the target+MTP attachment, not the orchestrator.
     // MTP's attach() already enabled+pinned FULL_SEQ; calling here would be a
     // no-op and an architectural smell (orchestrator reaching into target state).
+    // No-op for non-MTP targets; Qwen35DFlashTarget overrides to pin capture.
     target->enable_hidden_seq_capture(true);  // idempotent for MTP-bound target
 
     std::vector<float> all_prefill_hidden((size_t)prompt_len * hidden);
@@ -103,7 +104,8 @@ GenerateResult warm_and_decode(ModelBackend * backend,
     }
     if (module->flavor() == dflash::common::mtp::MtpFlavor::NativeHeads
         && !all_prefill_hidden.empty()) {
-        auto * native = dynamic_cast<dflash::common::mtp::INativeMtp *>(module);
+        // flavor() guarantees the concrete type; static_cast is safe.
+        auto * native = static_cast<dflash::common::mtp::INativeMtp *>(module);
         if (native && !native->warm_head_kv(req.prompt.data(), prompt_len,
                                             last_tok, all_prefill_hidden.data())) {
             result.error = "warm_and_decode: warm_head_kv failed";
