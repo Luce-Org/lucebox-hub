@@ -249,9 +249,9 @@ add_library(dflash_common STATIC
     src/qwen35/qwen35_layer_split_dflash_target.cpp
     src/qwen35/layer_split_daemon_loop.cpp
     src/qwen35/qwen35_daemon.cpp
-    src/qwen36/qwen36_mtp.cpp
-    src/qwen36/qwen36_mtp_graph.cpp
-    src/qwen36/qwen36_mtp_loader.cpp
+    src/qwen35/qwen35_mtp.cpp
+    src/qwen35/qwen35_mtp_graph.cpp
+    src/qwen35/qwen35_mtp_loader.cpp
     src/common/mtp_chain_runner.cpp
     src/common/mtp_orchestrator.cpp
     src/common/sampler.cpp

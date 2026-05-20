@@ -1,11 +1,11 @@
-// qwen36_mtp_graph.cpp — CUDA cgraph builder for Qwen3.6 MTP head's
+// qwen35_mtp_graph.cpp — CUDA cgraph builder for Qwen3.6 MTP head's
 // per-step forward.  Mirrors the backbone's full-attention TRMBlock shape
 // (qwen35_target_graph.cpp:build_full_attn_block) using ggml ops on the
 // backbone's CUDA backend, so the head's matmuls use ggml's quant-aware
 // MMQ kernels (matching backbone precision) instead of a CPU fp32 forward
 // that drifts on Q2_K / Q3_K weights.
 
-#include "qwen36_mtp_graph.h"
+#include "qwen35_mtp_graph.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -23,7 +23,7 @@ static ggml_tensor * rms_norm_mul(ggml_context * ctx, ggml_tensor * x,
     return ggml_mul(ctx, n, weight);
 }
 
-void qwen36_mtp_step_graph_free(Qwen36MtpStepGraph & sg) {
+void qwen35_mtp_step_graph_free(Qwen35MtpStepGraph & sg) {
     if (sg.alloc) {
         ggml_gallocr_free(sg.alloc);
         sg.alloc = nullptr;
@@ -49,7 +49,7 @@ void qwen36_mtp_step_graph_free(Qwen36MtpStepGraph & sg) {
     sg.fused_lm_head     = false;
 }
 
-void qwen36_mtp_warm_graph_free(Qwen36MtpWarmGraph & sg) {
+void qwen35_mtp_warm_graph_free(Qwen35MtpWarmGraph & sg) {
     if (sg.alloc) {
         ggml_gallocr_free(sg.alloc);
         sg.alloc = nullptr;
@@ -64,9 +64,9 @@ void qwen36_mtp_warm_graph_free(Qwen36MtpWarmGraph & sg) {
     sg.inp_pos       = nullptr;
 }
 
-bool build_qwen36_mtp_warm_graph(
-        Qwen36MtpWarmGraph & sg,
-        const Qwen36MtpHeadWeights & head,
+bool build_qwen35_mtp_warm_graph(
+        Qwen35MtpWarmGraph & sg,
+        const Qwen35MtpHeadWeights & head,
         ggml_tensor * head_k_cache,
         ggml_tensor * head_v_cache,
         ggml_backend_t backend,
@@ -80,7 +80,7 @@ bool build_qwen36_mtp_warm_graph(
         float rms_eps,
         int slot_start,
         int n_tokens) {
-    qwen36_mtp_warm_graph_free(sg);
+    qwen35_mtp_warm_graph_free(sg);
     if (n_tokens <= 0) return false;
 
     const int head_dim = key_len;  // qwen3.6 has key_length == value_length
@@ -149,19 +149,19 @@ bool build_qwen36_mtp_warm_graph(
 
     sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     if (!sg.alloc) {
-        std::fprintf(stderr, "[qwen36_mtp_warm_graph] gallocr_new failed\n");
+        std::fprintf(stderr, "[qwen35_mtp_warm_graph] gallocr_new failed\n");
         return false;
     }
     if (!ggml_gallocr_alloc_graph(sg.alloc, sg.gf)) {
-        std::fprintf(stderr, "[qwen36_mtp_warm_graph] alloc_graph failed\n");
+        std::fprintf(stderr, "[qwen35_mtp_warm_graph] alloc_graph failed\n");
         return false;
     }
     return true;
 }
 
-bool build_qwen36_mtp_step_graph(
-        Qwen36MtpStepGraph & sg,
-        const Qwen36MtpHeadWeights & head,
+bool build_qwen35_mtp_step_graph(
+        Qwen35MtpStepGraph & sg,
+        const Qwen35MtpHeadWeights & head,
         ggml_tensor * head_k_cache,
         ggml_tensor * head_v_cache,
         ggml_backend_t backend,
@@ -179,7 +179,7 @@ bool build_qwen36_mtp_step_graph(
         int fa_window,
         ggml_tensor * lm_head_weight,
         int lm_head_topk) {
-    qwen36_mtp_step_graph_free(sg);
+    qwen35_mtp_step_graph_free(sg);
 
     const int q_dim = n_head * key_len;
     const int head_dim = key_len;  // qwen3.6 has key_length == value_length
@@ -337,7 +337,7 @@ bool build_qwen36_mtp_step_graph(
     // must be POST-residual-add but PRE-`shared_head_norm`.  Feeding
     // back `out_x_normed` (post-norm) double-normalises on the next
     // iter's `hnorm` and compounds rejection per depth.  See the
-    // CPU-path reference at qwen36_mtp.cpp:1166 (`last_hidden = x`).
+    // CPU-path reference at qwen35_mtp.cpp:1166 (`last_hidden = x`).
     ggml_set_name(x, "mtp_out_h_pre_norm");
     ggml_set_output(x);
     sg.out_h_pre_norm = x;
@@ -384,15 +384,15 @@ bool build_qwen36_mtp_step_graph(
     // ─── Allocate ────────────────────────────────────────────────
     sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     if (!sg.alloc) {
-        std::fprintf(stderr, "[qwen36_mtp_graph] ggml_gallocr_new failed\n");
+        std::fprintf(stderr, "[qwen35_mtp_graph] ggml_gallocr_new failed\n");
         return false;
     }
     if (!ggml_gallocr_alloc_graph(sg.alloc, sg.gf)) {
-        std::fprintf(stderr, "[qwen36_mtp_graph] ggml_gallocr_alloc_graph failed\n");
+        std::fprintf(stderr, "[qwen35_mtp_graph] ggml_gallocr_alloc_graph failed\n");
         return false;
     }
 
-    // Record build keys for cache invalidation in Qwen36MtpModule.
+    // Record build keys for cache invalidation in Qwen35MtpModule.
     sg.fa_window     = fa_window;
     sg.fa_max        = fa_max;
     sg.topk_k        = lm_head_topk;

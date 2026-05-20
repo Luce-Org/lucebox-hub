@@ -194,7 +194,7 @@ struct INativeMtp : IMtpModule {
     // multi-head native modules (where step_batch emits `num_heads` drafts
     // per call) — the runner sees the same draft count it did before, and
     // `chain_depth` is effectively ignored for any module that hasn't
-    // overridden step_chain.  Overriders (Qwen36MtpModule today) treat
+    // overridden step_chain.  Overriders (Qwen35MtpModule today) treat
     // chain_depth as authoritative.
     virtual bool step_chain(int32_t current_token,
                             int base_pos,

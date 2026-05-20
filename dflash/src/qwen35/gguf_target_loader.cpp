@@ -280,7 +280,7 @@ bool load_target_gguf_partial(const std::string & path,
     const uint32_t n_ff   = get_u32_or(gctx, "qwen35.feed_forward_length", 0);
     const uint32_t n_block_raw = get_u32_or(gctx, "qwen35.block_count",    0);
     // Qwen3.6 MTP GGUFs append `nextn_predict_layers` extra blocks holding the
-    // NextN heads (e.g. block_count=65 = 63 backbone + 2 MTP heads). The qwen36
+    // NextN heads (e.g. block_count=65 = 63 backbone + 2 MTP heads). The qwen35
     // MTP loader picks those up separately; here we treat n_layer as backbone
     // layers only so the divisibility check + tensor binding ignore the heads.
     const uint32_t n_nextn = get_u32_or(gctx, "qwen35.nextn_predict_layers", 0);

@@ -32,7 +32,7 @@
 #include "layer_split_daemon_loop.h" // extracted layer-split daemon loop
 #include "qwen3_daemon.h"   // arch dispatch - qwen3 (0.6B standalone)
 #include "gemma4_daemon.h"  // arch dispatch - gemma4 (iSWA + MoE)
-#include "qwen36/qwen36_mtp.h"
+#include "qwen35/qwen35_mtp.h"
 #include "common/mtp_chain_runner.h"
 #include "sampler.h"        // shared CPU sampler chain (SamplerCfg /
                             // sample_logits / parse_sampler_token) used by
@@ -659,8 +659,8 @@ static int run_target_layer_split_harness(
 //                 only verify surface available on DFlashTarget today; a true
 //                 tree-mask verify would require lifting test_dflash.cpp's
 //                 spec-decode loop out of the qwen35 graph builder — see the
-//                 BLOCKER note in qwen36-mtp experiment-C wiring docs).
-static int run_qwen36_mtp_harness(const char * target_path,
+//                 BLOCKER note in qwen35-mtp experiment-C wiring docs).
+static int run_qwen35_mtp_harness(const char * target_path,
                                   const char * mtp_gguf_path,
                                   const char * prompt_path,
                                   int n_gen,
@@ -675,26 +675,26 @@ static int run_qwen36_mtp_harness(const char * target_path,
                                   bool ddtree_chain_seed,
                                   float ddtree_temp) {
     if (!target_path || !mtp_gguf_path || !prompt_path) {
-        std::fprintf(stderr, "qwen36-mtp requires target, --mtp-gguf, and --prompt-bin\n");
+        std::fprintf(stderr, "qwen35-mtp requires target, --mtp-gguf, and --prompt-bin\n");
         return 2;
     }
     if (n_gen <= 0) {
-        std::fprintf(stderr, "qwen36-mtp requires --n-gen > 0\n");
+        std::fprintf(stderr, "qwen35-mtp requires --n-gen > 0\n");
         return 2;
     }
     if (gamma < 0) {
-        std::fprintf(stderr, "qwen36-mtp requires --gamma >= 0\n");
+        std::fprintf(stderr, "qwen35-mtp requires --gamma >= 0\n");
         return 2;
     }
 
     std::vector<int32_t> prompt = read_int32_file(prompt_path);
     if (prompt.empty()) {
-        std::fprintf(stderr, "qwen36-mtp empty prompt: %s\n", prompt_path);
+        std::fprintf(stderr, "qwen35-mtp empty prompt: %s\n", prompt_path);
         return 1;
     }
     if ((int)prompt.size() + n_gen + std::max(1, gamma) + 1 > max_ctx) {
         std::fprintf(stderr,
-            "qwen36-mtp prompt (%zu) + n_gen (%d) exceeds max_ctx (%d)\n",
+            "qwen35-mtp prompt (%zu) + n_gen (%d) exceeds max_ctx (%d)\n",
             prompt.size(), n_gen, max_ctx);
         return 1;
     }
@@ -711,30 +711,30 @@ static int run_qwen36_mtp_harness(const char * target_path,
 
     Qwen35Backend backend(cfg);
     if (!backend.init()) {
-        std::fprintf(stderr, "qwen36-mtp backend init failed\n");
+        std::fprintf(stderr, "qwen35-mtp backend init failed\n");
         return 1;
     }
     if (!backend.ensure_decode_cache(std::max(DFLASH27B_DRAFT_BLOCK_SIZE, gamma + 1))) {
-        std::fprintf(stderr, "qwen36-mtp decode cache: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "qwen35-mtp decode cache: %s\n", dflash27b_last_error());
         return 1;
     }
 
     DFlashTarget * target = backend.dflash_target();
     if (!target) {
-        std::fprintf(stderr, "qwen36-mtp target adapter unavailable\n");
+        std::fprintf(stderr, "qwen35-mtp target adapter unavailable\n");
         return 1;
     }
 
-    std::unique_ptr<mtp::Qwen36MtpModule> mtp_module;
+    std::unique_ptr<mtp::Qwen35MtpModule> mtp_module;
     if (gamma > 0) {
-        mtp_module = std::make_unique<mtp::Qwen36MtpModule>();
+        mtp_module = std::make_unique<mtp::Qwen35MtpModule>();
         std::string err;
         if (!mtp_module->init(mtp_gguf_path, target, err)) {
-            std::fprintf(stderr, "qwen36-mtp init failed: %s\n", err.c_str());
+            std::fprintf(stderr, "qwen35-mtp init failed: %s\n", err.c_str());
             return 1;
         }
         if (!mtp_module->attach(target)) {
-            std::fprintf(stderr, "qwen36-mtp attach(target) failed\n");
+            std::fprintf(stderr, "qwen35-mtp attach(target) failed\n");
             return 1;
         }
         // Shape B (PR 2e-final): the MTP module reads the backbone's final
@@ -759,7 +759,7 @@ static int run_qwen36_mtp_harness(const char * target_path,
         std::vector<int32_t> chunk(prompt.begin() + start,
                                    prompt.begin() + start + n);
         if (!target->verify_batch(chunk, start, prefill_next, nullptr)) {
-            std::fprintf(stderr, "qwen36-mtp prefill failed at %d\n", start);
+            std::fprintf(stderr, "qwen35-mtp prefill failed at %d\n", start);
             return 1;
         }
         if (mtp_module) {
@@ -772,7 +772,7 @@ static int run_qwen36_mtp_harness(const char * target_path,
                             sizeof(float) * (size_t)n * target->hidden_size());
             } else {
                 std::fprintf(stderr,
-                    "qwen36-mtp prefill chunk hidden seq missing: "
+                    "qwen35-mtp prefill chunk hidden seq missing: "
                     "expected %d tokens, got %d\n", n, n_chunk);
             }
         }
@@ -786,14 +786,14 @@ static int run_qwen36_mtp_harness(const char * target_path,
     if (mtp_module && !all_prefill_hidden.empty() && prefill_next >= 0) {
         if (!mtp_module->warm_head_kv(prompt.data(), (int)prompt.size(),
                                        prefill_next, all_prefill_hidden.data())) {
-            std::fprintf(stderr, "qwen36-mtp warm_head_kv failed\n");
+            std::fprintf(stderr, "qwen35-mtp warm_head_kv failed\n");
             return 1;
         }
     }
     auto t_prefill1 = std::chrono::steady_clock::now();
     const double prefill_s = std::chrono::duration<double>(t_prefill1 - t_prefill0).count();
     if (prefill_next < 0) {
-        std::fprintf(stderr, "qwen36-mtp prefill produced invalid token\n");
+        std::fprintf(stderr, "qwen35-mtp prefill produced invalid token\n");
         return 1;
     }
 
@@ -815,7 +815,7 @@ static int run_qwen36_mtp_harness(const char * target_path,
                 int32_t next = -1;
                 std::vector<int32_t> one{cur};
                 if (!target->verify_batch(one, base_pos, next, nullptr)) {
-                    std::fprintf(stderr, "qwen36-mtp AR decode failed at pos %d\n", base_pos);
+                    std::fprintf(stderr, "qwen35-mtp AR decode failed at pos %d\n", base_pos);
                     return 1;
                 }
                 generated.push_back(next);
@@ -835,7 +835,7 @@ static int run_qwen36_mtp_harness(const char * target_path,
                                             (int)prompt.size(),
                                             gamma);
             if (!res.ok) {
-                std::fprintf(stderr, "qwen36-mtp runner failed: %s\n", res.error.c_str());
+                std::fprintf(stderr, "qwen35-mtp runner failed: %s\n", res.error.c_str());
                 return 1;
             }
             generated.insert(generated.end(), res.tokens.begin(), res.tokens.end());
@@ -876,7 +876,7 @@ static int run_qwen36_mtp_harness(const char * target_path,
             while ((int)generated.size() < n_gen) {
                 std::vector<mtp::StepOutput> outs;
                 if (!mtp_module->step_batch(cur, base_pos, outs)) {
-                    std::fprintf(stderr, "qwen36-mtp[topk] step_batch failed at pos %d\n", base_pos);
+                    std::fprintf(stderr, "qwen35-mtp[topk] step_batch failed at pos %d\n", base_pos);
                     return 1;
                 }
                 const int L = std::min((int)outs.size(), L_max);
@@ -894,7 +894,7 @@ static int run_qwen36_mtp_harness(const char * target_path,
                         if ((int)outs[i].topk_logprobs.size() != K ||
                             (int)outs[i].topk_ids.size()      != K) {
                             std::fprintf(stderr,
-                                "qwen36-mtp[topk] head %d: expected K=%d topk entries, "
+                                "qwen35-mtp[topk] head %d: expected K=%d topk entries, "
                                 "got logp=%zu ids=%zu\n",
                                 i, K, outs[i].topk_logprobs.size(), outs[i].topk_ids.size());
                             return 1;
@@ -984,7 +984,7 @@ static int run_qwen36_mtp_harness(const char * target_path,
                             accepted_path.begin() + committed_dfs_n);
                         if (!target->restore_kv_at_dfs(commit_prefix)) {
                             std::fprintf(stderr,
-                                "qwen36-mtp[topk] restore_kv_at_dfs failed "
+                                "qwen35-mtp[topk] restore_kv_at_dfs failed "
                                 "(commit_n=%d, deepest_dfs=%d)\n",
                                 committed_dfs_n,
                                 committed_dfs_n > 0
@@ -1031,11 +1031,11 @@ static int run_qwen36_mtp_harness(const char * target_path,
                 std::vector<int32_t> all_argmax;
                 int32_t last_argmax = -1;
                 if (!target->verify_batch(candidate, base_pos, last_argmax, &all_argmax)) {
-                    std::fprintf(stderr, "qwen36-mtp[topk] verify_batch failed at pos %d\n", base_pos);
+                    std::fprintf(stderr, "qwen35-mtp[topk] verify_batch failed at pos %d\n", base_pos);
                     return 1;
                 }
                 if ((int)all_argmax.size() < g + 1) {
-                    std::fprintf(stderr, "qwen36-mtp[topk] verify_batch short: got %zu expected %d\n",
+                    std::fprintf(stderr, "qwen35-mtp[topk] verify_batch short: got %zu expected %d\n",
                                  all_argmax.size(), g + 1);
                     return 1;
                 }
@@ -1087,7 +1087,7 @@ static int run_qwen36_mtp_harness(const char * target_path,
             const double mean_gamma = proposed > 0 && n_steps > 0
                 ? (double)proposed / (double)n_steps : 0.0;
             std::fprintf(stderr,
-                "[qwen36-mtp topk] K=%d budget=%d chain_seed=%d steps=%d "
+                "[qwen35-mtp topk] K=%d budget=%d chain_seed=%d steps=%d "
                 "mean_tree_size=%.2f mean_gamma=%.2f\n",
                 K, ddtree_budget, (int)ddtree_chain_seed,
                 n_steps, mean_tree_size, mean_gamma);
@@ -1256,7 +1256,7 @@ int main(int argc, char ** argv) {
     int   mtp_prompt_id = 0;
     // Experiment-C draft source for the MTP harness. "chain" preserves
     // the existing MtpChainRunner path; "mtp_topk" wires set_draft_topk +
-    // build_ddtree (see run_qwen36_mtp_harness for the BLOCKER on true
+    // build_ddtree (see run_qwen35_mtp_harness for the BLOCKER on true
     // tree-mask verify).
     const char * mtp_draft_source = "chain";
     int   mtp_draft_topk = 4;
@@ -1628,7 +1628,7 @@ int main(int argc, char ** argv) {
     }
     if (mtp_gguf_path) {
         if (target_gpus.size() > 1) {
-            std::fprintf(stderr, "qwen36-mtp does not support --target-gpus\n");
+            std::fprintf(stderr, "qwen35-mtp does not support --target-gpus\n");
             return 2;
         }
         const int max_ctx_eff = g_max_ctx_override > 0 ? g_max_ctx_override : 4096;
@@ -1665,9 +1665,9 @@ int main(int argc, char ** argv) {
         }
         // ---- MTP file-mode harness (bench / one-shot) ----
         std::fprintf(stderr,
-            "[test_dflash] qwen36-mtp bench target=%s mtp=%s gamma=%d max_ctx=%d\n",
+            "[test_dflash] qwen35-mtp bench target=%s mtp=%s gamma=%d max_ctx=%d\n",
             target_path, mtp_gguf_path, mtp_gamma, max_ctx_eff);
-        return run_qwen36_mtp_harness(target_path, mtp_gguf_path,
+        return run_qwen35_mtp_harness(target_path, mtp_gguf_path,
                                       prompt_path, n_gen, out_path,
                                       mtp_gamma, mtp_prompt_id,
                                       target_gpu, max_ctx_eff,

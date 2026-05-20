@@ -1,9 +1,9 @@
-// qwen36_mtp_loader.cpp — Discovery loader for unsloth Qwen3.6 MTP GGUFs.
+// qwen35_mtp_loader.cpp — Discovery loader for unsloth Qwen3.6 MTP GGUFs.
 //
 // PR 2 (this commit): introspection only. Reads the GGUF header, parses
 // NextN metadata (`<arch>.nextn_predict_layers`), and probes for the
 // per-MTP-block NextN tensors named per dflash/deps/llama.cpp's
-// LLM_TENSOR_NEXTN_* schema. Populates Qwen36MtpWeights pointers from
+// LLM_TENSOR_NEXTN_* schema. Populates Qwen35MtpWeights pointers from
 // the ggml_context built by ggml_init_from_file.
 //
 // Real weight materialization onto a CUDA backend, plus the MTP forward
@@ -12,7 +12,7 @@
 // NativeHeads design, gates compile against the unsloth tensor layout,
 // and gives a clear plug-in point for the forward.
 
-#include "qwen36_mtp.h"
+#include "qwen35_mtp.h"
 
 #include "common/gguf_metadata.h"
 #include "ggml.h"
@@ -36,11 +36,11 @@ ggml_tensor * find_tensor(ggml_context * ctx, const std::string & name) {
 
 }  // anonymous
 
-bool load_qwen36_mtp_weights(const std::string & gguf_path,
+bool load_qwen35_mtp_weights(const std::string & gguf_path,
                              ggml_context * ctx,
                              int expected_n_embd,
                              int expected_n_vocab,
-                             Qwen36MtpWeights & out_weights,
+                             Qwen35MtpWeights & out_weights,
                              std::string & out_error) {
     out_error.clear();
 
@@ -55,7 +55,7 @@ bool load_qwen36_mtp_weights(const std::string & gguf_path,
     gp.ctx      = nullptr;
     struct gguf_context * gguf = gguf_init_from_file(gguf_path.c_str(), gp);
     if (!gguf) {
-        out_error = "qwen36_mtp_loader: gguf_init_from_file failed for " + gguf_path;
+        out_error = "qwen35_mtp_loader: gguf_init_from_file failed for " + gguf_path;
         return false;
     }
 
@@ -63,7 +63,7 @@ bool load_qwen36_mtp_weights(const std::string & gguf_path,
     {
         std::string arch_err;
         if (!dflash::common::gguf_check_architecture(gguf, "qwen35", arch_err)) {
-            out_error = "qwen36_mtp_loader: " + arch_err;
+            out_error = "qwen35_mtp_loader: " + arch_err;
             gguf_free(gguf);
             return false;
         }
@@ -73,20 +73,20 @@ bool load_qwen36_mtp_weights(const std::string & gguf_path,
 
     uint32_t n_layer = 0;
     if (!dflash::common::gguf_require_u32(gguf, "qwen35.block_count", n_layer, out_error)) {
-        out_error = "qwen36_mtp_loader: " + out_error;
+        out_error = "qwen35_mtp_loader: " + out_error;
         gguf_free(gguf);
         return false;
     }
     uint32_t n_embd_meta = 0;
     if (!dflash::common::gguf_require_u32(gguf, "qwen35.embedding_length", n_embd_meta, out_error)) {
-        out_error = "qwen36_mtp_loader: " + out_error;
+        out_error = "qwen35_mtp_loader: " + out_error;
         gguf_free(gguf);
         return false;
     }
     if ((int)n_embd_meta != expected_n_embd) {
         char msg[256];
         std::snprintf(msg, sizeof msg,
-            "qwen36_mtp_loader: backbone n_embd mismatch (gguf=%u, expected=%d)",
+            "qwen35_mtp_loader: backbone n_embd mismatch (gguf=%u, expected=%d)",
             n_embd_meta, expected_n_embd);
         out_error = msg;
         gguf_free(gguf);
@@ -98,19 +98,19 @@ bool load_qwen36_mtp_weights(const std::string & gguf_path,
     // ── NextN head count ──────────────────────────────────────────────
     uint32_t n_heads = 0;
     if (!dflash::common::gguf_require_u32(gguf, "qwen35.nextn_predict_layers", n_heads, out_error)) {
-        out_error = "qwen36_mtp_loader: GGUF lacks qwen35.nextn_predict_layers — this is not an MTP variant";
+        out_error = "qwen35_mtp_loader: GGUF lacks qwen35.nextn_predict_layers — this is not an MTP variant";
         gguf_free(gguf);
         return false;
     }
     if (n_heads == 0) {
-        out_error = "qwen36_mtp_loader: nextn_predict_layers=0 — no MTP heads in this file";
+        out_error = "qwen35_mtp_loader: nextn_predict_layers=0 — no MTP heads in this file";
         gguf_free(gguf);
         return false;
     }
     if (n_heads > (uint32_t)n_layer) {
         char msg[256];
         std::snprintf(msg, sizeof msg,
-            "qwen36_mtp_loader: nextn_predict_layers=%u > n_layer=%u (corrupt metadata)",
+            "qwen35_mtp_loader: nextn_predict_layers=%u > n_layer=%u (corrupt metadata)",
             n_heads, n_layer);
         out_error = msg;
         gguf_free(gguf);
@@ -120,31 +120,31 @@ bool load_qwen36_mtp_weights(const std::string & gguf_path,
     // ── Attention sizing metadata ─────────────────────────────────────────
     uint32_t n_head_count = 0;
     if (!dflash::common::gguf_require_u32(gguf, "qwen35.attention.head_count", n_head_count, out_error)) {
-        out_error = "qwen36_mtp_loader: " + out_error;
+        out_error = "qwen35_mtp_loader: " + out_error;
         gguf_free(gguf);
         return false;
     }
     uint32_t n_head_kv = 0;
     if (!dflash::common::gguf_require_u32(gguf, "qwen35.attention.head_count_kv", n_head_kv, out_error)) {
-        out_error = "qwen36_mtp_loader: " + out_error;
+        out_error = "qwen35_mtp_loader: " + out_error;
         gguf_free(gguf);
         return false;
     }
     uint32_t n_key_length = 0;
     if (!dflash::common::gguf_require_u32(gguf, "qwen35.attention.key_length", n_key_length, out_error)) {
-        out_error = "qwen36_mtp_loader: " + out_error;
+        out_error = "qwen35_mtp_loader: " + out_error;
         gguf_free(gguf);
         return false;
     }
     uint32_t n_value_length = 0;
     if (!dflash::common::gguf_require_u32(gguf, "qwen35.attention.value_length", n_value_length, out_error)) {
-        out_error = "qwen36_mtp_loader: " + out_error;
+        out_error = "qwen35_mtp_loader: " + out_error;
         gguf_free(gguf);
         return false;
     }
     uint32_t n_ffn_length = 0;
     if (!dflash::common::gguf_require_u32(gguf, "qwen35.feed_forward_length", n_ffn_length, out_error)) {
-        out_error = "qwen36_mtp_loader: " + out_error;
+        out_error = "qwen35_mtp_loader: " + out_error;
         gguf_free(gguf);
         return false;
     }
@@ -178,7 +178,7 @@ bool load_qwen36_mtp_weights(const std::string & gguf_path,
             ggml_tensor * t = find_tensor(ctx, name);
             if (!t && required) {
                 std::fprintf(stderr,
-                    "[qwen36_mtp_loader] missing required tensor: %s\n", name);
+                    "[qwen35_mtp_loader] missing required tensor: %s\n", name);
                 missing_required++;
             }
             return t;
@@ -198,7 +198,7 @@ bool load_qwen36_mtp_weights(const std::string & gguf_path,
             ggml_tensor * t = find_tensor(ctx, full);
             if (!t && required) {
                 std::fprintf(stderr,
-                    "[qwen36_mtp_loader] missing required tensor: %s\n", full);
+                    "[qwen35_mtp_loader] missing required tensor: %s\n", full);
                 missing_required++;
             }
             return t;
@@ -221,7 +221,7 @@ bool load_qwen36_mtp_weights(const std::string & gguf_path,
     if (missing_required > 0) {
         char msg[256];
         std::snprintf(msg, sizeof msg,
-            "qwen36_mtp_loader: %d required NextN tensor(s) missing — context likely lacks the MTP tensors. Did the backbone loader allocate them?",
+            "qwen35_mtp_loader: %d required NextN tensor(s) missing — context likely lacks the MTP tensors. Did the backbone loader allocate them?",
             missing_required);
         out_error = msg;
         return false;

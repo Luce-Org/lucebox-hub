@@ -19,7 +19,7 @@
 #include "dflash_feature_ring.h"
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights, PrefixSnapshot
 #include "qwen3/qwen3_drafter.h"  // DrafterContext, load_drafter, free_drafter, drafter_score_and_compress
-#include "qwen36/qwen36_mtp.h"    // Qwen36MtpModule
+#include "qwen35/qwen35_mtp.h"    // Qwen35MtpModule
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -180,7 +180,7 @@ private:
     std::unique_ptr<DFlashTarget> dflash_target_;
 
     // ── MTP speculator (optional, set when cfg_.mtp_gguf_path != nullptr) ──
-    std::unique_ptr<mtp::Qwen36MtpModule> mtp_module_;
+    std::unique_ptr<mtp::Qwen35MtpModule> mtp_module_;
 
     // ── Internal helpers ─────────────────────────────────────────────
     // Prefill a prompt and return the number of tokens committed to KV.
@@ -208,7 +208,7 @@ private:
     // DDTree tree-mode verify.
     int verify_tree(int committed, const DDTree & tree);
 
-    // MTP init: load and attach the Qwen36MtpModule. Called from init() when
+    // MTP init: load and attach the Qwen35MtpModule. Called from init() when
     // cfg_.mtp_gguf_path is set. Returns false on failure.
     bool init_mtp_();
 

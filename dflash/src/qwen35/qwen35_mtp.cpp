@@ -1,4 +1,4 @@
-// qwen36_mtp.cpp — see qwen36_mtp.h for contract.
+// qwen35_mtp.cpp — see qwen35_mtp.h for contract.
 //
 // Implements the full DeepSeek-V3 NextN per-head forward
 // per Eq 21-23: RMSNorm → eh_proj([hnorm(h_prev); enorm(embed)]) → head-owned
@@ -25,8 +25,8 @@
 // lacks the transformer-block tensors). The default path requires all attn/ffn
 // tensors to be non-null.
 
-#include "qwen36_mtp.h"
-#include "qwen36_mtp_graph.h"
+#include "qwen35_mtp.h"
+#include "qwen35_mtp_graph.h"
 
 #include "common/dflash_target.h"
 #include "common/gguf_mmap.h"
@@ -310,7 +310,7 @@ static bool append_tensor(std::vector<ggml_tensor *> & tensors,
 }
 
 static bool materialize_mtp_tensors(const std::string & gguf_path,
-                                    const Qwen36MtpWeights & weights,
+                                    const Qwen35MtpWeights & weights,
                                     ggml_backend_buffer_type_t target_buft,
                                     ggml_backend_buffer_t & out_buf,
                                     std::string & out_error) {
@@ -354,7 +354,7 @@ static bool materialize_mtp_tensors(const std::string & gguf_path,
 
     ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, total);
     if (!buf) {
-        out_error = "qwen36_mtp: failed to allocate CPU buffer for MTP tensors";
+        out_error = "qwen35_mtp: failed to allocate CPU buffer for MTP tensors";
         return false;
     }
     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -363,7 +363,7 @@ static bool materialize_mtp_tensors(const std::string & gguf_path,
     for (size_t i = 0; i < tensors.size(); i++) {
         if (ggml_backend_tensor_alloc(buf, tensors[i], base + offsets[i]) != GGML_STATUS_SUCCESS) {
             ggml_backend_buffer_free(buf);
-            out_error = "qwen36_mtp: ggml_backend_tensor_alloc failed";
+            out_error = "qwen35_mtp: ggml_backend_tensor_alloc failed";
             return false;
         }
     }
@@ -374,7 +374,7 @@ static bool materialize_mtp_tensors(const std::string & gguf_path,
     gguf_context * gguf = gguf_init_from_file(gguf_path.c_str(), gp);
     if (!gguf) {
         ggml_backend_buffer_free(buf);
-        out_error = "qwen36_mtp: gguf_init_from_file failed for " + gguf_path;
+        out_error = "qwen35_mtp: gguf_init_from_file failed for " + gguf_path;
         return false;
     }
 
@@ -394,7 +394,7 @@ static bool materialize_mtp_tensors(const std::string & gguf_path,
         if (tid < 0) {
             gguf_free(gguf);
             ggml_backend_buffer_free(buf);
-            out_error = std::string("qwen36_mtp: tensor missing from GGUF: ") + name;
+            out_error = std::string("qwen35_mtp: tensor missing from GGUF: ") + name;
             return false;
         }
         const size_t off = data_start + gguf_get_tensor_offset(gguf, tid);
@@ -402,7 +402,7 @@ static bool materialize_mtp_tensors(const std::string & gguf_path,
         if (off + sz > mm.size()) {
             gguf_free(gguf);
             ggml_backend_buffer_free(buf);
-            out_error = std::string("qwen36_mtp: tensor overflows GGUF: ") + name;
+            out_error = std::string("qwen35_mtp: tensor overflows GGUF: ") + name;
             return false;
         }
         ggml_backend_tensor_set(t,
@@ -424,7 +424,7 @@ static ggml_context * load_gguf_tensor_context(const std::string & gguf_path,
     gguf_context * gguf = gguf_init_from_file(gguf_path.c_str(), gp);
     if (!gguf || !ctx) {
         if (gguf) gguf_free(gguf);
-        out_error = "qwen36_mtp: failed to create GGUF tensor context for " + gguf_path;
+        out_error = "qwen35_mtp: failed to create GGUF tensor context for " + gguf_path;
         return nullptr;
     }
     gguf_free(gguf);
@@ -448,8 +448,8 @@ struct HeadKvBuffer {
     std::vector<float> v;
 };
 
-struct Qwen36MtpModule::State {
-    Qwen36MtpWeights  weights;
+struct Qwen35MtpModule::State {
+    Qwen35MtpWeights  weights;
     DFlashTarget *    target    = nullptr;
     ggml_context *    owned_ctx = nullptr;
     ggml_backend_buffer_t mtp_buf = nullptr;
@@ -489,12 +489,12 @@ struct Qwen36MtpModule::State {
         bool fused_lm_head = false;
         int  topk_k       = 0;
     };
-    std::array<std::pair<StepGraphKey, std::unique_ptr<Qwen36MtpStepGraph>>, 4> step_sg_cache{};
+    std::array<std::pair<StepGraphKey, std::unique_ptr<Qwen35MtpStepGraph>>, 4> step_sg_cache{};
     // Single scratch graph for the deprecated path (callers that pass the
-    // legacy build_qwen36_mtp_step_graph signature with no caching).
-    Qwen36MtpStepGraph        step_sg;
+    // legacy build_qwen35_mtp_step_graph signature with no caching).
+    Qwen35MtpStepGraph        step_sg;
     // Cached warmup graph (rebuilt per call because n_tokens varies).
-    Qwen36MtpWarmGraph        warm_sg;
+    Qwen35MtpWarmGraph        warm_sg;
 
     // Per-head top-K logprob emission. K=1 means argmax-only (legacy ABI:
     // StepOutput.topk_* stays empty). K>1 populates the topk surface in
@@ -506,10 +506,10 @@ struct Qwen36MtpModule::State {
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────
 
-Qwen36MtpModule::Qwen36MtpModule() : state_(std::make_unique<State>()) {}
-Qwen36MtpModule::~Qwen36MtpModule() { shutdown(); }
+Qwen35MtpModule::Qwen35MtpModule() : state_(std::make_unique<State>()) {}
+Qwen35MtpModule::~Qwen35MtpModule() { shutdown(); }
 
-bool Qwen36MtpModule::init(const std::string & gguf_path,
+bool Qwen35MtpModule::init(const std::string & gguf_path,
                            DFlashTarget * target,
                            std::string & out_error) {
     shutdown();
@@ -525,22 +525,22 @@ bool Qwen36MtpModule::init(const std::string & gguf_path,
     return true;
 }
 
-bool Qwen36MtpModule::init(const std::string & gguf_path,
+bool Qwen35MtpModule::init(const std::string & gguf_path,
                            ggml_context * ctx,
                            DFlashTarget * target,
                            std::string & out_error) {
     if (!target) {
-        out_error = "Qwen36MtpModule::init: target is null";
+        out_error = "Qwen35MtpModule::init: target is null";
         return false;
     }
     if (!ctx) {
-        out_error = "Qwen36MtpModule::init: ctx is null";
+        out_error = "Qwen35MtpModule::init: ctx is null";
         return false;
     }
     if (!state_->owned_ctx) {
         shutdown();
     }
-    const bool ok = load_qwen36_mtp_weights(
+    const bool ok = load_qwen35_mtp_weights(
         gguf_path, ctx,
         /*expected_n_embd=*/target->hidden_size(),
         /*expected_n_vocab=*/0,
@@ -566,7 +566,7 @@ bool Qwen36MtpModule::init(const std::string & gguf_path,
     if (state_->weights.n_heads > 1) {
         char buf[256];
         std::snprintf(buf, sizeof(buf),
-            "Qwen36MtpModule::init: n_heads=%d (>1) is not supported. "
+            "Qwen35MtpModule::init: n_heads=%d (>1) is not supported. "
             "warm_head_kv only initializes head 0 and step_chain reuses "
             "head 0 across iters; multi-head GGUFs would silently produce "
             "wrong drafts. See momus review.",
@@ -617,7 +617,7 @@ bool Qwen36MtpModule::init(const std::string & gguf_path,
                 kp.no_alloc   = true;
                 state_->kv_ctx = ggml_init(kp);
                 if (!state_->kv_ctx) {
-                    out_error = "qwen36_mtp: head_kv ggml_init failed";
+                    out_error = "qwen35_mtp: head_kv ggml_init failed";
                     return false;
                 }
                 for (int h = 0; h < gamma_max; h++) {
@@ -646,7 +646,7 @@ bool Qwen36MtpModule::init(const std::string & gguf_path,
                     ggml_free(state_->kv_ctx);
                     state_->kv_ctx = nullptr;
                     state_->head_kv.clear();
-                    out_error = "qwen36_mtp: ggml_backend_alloc_ctx_tensors for head_kv failed";
+                    out_error = "qwen35_mtp: ggml_backend_alloc_ctx_tensors for head_kv failed";
                     return false;
                 }
                 ggml_backend_buffer_clear(state_->kv_buf, 0);
@@ -663,7 +663,7 @@ bool Qwen36MtpModule::init(const std::string & gguf_path,
     return attach(target);
 }
 
-int  Qwen36MtpModule::max_gamma()   const {
+int  Qwen35MtpModule::max_gamma()   const {
     // Post-Phase-A semantics: max_gamma is the autoregressive CHAIN depth ceiling,
     // not the physical NextN head count. We re-feed the single head's own
     // post-shared_head_norm hidden as h_prev to extend the chain to arbitrary depth
@@ -673,14 +673,14 @@ int  Qwen36MtpModule::max_gamma()   const {
     if (!state_->loaded) return 0;
     return 8;
 }
-int  Qwen36MtpModule::hidden_size() const { return state_->weights.n_embd; }
-int  Qwen36MtpModule::num_heads()   const { return state_->weights.n_heads; }
+int  Qwen35MtpModule::hidden_size() const { return state_->weights.n_embd; }
+int  Qwen35MtpModule::num_heads()   const { return state_->weights.n_heads; }
 
-bool Qwen36MtpModule::attach(DFlashTarget * target) {
+bool Qwen35MtpModule::attach(DFlashTarget * target) {
     if (!target) return false;
     if (state_->loaded && target->hidden_size() != state_->weights.n_embd) {
         std::fprintf(stderr,
-            "[qwen36_mtp] hidden_size mismatch (target=%d, mtp=%d)\n",
+            "[qwen35_mtp] hidden_size mismatch (target=%d, mtp=%d)\n",
             target->hidden_size(), state_->weights.n_embd);
         return false;
     }
@@ -695,7 +695,7 @@ bool Qwen36MtpModule::attach(DFlashTarget * target) {
     return true;
 }
 
-void Qwen36MtpModule::reset_chain() {
+void Qwen35MtpModule::reset_chain() {
     if (state_->loaded) {
         std::fill(state_->last_hidden.begin(), state_->last_hidden.end(), 0.0f);
     }
@@ -703,18 +703,18 @@ void Qwen36MtpModule::reset_chain() {
     state_->initial_hidden_dim = 0;
 }
 
-void Qwen36MtpModule::set_draft_topk(int k) {
+void Qwen35MtpModule::set_draft_topk(int k) {
     state_->draft_topk = (k >= 1) ? k : 1;
 }
 
-void Qwen36MtpModule::shutdown() {
+void Qwen35MtpModule::shutdown() {
     for (auto & e : state_->step_sg_cache) {
-        if (e.second) qwen36_mtp_step_graph_free(*e.second);
+        if (e.second) qwen35_mtp_step_graph_free(*e.second);
         e.second.reset();
         e.first = State::StepGraphKey{};
     }
-    qwen36_mtp_step_graph_free(state_->step_sg);
-    qwen36_mtp_warm_graph_free(state_->warm_sg);
+    qwen35_mtp_step_graph_free(state_->step_sg);
+    qwen35_mtp_warm_graph_free(state_->warm_sg);
     if (state_->kv_buf) {
         ggml_backend_buffer_free(state_->kv_buf);
         state_->kv_buf = nullptr;
@@ -761,7 +761,7 @@ void Qwen36MtpModule::shutdown() {
 //
 // When MTP_PHASE_A_FALLBACK is defined, skips the TRMBlock (Phase A path).
 
-bool Qwen36MtpModule::step_batch(int32_t current_token,
+bool Qwen35MtpModule::step_batch(int32_t current_token,
                                  int base_pos,
                                  std::vector<StepOutput> & out) {
     // Guard: module must be loaded and attached.
@@ -793,7 +793,7 @@ bool Qwen36MtpModule::step_batch(int32_t current_token,
     // RoPE params (Qwen3.6-27B constants from GGUF metadata).
     // For the 27B GGUF: rope_dimension_count=64, rope_theta=1e7.
     // We use these constants directly since they're part of the verified GGUF
-    // contract (qwen36_mtp_redesign.md §Verified GGUF Constants).
+    // contract (qwen35_mtp_redesign.md §Verified GGUF Constants).
     // For text-mode MROPE, the 3 active axes share the same position, so
     // it reduces to NeoX RoPE with n_rot=rope.dimension_count=64.  The CPU
     // fallback path uses plain rope_cpu(); the GPU graph calls ggml_rope_multi
@@ -886,7 +886,7 @@ bool Qwen36MtpModule::step_batch(int32_t current_token,
             }
             if (!found_hidden) {
                 std::fprintf(stderr,
-                    "[qwen36_mtp] step_batch: no live hidden available at base_pos=%d; "
+                    "[qwen35_mtp] step_batch: no live hidden available at base_pos=%d; "
                     "using zero vector for h_prev\n", base_pos);
             }
         }
@@ -895,7 +895,7 @@ bool Qwen36MtpModule::step_batch(int32_t current_token,
         const int32_t tok_ids[1] = { cur_token };
         if (!state_->target->embed_tokens(tok_ids, 1, embed_buf.data())) {
             std::fprintf(stderr,
-                "[qwen36_mtp] step_batch: embed_tokens failed for head %d\n", h);
+                "[qwen35_mtp] step_batch: embed_tokens failed for head %d\n", h);
             out.clear();
             return false;
         }
@@ -906,14 +906,14 @@ bool Qwen36MtpModule::step_batch(int32_t current_token,
         if (!tensor_to_floats(head.enorm, enorm_data) ||
             (int)enorm_data.size() != n_embd) {
             std::fprintf(stderr,
-                "[qwen36_mtp] step_batch: invalid enorm at head %d\n", h);
+                "[qwen35_mtp] step_batch: invalid enorm at head %d\n", h);
             out.clear();
             return false;
         }
         if (!tensor_to_floats(head.hnorm, hnorm_data) ||
             (int)hnorm_data.size() != n_embd) {
             std::fprintf(stderr,
-                "[qwen36_mtp] step_batch: invalid hnorm at head %d\n", h);
+                "[qwen35_mtp] step_batch: invalid hnorm at head %d\n", h);
             out.clear();
             return false;
         }
@@ -924,7 +924,7 @@ bool Qwen36MtpModule::step_batch(int32_t current_token,
         // Concat order [e_in; h_in] (embed first, hidden second) matches the
         // reference llama.cpp PR #22673 graph_mtp:
         //   `ggml_concat(ctx0, e_norm, h_norm, /*dim=*/0)`.
-        // The earlier "hidden first" claim in qwen36_mtp_redesign.md was wrong.
+        // The earlier "hidden first" claim in qwen35_mtp_redesign.md was wrong.
         std::copy(e_in.begin(), e_in.end(), concat_buf.begin());
         std::copy(h_in.begin(), h_in.end(), concat_buf.begin() + n_embd);
 
@@ -932,7 +932,7 @@ bool Qwen36MtpModule::step_batch(int32_t current_token,
         if (!tensor_to_floats(head.eh_proj, eh_proj_data) ||
             (int)eh_proj_data.size() != n_embd * 2 * n_embd) {
             std::fprintf(stderr,
-                "[qwen36_mtp] step_batch: invalid eh_proj at head %d "
+                "[qwen35_mtp] step_batch: invalid eh_proj at head %d "
                 "(got %zu, expected %d)\n",
                 h, eh_proj_data.size(), n_embd * 2 * n_embd);
             out.clear();
@@ -949,7 +949,7 @@ bool Qwen36MtpModule::step_batch(int32_t current_token,
         if (!tensor_to_floats(head.attn_norm, attn_norm_data) ||
             (int)attn_norm_data.size() != n_embd) {
             std::fprintf(stderr,
-                "[qwen36_mtp] step_batch: invalid attn_norm at head %d\n", h);
+                "[qwen35_mtp] step_batch: invalid attn_norm at head %d\n", h);
             out.clear();
             return false;
         }
@@ -962,7 +962,7 @@ bool Qwen36MtpModule::step_batch(int32_t current_token,
         if (!tensor_to_floats(head.attn_q, attn_q_data) ||
             (int)attn_q_data.size() != 2 * q_dim * n_embd) {
             std::fprintf(stderr,
-                "[qwen36_mtp] step_batch: invalid attn_q at head %d "
+                "[qwen35_mtp] step_batch: invalid attn_q at head %d "
                 "(got %zu, expected %d)\n",
                 h, attn_q_data.size(), 2 * q_dim * n_embd);
             out.clear();
@@ -993,7 +993,7 @@ bool Qwen36MtpModule::step_batch(int32_t current_token,
         if (!tensor_to_floats(head.attn_k, attn_k_data) ||
             (int)attn_k_data.size() != kv_dim * n_embd) {
             std::fprintf(stderr,
-                "[qwen36_mtp] step_batch: invalid attn_k at head %d\n", h);
+                "[qwen35_mtp] step_batch: invalid attn_k at head %d\n", h);
             out.clear();
             return false;
         }
@@ -1005,7 +1005,7 @@ bool Qwen36MtpModule::step_batch(int32_t current_token,
         if (!tensor_to_floats(head.attn_v, attn_v_data) ||
             (int)attn_v_data.size() != v_total * n_embd) {
             std::fprintf(stderr,
-                "[qwen36_mtp] step_batch: invalid attn_v at head %d\n", h);
+                "[qwen35_mtp] step_batch: invalid attn_v at head %d\n", h);
             out.clear();
             return false;
         }
@@ -1017,14 +1017,14 @@ bool Qwen36MtpModule::step_batch(int32_t current_token,
         if (!tensor_to_floats(head.attn_q_norm, attn_q_norm_data) ||
             (int)attn_q_norm_data.size() != key_len) {
             std::fprintf(stderr,
-                "[qwen36_mtp] step_batch: invalid attn_q_norm at head %d\n", h);
+                "[qwen35_mtp] step_batch: invalid attn_q_norm at head %d\n", h);
             out.clear();
             return false;
         }
         if (!tensor_to_floats(head.attn_k_norm, attn_k_norm_data) ||
             (int)attn_k_norm_data.size() != key_len) {
             std::fprintf(stderr,
-                "[qwen36_mtp] step_batch: invalid attn_k_norm at head %d\n", h);
+                "[qwen35_mtp] step_batch: invalid attn_k_norm at head %d\n", h);
             out.clear();
             return false;
         }
@@ -1037,7 +1037,7 @@ bool Qwen36MtpModule::step_batch(int32_t current_token,
         if (draft_pos >= state_->n_ctx ||
             (int)state_->head_kv.size() <= h) {
             std::fprintf(stderr,
-                "[qwen36_mtp] step_batch: draft_pos %d out of head_kv range "
+                "[qwen35_mtp] step_batch: draft_pos %d out of head_kv range "
                 "(n_ctx=%d, head=%d, head_kv_size=%zu)\n",
                 draft_pos, state_->n_ctx, h, state_->head_kv.size());
             out.clear();
@@ -1075,7 +1075,7 @@ bool Qwen36MtpModule::step_batch(int32_t current_token,
         if (!tensor_to_floats(head.attn_output, attn_output_data) ||
             (int)attn_output_data.size() != n_embd * q_dim) {
             std::fprintf(stderr,
-                "[qwen36_mtp] step_batch: invalid attn_output at head %d "
+                "[qwen35_mtp] step_batch: invalid attn_output at head %d "
                 "(got %zu, expected %d)\n",
                 h, attn_output_data.size(), n_embd * q_dim);
             out.clear();
@@ -1092,7 +1092,7 @@ bool Qwen36MtpModule::step_batch(int32_t current_token,
         if (!tensor_to_floats(head.post_attention_norm, post_attn_norm_data) ||
             (int)post_attn_norm_data.size() != n_embd) {
             std::fprintf(stderr,
-                "[qwen36_mtp] step_batch: invalid post_attention_norm at head %d\n", h);
+                "[qwen35_mtp] step_batch: invalid post_attention_norm at head %d\n", h);
             out.clear();
             return false;
         }
@@ -1102,21 +1102,21 @@ bool Qwen36MtpModule::step_batch(int32_t current_token,
         if (!tensor_to_floats(head.ffn_gate, ffn_gate_data) ||
             (int)ffn_gate_data.size() != ffn_len * n_embd) {
             std::fprintf(stderr,
-                "[qwen36_mtp] step_batch: invalid ffn_gate at head %d\n", h);
+                "[qwen35_mtp] step_batch: invalid ffn_gate at head %d\n", h);
             out.clear();
             return false;
         }
         if (!tensor_to_floats(head.ffn_up, ffn_up_data) ||
             (int)ffn_up_data.size() != ffn_len * n_embd) {
             std::fprintf(stderr,
-                "[qwen36_mtp] step_batch: invalid ffn_up at head %d\n", h);
+                "[qwen35_mtp] step_batch: invalid ffn_up at head %d\n", h);
             out.clear();
             return false;
         }
         if (!tensor_to_floats(head.ffn_down, ffn_down_data) ||
             (int)ffn_down_data.size() != n_embd * ffn_len) {
             std::fprintf(stderr,
-                "[qwen36_mtp] step_batch: invalid ffn_down at head %d\n", h);
+                "[qwen35_mtp] step_batch: invalid ffn_down at head %d\n", h);
             out.clear();
             return false;
         }
@@ -1188,7 +1188,7 @@ bool Qwen36MtpModule::step_batch(int32_t current_token,
                     if (!state_->target->project_hidden_to_tokens(x_normed.data(), 1, tok_out)
                         || tok_out.empty()) {
                         std::fprintf(stderr,
-                            "[qwen36_mtp] step_batch: project_hidden_to_tokens failed at head %d\n", h);
+                            "[qwen35_mtp] step_batch: project_hidden_to_tokens failed at head %d\n", h);
                         out.clear();
                         return false;
                     }
@@ -1197,7 +1197,7 @@ bool Qwen36MtpModule::step_batch(int32_t current_token,
                     static bool warned = false;
                     if (!warned) {
                         std::fprintf(stderr,
-                            "[qwen36_mtp] step_batch: draft_topk=%d requested but target "
+                            "[qwen35_mtp] step_batch: draft_topk=%d requested but target "
                             "lacks project_hidden_to_logits; emitting argmax only.\n",
                             state_->draft_topk);
                         warned = true;
@@ -1208,7 +1208,7 @@ bool Qwen36MtpModule::step_batch(int32_t current_token,
                 if (!state_->target->project_hidden_to_tokens(x_normed.data(), 1, tok_out)
                     || tok_out.empty()) {
                     std::fprintf(stderr,
-                        "[qwen36_mtp] step_batch: project_hidden_to_tokens failed at head %d\n", h);
+                        "[qwen35_mtp] step_batch: project_hidden_to_tokens failed at head %d\n", h);
                     out.clear();
                     return false;
                 }
@@ -1228,11 +1228,11 @@ bool Qwen36MtpModule::step_batch(int32_t current_token,
     return true;
 }
 
-const Qwen36MtpWeights & Qwen36MtpModule::weights() const {
+const Qwen35MtpWeights & Qwen35MtpModule::weights() const {
     return state_->weights;
 }
 
-void Qwen36MtpModule::attach_weights_for_test(const Qwen36MtpWeights & w) {
+void Qwen35MtpModule::attach_weights_for_test(const Qwen35MtpWeights & w) {
     state_->weights     = w;
     state_->loaded      = true;
     state_->last_hidden.assign(w.n_embd, 0.0f);
@@ -1257,7 +1257,7 @@ void Qwen36MtpModule::attach_weights_for_test(const Qwen36MtpWeights & w) {
     }
 }
 
-void Qwen36MtpModule::set_initial_hidden(const float * h_prev, int dim) {
+void Qwen35MtpModule::set_initial_hidden(const float * h_prev, int dim) {
     // Stash caller's pointer + dim. The pointer must remain valid for the
     // duration of the next step_batch() call.
     // The Shape B TRMBlock forward reads it.
@@ -1265,13 +1265,13 @@ void Qwen36MtpModule::set_initial_hidden(const float * h_prev, int dim) {
     state_->initial_hidden_dim = dim;
 }
 
-bool Qwen36MtpModule::warm_head_kv(const int32_t * prompt_tokens,
+bool Qwen35MtpModule::warm_head_kv(const int32_t * prompt_tokens,
                                    int             n_prompt,
                                    int32_t         prefill_next,
                                    const float *   hiddens) {
     if (!state_->loaded || !state_->attached || !state_->target) {
         std::fprintf(stderr,
-            "[qwen36_mtp] warm_head_kv: module not loaded/attached\n");
+            "[qwen35_mtp] warm_head_kv: module not loaded/attached\n");
         return false;
     }
     if (n_prompt <= 0 || !prompt_tokens || !hiddens) return true;
@@ -1288,13 +1288,13 @@ bool Qwen36MtpModule::warm_head_kv(const int32_t * prompt_tokens,
 
     if (n_prompt > state_->n_ctx) {
         std::fprintf(stderr,
-            "[qwen36_mtp] warm_head_kv: n_prompt=%d exceeds head_kv capacity n_ctx=%d\n",
+            "[qwen35_mtp] warm_head_kv: n_prompt=%d exceeds head_kv capacity n_ctx=%d\n",
             n_prompt, state_->n_ctx);
         return false;
     }
     if ((int)state_->head_kv.size() < n_heads) {
         std::fprintf(stderr,
-            "[qwen36_mtp] warm_head_kv: head_kv not allocated (size=%zu, expected=%d)\n",
+            "[qwen35_mtp] warm_head_kv: head_kv not allocated (size=%zu, expected=%d)\n",
             state_->head_kv.size(), n_heads);
         return false;
     }
@@ -1321,7 +1321,7 @@ bool Qwen36MtpModule::warm_head_kv(const int32_t * prompt_tokens,
         std::vector<float> embed_seq((size_t)n_prompt * n_embd);
         if (!state_->target->embed_tokens(input_tok_seq.data(), n_prompt,
                                            embed_seq.data())) {
-            std::fprintf(stderr, "[qwen36_mtp gpu-warm] embed_tokens failed\n");
+            std::fprintf(stderr, "[qwen35_mtp gpu-warm] embed_tokens failed\n");
             return false;
         }
 
@@ -1335,7 +1335,7 @@ bool Qwen36MtpModule::warm_head_kv(const int32_t * prompt_tokens,
             pos_seq[4 * i + 3] = 0;
         }
 
-        if (!build_qwen36_mtp_warm_graph(state_->warm_sg, head,
+        if (!build_qwen35_mtp_warm_graph(state_->warm_sg, head,
                                           state_->head_kv[h].k_cache,
                                           state_->head_kv[h].v_cache,
                                           backend,
@@ -1356,7 +1356,7 @@ bool Qwen36MtpModule::warm_head_kv(const int32_t * prompt_tokens,
         auto st = ggml_backend_graph_compute(backend, state_->warm_sg.gf);
         if (st != GGML_STATUS_SUCCESS) {
             std::fprintf(stderr,
-                "[qwen36_mtp gpu-warm] graph_compute status=%d\n", (int)st);
+                "[qwen35_mtp gpu-warm] graph_compute status=%d\n", (int)st);
             return false;
         }
         return true;
@@ -1397,7 +1397,7 @@ bool Qwen36MtpModule::warm_head_kv(const int32_t * prompt_tokens,
         !tensor_to_floats(head.attn_k_norm, attn_k_norm_data) ||
         (int)attn_k_norm_data.size() != key_len) {
         std::fprintf(stderr,
-            "[qwen36_mtp] warm_head_kv: failed to dequant head tensors\n");
+            "[qwen35_mtp] warm_head_kv: failed to dequant head tensors\n");
         return false;
     }
 
@@ -1414,7 +1414,7 @@ bool Qwen36MtpModule::warm_head_kv(const int32_t * prompt_tokens,
     const int last_slot = n_prompt;  // inclusive
     if (last_slot >= state_->n_ctx) {
         std::fprintf(stderr,
-            "[qwen36_mtp] warm_head_kv: last_slot=%d exceeds n_ctx=%d\n",
+            "[qwen35_mtp] warm_head_kv: last_slot=%d exceeds n_ctx=%d\n",
             last_slot, state_->n_ctx);
         return false;
     }
@@ -1424,7 +1424,7 @@ bool Qwen36MtpModule::warm_head_kv(const int32_t * prompt_tokens,
 
         if (!state_->target->embed_tokens(&input_tok, 1, embed_buf.data())) {
             std::fprintf(stderr,
-                "[qwen36_mtp] warm_head_kv: embed_tokens failed at p=%d\n", p);
+                "[qwen35_mtp] warm_head_kv: embed_tokens failed at p=%d\n", p);
             return false;
         }
         rmsnorm_cpu(embed_buf.data(), enorm_data.data(), e_in.data(), n_embd);
@@ -1471,10 +1471,10 @@ bool Qwen36MtpModule::warm_head_kv(const int32_t * prompt_tokens,
     return true;
 }
 
-const float * Qwen36MtpModule::test_initial_hidden_ptr() const {
+const float * Qwen35MtpModule::test_initial_hidden_ptr() const {
     return state_->initial_hidden_ptr;
 }
-int Qwen36MtpModule::test_initial_hidden_dim() const {
+int Qwen35MtpModule::test_initial_hidden_dim() const {
     return state_->initial_hidden_dim;
 }
 
@@ -1483,7 +1483,7 @@ int Qwen36MtpModule::test_initial_hidden_dim() const {
 
 // Push the runtime KV routing inputs (write slot, read idxs, mask) for the
 // current draft_pos / kv_len.  fa_max is baked into the graph at build time.
-static void push_kv_slot_inputs_(Qwen36MtpStepGraph * sg,
+static void push_kv_slot_inputs_(Qwen35MtpStepGraph * sg,
                                  int draft_pos, int kv_len,
                                  int n_head_kv) {
     const int fa_max  = sg->fa_max;
@@ -1511,7 +1511,7 @@ static void push_kv_slot_inputs_(Qwen36MtpStepGraph * sg,
         sizeof(uint16_t) * mask.size());
 }
 
-Qwen36MtpStepGraph * Qwen36MtpModule::get_or_build_step_graph_(int head_idx) {
+Qwen35MtpStepGraph * Qwen35MtpModule::get_or_build_step_graph_(int head_idx) {
     if (head_idx < 0 || head_idx >= (int)state_->weights.heads.size()) {
         return nullptr;
     }
@@ -1548,11 +1548,11 @@ Qwen36MtpStepGraph * Qwen36MtpModule::get_or_build_step_graph_(int head_idx) {
     if (free_slot < 0) free_slot = 0;  // evict slot 0 (FIFO is fine; cap=4)
 
     auto & slot = state_->step_sg_cache[free_slot];
-    if (slot.second) qwen36_mtp_step_graph_free(*slot.second);
-    else             slot.second.reset(new Qwen36MtpStepGraph());
+    if (slot.second) qwen35_mtp_step_graph_free(*slot.second);
+    else             slot.second.reset(new Qwen35MtpStepGraph());
 
     const auto & head = state_->weights.heads[head_idx];
-    if (!build_qwen36_mtp_step_graph(*slot.second, head,
+    if (!build_qwen35_mtp_step_graph(*slot.second, head,
                                       state_->head_kv[head_idx].k_cache,
                                       state_->head_kv[head_idx].v_cache,
                                       state_->target->backend(),
@@ -1563,7 +1563,7 @@ Qwen36MtpStepGraph * Qwen36MtpModule::get_or_build_step_graph_(int head_idx) {
                                       state_->n_ctx,
                                       fa_win, lm_head, topk_k)) {
         std::fprintf(stderr,
-            "[qwen36_mtp] get_or_build_step_graph_: build failed head=%d\n",
+            "[qwen35_mtp] get_or_build_step_graph_: build failed head=%d\n",
             head_idx);
         slot.second.reset();
         slot.first = State::StepGraphKey{};
@@ -1577,7 +1577,7 @@ Qwen36MtpStepGraph * Qwen36MtpModule::get_or_build_step_graph_(int head_idx) {
 // in state_->step_sg_cache (Phase B+).  When the bound target exposes its
 // lm_head_weight() the graph also fuses the LM-head matmul + argmax so we
 // skip the hidden -> host -> separate-cgraph round trip per call.
-bool Qwen36MtpModule::step_batch_gpu_(int32_t current_token,
+bool Qwen35MtpModule::step_batch_gpu_(int32_t current_token,
                                        int base_pos,
                                        std::vector<StepOutput> & out) {
     const int n_embd    = state_->weights.n_embd;
@@ -1594,7 +1594,7 @@ bool Qwen36MtpModule::step_batch_gpu_(int32_t current_token,
         const int draft_pos = base_pos + h;
         if (draft_pos >= state_->n_ctx) {
             std::fprintf(stderr,
-                "[qwen36_mtp gpu] draft_pos=%d exceeds n_ctx=%d\n",
+                "[qwen35_mtp gpu] draft_pos=%d exceeds n_ctx=%d\n",
                 draft_pos, state_->n_ctx);
             out.clear();
             return false;
@@ -1621,7 +1621,7 @@ bool Qwen36MtpModule::step_batch_gpu_(int32_t current_token,
             }
             if (!h_prev) {
                 std::fprintf(stderr,
-                    "[qwen36_mtp gpu] no hidden available at base_pos=%d\n",
+                    "[qwen35_mtp gpu] no hidden available at base_pos=%d\n",
                     base_pos);
                 out.clear();
                 return false;
@@ -1634,13 +1634,13 @@ bool Qwen36MtpModule::step_batch_gpu_(int32_t current_token,
         }
         // Embed cur_token via target (already on host).
         if (!state_->target->embed_tokens(&cur_token, 1, embed_buf.data())) {
-            std::fprintf(stderr, "[qwen36_mtp gpu] embed_tokens failed h=%d\n", h);
+            std::fprintf(stderr, "[qwen35_mtp gpu] embed_tokens failed h=%d\n", h);
             out.clear();
             return false;
         }
 
         // Get-or-build the shape-only step graph.
-        Qwen36MtpStepGraph * sg = get_or_build_step_graph_(h);
+        Qwen35MtpStepGraph * sg = get_or_build_step_graph_(h);
         if (!sg) { out.clear(); return false; }
 
         // Upload inputs.  Pass h_prev directly (no scratch memcpy — task E).
@@ -1655,7 +1655,7 @@ bool Qwen36MtpModule::step_batch_gpu_(int32_t current_token,
 
         auto st = ggml_backend_graph_compute(backend, sg->gf);
         if (st != GGML_STATUS_SUCCESS) {
-            std::fprintf(stderr, "[qwen36_mtp gpu] graph_compute status=%d\n", (int)st);
+            std::fprintf(stderr, "[qwen35_mtp gpu] graph_compute status=%d\n", (int)st);
             out.clear();
             return false;
         }
@@ -1682,7 +1682,7 @@ bool Qwen36MtpModule::step_batch_gpu_(int32_t current_token,
             // hidden.  Skip the download otherwise to keep the fused path
             // zero-host-roundtrip.  Read PRE-shared_head_norm hidden — feeding
             // post-norm here causes the next iter's `hnorm` to double-
-            // normalise (see qwen36_mtp_graph.cpp pre-norm output comment;
+            // normalise (see qwen35_mtp_graph.cpp pre-norm output comment;
             // mirrors llama.cpp PR #22673 `t_h_pre_norm` design).
             if (n_heads > 1) {
                 std::vector<float> h_pre(n_embd);
@@ -1711,7 +1711,7 @@ bool Qwen36MtpModule::step_batch_gpu_(int32_t current_token,
                                                                    tok_out) ||
                         tok_out.empty()) {
                         std::fprintf(stderr,
-                            "[qwen36_mtp gpu] project_hidden_to_tokens failed h=%d\n", h);
+                            "[qwen35_mtp gpu] project_hidden_to_tokens failed h=%d\n", h);
                         out.clear();
                         return false;
                     }
@@ -1720,7 +1720,7 @@ bool Qwen36MtpModule::step_batch_gpu_(int32_t current_token,
                     static bool warned = false;
                     if (!warned) {
                         std::fprintf(stderr,
-                            "[qwen36_mtp gpu] draft_topk=%d requested but target "
+                            "[qwen35_mtp gpu] draft_topk=%d requested but target "
                             "lacks project_hidden_to_logits; emitting argmax only.\n",
                             state_->draft_topk);
                         warned = true;
@@ -1732,7 +1732,7 @@ bool Qwen36MtpModule::step_batch_gpu_(int32_t current_token,
                                                                tok_out) ||
                     tok_out.empty()) {
                     std::fprintf(stderr,
-                        "[qwen36_mtp gpu] project_hidden_to_tokens failed h=%d\n", h);
+                        "[qwen35_mtp gpu] project_hidden_to_tokens failed h=%d\n", h);
                     out.clear();
                     return false;
                 }
@@ -1740,7 +1740,7 @@ bool Qwen36MtpModule::step_batch_gpu_(int32_t current_token,
                 so.draft_logit = 0.0f;
             }
             // last_hidden must be PRE-shared_head_norm (chain h_prev contract;
-            // see qwen36_mtp_graph.cpp pre-norm output comment and
+            // see qwen35_mtp_graph.cpp pre-norm output comment and
             // llama.cpp PR #22673 `t_h_pre_norm`).  `x_normed` is consumed
             // above for the LM-head projection only.
             if (n_heads > 1) {
@@ -1764,7 +1764,7 @@ bool Qwen36MtpModule::step_batch_gpu_(int32_t current_token,
 // CPU stub path (no backend / no kv_ctx): degrade gracefully to the default
 // `step_batch`+clamp.  Unit tests exercising the CPU forward at depth=1
 // remain byte-identical to the old behaviour.
-bool Qwen36MtpModule::step_chain(int32_t current_token,
+bool Qwen35MtpModule::step_chain(int32_t current_token,
                                  int base_pos,
                                  int chain_depth,
                                  std::vector<StepOutput> & out) {
@@ -1812,7 +1812,7 @@ bool Qwen36MtpModule::step_chain(int32_t current_token,
     if ((int)state_->weights.heads.size() <= h ||
         (int)state_->head_kv.size() <= h) {
         std::fprintf(stderr,
-            "[qwen36_mtp gpu chain] head 0 missing (heads=%zu head_kv=%zu)\n",
+            "[qwen35_mtp gpu chain] head 0 missing (heads=%zu head_kv=%zu)\n",
             state_->weights.heads.size(), state_->head_kv.size());
         return false;
     }
@@ -1834,7 +1834,7 @@ bool Qwen36MtpModule::step_chain(int32_t current_token,
         const int draft_pos = base_pos + it;
         if (draft_pos >= state_->n_ctx) {
             std::fprintf(stderr,
-                "[qwen36_mtp gpu chain] draft_pos=%d exceeds n_ctx=%d (iter=%d)\n",
+                "[qwen35_mtp gpu chain] draft_pos=%d exceeds n_ctx=%d (iter=%d)\n",
                 draft_pos, state_->n_ctx, it);
             return false;
         }
@@ -1863,7 +1863,7 @@ bool Qwen36MtpModule::step_chain(int32_t current_token,
                     static bool warned_post_norm = false;
                     if (!warned_post_norm) {
                         std::fprintf(stderr,
-                            "[qwen36_mtp gpu chain] WARN: hidden_at_pos_pre_norm "
+                            "[qwen35_mtp gpu chain] WARN: hidden_at_pos_pre_norm "
                             "returned null at base_pos=%d, falling back to "
                             "post-norm hidden. This silently undoes the "
                             "PR #22673 t_h_pre_norm fix at iter 0 and crushes "
@@ -1883,14 +1883,14 @@ bool Qwen36MtpModule::step_chain(int32_t current_token,
             }
             if (!h_prev) {
                 std::fprintf(stderr,
-                    "[qwen36_mtp gpu chain] no hidden available at base_pos=%d\n",
+                    "[qwen35_mtp gpu chain] no hidden available at base_pos=%d\n",
                     base_pos);
                 return false;
             }
         } else {
             if ((int)state_->last_hidden.size() != n_embd) {
                 std::fprintf(stderr,
-                    "[qwen36_mtp gpu chain] last_hidden missing for iter %d\n", it);
+                    "[qwen35_mtp gpu chain] last_hidden missing for iter %d\n", it);
                 return false;
             }
             h_prev = state_->last_hidden.data();
@@ -1902,14 +1902,14 @@ bool Qwen36MtpModule::step_chain(int32_t current_token,
 #endif  // DFLASH_MTP_PROFILE
         if (!state_->target->embed_tokens(&cur_token, 1, embed_buf.data())) {
             std::fprintf(stderr,
-                "[qwen36_mtp gpu chain] embed_tokens failed iter=%d\n", it);
+                "[qwen35_mtp gpu chain] embed_tokens failed iter=%d\n", it);
             return false;
         }
 #ifdef DFLASH_MTP_PROFILE
         const double t_embed = prof_on ? prof_ms_since(t0) : 0.0;
 #endif  // DFLASH_MTP_PROFILE
 
-        Qwen36MtpStepGraph * sg = get_or_build_step_graph_(h);
+        Qwen35MtpStepGraph * sg = get_or_build_step_graph_(h);
         if (!sg) return false;
 
 #ifdef DFLASH_MTP_PROFILE
@@ -1941,7 +1941,7 @@ bool Qwen36MtpModule::step_chain(int32_t current_token,
 #endif
         if (st != GGML_STATUS_SUCCESS) {
             std::fprintf(stderr,
-                "[qwen36_mtp gpu chain] graph_compute status=%d iter=%d\n",
+                "[qwen35_mtp gpu chain] graph_compute status=%d iter=%d\n",
                 (int)st, it);
             return false;
         }
@@ -2027,7 +2027,7 @@ bool Qwen36MtpModule::step_chain(int32_t current_token,
                                                                tok_out) ||
                     tok_out.empty()) {
                     std::fprintf(stderr,
-                        "[qwen36_mtp gpu chain] project_hidden_to_tokens failed iter=%d\n", it);
+                        "[qwen35_mtp gpu chain] project_hidden_to_tokens failed iter=%d\n", it);
                     return false;
                 }
                 so.draft_token = tok_out[0];
@@ -2039,7 +2039,7 @@ bool Qwen36MtpModule::step_chain(int32_t current_token,
                                                            tok_out) ||
                 tok_out.empty()) {
                 std::fprintf(stderr,
-                    "[qwen36_mtp gpu chain] project_hidden_to_tokens failed iter=%d\n", it);
+                    "[qwen35_mtp gpu chain] project_hidden_to_tokens failed iter=%d\n", it);
                 return false;
             }
             so.draft_token = tok_out[0];

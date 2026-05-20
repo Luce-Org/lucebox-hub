@@ -1,4 +1,4 @@
-// qwen36_mtp.h — Native-heads MTP module for unsloth Qwen3.6 GGUFs.
+// qwen35_mtp.h — Native-heads MTP module for unsloth Qwen3.6 GGUFs.
 //
 // Qwen3.6's GGUF architecture is `qwen35` (same backbone). The MTP heads are
 // stored as additional per-layer tensors on the last `qwen35.nextn_predict_layers`
@@ -46,8 +46,8 @@ namespace mtp {
 //
 // Shape B (DeepSeek-V3 NextN): each head owns a full transformer-block at its
 // GGUF block index. These tensors are loaded from blk.{layer_idx}.* (no nextn.
-// prefix). See qwen36_mtp_redesign.md for the verified GGUF tensor inventory.
-struct Qwen36MtpHeadWeights {
+// prefix). See qwen35_mtp_redesign.md for the verified GGUF tensor inventory.
+struct Qwen35MtpHeadWeights {
     int layer_idx     = -1;            // absolute GGUF block index
     // NextN-specific tensors (required)
     ggml_tensor * eh_proj          = nullptr;   // [n_embd, 2*n_embd]
@@ -70,12 +70,12 @@ struct Qwen36MtpHeadWeights {
     ggml_tensor * ffn_down            = nullptr;   // [ffn_length, n_embd]
 };
 
-struct Qwen36MtpWeights {
+struct Qwen35MtpWeights {
     int                                   n_embd            = 0;
     int                                   n_vocab           = 0;
     int                                   n_heads           = 0;   // == nextn_predict_layers
     int                                   n_backbone_layers = 0;   // total backbone n_layer
-    std::vector<Qwen36MtpHeadWeights>     heads;                   // size == n_heads
+    std::vector<Qwen35MtpHeadWeights>     heads;                   // size == n_heads
     // GGUF metadata copies for cross-checks
     std::string                           backbone_arch;           // e.g. "qwen35"
     std::string                           base_model_name;         // e.g. "Qwen3.6-27B"
@@ -93,20 +93,20 @@ struct Qwen36MtpWeights {
 //
 // `expected_n_embd` / `expected_n_vocab` are sanity-checked against GGUF
 // metadata; pass values from the bound target.
-bool load_qwen36_mtp_weights(const std::string & gguf_path,
+bool load_qwen35_mtp_weights(const std::string & gguf_path,
                              ggml_context * ctx,
                              int expected_n_embd,
                              int expected_n_vocab,
-                             Qwen36MtpWeights & out_weights,
+                             Qwen35MtpWeights & out_weights,
                              std::string & out_error);
 
 // Concrete INativeMtp impl for Qwen3.6 (unsloth -MTP-GGUF). Wraps the
 // loaded weights + a bound DFlashTarget (typically Qwen35Backend's
 // dflash_target()) which provides backbone embedding, KV, LM head.
-class Qwen36MtpModule : public INativeMtp {
+class Qwen35MtpModule : public INativeMtp {
 public:
-    Qwen36MtpModule();
-    ~Qwen36MtpModule() override;
+    Qwen35MtpModule();
+    ~Qwen35MtpModule() override;
 
     // One-shot construction: load weights then attach in a single call.
     // The returned module is ready for step_batch() once attach() succeeds.
@@ -178,14 +178,14 @@ public:
                       const float *   hiddens) override;
 
     // Read-only access for tests / introspection.
-    const Qwen36MtpWeights & weights() const;
+    const Qwen35MtpWeights & weights() const;
 
     // Inject pre-built weights for unit tests without a real GGUF file.
     // The "_for_test" / "test_" prefix is the contract: production code uses init().
-    void attach_weights_for_test(const Qwen36MtpWeights & w);
+    void attach_weights_for_test(const Qwen35MtpWeights & w);
 
     // Test-only accessors: return the last set_initial_hidden state.
-    // Used by test_qwen36_mtp_step_unit; not for production paths.
+    // Used by test_qwen35_mtp_step_unit; not for production paths.
     const float * test_initial_hidden_ptr() const;
     int           test_initial_hidden_dim() const;
 
@@ -203,7 +203,7 @@ private:
     // Bug #5 fix: graphs are shape-only, keyed on (head_idx, fa_window,
     // fused_lm_head, topk_k).  Per-call slot routing (write idx, read
     // idxs, mask) is pushed as runtime tensor inputs by the caller.
-    struct Qwen36MtpStepGraph * get_or_build_step_graph_(int head_idx);
+    struct Qwen35MtpStepGraph * get_or_build_step_graph_(int head_idx);
 };
 
 }  // namespace mtp

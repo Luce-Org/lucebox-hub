@@ -12,7 +12,7 @@
 #include "common/mtp_chain_runner.h"
 #include "common/mtp_orchestrator.h"
 #include "qwen3/qwen3_drafter.h"
-#include "qwen36/qwen36_mtp.h"
+#include "qwen35/qwen35_mtp.h"
 
 #include "ggml-cuda.h"
 #include "common/snapshot_backend.h"
@@ -1093,7 +1093,7 @@ int Qwen35Backend::verify_tree(int committed, const DDTree & tree) {
 
 // ── MTP init helper ─────────────────────────────────────────────────────────
 //
-// Mirrors run_qwen36_mtp_harness lines 728-746: construct Qwen36MtpModule,
+// Mirrors run_qwen35_mtp_harness lines 728-746: construct Qwen35MtpModule,
 // load weights from the fused GGUF sharing the backbone tensor context,
 // then attach to the DFlashTarget adapter.
 //
@@ -1108,7 +1108,7 @@ bool Qwen35Backend::init_mtp_() {
         return false;
     }
 
-    mtp_module_ = std::make_unique<mtp::Qwen36MtpModule>();
+    mtp_module_ = std::make_unique<mtp::Qwen35MtpModule>();
     std::string err;
     // Use the 3-arg init so MTP tensors are loaded from the MTP GGUF's own
     // context (blk.64.* live there, not in the backbone ctx).
@@ -1158,7 +1158,7 @@ bool Qwen35Backend::init_mtp_() {
 
 // ── MTP warm helper ──────────────────────────────────────────────────────────
 //
-// Mirrors run_qwen36_mtp_harness lines 783-792: seed the MTP module with the
+// Mirrors run_qwen35_mtp_harness lines 783-792: seed the MTP module with the
 // backbone's final post-norm hidden after prefill, then warm the head KV cache
 // over all prefill positions.
 //

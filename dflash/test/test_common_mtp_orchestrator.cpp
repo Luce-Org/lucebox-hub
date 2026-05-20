@@ -11,7 +11,7 @@
 //         accept, n_gen termination, step failure, stats accounting).
 // T11-T14: MtpOrchestrator lifecycle (reset_chain ordering, set_initial_hidden
 //          plumbing, gamma derivation, warm_head_kv gate).
-// T15-T19: Qwen36MtpModule error paths (no GGUF required).
+// T15-T19: Qwen35MtpModule error paths (no GGUF required).
 //
 // Plain int main(), assert-based, mirrors test_kv_quant.cpp style.
 
@@ -20,7 +20,7 @@
 #include "common/model_backend.h"
 #include "common/mtp_interface.h"
 #include "common/dflash_target.h"
-#include "qwen36/qwen36_mtp.h"
+#include "qwen35/qwen35_mtp.h"
 
 #include <cassert>
 #include <cstdio>
@@ -556,10 +556,10 @@ static void t14_zero_gamma_rejected() {
     std::puts("T14 zero_gamma_rejected PASS");
 }
 
-// ─── T15: Qwen36MtpModule::attach(nullptr) returns false without crash ────
+// ─── T15: Qwen35MtpModule::attach(nullptr) returns false without crash ────
 
 static void t15_attach_null_returns_false() {
-    dflash27b::mtp::Qwen36MtpModule mod;
+    dflash27b::mtp::Qwen35MtpModule mod;
     // No init() — module is not loaded. attach(nullptr) must return false.
     bool ok = mod.attach(nullptr);
     assert(!ok);
@@ -571,7 +571,7 @@ static void t15_attach_null_returns_false() {
 //          Post attach_weights_for_test: max_gamma() == 8 (production ceiling).
 
 static void t16_set_effective_gamma_clamping() {
-    dflash27b::mtp::Qwen36MtpModule mod;
+    dflash27b::mtp::Qwen35MtpModule mod;
 
     // Pre-init: max_gamma()==0, so effective_gamma stays 0 after any set call.
     mod.set_effective_gamma(5);
@@ -580,7 +580,7 @@ static void t16_set_effective_gamma_clamping() {
     assert(mod.effective_gamma() == 0);
 
     // Inject minimal weights so loaded==true; max_gamma() returns 8.
-    dflash27b::mtp::Qwen36MtpWeights w;
+    dflash27b::mtp::Qwen35MtpWeights w;
     w.n_embd  = 4;
     w.n_vocab = 16;
     w.n_heads = 1;
@@ -608,7 +608,7 @@ static void t16_set_effective_gamma_clamping() {
 // ─── T17: step_batch returns false when not attached ─────────────────────
 
 static void t17_step_batch_not_attached() {
-    dflash27b::mtp::Qwen36MtpModule mod;
+    dflash27b::mtp::Qwen35MtpModule mod;
     // No init/attach — state.loaded==false.
     std::vector<dflash27b::mtp::StepOutput> out;
     bool ok = mod.step_batch(0, 0, out);
@@ -620,7 +620,7 @@ static void t17_step_batch_not_attached() {
 // ─── T18: shutdown() is idempotent ────────────────────────────────────────
 
 static void t18_shutdown_idempotent() {
-    dflash27b::mtp::Qwen36MtpModule mod;
+    dflash27b::mtp::Qwen35MtpModule mod;
     // Two shutdown calls without init; should not crash.
     mod.shutdown();
     mod.shutdown();
@@ -632,7 +632,7 @@ static void t18_shutdown_idempotent() {
 // ─── T19: reset_chain() before attach() is a safe no-op ──────────────────
 
 static void t19_reset_chain_before_attach() {
-    dflash27b::mtp::Qwen36MtpModule mod;
+    dflash27b::mtp::Qwen35MtpModule mod;
     // reset_chain() checks state_->loaded; before init it should be safe.
     mod.reset_chain();
     mod.reset_chain();
@@ -658,7 +658,7 @@ int main() {
     t12_set_initial_hidden_plumbing();
     t13_gamma_derived_from_module();
     t14_zero_gamma_rejected();
-    // Area C: Qwen36MtpModule error paths
+    // Area C: Qwen35MtpModule error paths
     t15_attach_null_returns_false();
     t16_set_effective_gamma_clamping();
     t17_step_batch_not_attached();

@@ -1,8 +1,8 @@
-// qwen36_mtp_graph.h — CUDA cgraph for Qwen3.6 MTP head step forward.
+// qwen35_mtp_graph.h — CUDA cgraph for Qwen3.6 MTP head step forward.
 
 #pragma once
 
-#include "qwen36_mtp.h"
+#include "qwen35_mtp.h"
 
 struct ggml_tensor;
 struct ggml_context;
@@ -24,7 +24,7 @@ namespace mtp {
 // slot to write and the FA read indices + mask are runtime inputs, so
 // one graph per (head, fa_window, fused_lm_head, topk_k) suffices for
 // the entire generation instead of one per draft_pos.
-struct Qwen36MtpStepGraph {
+struct Qwen35MtpStepGraph {
     ggml_context * ctx           = nullptr;
     ggml_cgraph  * gf            = nullptr;
     ggml_gallocr_t alloc         = nullptr;
@@ -51,7 +51,7 @@ struct Qwen36MtpStepGraph {
     // `out_x_normed` here causes the next iter's `hnorm` to double-
     // normalise, producing a distribution drift that compounds per depth
     // (D=3 accept collapsed from ~91% to ~67% per-position in our bench;
-    // see qwen36_mtp.cpp:1166 for the byte-correct CPU stash of pre-norm).
+    // see qwen35_mtp.cpp:1166 for the byte-correct CPU stash of pre-norm).
     ggml_tensor * out_h_pre_norm   = nullptr;  // [n_embd]   f32 — pre shared_head_norm hidden
     // Fused LM-head outputs (only populated when build is called with a
     // non-null lm_head_weight).  out_argmax_token holds the i32 argmax of
@@ -61,12 +61,12 @@ struct Qwen36MtpStepGraph {
     ggml_tensor * out_logits       = nullptr;  // [n_vocab]  f32 — full logits (optional)
 };
 
-void qwen36_mtp_step_graph_free(Qwen36MtpStepGraph & sg);
+void qwen35_mtp_step_graph_free(Qwen35MtpStepGraph & sg);
 
 // Batched warmup graph: writes K/V to head_kv slots [slot_start, slot_start+n_tokens)
 // in a single backend pass.  Replaces the host-side per-position CPU loop with
 // one ggml cgraph using the same quant-aware matmul kernels the step graph uses.
-struct Qwen36MtpWarmGraph {
+struct Qwen35MtpWarmGraph {
     ggml_context * ctx           = nullptr;
     ggml_cgraph  * gf            = nullptr;
     ggml_gallocr_t alloc         = nullptr;
@@ -76,13 +76,13 @@ struct Qwen36MtpWarmGraph {
     ggml_tensor * inp_pos        = nullptr;   // [4 * n_tokens]     i32 — MROPE positions
 };
 
-void qwen36_mtp_warm_graph_free(Qwen36MtpWarmGraph & sg);
+void qwen35_mtp_warm_graph_free(Qwen35MtpWarmGraph & sg);
 
 // Build the warmup graph for n_tokens prefill positions writing to slots
 // [slot_start, slot_start + n_tokens) of head_k_cache / head_v_cache.
-bool build_qwen36_mtp_warm_graph(
-        Qwen36MtpWarmGraph & sg,
-        const Qwen36MtpHeadWeights & head,
+bool build_qwen35_mtp_warm_graph(
+        Qwen35MtpWarmGraph & sg,
+        const Qwen35MtpHeadWeights & head,
         ggml_tensor * head_k_cache,
         ggml_tensor * head_v_cache,
         ggml_backend_t backend,
@@ -108,9 +108,9 @@ bool build_qwen36_mtp_warm_graph(
 //     runtime via inp_kv_mask.
 //   - lm_head_weight / lm_head_topk: see prior comment block; behaviour unchanged.
 // Returns false on allocation failure.
-bool build_qwen36_mtp_step_graph(
-        Qwen36MtpStepGraph & sg,
-        const Qwen36MtpHeadWeights & head,
+bool build_qwen35_mtp_step_graph(
+        Qwen35MtpStepGraph & sg,
+        const Qwen35MtpHeadWeights & head,
         ggml_tensor * head_k_cache,
         ggml_tensor * head_v_cache,
         ggml_backend_t backend,

@@ -348,7 +348,7 @@ bool Qwen35DFlashTarget::verify_tree(
     }
 
     // Real tree verify — body lifted from test_dflash.cpp:3140-3231 (the
-    // ddtree-verify branch of run_qwen36_mtp_harness's spec-decode loop)
+    // ddtree-verify branch of run_qwen35_mtp_harness's spec-decode loop)
     // minus the walk/commit policy (the harness keeps that).
     //
     // Stage 3: build_target_step_tree below uses capture_delta_intermediate

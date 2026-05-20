@@ -1167,7 +1167,7 @@ QwenGraphOutputs build_qwen35_graph(
     //       The Qwen3.6 MTP head's hnorm normalises h_prev internally; if
     //       we feed it the post-output-norm hidden it double-normalises,
     //       compounding the per-depth rejection rate (see audit notes in
-    //       qwen36_mtp.cpp:1743 / qwen36_mtp_graph.cpp:329).  Only wired
+    //       qwen35_mtp.cpp:1743 / qwen35_mtp_graph.cpp:329).  Only wired
     //       as a graph output when capture_all_norm_hidden is set — that
     //       flag is owned by the MTP module's adapter.
     ggml_tensor * last_h_pre_norm = nullptr;
