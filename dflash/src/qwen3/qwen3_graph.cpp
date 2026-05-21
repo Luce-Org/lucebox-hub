@@ -358,6 +358,19 @@ bool forward_qwen3_drafter_model(
         ggml_free(gctx);
     }
 
+    // DFLASH_DRAFTER_EARLY_EXIT_N=N: only compute the first N transformer layers.
+    // Default: w.n_layer (no early exit). Layers N..w.n_layer-1 are skipped entirely,
+    // saving A_compute + FP cost for those layers. The scoring head is automatically
+    // capped to layers 0..N-1 so it never reads uninitialized K/Q buffers.
+    static const int early_exit_n = []() -> int {
+        const char * e = std::getenv("DFLASH_DRAFTER_EARLY_EXIT_N");
+        if (e) {
+            int v = std::atoi(e);
+            if (v > 0) return v;
+        }
+        return -1; // -1 means all layers
+    }();
+
     // Per-layer A→FA→B loop.
     ggml_gallocr_t galloc = ggml_gallocr_new(
         ggml_backend_get_default_buffer_type(w.backend));
@@ -378,7 +391,10 @@ bool forward_qwen3_drafter_model(
     double t_b_warm = 0.0, t_b_setup = 0.0, t_b_alloc = 0.0, t_b_copy_in = 0.0, t_b_norm = 0.0, t_compute_b = 0.0, t_b_copy_out = 0.0;
     double t_fp = 0.0;
 
-    for (int il = 0; il < w.n_layer; ++il) {
+    const int fwd_layer_limit = (early_exit_n > 0 && early_exit_n < w.n_layer)
+        ? early_exit_n : w.n_layer;
+
+    for (int il = 0; il < fwd_layer_limit; ++il) {
         const auto & L = w.layers[il];
         const bool debug_first_layer = (il == 0 && std::getenv("DFLASH_FP_DEBUG_LAYER0") != nullptr);
 
@@ -713,12 +729,12 @@ bool forward_qwen3_drafter_model(
         }
 #endif
 
-        if (il == 0 || il == w.n_layer - 1) {
+        if (il == 0 || il == fwd_layer_limit - 1) {
             std::fprintf(stderr,
                          "[qwen3-0.6b-fp] layer %d/%d done "
                          "(A_setup=%.3fs A_alloc=%.3fs A_compute=%.3fs FP=%.3fs "
                          "B_warm=%.3fs B_setup=%.3fs B_alloc=%.3fs B_copy_in=%.3fs B_norm=%.3fs B_compute=%.3fs B_copy_out=%.3fs)\n",
-                         il + 1, w.n_layer,
+                         il + 1, fwd_layer_limit,
                          t_a_setup, t_a_alloc, t_compute_a, t_fp,
                          t_b_warm, t_b_setup, t_b_alloc, t_b_copy_in, t_b_norm, t_compute_b, t_b_copy_out);
             std::fflush(stderr);
@@ -741,13 +757,18 @@ bool forward_qwen3_drafter_model(
         }
         return -1; // -1 means all layers
     }();
-    const int score_layer_start = (score_layers > 0 && score_layers < w.n_layer)
-        ? (w.n_layer - score_layers) : 0;
+    // Cap scoring to layers that were actually computed (fwd_layer_limit).
+    // If SCORE_LAYERS requests layers beyond fwd_layer_limit, clamp the start.
+    const int score_layer_end = fwd_layer_limit;
+    const int score_layer_start = std::min(
+        (score_layers > 0 && score_layers < w.n_layer)
+            ? (w.n_layer - score_layers) : 0,
+        score_layer_end);
 
     std::vector<float> probs_h((size_t)S * n_lookahead * H);
     auto t_score_start = std::chrono::steady_clock::now();
 
-    for (int il = score_layer_start; il < w.n_layer; ++il) {
+    for (int il = score_layer_start; il < score_layer_end; ++il) {
         ggml_init_params ip{};
         ip.mem_size = ggml_tensor_overhead() * 32 + ggml_graph_overhead() + 16 * 1024;
         ip.no_alloc = true;
@@ -817,7 +838,7 @@ bool forward_qwen3_drafter_model(
         "[qwen3-0.6b-fp] forward %.2fs (S=%d, A_setup=%.2fs A_alloc=%.2fs A_compute=%.2fs FP=%.2fs B_warm=%.2fs B_setup=%.2fs B_alloc=%.2fs B_copy_in=%.2fs B_norm=%.2fs B_compute=%.2fs B_copy_out=%.2fs)  "
         "tail-score %.2fs (layers %d-%d)  total %.2fs\n",
         t_fwd, S, t_a_setup, t_a_alloc, t_compute_a, t_fp, t_b_warm, t_b_setup, t_b_alloc, t_b_copy_in, t_b_norm, t_compute_b, t_b_copy_out,
-        t_score, score_layer_start, w.n_layer - 1, t_fwd + t_score);
+        t_score, score_layer_start, score_layer_end - 1, t_fwd + t_score);
     std::fflush(stderr);
 
     cleanup_all();
