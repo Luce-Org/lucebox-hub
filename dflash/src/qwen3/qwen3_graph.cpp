@@ -730,11 +730,24 @@ bool forward_qwen3_drafter_model(
     auto t_fwd_end = std::chrono::steady_clock::now();
     double t_fwd = std::chrono::duration<double>(t_fwd_end - t_total_start).count();
 
-    // Tail attention scoring (unchanged from previous impl).
+    // Tail attention scoring.
+    // DFLASH_DRAFTER_SCORE_LAYERS=N: only use the last N layers for scoring.
+    // Default: all 28 layers. Setting to 7 cuts scoring cost ~4x.
+    static const int score_layers = []() -> int {
+        const char * e = std::getenv("DFLASH_DRAFTER_SCORE_LAYERS");
+        if (e) {
+            int v = std::atoi(e);
+            if (v > 0) return v;
+        }
+        return -1; // -1 means all layers
+    }();
+    const int score_layer_start = (score_layers > 0 && score_layers < w.n_layer)
+        ? (w.n_layer - score_layers) : 0;
+
     std::vector<float> probs_h((size_t)S * n_lookahead * H);
     auto t_score_start = std::chrono::steady_clock::now();
 
-    for (int il = 0; il < w.n_layer; ++il) {
+    for (int il = score_layer_start; il < w.n_layer; ++il) {
         ggml_init_params ip{};
         ip.mem_size = ggml_tensor_overhead() * 32 + ggml_graph_overhead() + 16 * 1024;
         ip.no_alloc = true;
@@ -802,8 +815,9 @@ bool forward_qwen3_drafter_model(
     double t_score = std::chrono::duration<double>(t_total_end - t_score_start).count();
     std::fprintf(stderr,
         "[qwen3-0.6b-fp] forward %.2fs (S=%d, A_setup=%.2fs A_alloc=%.2fs A_compute=%.2fs FP=%.2fs B_warm=%.2fs B_setup=%.2fs B_alloc=%.2fs B_copy_in=%.2fs B_norm=%.2fs B_compute=%.2fs B_copy_out=%.2fs)  "
-        "tail-score %.2fs  total %.2fs\n",
-        t_fwd, S, t_a_setup, t_a_alloc, t_compute_a, t_fp, t_b_warm, t_b_setup, t_b_alloc, t_b_copy_in, t_b_norm, t_compute_b, t_b_copy_out, t_score, t_fwd + t_score);
+        "tail-score %.2fs (layers %d-%d)  total %.2fs\n",
+        t_fwd, S, t_a_setup, t_a_alloc, t_compute_a, t_fp, t_b_warm, t_b_setup, t_b_alloc, t_b_copy_in, t_b_norm, t_compute_b, t_b_copy_out,
+        t_score, score_layer_start, w.n_layer - 1, t_fwd + t_score);
     std::fflush(stderr);
 
     cleanup_all();
