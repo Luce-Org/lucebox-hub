@@ -24,7 +24,12 @@ int env_int(const char * name, int defv) {
 
 GenerateResult warm_and_decode(ModelBackend * backend,
                                 const GenerateRequest & req,
-                                const DaemonIO & io) {
+                                const DaemonIO & io_in) {
+    // Mirror laguna_backend.cpp:151 / gemma4_backend.cpp:172: wrap io
+    // with the request's token callback so MTP requests get streaming
+    // disconnect cancellation and per-token notifications.
+    const DaemonIO io = io_in.with_token_callback(req.on_token);
+
     GenerateResult result;
     if (!backend) {
         result.error = "warm_and_decode: backend pointer is null";

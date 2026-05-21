@@ -369,7 +369,13 @@ int main(int argc, char ** argv) {
     }
 
     // --draft and MTP are mutually exclusive; MTP wins if both are set.
-    const bool mtp_active = (bargs.mtp_source != MtpSource::None);
+    // --draft suppression and env defaults gate on a concrete MTP source.
+    // Auto and Unset defer to backend resolution; this preserves --draft
+    // as a fallback when Auto resolves to None and avoids reserving MTP
+    // head_kv memory that may never be used.
+    const bool mtp_active =
+        (bargs.mtp_source == MtpSource::Native ||
+         bargs.mtp_source == MtpSource::ExternalDrafter);
     if (bargs.draft_path && mtp_active) {
         std::fprintf(stderr,
             "[server] WARNING: --draft and MTP both set; ignoring --draft.\n"
