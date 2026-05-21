@@ -1032,7 +1032,8 @@ void HttpServer::worker_loop() {
                     {"usage", {
                         {"prompt_tokens", (int)req.prompt_tokens.size()},
                         {"completion_tokens", (int)result.tokens.size()},
-                        {"total_tokens", (int)(req.prompt_tokens.size() + result.tokens.size())}
+                        {"total_tokens", (int)(req.prompt_tokens.size() + result.tokens.size())},
+                        {"accept_rate", result.accept_rate}
                     }}
                 };
                 break;
@@ -1080,7 +1081,8 @@ void HttpServer::worker_loop() {
                     {"stop_reason", emitter.finish_reason() == "stop" ? "end_turn" : "tool_use"},
                     {"usage", {
                         {"input_tokens", (int)req.prompt_tokens.size()},
-                        {"output_tokens", (int)result.tokens.size()}
+                        {"output_tokens", (int)result.tokens.size()},
+                        {"accept_rate", result.accept_rate}
                     }}
                 };
                 break;
@@ -1112,7 +1114,8 @@ void HttpServer::worker_loop() {
                     {"usage", {
                         {"input_tokens", (int)req.prompt_tokens.size()},
                         {"output_tokens", (int)result.tokens.size()},
-                        {"total_tokens", (int)(req.prompt_tokens.size() + result.tokens.size())}
+                        {"total_tokens", (int)(req.prompt_tokens.size() + result.tokens.size())},
+                        {"accept_rate", result.accept_rate}
                     }}
                 };
                 break;

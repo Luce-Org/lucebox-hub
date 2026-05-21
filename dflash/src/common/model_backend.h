@@ -73,6 +73,9 @@ struct GenerateResult {
     std::vector<int32_t>       tokens;
     double                     prefill_s   = 0.0;
     double                     decode_s    = 0.0;
+    // DFlash chain accept rate: accepted_draft_tokens / total_draft_positions.
+    // 0.0 when spec decode did not run (AR fallback or no draft model).
+    float                      accept_rate = 0.0f;
 };
 
 // ─── Backend interface ──────────────────────────────────────────────────
