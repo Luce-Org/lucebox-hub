@@ -35,6 +35,7 @@
 #include "qwen3_drafter_model.h"
 #include "internal.h"
 #include "flashprefill.h"
+#include "score_range.h"
 
 #include "device_runtime.h"
 
@@ -757,13 +758,14 @@ bool forward_qwen3_drafter_model(
         }
         return -1; // -1 means all layers
     }();
-    // Cap scoring to layers that were actually computed (fwd_layer_limit).
-    // If SCORE_LAYERS requests layers beyond fwd_layer_limit, clamp the start.
-    const int score_layer_end = fwd_layer_limit;
-    const int score_layer_start = std::min(
-        (score_layers > 0 && score_layers < w.n_layer)
-            ? (w.n_layer - score_layers) : 0,
-        score_layer_end);
+    // Compute scoring range. SCORE_LAYERS is interpreted as "how many of the
+    // computed layers to score", counted from the END of [0, fwd_layer_limit).
+    // This prevents the empty-loop bug when early_exit_n == score_layers:
+    //   old: start = min(n_layer - score_layers, fwd_layer_limit) = min(21,7) = 7 = end → empty
+    //   new: start = fwd_layer_limit - min(score_layers, fwd_layer_limit) = 7-7 = 0, end = 7
+    const ScoreRange score_range = compute_score_range(w.n_layer, score_layers, fwd_layer_limit);
+    const int score_layer_start  = score_range.start;
+    const int score_layer_end    = score_range.end;
 
     std::vector<float> probs_h((size_t)S * n_lookahead * H);
     auto t_score_start = std::chrono::steady_clock::now();
