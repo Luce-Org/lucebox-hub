@@ -249,13 +249,39 @@ bool forward_qwen3_drafter_model(
     }
     running_max.assign((size_t)n_lookahead * S, -INFINITY);
 
+    // Compute score_layer_start early so we can avoid allocating K_norope/Q_norope
+    // for layers that will never be used in scoring.  At S=128K the full K_norope
+    // allocation is ~5.6 GB (21 unused layers × 268 MB) — skipping it keeps total
+    // VRAM under 24 GB and eliminates the warm-path regression (A_compute 5.4x).
+    static const int score_layers_pre = []() -> int {
+        const char * e = std::getenv("DFLASH_DRAFTER_SCORE_LAYERS");
+        if (e) { int v = std::atoi(e); if (v > 0) return v; }
+        return -1;
+    }();
+    static const int early_exit_pre = []() -> int {
+        const char * e = std::getenv("DFLASH_DRAFTER_EARLY_EXIT_N");
+        if (e) { int v = std::atoi(e); if (v > 0) return v; }
+        return -1;
+    }();
+    // fwd_layer_limit_pre mirrors the fwd_layer_limit computed later in the loop.
+    const int fwd_layer_limit_pre = (early_exit_pre > 0 && early_exit_pre < w.n_layer)
+        ? early_exit_pre : w.n_layer;
+    // Use compute_score_range (same formula as the scoring loop) so the pre-alloc
+    // boundary is guaranteed to match the actual scoring boundary.
+    const ScoreRange pre_range = compute_score_range(w.n_layer, score_layers_pre, fwd_layer_limit_pre);
+    const int score_layer_start_pre = pre_range.start;
+    // Number of layers that participate in scoring (and need K_norope/Q_norope).
+    const int n_score_layers = pre_range.count();
+
     PersBuf hidden_buf, pos_buf, mask_tail_buf, Q_buf, attn_out_buf;
     std::vector<PersBuf> K_curr_v((size_t)w.n_layer);
     std::vector<PersBuf> V_curr_v((size_t)w.n_layer);
     std::vector<PersBuf> Q_last_v((size_t)w.n_layer);
-    // NoPE: pre-RoPE K (full sequence) and Q tail; allocated only when nope_tail.
-    std::vector<PersBuf> K_norope_v(nope_tail ? (size_t)w.n_layer : 0);
-    std::vector<PersBuf> Q_norope_v(nope_tail ? (size_t)w.n_layer : 0);
+    // NoPE: only allocate K_norope/Q_norope for layers that will be scored.
+    // When score_layer_start_pre > 0 this trims up to 21 × 268 MB = 5.6 GB,
+    // preventing the VRAM overflow that causes the warm-path regression at 128K.
+    std::vector<PersBuf> K_norope_v(nope_tail ? (size_t)n_score_layers : 0);
+    std::vector<PersBuf> Q_norope_v(nope_tail ? (size_t)n_score_layers : 0);
     auto cleanup_all = [&]() {
         free_pers(hidden_buf);
         free_pers(pos_buf);
@@ -301,9 +327,10 @@ bool forward_qwen3_drafter_model(
                 cleanup_all();
                 return false;
             }
-            if (nope_tail) {
-                if (!make_pers(w.backend, half_type, 3, d_kv, K_norope_v[il]) ||
-                    !make_pers(w.backend, GGML_TYPE_F32, 3, d_ql, Q_norope_v[il])) {
+            if (nope_tail && il >= score_layer_start_pre) {
+                const int si = il - score_layer_start_pre;
+                if (!make_pers(w.backend, half_type, 3, d_kv, K_norope_v[si]) ||
+                    !make_pers(w.backend, GGML_TYPE_F32, 3, d_ql, Q_norope_v[si])) {
                     set_last_error("forward_qwen3: K_norope/Q_norope alloc failed at layer " + std::to_string(il));
                     cleanup_all();
                     return false;
@@ -359,18 +386,9 @@ bool forward_qwen3_drafter_model(
         ggml_free(gctx);
     }
 
-    // DFLASH_DRAFTER_EARLY_EXIT_N=N: only compute the first N transformer layers.
-    // Default: w.n_layer (no early exit). Layers N..w.n_layer-1 are skipped entirely,
-    // saving A_compute + FP cost for those layers. The scoring head is automatically
-    // capped to layers 0..N-1 so it never reads uninitialized K/Q buffers.
-    static const int early_exit_n = []() -> int {
-        const char * e = std::getenv("DFLASH_DRAFTER_EARLY_EXIT_N");
-        if (e) {
-            int v = std::atoi(e);
-            if (v > 0) return v;
-        }
-        return -1; // -1 means all layers
-    }();
+    // DFLASH_DRAFTER_EARLY_EXIT_N: already read into early_exit_pre above.
+    // Alias used in the forward-loop limit below.
+    const int & early_exit_n = early_exit_pre;
 
     // Per-layer A→FA→B loop.
     ggml_gallocr_t galloc = ggml_gallocr_new(
@@ -434,10 +452,13 @@ bool forward_qwen3_drafter_model(
 
             ggml_tensor * Q = ggml_mul_mat(gA, L.wq, h_norm);
             Q = ggml_reshape_3d(gA, Q, D, H, cl);
-            Q = ggml_rms_norm(gA, Q, eps);
-            Q = ggml_mul(gA, Q, L.q_norm);
-            // NoPE: capture pre-RoPE Q tail so the tail scorer is not biased by distance.
-            if (nope_tail) {
+            if (L.q_norm) {
+                Q = ggml_rms_norm(gA, Q, eps);
+                Q = ggml_mul(gA, Q, L.q_norm);
+            }
+            // NoPE: capture pre-RoPE Q tail (only for layers that will be scored).
+            if (nope_tail && il >= score_layer_start_pre) {
+                const int si = il - score_layer_start_pre;
                 const int tail_lo_nr = S - n_lookahead;
                 if (tail_lo_nr >= cs && tail_lo_nr < cs + cl) {
                     const int local_lo_nr = tail_lo_nr - cs;
@@ -446,7 +467,7 @@ bool forward_qwen3_drafter_model(
                         Q->nb[1], Q->nb[2],
                         (size_t)local_lo_nr * Q->nb[2]);
                     ggml_build_forward_expand(gfA,
-                        ggml_cpy(gA, Q_prenrope_tail, Q_norope_v[il].t));
+                        ggml_cpy(gA, Q_prenrope_tail, Q_norope_v[si].t));
                 }
             }
             Q = ggml_rope_ext(gA, Q, pos_chunk, nullptr, D,
@@ -455,12 +476,15 @@ bool forward_qwen3_drafter_model(
 
             ggml_tensor * K = ggml_mul_mat(gA, L.wk, h_norm);
             K = ggml_reshape_3d(gA, K, D, Hk, cl);
-            K = ggml_rms_norm(gA, K, eps);
-            K = ggml_mul(gA, K, L.k_norm);
-            // NoPE: save pre-RoPE K chunk alongside K_curr_v.
-            if (nope_tail) {
-                const size_t kn_esz = ggml_element_size(K_norope_v[il].t);
-                ggml_tensor * Kn_dst = ggml_view_3d(gA, K_norope_v[il].t, D, Hk, cl,
+            if (L.k_norm) {
+                K = ggml_rms_norm(gA, K, eps);
+                K = ggml_mul(gA, K, L.k_norm);
+            }
+            // NoPE: save pre-RoPE K chunk (only for layers that will be scored).
+            if (nope_tail && il >= score_layer_start_pre) {
+                const int si = il - score_layer_start_pre;
+                const size_t kn_esz = ggml_element_size(K_norope_v[si].t);
+                ggml_tensor * Kn_dst = ggml_view_3d(gA, K_norope_v[si].t, D, Hk, cl,
                                                     kn_esz * D, kn_esz * D * Hk,
                                                     (size_t)cs * kn_esz * D * Hk);
                 ggml_build_forward_expand(gfA, ggml_cpy(gA, K, Kn_dst));
@@ -748,24 +772,12 @@ bool forward_qwen3_drafter_model(
     double t_fwd = std::chrono::duration<double>(t_fwd_end - t_total_start).count();
 
     // Tail attention scoring.
-    // DFLASH_DRAFTER_SCORE_LAYERS=N: only use the last N layers for scoring.
-    // Default: all 28 layers. Setting to 7 cuts scoring cost ~4x.
-    static const int score_layers = []() -> int {
-        const char * e = std::getenv("DFLASH_DRAFTER_SCORE_LAYERS");
-        if (e) {
-            int v = std::atoi(e);
-            if (v > 0) return v;
-        }
-        return -1; // -1 means all layers
-    }();
-    // Compute scoring range. SCORE_LAYERS is interpreted as "how many of the
-    // computed layers to score", counted from the END of [0, fwd_layer_limit).
-    // This prevents the empty-loop bug when early_exit_n == score_layers:
-    //   old: start = min(n_layer - score_layers, fwd_layer_limit) = min(21,7) = 7 = end → empty
-    //   new: start = fwd_layer_limit - min(score_layers, fwd_layer_limit) = 7-7 = 0, end = 7
-    const ScoreRange score_range = compute_score_range(w.n_layer, score_layers, fwd_layer_limit);
-    const int score_layer_start  = score_range.start;
-    const int score_layer_end    = score_range.end;
+    // score_layers_pre / compute_score_range already determined the range before
+    // allocation (to size K_norope_v correctly).  Re-use that result here.
+    // score_layer_start_pre == score_layer_start by construction (same formula,
+    // same env vars, same fwd_layer_limit_pre == fwd_layer_limit).
+    const int score_layer_start  = score_layer_start_pre;
+    const int score_layer_end    = fwd_layer_limit;
 
     std::vector<float> probs_h((size_t)S * n_lookahead * H);
     auto t_score_start = std::chrono::steady_clock::now();
@@ -776,9 +788,11 @@ bool forward_qwen3_drafter_model(
         ip.no_alloc = true;
         ggml_context * gctx = ggml_init(ip);
 
+        // K_norope_v / Q_norope_v are indexed from score_layer_start_pre.
+        const int si = il - score_layer_start_pre;
         ggml_tensor * K_f32 = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, D, Hk, S);
         ggml_tensor * K_cast = ggml_cpy(gctx,
-            nope_tail ? K_norope_v[il].t : K_curr_v[il].t, K_f32);
+            nope_tail ? K_norope_v[si].t : K_curr_v[il].t, K_f32);
         ggml_tensor * K_perm = ggml_cont(gctx,
             ggml_permute(gctx, K_cast, 0, 2, 1, 3));
         ggml_tensor * K_score = K_perm;
@@ -791,7 +805,7 @@ bool forward_qwen3_drafter_model(
         }
         ggml_tensor * Q_tail_perm = ggml_cont(gctx,
             ggml_permute(gctx,
-                nope_tail ? Q_norope_v[il].t : Q_last_v[il].t,
+                nope_tail ? Q_norope_v[si].t : Q_last_v[il].t,
                 0, 2, 1, 3));
         ggml_tensor * attn_score = ggml_mul_mat(gctx, K_score, Q_tail_perm);
         ggml_tensor * probs = ggml_soft_max_ext(gctx, attn_score, mask_tail_buf.t,

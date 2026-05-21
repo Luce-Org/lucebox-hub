@@ -552,6 +552,14 @@ if(DFLASH27B_TESTS)
         add_test(NAME test_drafter_early_exit_score_range
             COMMAND test_drafter_early_exit_score_range)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_warm_path_regression.cpp")
+        add_executable(test_drafter_warm_path_regression
+            test/test_drafter_warm_path_regression.cpp)
+        target_include_directories(test_drafter_warm_path_regression PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3)
+        add_test(NAME test_drafter_warm_path_regression
+            COMMAND test_drafter_warm_path_regression)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_vs_reference.cpp")
         add_executable(test_draft_vs_reference test/test_draft_vs_reference.cpp)
         target_link_libraries(test_draft_vs_reference PRIVATE dflash_common)
