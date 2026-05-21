@@ -43,7 +43,7 @@ int run_qwen35_daemon(const Qwen35DaemonArgs & args) {
             cfg.mtp_gguf_path = args.mtp_gguf_path;
             break;
         case MtpSource::Auto:
-            cfg.mtp_gguf_path = dflash27b::gguf_contains_mtp_tensors(args.target_path)
+            cfg.mtp_gguf_path = dflash::common::gguf_contains_mtp_tensors(args.target_path)
                                      ? args.target_path
                                      : nullptr;
             break;

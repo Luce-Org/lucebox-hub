@@ -551,8 +551,10 @@ if(DFLASH27B_TESTS)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_common_mtp_orchestrator.cpp")
         add_executable(test_common_mtp_orchestrator test/test_common_mtp_orchestrator.cpp)
-        target_include_directories(test_common_mtp_orchestrator PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        target_link_libraries(test_common_mtp_orchestrator PRIVATE dflash_common)
+        target_include_directories(test_common_mtp_orchestrator PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_common_mtp_orchestrator PRIVATE dflash_common ggml-base)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_vs_reference.cpp")
         add_executable(test_draft_vs_reference test/test_draft_vs_reference.cpp)

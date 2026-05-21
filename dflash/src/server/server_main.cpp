@@ -350,11 +350,14 @@ int main(int argc, char ** argv) {
     // Infer MtpSource from legacy flags when --mtp-source is absent.
     //   --mtp-gguf without --mtp-source  → ExternalDrafter (backward compat)
     //   --mtp-gamma without --mtp-source → Auto (probe the target GGUF)
-    if (bargs.mtp_source == MtpSource::None) {
+    // Only infer when Unset — explicit --mtp-source none must not be overridden.
+    if (bargs.mtp_source == MtpSource::Unset) {
         if (bargs.mtp_gguf_path) {
             bargs.mtp_source = MtpSource::ExternalDrafter;
         } else if (bargs.mtp_gamma > 0) {
             bargs.mtp_source = MtpSource::Auto;
+        } else {
+            bargs.mtp_source = MtpSource::None;
         }
     }
 

@@ -648,7 +648,7 @@ static void t19_reset_chain_before_attach() {
 // ExternalDrafter stub: proposes two tokens (100, 101) per step chain and
 // fills next_hidden so the fix branch (set_capture_row / consume_captured_hidden)
 // is reachable. Records every call to the two methods under test.
-struct StubExternalDrafter : public dflash27b::mtp::IExternalDrafterMtp {
+struct StubExternalDrafter : public dflash::common::mtp::IExternalDrafterMtp {
     // IMtpModule tuneables
     int max_gamma_value       = 2;
     int effective_gamma_value = 2;
@@ -674,14 +674,14 @@ struct StubExternalDrafter : public dflash27b::mtp::IExternalDrafterMtp {
     int  effective_gamma() const override { return effective_gamma_value; }
     void set_effective_gamma(int g) override { effective_gamma_value = g; }
     int  hidden_size()     const override { return hidden_size_value; }
-    bool attach(dflash27b::DFlashTarget *) override { ++attach_calls; return true; }
+    bool attach(dflash::common::DFlashTarget *) override { ++attach_calls; return true; }
     void reset_chain() override { ++reset_chain_calls; }
     void shutdown()    override {}
     void set_initial_hidden(const float *, int) override { ++set_initial_hidden_calls; }
 
     // IExternalDrafterMtp
-    bool step(const dflash27b::mtp::StepInput & in,
-              dflash27b::mtp::StepOutput & out) override {
+    bool step(const dflash::common::mtp::StepInput & in,
+              dflash::common::mtp::StepOutput & out) override {
         ++step_calls;
         // Propose token 100+gamma_index so each step produces a distinct token.
         out.draft_token = 100 + in.gamma_index;
@@ -758,14 +758,14 @@ static void t20_external_drafter_partial_accept_threads_committed_row() {
     target.argmax_token = ExternalPartialTarget::kDivergeToken;
     target.hidden_sz    = ext.hidden_size_value;
 
-    dflash27b::SamplerCfg sampler;
-    dflash27b::mtp::MtpChainRunner runner(ext, target, sampler);
+    dflash::common::SamplerCfg sampler;
+    dflash::common::mtp::MtpChainRunner runner(ext, target, sampler);
 
-    dflash27b::GenerateRequest req;
+    dflash::common::GenerateRequest req;
     req.n_gen  = 2;   // enough for one full chain iteration
     req.stream = false;
 
-    dflash27b::DaemonIO io;
+    dflash::common::DaemonIO io;
     auto res = runner.run(req, io, /*last_prefill_token=*/10, /*committed_pos=*/4,
                           /*gamma=*/2);
 

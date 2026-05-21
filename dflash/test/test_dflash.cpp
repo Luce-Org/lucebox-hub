@@ -1625,7 +1625,7 @@ int main(int argc, char ** argv) {
                 "[test_dflash] arch=qwen35+mtp daemon -> dispatching to run_qwen35_daemon "
                 "(mtp=%s gamma=%d max_ctx=%d stream_fd=%d)\n",
                 mtp_gguf_path, mtp_gamma, max_ctx_eff, stream_fd);
-            dflash27b::Qwen35DaemonArgs qargs;
+            dflash::common::Qwen35DaemonArgs qargs;
             qargs.target_path       = target_path;
             qargs.draft_path        = nullptr;   // MTP mode: no DFlash draft
             qargs.device.gpu        = target_gpu;
@@ -1644,12 +1644,12 @@ int main(int argc, char ** argv) {
             qargs.ddtree_temp       = ddtree_temp;
             qargs.ddtree_chain_seed = ddtree_chain_seed;
             qargs.use_feature_mirror = false;
-            qargs.mtp_source        = dflash27b::MtpSource::ExternalDrafter;
+            qargs.mtp_source        = dflash::common::MtpSource::ExternalDrafter;
             qargs.mtp_gguf_path     = mtp_gguf_path;
             qargs.mtp_gamma         = mtp_gamma;
             qargs.mtp_use_topk      = mtp_use_topk;
             qargs.mtp_draft_topk    = mtp_draft_topk;
-            return dflash27b::run_qwen35_daemon(qargs);
+            return dflash::common::run_qwen35_daemon(qargs);
         }
         // ---- MTP file-mode harness (bench / one-shot) ----
         std::fprintf(stderr,

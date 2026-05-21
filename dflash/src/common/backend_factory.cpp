@@ -10,6 +10,7 @@
 
 #include "gguf.h"
 
+#include <cassert>
 #include <cstdio>
 
 namespace dflash::common {
@@ -53,6 +54,10 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
     }
 
     std::fprintf(stderr, "[backend_factory] detected arch=%s\n", arch.c_str());
+
+    // Unset must have been resolved to None by arg parsing before reaching here.
+    assert(args.mtp_source != MtpSource::Unset &&
+           "MtpSource::Unset must be resolved by arg parsing before reaching the backend factory");
 
     // Resolve MtpSource::Auto before constructing the backend.
     MtpSource resolved_source = args.mtp_source;
@@ -99,7 +104,8 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
                 cfg.mtp_gguf_path = args.mtp_gguf_path;
                 break;
             case MtpSource::None:
-            case MtpSource::Auto:  // Auto is fully resolved above; this arm is unreachable.
+            case MtpSource::Auto:    // fully resolved above; arm is unreachable.
+            case MtpSource::Unset:   // guarded by assert above; arm is unreachable.
             default:
                 cfg.mtp_gguf_path = nullptr;
                 break;
