@@ -673,11 +673,15 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                 enable_thinking = true;
             }
         }
-        // Anthropic: "thinking" field
+        // Anthropic-style: "thinking" field. Presence-as-opt-in: any
+        // request that sends this field has opted in to the thinking-budget
+        // envelope (and will see a `finish_details` block on the response).
         if (body.contains("thinking")) {
             auto & th = body["thinking"];
             if (th.contains("type")) {
-                enable_thinking = (th.value("type", "") == "enabled");
+                std::string type = th.value("type", "");
+                enable_thinking = (type == "enabled");
+                req.thinking_opt_in = (type == "enabled");
             }
         }
         // Direct: chat_template_kwargs.enable_thinking
@@ -1163,16 +1167,43 @@ void HttpServer::worker_loop() {
                     }
                     msg["tool_calls"] = tcs;
                 }
+                json choice = {
+                    {"index", 0}, {"message", msg},
+                    {"finish_reason", emitter.finish_reason()}
+                };
+                // finish_details — mirrors ds4_eval.c's eval_think_close_info.
+                // Emitted when the caller opted in to the thinking-budget
+                // envelope via `thinking:{type:enabled}`. The C++ server
+                // currently lacks phase-2 reprompt (TODO: port from
+                // server.py:2141-2196), so close_kind is always "natural"
+                // for now — when phase-2 lands, set "hard" on force-close.
+                // See docs/specs/thinking-budget.md:43-58 for the contract.
+                if (req.thinking_opt_in) {
+                    int reasoning_toks = 0, content_toks = 0;
+                    if (!emitter.reasoning_text().empty()) {
+                        // We don't track per-token reasoning/content split
+                        // yet in C++ (the emitter accumulates both). Until
+                        // phase-2 lands and gives us the natural split, fall
+                        // back to total counts. The bench layer uses
+                        // total_tokens for budget accounting anyway.
+                        reasoning_toks = (int)result.tokens.size();
+                    } else {
+                        content_toks = (int)result.tokens.size();
+                    }
+                    choice["finish_details"] = {
+                        {"close_kind",      "natural"},
+                        {"thinking_tokens", reasoning_toks},
+                        {"content_tokens",  content_toks},
+                        {"total_tokens",    (int)result.tokens.size()},
+                    };
+                }
                 resp = {
                     {"id", req.response_id},
                     {"object", "chat.completion"},
                     {"created", std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::system_clock::now().time_since_epoch()).count()},
                     {"model", req.model},
-                    {"choices", json::array({{
-                        {"index", 0}, {"message", msg},
-                        {"finish_reason", emitter.finish_reason()}
-                    }})},
+                    {"choices", json::array({choice})},
                     {"usage", {
                         {"prompt_tokens", (int)req.prompt_tokens.size()},
                         {"completion_tokens", (int)result.tokens.size()},

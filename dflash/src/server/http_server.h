@@ -43,11 +43,21 @@ struct ServerJob;
 struct ServerConfig {
     std::string host        = "0.0.0.0";
     int         port        = 8080;
-    int         max_tokens  = 4096;     // default max output tokens
+    int         max_tokens  = 4096;     // default max output tokens (legacy alias for default_max_tokens)
     int         max_ctx     = 0;        // 0 = use backend's DevicePlacement default (8192)
     bool        enable_cors = true;
     std::string model_name  = "dflash";
     int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
+
+    // Thinking-budget v2 (mirrors antirez/ds4 ds4_eval.c knob names).
+    // Applied when a request opts in via `thinking: {type: "enabled"}`.
+    // think_max_tokens caps the phase-1 reasoning generation; the combined
+    // (reasoning + content) cap is the request's max_tokens, defaulting to
+    // default_max_tokens when omitted. The phase-1/phase-2 reprompt logic
+    // itself is a follow-up PR — this PR ships only the wire surface
+    // (CLI flag + finish_details emission) so consumers can probe + plan.
+    int         think_max_tokens    = 10000;
+    int         default_max_tokens  = 16000;
 
     // /props introspection inputs — captured at startup by server_main so
     // the /props handler doesn't need to crack open BackendArgs or env.
@@ -107,6 +117,11 @@ struct ParsedRequest {
     // Thinking/reasoning state
     bool                      thinking_enabled = true;
     bool                      started_in_thinking = false;
+    // True when the request opted in to the thinking-budget envelope via
+    // `thinking: {type: "enabled"}`. Distinct from thinking_enabled (which
+    // can be set via the chat template kwarg alone). When true, the response
+    // includes a `finish_details` block. Mirrors server.py:2271 conditional.
+    bool                      thinking_opt_in = false;
     // Stop sequences (OpenAI "stop" + Anthropic "stop_sequences")
     std::vector<std::string>  stop_sequences;
 };

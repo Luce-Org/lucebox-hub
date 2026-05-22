@@ -826,3 +826,52 @@ class TestCountTokens:
         assert r.status_code == 200
         # 1s is generous; real bound is dominated by tokenizer + HTTP RTT.
         assert elapsed < 1.0, f"count_tokens took {elapsed:.2f}s (expected <1s)"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Thinking-budget envelope — finish_details emission
+# ═══════════════════════════════════════════════════════════════════
+
+class TestThinkingBudget:
+    """Verifies the response includes a `finish_details` block when the
+    request opted in via `thinking: {type: "enabled"}`. Mirrors
+    docs/specs/thinking-budget.md:43-58.
+
+    The C++ server currently lacks phase-2 reprompt (TODO), so close_kind
+    will be "natural" for all cases. Once phase-2 lands, add a test that
+    forces phase-1 truncation and asserts close_kind == "hard"."""
+
+    @pytest.mark.slow
+    def test_finish_details_present_when_thinking_opted_in(self):
+        body = {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "What is 2+2? Answer in one word."}],
+            "max_tokens": 256,
+            "thinking": {"type": "enabled"},
+            "temperature": 0,
+        }
+        r = post_json("/v1/chat/completions", body)
+        assert r.status_code == 200
+        choice = r.json()["choices"][0]
+        assert "finish_details" in choice, \
+            "finish_details missing despite thinking:{type:enabled}"
+        fd = choice["finish_details"]
+        assert fd["close_kind"] in {"natural", "hard"}
+        assert isinstance(fd["thinking_tokens"], int)
+        assert isinstance(fd["content_tokens"], int)
+        assert isinstance(fd["total_tokens"], int)
+        # Invariant: the two sub-counts sum to the total.
+        assert fd["thinking_tokens"] + fd["content_tokens"] == fd["total_tokens"]
+
+    def test_finish_details_absent_when_thinking_not_opted_in(self):
+        body = {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "Say hi"}],
+            "max_tokens": 16,
+            "temperature": 0,
+        }
+        r = post_json("/v1/chat/completions", body)
+        assert r.status_code == 200
+        choice = r.json()["choices"][0]
+        assert "finish_details" not in choice, \
+            "finish_details should only appear when thinking is opted in"

@@ -120,6 +120,10 @@ static void print_usage(const char * prog) {
         "  --ddtree             Enable DDTree speculative decode\n"
         "  --ddtree-budget <N>  DDTree budget (default: 64)\n"
         "  --no-cors            Disable CORS headers\n"
+        "  --think-max-tokens <N>     Phase-1 reasoning cap when a request opts in\n"
+        "                             via thinking:{type:enabled} (default: 10000)\n"
+        "  --default-max-tokens <N>   Combined cap when request omits max_tokens\n"
+        "                             (default: 16000, matches antirez/ds4 ds4_eval.c)\n"
         "\n"
         "KV cache:\n"
         "  --cache-type-k <type>  KV cache K type (f16,bf16,q4_0,q4_1,q5_0,q5_1,q8_0,tq3_0)\n"
@@ -227,6 +231,10 @@ int main(int argc, char ** argv) {
             bargs.ddtree_budget = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--no-cors") == 0) {
             sconfig.enable_cors = false;
+        } else if (std::strcmp(argv[i], "--think-max-tokens") == 0 && i + 1 < argc) {
+            sconfig.think_max_tokens = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--default-max-tokens") == 0 && i + 1 < argc) {
+            sconfig.default_max_tokens = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--prefill-compression") == 0 && i + 1 < argc) {
             const char * mode = argv[++i];
             if (std::strcmp(mode, "auto") == 0)
