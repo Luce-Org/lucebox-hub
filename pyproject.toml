@@ -8,13 +8,44 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "Lucebox" }]
 
 dependencies = [
+    "lucebox",
     "lucebox-dflash",
     "pflash",
 ]
 
 [project.optional-dependencies]
 megakernel = ["qwen35-megakernel-bf16"]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "mypy>=1.10,<2", "ruff>=0.14,<1"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+# Staged lint adoption for the Python surfaces touched by the Docker,
+# benchmark, autotune, and host-CLI stack. Untouched server-adjacent scripts and
+# vendored dependencies stay outside this gate until they are cleaned up.
+include = [
+    "dflash/scripts/bench_agent.py",
+    "dflash/scripts/bench_agentic_session.py",
+    "dflash/scripts/bench_agentic_tools.py",
+    "dflash/scripts/bench_he.py",
+    "dflash/scripts/bench_http_capability.py",
+    "dflash/scripts/bench_http_frontiers.py",
+    "dflash/scripts/bench_llm.py",
+    "dflash/scripts/lucebox_bench.py",
+    "dflash/scripts/prefix_cache.py",
+    "dflash/scripts/test_lucebox_bench.py",
+    "dflash/scripts/test_server.py",
+    "dflash/scripts/tool_memory.py",
+    "lucebox/**/*.py",
+]
+extend-exclude = [
+    "dflash/deps",
+    "megakernel",
+    "pflash",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
 
 [tool.uv]
 package = false
@@ -31,9 +62,10 @@ package = false
 no-build-isolation-package = ["qwen35-megakernel-bf16"]
 
 [tool.uv.workspace]
-members = ["dflash", "megakernel", "pflash"]
+members = ["dflash", "lucebox", "megakernel", "pflash"]
 
 [tool.uv.sources]
+lucebox = { workspace = true }
 lucebox-dflash = { workspace = true }
 pflash = { workspace = true }
 qwen35-megakernel-bf16 = { workspace = true }
