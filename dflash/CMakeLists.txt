@@ -235,6 +235,7 @@ add_library(dflash_common STATIC
     src/laguna/laguna_target_graph.cpp
     src/laguna/laguna_daemon.cpp
     src/laguna/laguna_backend.cpp
+    src/common/backend_ipc.cpp
     src/common/dflash_feature_ring.cpp
     src/common/dflash_capture.cpp
     src/common/dflash_draft_ipc.cpp
@@ -671,24 +672,24 @@ if(DFLASH27B_TESTS)
         endif()
     endif()
 
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc/dflash_draft_ipc_main.cpp")
-        add_executable(dflash_draft_ipc_daemon
-            src/ipc/dflash_draft_ipc_main.cpp
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc/backend_ipc_main.cpp")
+        add_executable(backend_ipc_daemon
+            src/ipc/backend_ipc_main.cpp
         )
-        target_include_directories(dflash_draft_ipc_daemon PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_include_directories(backend_ipc_daemon PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
-            target_compile_definitions(dflash_draft_ipc_daemon PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+            target_compile_definitions(backend_ipc_daemon PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
         else()
-            target_compile_definitions(dflash_draft_ipc_daemon PRIVATE
+            target_compile_definitions(backend_ipc_daemon PRIVATE
                 DFLASH27B_BACKEND_CUDA=1
                 DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
         endif()
-        target_link_libraries(dflash_draft_ipc_daemon PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread)
+        target_link_libraries(backend_ipc_daemon PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread)
         if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             find_package(CUDAToolkit REQUIRED)
-            target_link_libraries(dflash_draft_ipc_daemon PRIVATE CUDA::cudart)
+            target_link_libraries(backend_ipc_daemon PRIVATE CUDA::cudart)
         else()
-            target_link_libraries(dflash_draft_ipc_daemon PRIVATE hip::host)
+            target_link_libraries(backend_ipc_daemon PRIVATE hip::host)
         endif()
     endif()
 

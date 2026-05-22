@@ -42,6 +42,7 @@ dflash/src/
 │   ├── snapshot_backend.h  # Platform-aware snapshot backend selection
 │   ├── dflash_target.h     # DFlashTarget interface (spec decode)
 │   ├── daemon_loop.{h,cpp} # Generic stdin/stdout daemon loop
+│   ├── backend_ipc.{h,cpp} # Generic backend IPC process lifecycle
 │   ├── device_placement.h  # Multi-GPU placement config
 │   ├── gguf_inspect.{h,cpp}# Read arch + layer count from GGUF
 │   ├── layer_split_utils.{h,cpp}  # compute_layer_ranges()
@@ -49,7 +50,7 @@ dflash/src/
 │   ├── dflash_feature_ring.{h,cpp}   # DraftFeatureMirror + ring copy helpers
 │   ├── dflash_capture.{h,cpp}        # target_capture_index() helper
 │   ├── dflash_draft_ipc.{h,cpp}      # DFlash draft IPC client + remote copy
-│   ├── dflash_draft_ipc_daemon.cpp   # Generic DFlash draft IPC daemon body
+│   ├── dflash_draft_ipc_daemon.cpp   # DFlash draft mode for backend_ipc_daemon
 │   ├── dflash_draft_graph.{h,cpp}    # Universal build_draft_step (DFlash draft graph)
 │   ├── dflash_spec_decode.{h,cpp}    # Generic spec-decode loop over DFlashTarget
 │   ├── ddtree.{h,cpp}     # Dynamic Draft Tree algorithm
@@ -240,15 +241,14 @@ Key components:
   Bridge qwen35 internals (`TargetWeights`, `TargetCache`,
   `TargetLayerSplitShard`) to the generic `DFlashTarget` interface so the
   shared spec-decode loop can drive verification.
-- **Feature transfer + draft daemon** (`common/dflash_feature_ring.{h,cpp}`,
-  `common/dflash_capture.{h,cpp}`, `common/dflash_draft_ipc.{h,cpp}`,
-  `common/dflash_draft_ipc_daemon.cpp`):
+- **Feature transfer + backend IPC daemon** (`common/backend_ipc.{h,cpp}`,
+  `common/dflash_feature_ring.{h,cpp}`, `common/dflash_capture.{h,cpp}`,
+  `common/dflash_draft_ipc.{h,cpp}`, `common/dflash_draft_ipc_daemon.cpp`):
   Move captured target activations into the draft-side ring buffer
   (`DraftFeatureMirror`) and ship them across processes/GPUs. The IPC
-  client, parent-side feature-slice helper, and the daemon body itself
-  all live in `common/` and are reusable by any DFlash target architecture
-  (the DFlash draft model is a single universal Qwen3-style network shared
-  across every target).
+  process lifecycle is shared through `backend_ipc`; the DFlash draft client,
+  parent-side feature-slice helper, and daemon mode stay on top of that common
+  process layer and remain reusable by any DFlash target architecture.
 
 ### Qwen3Backend, Gemma4Backend, LagunaBackend
 

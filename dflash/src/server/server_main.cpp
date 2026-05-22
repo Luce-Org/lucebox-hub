@@ -129,7 +129,7 @@ static void print_usage(const char * prog) {
         "  --max-tokens <N>     Default max output tokens (default: 4096)\n"
         "  --target-device <backend:gpu>  Target device (default: auto:0)\n"
         "  --draft-device <backend:gpu>   Draft device (default: auto:0)\n"
-        "  --draft-ipc-bin <path>         Remote draft IPC daemon for mixed backends\n"
+        "  --draft-ipc-bin <path>         Remote backend IPC daemon for mixed backends\n"
         "  --draft-ipc-work-dir <path>    Remote draft IPC scratch directory\n"
         "  --draft-ipc-ring-cap <N>       Remote draft feature ring capacity\n"
         "  --target-devices <list>        Reserved layer-split devices, e.g. cuda:0,cuda:1\n"

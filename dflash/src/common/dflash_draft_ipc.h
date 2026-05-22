@@ -1,4 +1,4 @@
-// dflash_draft_ipc.h — DFlash draft model IPC client + daemon entry.
+// dflash_draft_ipc.h - DFlash draft IPC mode.
 //
 // The draft IPC mechanism spawns a child process running the draft model on
 // a separate GPU. Communication is via stdin commands + a stream pipe for
@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include "backend_ipc.h"
 #include "dflash27b.h"
 #include "io_utils.h"
 
@@ -22,14 +23,6 @@
 #include <cstdio>
 #include <string>
 #include <vector>
-
-#if !defined(_WIN32)
-#  include <cerrno>
-#  include <cstring>
-#  include <sys/stat.h>
-#  include <sys/wait.h>
-#  include <unistd.h>
-#endif
 
 namespace dflash::common {
 
@@ -70,17 +63,7 @@ public:
     void close();
 
 private:
-#if !defined(_WIN32)
-    bool init_work_dir(const std::string & requested);
-    std::string next_path(const char * prefix);
-
-    pid_t pid_ = -1;
-    FILE * cmd_ = nullptr;
-    int stream_fd_ = -1;
-    std::string work_dir_;
-    int seq_ = 0;
-    bool owns_work_dir_ = false;
-#endif
+    BackendIpcProcess process_;
     bool active_ = false;
     int ring_cap_ = 0;
     int hidden_size_ = DFLASH27B_TARGET_HIDDEN;

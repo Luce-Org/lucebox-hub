@@ -17,6 +17,7 @@
 #include "server/http_server.h"
 #include "server/chat_template.h"
 #include "common/sampler.h"
+#include "common/backend_ipc.h"
 #include <nlohmann/json.hpp>
 
 #include <cmath>
@@ -26,6 +27,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <unistd.h>
@@ -1238,6 +1240,28 @@ static void test_disk_cache_save_below_min_tokens() {
     rm_rf(dir);
 }
 
+static void test_backend_ipc_rejects_file_work_dir() {
+    const std::string file_path = "/tmp/dflash_test_backend_ipc_work_dir_file";
+    unlink(file_path.c_str());
+    int fd = open(file_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    TEST_ASSERT(fd >= 0);
+    if (fd >= 0) {
+        const char payload[] = "not a dir";
+        (void)write(fd, payload, sizeof(payload) - 1);
+        close(fd);
+    }
+
+    BackendIpcLaunchConfig cfg;
+    cfg.bin = "/bin/true";
+    cfg.payload_path = "/tmp/dflash_test_backend_ipc_payload";
+    cfg.work_dir = file_path;
+
+    BackendIpcProcess proc;
+    TEST_ASSERT(!proc.start(cfg));
+    TEST_ASSERT(!proc.active());
+    unlink(file_path.c_str());
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Sampler tests (model-independent, CPU-only)
 // ═══════════════════════════════════════════════════════════════════════
@@ -1648,6 +1672,7 @@ int main() {
     RUN_TEST(test_disk_cache_budget_enforcement_scoring);
     RUN_TEST(test_disk_cache_lookup_miss_no_layout);
     RUN_TEST(test_disk_cache_save_below_min_tokens);
+    RUN_TEST(test_backend_ipc_rejects_file_work_dir);
 
     std::fprintf(stderr, "\n── Sampler ──\n");
     RUN_TEST(test_sampler_cfg_defaults);
