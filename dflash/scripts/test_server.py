@@ -1,20 +1,28 @@
-import os
-import struct
 import json
-import asyncio
+import struct
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
-
 from server import (
-    build_app, MODEL_NAME,
-    parse_tool_calls, parse_reasoning,
-    normalize_stop, first_stop_match,
-    _thinking_enabled, strip_closed_think_prefill, split_unclosed_thinking,
+    MODEL_NAME,
+    PROPS_SCHEMA,
+    SERVER_VERSION,
+    _capabilities,
+    _effective_kv_type,
+    _resolve_server_version,
+    _runtime_backend,
+    _thinking_enabled,
+    build_app,
+    first_stop_match,
+    normalize_stop,
+    parse_reasoning,
+    parse_tool_calls,
+    split_unclosed_thinking,
+    strip_closed_think_prefill,
 )
-
 
 # ─── Fixtures ──────────────────────────────────────────────────────
 
@@ -225,7 +233,11 @@ class TestParseToolCalls:
         assert calls[0]["type"] == "function"
 
     def test_text_before_and_after_tool_call(self):
-        text = "Before\n<tool_call><function=f><parameter=x>1</parameter></function></tool_call>\nAfter"
+        text = (
+            "Before\n"
+            "<tool_call><function=f><parameter=x>1</parameter></function></tool_call>\n"
+            "After"
+        )
         cleaned, calls = parse_tool_calls(text, tools=None)
         assert len(calls) == 1
         assert "Before" in cleaned
@@ -463,6 +475,62 @@ def test_chat_completions_non_streaming_with_tool_call(mock_os_read, mock_pipe,
 
 @patch("server.os.pipe")
 @patch("server.os.read")
+def test_chat_completions_tool_request_enables_thinking_by_default(
+        mock_os_read, mock_pipe, mock_tokenizer, app):
+    mock_pipe.return_value = (1, 2)
+    mock_os_read.side_effect = [struct.pack("<i", 10), struct.pack("<i", -1)]
+
+    client = TestClient(app)
+    response = client.post("/v1/chat/completions", json={
+        "model": MODEL_NAME,
+        "messages": [{"role": "user", "content": "read test.py"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }],
+        "stream": False,
+    })
+
+    assert response.status_code == 200
+    kwargs = mock_tokenizer.apply_chat_template.call_args_list[-1].kwargs
+    assert kwargs["enable_thinking"] is True
+    assert kwargs["tools"][0]["name"] == "read_file"
+
+
+@patch("server.os.pipe")
+@patch("server.os.read")
+def test_chat_completions_tool_request_can_disable_thinking(
+        mock_os_read, mock_pipe, mock_tokenizer, app):
+    mock_pipe.return_value = (1, 2)
+    mock_os_read.side_effect = [struct.pack("<i", 10), struct.pack("<i", -1)]
+
+    client = TestClient(app)
+    response = client.post("/v1/chat/completions", json={
+        "model": MODEL_NAME,
+        "messages": [{"role": "user", "content": "read test.py"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }],
+        "stream": False,
+        "chat_template_kwargs": {"enable_thinking": False},
+    })
+
+    assert response.status_code == 200
+    kwargs = mock_tokenizer.apply_chat_template.call_args_list[-1].kwargs
+    assert kwargs["enable_thinking"] is False
+
+
+@patch("server.os.pipe")
+@patch("server.os.read")
 def test_chat_completions_replays_raw_tool_call_text(mock_os_read, mock_pipe,
                                                      mock_tokenizer, app):
     mock_pipe.return_value = (1, 2)
@@ -493,7 +561,11 @@ def test_chat_completions_replays_raw_tool_call_text(mock_os_read, mock_pipe,
         "messages": [
             {"role": "user", "content": "read test.py"},
             assistant_msg,
-            {"role": "tool", "tool_call_id": assistant_msg["tool_calls"][0]["id"], "content": "file body"},
+            {
+                "role": "tool",
+                "tool_call_id": assistant_msg["tool_calls"][0]["id"],
+                "content": "file body",
+            },
             {"role": "user", "content": "what next?"},
         ],
         "stream": False,
@@ -768,6 +840,29 @@ def test_chat_completions_streaming_replays_exact_raw_text_with_reasoning(
     assert "tool_calls" not in assistant
 
 
+def test_anthropic_count_tokens_accepts_claude_code_shape(mock_tokenizer, app):
+    mock_tokenizer.encode.return_value = [1, 2, 3]
+
+    client = TestClient(app)
+    response = client.post("/v1/messages/count_tokens?beta=true", json={
+        "model": MODEL_NAME,
+        "system": [{"type": "text", "text": "You are a coding agent."}],
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "read x.py"}]}],
+        "tools": [{
+            "name": "Read",
+            "description": "Read a file.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"file_path": {"type": "string"}},
+                "required": ["file_path"],
+            },
+        }],
+    })
+
+    assert response.status_code == 200
+    assert response.json() == {"input_tokens": 3}
+
+
 # ─── POST /v1/responses ───────────────────────────────────────────
 
 @patch("server.os.pipe")
@@ -792,7 +887,10 @@ def test_responses_non_streaming(mock_os_read, mock_pipe, mock_tokenizer, app):
     assert data["output"][0]["content"][0]["type"] == "output_text"
     assert data["usage"]["input_tokens"] > 0
     assert data["usage"]["output_tokens"] > 0
-    assert data["usage"]["total_tokens"] == data["usage"]["input_tokens"] + data["usage"]["output_tokens"]
+    assert (
+        data["usage"]["total_tokens"]
+        == data["usage"]["input_tokens"] + data["usage"]["output_tokens"]
+    )
 
 
 @patch("server.os.pipe")
@@ -895,7 +993,7 @@ def test_responses_streaming(mock_os_read, mock_pipe, mock_tokenizer, app):
     # Parse the completed event to verify structure
     for line_block in text.split("\n\n"):
         if "event: response.completed" in line_block:
-            data_line = [l for l in line_block.split("\n") if l.startswith("data: ")][0]
+            data_line = [line for line in line_block.split("\n") if line.startswith("data: ")][0]
             completed = json.loads(data_line[6:])
             assert completed["response"]["status"] == "completed"
             assert "usage" in completed["response"]
@@ -984,6 +1082,9 @@ def test_responses_with_tools(mock_os_read, mock_pipe, mock_tokenizer, app):
     data = response.json()
     assert data["object"] == "response"
     assert data["status"] == "completed"
+    kwargs = mock_tokenizer.apply_chat_template.call_args_list[-1].kwargs
+    assert kwargs["enable_thinking"] is True
+    assert kwargs["tools"][0]["name"] == "read_file"
 
 
 @patch("server.os.pipe")
@@ -1074,7 +1175,11 @@ def test_responses_replay_raw_tool_call_text(mock_os_read, mock_pipe,
         "input": [
             {"type": "message", "role": "user", "content": "read file.txt"},
             first_output,
-            {"type": "function_call_output", "call_id": first_output["call_id"], "output": "file body"},
+            {
+                "type": "function_call_output",
+                "call_id": first_output["call_id"],
+                "output": "file body",
+            },
             {"type": "message", "role": "user", "content": "what next?"},
         ],
     })
@@ -1137,6 +1242,361 @@ def test_responses_instructions_and_developer_merged(mock_os_read, mock_pipe,
     assert len(system_msgs) == 1
     assert "Top-level instructions." in system_msgs[0]["content"]
     assert "Developer context." in system_msgs[0]["content"]
+
+
+# ─── GET /props ────────────────────────────────────────────────────
+
+_PROPS_TOP_KEYS = {
+    "default_generation_settings", "model_alias", "model_path", "build_info",
+    "speculative_mode", "server", "model", "runtime", "reasoning",
+    "speculative", "sampling", "pflash", "prefix_cache", "full_cache",
+    "tool_replay", "daemon", "api",
+}
+
+
+def _build_props_app(mock_tokenizer, *, arch="qwen35", draft=Path("d.safetensors"),
+                     prefill_cfg=None, extra_daemon_args=None,
+                     prefix_cache_slots=4, prefill_cache_slots=4):
+    """Build an app with mocked daemon, tuned for /props tests."""
+    mock_tokenizer.name_or_path = "Qwen/Qwen3.5-27B"
+    with patch("server.subprocess.Popen") as mock_popen:
+        mock_popen.return_value.poll.return_value = None
+        return build_app(
+            target=Path("target.gguf"),
+            draft=draft,
+            bin_path=Path("test_dflash"),
+            budget=22,
+            max_ctx=131072,
+            tokenizer=mock_tokenizer,
+            stop_ids={2},
+            prefill_cfg=prefill_cfg,
+            drafter_tokenizer=mock_tokenizer if prefill_cfg else None,
+            prefix_cache_slots=prefix_cache_slots,
+            prefill_cache_slots=prefill_cache_slots,
+            arch=arch,
+            extra_daemon_args=extra_daemon_args,
+        )
+
+
+def test_props_endpoint_shape(client):
+    response = client.get("/props")
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body.keys()) == _PROPS_TOP_KEYS
+    assert body["server"]["props_schema"] == PROPS_SCHEMA
+    assert body["server"]["version"] == SERVER_VERSION
+    assert body["server"]["name"] == "luce-dflash"
+    assert body["model_alias"] == MODEL_NAME
+    assert body["model_path"] == "target.gguf"
+    assert body["build_info"] == f"luce-dflash v{SERVER_VERSION} props_schema={PROPS_SCHEMA}"
+
+
+def test_props_llama_compat_fields(client):
+    body = client.get("/props").json()
+    assert body["default_generation_settings"] == {
+        "n_ctx": 131072,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.0,
+        "repeat_penalty": 1.0,
+    }
+    assert body["runtime"]["backend"]
+    assert body["speculative_mode"] == "dflash"
+    assert body["reasoning"] == {
+        "supported": True,
+        "default": None,
+        "supported_efforts": ["medium"],
+    }
+    assert body["sampling"] == {
+        "capabilities": {
+            "supports_temperature": True,
+            "supports_top_p": True,
+            "supports_top_k": True,
+            "supports_frequency_penalty": True,
+            "supports_seed": True,
+        },
+    }
+    assert "max_ctx" not in body["runtime"]
+    assert "id" not in body["model"]
+    assert "target_path" not in body["model"]
+    assert all(not key.startswith("supports_") for key in body["sampling"])
+    assert "default_enabled" not in body["reasoning"]
+
+
+def test_props_version_reads_pyproject():
+    # Best effort: when pyproject is reachable the value is the [project]
+    # version. We don't assert a literal because that drifts with releases.
+    version = _resolve_server_version()
+    assert isinstance(version, str)
+    assert version
+    if version != "0.0.0+unknown":
+        # pyproject was readable — version should look like semver-ish.
+        assert version[0].isdigit()
+
+
+def test_props_version_falls_back_when_pyproject_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr("server._PYPROJECT", tmp_path / "does_not_exist.toml")
+    assert _resolve_server_version() == "0.0.0+unknown"
+
+
+def test_runtime_backend_prefers_env(monkeypatch):
+    monkeypatch.setenv("DFLASH_RUNTIME_BACKEND", "HIP")
+    assert _runtime_backend(Path("missing")) == "hip"
+
+
+def test_runtime_backend_reads_cmake_cache(tmp_path, monkeypatch):
+    monkeypatch.delenv("DFLASH_RUNTIME_BACKEND", raising=False)
+    monkeypatch.delenv("DFLASH27B_GPU_BACKEND", raising=False)
+    build_dir = tmp_path / "build"
+    build_dir.mkdir()
+    (build_dir / "CMakeCache.txt").write_text(
+        "DFLASH27B_GPU_BACKEND:STRING=hip\n",
+        encoding="utf-8",
+    )
+    assert _runtime_backend(build_dir / "test_dflash") == "hip"
+
+
+def test_props_arch_qwen35(client):
+    body = client.get("/props").json()
+    assert body["model"]["arch"] == "qwen35"
+    assert body["model"]["draft_path"] is not None
+    assert body["reasoning"]["supported"] is True
+    assert body["speculative"]["enabled"] is True
+    assert body["speculative"]["ddtree_budget"] == 22
+
+
+def test_props_arch_laguna(mock_tokenizer):
+    app = _build_props_app(mock_tokenizer, arch="laguna", draft=None)
+    body = TestClient(app).get("/props").json()
+    assert body["model"]["arch"] == "laguna"
+    assert body["model"]["draft_path"] is None
+    assert body["reasoning"] == {
+        "supported": False,
+        "default": None,
+        "supported_efforts": [],
+    }
+    assert body["speculative"]["enabled"] is False
+    assert body["speculative"]["ddtree_budget"] is None
+    assert body["speculative_mode"] == "off"
+
+
+def test_props_pflash_disabled(client):
+    body = client.get("/props").json()
+    p = body["pflash"]
+    assert p["enabled"] is False
+    assert p["mode"] == "off"
+    for k in ("threshold", "keep_ratio", "drafter_gguf",
+              "bsa_enabled", "bsa_alpha", "lm_head_fix"):
+        assert p[k] is None, f"expected null pflash.{k} when disabled"
+
+
+def test_props_pflash_enabled(mock_tokenizer, monkeypatch):
+    from _prefill_hook import PrefillConfig
+    cfg = PrefillConfig(
+        mode="auto",
+        threshold=32000,
+        keep_ratio=0.05,
+        drafter_gguf=Path("/tmp/drafter.gguf"),
+        drafter_tokenizer_id="Qwen/Qwen3-0.6B",
+        skip_park=False,
+    )
+    monkeypatch.setenv("DFLASH_FP_USE_BSA", "1")
+    monkeypatch.setenv("DFLASH_FP_ALPHA", "0.85")
+    app = _build_props_app(mock_tokenizer, prefill_cfg=cfg)
+    body = TestClient(app).get("/props").json()
+    p = body["pflash"]
+    assert p["enabled"] is True
+    assert p["mode"] == "auto"
+    assert p["threshold"] == 32000
+    assert p["keep_ratio"] == pytest.approx(0.05)
+    assert p["drafter_gguf"] == "/tmp/drafter.gguf"
+    assert p["bsa_enabled"] is True
+    assert p["bsa_alpha"] == pytest.approx(0.85)
+    assert body["speculative_mode"] == "pflash"
+
+
+def test_props_target_sharding_disables_caches(mock_tokenizer):
+    app = _build_props_app(
+        mock_tokenizer,
+        extra_daemon_args=["--target-gpus=0,1"],
+    )
+    body = TestClient(app).get("/props").json()
+    assert body["runtime"]["target_sharding"] is True
+    assert body["prefix_cache"]["capacity"] == 0
+    assert body["full_cache"]["enabled"] is False
+
+
+def test_props_target_sharding_false_on_laguna_even_when_args_passed(mock_tokenizer):
+    """Laguna's daemon-spawn path discards extra_daemon_args (see server.py
+    ~line 788 — only the qwen35 branch calls cmd.extend). /props must not
+    claim sharding is active when the flag was silently dropped."""
+    app = _build_props_app(
+        mock_tokenizer,
+        arch="laguna",
+        draft=None,
+        extra_daemon_args=["--target-gpus=0,1"],
+    )
+    body = TestClient(app).get("/props").json()
+    assert body["runtime"]["target_sharding"] is False
+
+
+def test_props_endpoints_match_app_routes(client, app):
+    declared = set(client.get("/props").json()["api"]["endpoints"])
+    actual: set[str] = set()
+    for r in app.routes:
+        if not isinstance(r, APIRoute):
+            continue
+        for m in r.methods:
+            if m in {"GET", "POST"}:
+                actual.add(f"{m} {r.path}")
+    # FastAPI auto-routes we don't care to advertise.
+    actual -= {
+        "GET /openapi.json", "GET /docs", "GET /redoc",
+        "GET /docs/oauth2-redirect",
+    }
+    assert declared == actual
+
+
+def test_capabilities_arch_gated():
+    assert _capabilities("qwen35") == {
+        "reasoning_supported": True,
+        "speculative_supported": True,
+        "tools_supported": True,
+    }
+    assert _capabilities("laguna") == {
+        "reasoning_supported": False,
+        "speculative_supported": False,
+        "tools_supported": False,
+    }
+
+
+def test_effective_kv_type_qwen35_defaults(monkeypatch):
+    for env in ("DFLASH27B_KV_F16", "DFLASH27B_KV_Q4", "DFLASH27B_KV_TQ3",
+                "DFLASH27B_KV_K", "DFLASH27B_KV_V"):
+        monkeypatch.delenv(env, raising=False)
+    # qwen35 default per dflash/src/kv_quant.cpp:160 is q4_0 for both axes.
+    assert _effective_kv_type("k", "qwen35") == "q4_0"
+    assert _effective_kv_type("v", "qwen35") == "q4_0"
+
+
+def test_effective_kv_type_qwen35_per_axis_override(monkeypatch):
+    monkeypatch.setenv("DFLASH27B_KV_TQ3", "1")
+    monkeypatch.setenv("DFLASH27B_KV_V", "q4_0")
+    monkeypatch.delenv("DFLASH27B_KV_K", raising=False)
+    assert _effective_kv_type("k", "qwen35") == "tq3_0"
+    assert _effective_kv_type("v", "qwen35") == "q4_0"
+
+
+def test_effective_kv_type_laguna_ignores_legacy_and_v(monkeypatch):
+    # Laguna only reads DFLASH27B_KV_K and applies it to both axes.
+    monkeypatch.setenv("DFLASH27B_KV_TQ3", "1")
+    monkeypatch.setenv("DFLASH27B_KV_V", "q4_0")
+    monkeypatch.delenv("DFLASH27B_KV_K", raising=False)
+    assert _effective_kv_type("k", "laguna") == "q8_0"
+    assert _effective_kv_type("v", "laguna") == "q8_0"
+    monkeypatch.setenv("DFLASH27B_KV_K", "q4_0")
+    assert _effective_kv_type("k", "laguna") == "q4_0"
+    assert _effective_kv_type("v", "laguna") == "q4_0"
+
+
+def test_prefix_cache_stats_disabled():
+    from prefix_cache import PrefixCache
+    pc = PrefixCache.__new__(PrefixCache)
+    pc.disabled = True
+    pc.cap = 0
+    assert pc.stats() == {"capacity": 0, "in_use": 0, "lifetime_hits": 0}
+
+
+def test_prefix_cache_lifetime_hits_increments(mock_tokenizer):
+    """Driving lookup() across an eviction must still see the lifetime
+    counter — it is NOT a sum over surviving entries."""
+    from prefix_cache import PrefixCache, hash_prefix
+    pc = PrefixCache(
+        daemon_stdin=MagicMock(),
+        await_reply=lambda *_a, **_k: None,
+        daemon_lock=MagicMock(),
+        tokenizer=mock_tokenizer,
+        kv_k_type="q8_0",
+        fa_window=2048,
+        cap=2,
+    )
+    # Force-disable boundary detection so we can register synthetic entries.
+    pc.markers = {"family": "manual", "sys_role_prefix": (),
+                  "end_msg_seqs": [], "next_role_starts": []}
+    # Inject two entries directly and hit each twice.
+    ids_a = [1, 2, 3, 4]
+    ids_b = [5, 6, 7, 8]
+    key_a = hash_prefix(ids_a, pc.kv_k_type, pc.fa_window)
+    key_b = hash_prefix(ids_b, pc.kv_k_type, pc.fa_window)
+    pc.entries[key_a] = 0
+    pc.entries[key_b] = 1
+    # Stub out the boundary detector to return both candidate cuts.
+    pc._all_boundaries = lambda ids: [len(ids)]
+    pc.lookup(ids_a)
+    pc.lookup(ids_a)
+    pc.lookup(ids_b)
+    assert pc.stats()["lifetime_hits"] == 3
+    # Evict everything; counter persists.
+    pc.entries.clear()
+    assert pc.stats()["in_use"] == 0
+    assert pc.stats()["lifetime_hits"] == 3
+
+
+def test_full_cache_disk_bytes_snapshot_updates_on_mutation(mock_tokenizer, tmp_path):
+    """confirm_full_snap and _retire_full_entry must refresh the snapshot
+    so /props never has to walk the filesystem."""
+    from prefix_cache import PrefixCache
+    pc = PrefixCache(
+        daemon_stdin=MagicMock(),
+        await_reply=lambda *_a, **_k: None,
+        daemon_lock=MagicMock(),
+        tokenizer=mock_tokenizer,
+        kv_k_type="q8_0",
+        fa_window=2048,
+        cap=1,
+    )
+    pc.markers = {"family": "manual", "sys_role_prefix": (),
+                  "end_msg_seqs": [], "next_role_starts": []}
+    pc.init_full_cache(full_cap=2, cache_dir=str(tmp_path))
+    assert pc.full_stats()["disk_bytes"] == 0
+
+    # Source bin file the daemon would have written.
+    src = tmp_path / "cur.bin"
+    src.write_bytes(b"\x01\x00\x00\x00" * 16)
+
+    ids = [10, 20, 30]
+    slot, _ = pc.prepare_full_snap(ids)
+    pc.confirm_full_snap(slot, ids, src, cur_ids_len=16)
+    snap = pc.full_stats()
+    assert snap["enabled"] is True
+    assert snap["in_use"] == 1
+    assert snap["disk_bytes"] > 0
+    after_add = snap["disk_bytes"]
+
+    # Direct retire of the entry should refresh the snapshot to 0.
+    (key, entry), = pc.full_entries.items()
+    pc._retire_full_entry(key, entry, remove_files=True)
+    after_evict = pc.full_stats()
+    assert after_evict["in_use"] == 0
+    assert after_evict["disk_bytes"] == 0
+    assert after_evict["disk_bytes"] < after_add
+
+
+def test_tool_memory_stats():
+    from tool_memory import ToolMemory
+    tm = ToolMemory(max_entries=100, max_bytes=4096)
+    s = tm.stats()
+    assert s == {
+        "max_entries": 100,
+        "max_bytes": 4096,
+        "current_entries": 0,
+        "current_bytes": 0,
+    }
+    tm.remember(["call_a"], "hello")
+    s = tm.stats()
+    assert s["current_entries"] == 1
+    assert s["current_bytes"] == len(b"hello")
 
 
 # ─── out-of-range token filtering (OverflowError regression) ───────

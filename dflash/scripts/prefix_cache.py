@@ -63,7 +63,6 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
-
 # ---------------------------------------------------------------------------
 # DaemonStdoutBus
 # ---------------------------------------------------------------------------
@@ -130,7 +129,8 @@ class DaemonStdoutBus:
             # state is consistent for any caller awaiting a reply.
             for _cb_prefix, _cb in self._line_callbacks.items():
                 if decoded.startswith(_cb_prefix):
-                    try: _cb()
+                    try:
+                        _cb()
                     except Exception as _cbe:
                         print(f"  [bus] callback for {_cb_prefix!r} raised: {_cbe}", flush=True)
 
@@ -253,7 +253,8 @@ def _find_first_seq(ids, seq, start=0):
     if not seq:
         return -1
     head = seq[0]
-    n = len(ids); m = len(seq)
+    n = len(ids)
+    m = len(seq)
     i = start
     while i + m <= n:
         if ids[i] == head and _seq_at(ids, i, seq):
@@ -495,6 +496,9 @@ class PrefixCache:
 
         self.entries: OrderedDict[bytes, int] = OrderedDict()  # hash → slot_id
         self.next_slot = 0
+        # Cumulative hit counter, never decremented. Survives eviction —
+        # unlike a sum over surviving entries, which trends down under churn.
+        self._lifetime_hits = 0
         try:
             self.markers = _resolve_chat_markers(tokenizer)
         except ValueError as e:
@@ -548,9 +552,21 @@ class PrefixCache:
                     best = (self.entries[key], cut)
                 self.entries.move_to_end(key)   # mark fresh
         if best is not None:
+            self._lifetime_hits += 1
             print(f"{self.log_prefix} lookup hit slot={best[0]} prefix_len={best[1]} "
                   f"(of {len(prompt_ids)} total)", flush=True)
         return best
+
+    def stats(self) -> dict:
+        """Snapshot for /props. Lockless: a mutation under daemon_lock can
+        tear in_use vs lifetime_hits; acceptable for an introspection report."""
+        if self.disabled:
+            return {"capacity": 0, "in_use": 0, "lifetime_hits": 0}
+        return {
+            "capacity": self.cap,
+            "in_use": len(self.entries),
+            "lifetime_hits": self._lifetime_hits,
+        }
 
     def mark_all_cleared(self) -> None:
         """Drop every LRU entry after the daemon emits ``[snap] all-cleared``.
@@ -726,6 +742,11 @@ class PrefixCache:
         # Pending eviction: the LRU entry reserved for the next confirm.
         self._full_pending_evict_key: bytes | None = None
         self._full_pending_evict_path: str | None = None
+        # Cumulative hit + disk-usage snapshots for /props. Recomputed on
+        # every cache mutation so the introspection endpoint never has to
+        # walk the filesystem.
+        self._full_lifetime_hits = 0
+        self._full_disk_bytes_snapshot = 0
 
         cache_dir_path = Path(cache_dir) if cache_dir else Path("/tmp/prefix")
         cache_dir_path.mkdir(parents=True, exist_ok=True)
@@ -786,6 +807,36 @@ class PrefixCache:
             except OSError:
                 continue
         return total
+
+    def _recompute_full_disk_bytes_snapshot(self) -> None:
+        """Refresh the disk-usage snapshot used by /props. Called from every
+        full-cache mutation site so reads don't have to stat the filesystem."""
+        if getattr(self, "_full_disabled", True):
+            self._full_disk_bytes_snapshot = 0
+            return
+        self._full_disk_bytes_snapshot = sum(
+            self._full_entry_artifact_size(k, e)
+            for k, e in self.full_entries.items()
+        )
+
+    def full_stats(self) -> dict:
+        """Snapshot for /props. Reads cached disk-usage; never walks the
+        filesystem on a /props request."""
+        if getattr(self, "_full_disabled", True):
+            return {
+                "enabled": False,
+                "capacity": 0,
+                "in_use": 0,
+                "disk_bytes": 0,
+                "lifetime_hits": 0,
+            }
+        return {
+            "enabled": True,
+            "capacity": self._full_cap,
+            "in_use": len(self.full_entries),
+            "disk_bytes": self._full_disk_bytes_snapshot,
+            "lifetime_hits": self._full_lifetime_hits,
+        }
 
     @staticmethod
     def _read_full_meta_int(meta: dict, key: str, *, default: int | None = None) -> int | None:
@@ -869,6 +920,7 @@ class PrefixCache:
                 pass
             self._drop_full_metadata(key)
         self._recompute_full_next_slot()
+        self._recompute_full_disk_bytes_snapshot()
 
     def _enforce_full_budget(self, live_prompt_ids: list[int] | None = None) -> None:
         budget = int(getattr(self, "_full_budget_bytes", 0) or 0)
@@ -954,13 +1006,19 @@ class PrefixCache:
 
         if entries_by_key and getattr(self, "_full_budget_bytes", 0):
             self.full_entries = OrderedDict(
-                sorted(entries_by_key.items(), key=lambda item: (item[1].last_used_ns, item[0].hex()))
+                sorted(
+                    entries_by_key.items(),
+                    key=lambda item: (item[1].last_used_ns, item[0].hex()),
+                )
             )
             self._enforce_full_budget()
             entries_by_key = dict(self.full_entries)
             self.full_entries.clear()
 
-        return sorted(entries_by_key.items(), key=lambda item: (item[1].last_used_ns, item[0].hex()))
+        return sorted(
+            entries_by_key.items(),
+            key=lambda item: (item[1].last_used_ns, item[0].hex()),
+        )
 
     async def rehydrate_full_cache(self, replay_entry) -> int:
         """Restore persisted full-cache entries into fresh daemon slots.
@@ -1003,6 +1061,7 @@ class PrefixCache:
                     break
 
         self._recompute_full_next_slot()
+        self._recompute_full_disk_bytes_snapshot()
         if restored:
             print(f"{self.log_prefix} full-cache restored {restored} entries "
                   f"from disk", flush=True)
@@ -1028,8 +1087,10 @@ class PrefixCache:
         if not Path(cur_bin_path).exists():
             self.full_entries.pop(key, None)
             self._drop_full_metadata(key)
+            self._recompute_full_disk_bytes_snapshot()
             return None
         entry.hits += 1
+        self._full_lifetime_hits += 1
         entry.last_used_ns = time.time_ns()
         self.full_entries.move_to_end(key)  # mark fresh in LRU
         self._persist_full_metadata(key, entry)
@@ -1040,10 +1101,11 @@ class PrefixCache:
     def prepare_full_snap(self, prompt_ids: list[int]) -> tuple[int, int] | None:
         """Reserve a daemon slot for the full-prefill snapshot.
 
-        Returns ``(absolute_slot, 0)`` — the second element is a placeholder;
-        the real target_pos (== len(cur_ids)) is supplied by the caller to
-        ``confirm_full_snap``.  Returns None if full-cache is disabled or the
-        prompt is already cached.
+        Returns ``(absolute_slot, target_pos)``. Full-prompt snapshots know
+        the slot at reservation time; the caller supplies the real
+        ``target_pos`` to ``confirm_full_snap`` after generation succeeds.
+        Returns None if full-cache is disabled or the prompt is already
+        cached.
         """
         if getattr(self, "_full_disabled", True):
             return None
@@ -1068,7 +1130,7 @@ class PrefixCache:
             self._full_pending_evict_key = None
             self._full_pending_evict_path = None
 
-        return abs_slot, 0  # 0 is a placeholder; real pos passed to confirm
+        return abs_slot, 0
 
     def confirm_full_snap(self, slot: int, prompt_ids: list[int],
                           cur_bin_src: str | Path, cur_ids_len: int) -> None:
@@ -1119,6 +1181,10 @@ class PrefixCache:
         self.full_entries[key] = entry
         self._persist_full_metadata(key, entry)
         self._enforce_full_budget(prompt_ids)
+        # _enforce_full_budget may call _retire_full_entry which refreshes
+        # the snapshot, but it bails early when budget==0. Refresh here
+        # unconditionally so the new entry's bytes are always reflected.
+        self._recompute_full_disk_bytes_snapshot()
         print(f"{self.log_prefix} full-cache committed slot={slot} "
               f"cur_ids_len={cur_ids_len} key={key.hex()[:8]}", flush=True)
 
@@ -1144,7 +1210,9 @@ class PrefixCache:
             return
         slot, cut = prep
 
-        import os, struct, tempfile
+        import os
+        import struct
+        import tempfile
         fd, tmp_path = tempfile.mkstemp(suffix="_prefix.bin")
         with os.fdopen(fd, "wb") as f:
             for t in prompt_ids[:cut]:
@@ -1159,8 +1227,10 @@ class PrefixCache:
             self.confirm_inline_snap(slot, cut, prompt_ids)
             confirmed = True
         finally:
-            try: os.unlink(tmp_path)
-            except OSError: pass
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
             if not confirmed:
                 # The SNAPSHOT command may already have been processed on the
                 # daemon (the slot now holds new-prompt KV) even though we

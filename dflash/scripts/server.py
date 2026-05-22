@@ -23,15 +23,17 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import uuid
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 log = logging.getLogger("dflash.server")
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware          # FIX 1: add CORS
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel
 from starlette.concurrency import iterate_in_threadpool
 from transformers import AutoTokenizer
@@ -139,6 +141,178 @@ _QWEN35_ARCHES = {"qwen35", "qwen36"}
 _LAGUNA_ARCHES  = {"laguna"}
 
 _ALLOWED_TEMPLATE_KWARGS = frozenset({"enable_thinking", "tools", "add_generation_prompt"})
+
+
+# ─── /props introspection ──────────────────────────────────────────
+# Read-only GET /props endpoint returning a JSON snapshot of the live
+# Python-server state (model arch, KV/FA config, pflash mode, cache
+# occupancy, daemon liveness). Convention follows llama.cpp's /props.
+
+_PYPROJECT = Path(__file__).resolve().parent.parent / "pyproject.toml"
+
+
+def _resolve_server_version() -> str:
+    # Source: dflash/pyproject.toml [project] version. importlib.metadata
+    # is intentionally not used — that project sets [tool.uv] package=false,
+    # so the package is never installed and the metadata lookup would
+    # always raise PackageNotFoundError and silently fall through.
+    try:
+        with _PYPROJECT.open("rb") as f:
+            return tomllib.load(f)["project"]["version"]
+    except (OSError, KeyError):
+        # File missing or shape unexpected — common case before the
+        # workspace pyproject is committed. Silent fallback.
+        return "0.0.0+unknown"
+    except tomllib.TOMLDecodeError as exc:
+        # File present but malformed — that's a real config bug worth
+        # surfacing, not a silent fallback case.
+        log.warning("could not parse %s for server version: %s", _PYPROJECT, exc)
+        return "0.0.0+unknown"
+
+
+SERVER_VERSION = _resolve_server_version()
+
+PROPS_SCHEMA = 1
+# Bump only on breaking changes to /props output:
+#   - field renamed
+#   - field removed
+#   - existing field's semantics change (units, nullability, type)
+# Do NOT bump for additive changes (new fields, new sections).
+
+_API_ENDPOINTS: list[str] = [
+    "GET /health",
+    "GET /props",
+    "GET /v1/models",
+    "POST /v1/chat/completions",
+    "POST /v1/messages",
+    "POST /v1/messages/count_tokens",
+    "POST /v1/responses",
+]
+# Keep in sync with the @app.{get,post} decorators in build_app().
+# Drift is caught by test_props_endpoints_match_app_routes.
+
+
+def _capabilities(arch: str) -> dict:
+    """Arch-gated capability booleans for /props.
+
+    Currently consumed only by /props. The Codex /v1/models variant has
+    its own hardcoded capability fields; wiring it through this helper
+    is a v2 follow-up (the Codex schema requires non-empty reasoning-
+    level fields, which would need validation against a real client
+    before gating them on arch="laguna").
+    """
+    qwen = arch in _QWEN35_ARCHES
+    return {
+        "reasoning_supported": qwen,
+        "speculative_supported": qwen,
+        "tools_supported": qwen,
+    }
+
+
+def _effective_kv_type(axis: str, arch: str) -> str:
+    """KV K or V type as the C++ daemon actually resolves it.
+
+    Mirrors dflash::resolve_kv_types() in src/kv_quant.cpp (qwen35) and the
+    laguna-specific path in test/test_dflash.cpp (laguna). Distinct from
+    _resolve_kv_k_type() — that function uses q8_0 as a stable hash salt for
+    the prefix cache; this one reports what the daemon allocated.
+    """
+    if arch in _LAGUNA_ARCHES:
+        # laguna reads only DFLASH27B_KV_K; legacy shorthand and KV_V ignored.
+        kv = "q8_0"
+        if os.environ.get("DFLASH27B_KV_K"):
+            kv = os.environ["DFLASH27B_KV_K"].lower()
+        return kv
+    # qwen35: default Q4_0; legacy KV_F16/_KV_Q4/_KV_TQ3 last-wins; per-axis
+    # KV_K/_KV_V override legacy.
+    kv = "q4_0"
+    if os.environ.get("DFLASH27B_KV_F16", "0") != "0":
+        kv = "f16"
+    if os.environ.get("DFLASH27B_KV_Q4", "0") != "0":
+        kv = "q4_0"
+    if os.environ.get("DFLASH27B_KV_TQ3", "0") != "0":
+        kv = "tq3_0"
+    axis_env = f"DFLASH27B_KV_{axis.upper()}"
+    if os.environ.get(axis_env):
+        kv = os.environ[axis_env].lower()
+    return kv
+
+
+def _parse_optional_float(env_name: str) -> float | None:
+    raw = os.environ.get(env_name)
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning("ignoring non-numeric %s=%r", env_name, raw)
+        return None
+
+
+def _runtime_backend(bin_path: Path) -> str:
+    """Best-effort compute backend tag for /props.
+
+    The Python server does not yet have a daemon build-info handshake, so read
+    the same CMake cache knob that selected the test_dflash backend. Operators
+    can override this for unusual deployments.
+    """
+    for env_name in ("DFLASH_RUNTIME_BACKEND", "DFLASH27B_GPU_BACKEND"):
+        raw = os.environ.get(env_name)
+        if raw:
+            return raw.lower()
+
+    candidates = []
+    try:
+        bin_dir = Path(bin_path).resolve().parent
+    except OSError:
+        bin_dir = Path(bin_path).parent
+    candidates.append(bin_dir / "CMakeCache.txt")
+    candidates.append(ROOT / "build" / "CMakeCache.txt")
+
+    seen: set[Path] = set()
+    for cache_path in candidates:
+        if cache_path in seen:
+            continue
+        seen.add(cache_path)
+        try:
+            text = cache_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        match = re.search(r"^DFLASH27B_GPU_BACKEND:[^=]*=(\w+)$", text, re.MULTILINE)
+        if match:
+            return match.group(1).lower()
+        if re.search(r"^GGML_HIP:[^=]*=ON$", text, re.MULTILINE):
+            return "hip"
+        if re.search(r"^GGML_CUDA:[^=]*=ON$", text, re.MULTILINE):
+            return "cuda"
+
+    return "cuda"
+
+
+def _pflash_props(cfg: "PrefillConfig | None") -> dict:
+    if cfg is None or not cfg.enabled:
+        return {
+            "enabled": False,
+            "mode": "off",
+            "threshold": None,
+            "keep_ratio": None,
+            "drafter_gguf": None,
+            "skip_park": None,
+            "bsa_enabled": None,
+            "bsa_alpha": None,
+            "lm_head_fix": None,
+        }
+    return {
+        "enabled": True,
+        "mode": cfg.mode,
+        "threshold": cfg.threshold,
+        "keep_ratio": cfg.keep_ratio,
+        "drafter_gguf": str(cfg.drafter_gguf) if cfg.drafter_gguf else None,
+        "skip_park": bool(cfg.skip_park),
+        "bsa_enabled": os.environ.get("DFLASH_FP_USE_BSA", "0") != "0",
+        "bsa_alpha": _parse_optional_float("DFLASH_FP_ALPHA"),
+        "lm_head_fix": os.environ.get("DFLASH27B_LM_HEAD_FIX", "0") != "0",
+    }
 
 
 def resolve_draft(root: Path) -> Path:
@@ -659,15 +833,35 @@ def _anthropic_tools_to_openai(tools: list[dict] | None) -> list[ToolDef] | None
     return out or None
 
 
-# Default cap when the client omits ``max_tokens``. Override at start via
-# the ``DFLASH_DEFAULT_MAX_TOKENS`` env var. Set to a value < ``max_ctx`` to
-# avoid the unbounded-gen path; clients that send their own ``max_tokens``
-# are unaffected.
-DEFAULT_MAX_TOKENS = int(os.environ.get("DFLASH_DEFAULT_MAX_TOKENS", 4096))
+# Default combined cap when the client omits ``max_tokens``. Matches
+# antirez/ds4 ``ds4_eval.c``'s ``max_tokens=16000`` default so thinking-mode
+# requests have enough headroom for reasoning + answer in a single combined
+# cap. Override via ``--default-max-tokens`` (CLI) or
+# ``DFLASH_DEFAULT_MAX_TOKENS`` (env). Clients that send their own
+# ``max_tokens`` are unaffected.
+DEFAULT_MAX_TOKENS = int(os.environ.get("DFLASH_DEFAULT_MAX_TOKENS", 16000))
 
 
 def _default_chat_enable_thinking() -> bool:
     return _parse_bool(os.environ.get("DFLASH_ENABLE_THINKING"))
+
+
+class ThinkingConfig(BaseModel):
+    """OpenAI/Anthropic-shaped thinking toggle.
+
+    ``type="enabled"`` turns on the server's configured thinking-budget
+    policy for this request; ``type="disabled"`` (or omitting the field)
+    falls back to a single-cap ``max_tokens`` generation with no separate
+    reasoning budget.
+
+    The actual thinking-budget knob (``--think-max-tokens`` /
+    ``--default-max-tokens``) lives on the server config, not on the wire,
+    so the request shape stays compatible with generic OpenAI clients.
+    Extra fields (``budget_tokens``, etc.) are ignored.
+    """
+    type: Literal["enabled", "disabled"] = "enabled"
+
+    model_config = {"extra": "ignore"}
 
 
 class ChatRequest(BaseModel):
@@ -676,6 +870,12 @@ class ChatRequest(BaseModel):
     stream: bool = False
     max_tokens: int = DEFAULT_MAX_TOKENS
     max_completion_tokens: int | None = None
+    # OpenAI-shaped toggle. When ``type=="enabled"`` the server applies its
+    # configured ``--think-max-tokens`` cap to the reasoning phase and
+    # re-prompts the daemon for content if the model fails to close
+    # ``</think>`` within that cap. The combined cap is ``max_tokens`` /
+    # ``max_completion_tokens``.
+    thinking: ThinkingConfig | None = None
     temperature: float | None = None   # 0 = greedy, >0 = sample
     seed: int | None = None             # rng seed for sampling
     top_p: float | None = None         # nucleus, applied when temperature > 0
@@ -686,6 +886,20 @@ class ChatRequest(BaseModel):
     tool_choice: Any | None = None  # "auto" | "none" | {"function": {...}}
     chat_template_kwargs: dict | None = None
     stream_options: dict | None = None  # e.g. {"include_usage": true}
+
+
+def _chat_template_tools(tools: list[ToolDef] | None) -> list[dict] | None:
+    """Return the function-schema shape expected by Qwen chat templates."""
+    if not tools:
+        return None
+    rendered: list[dict] = []
+    for tool in tools:
+        fn = tool.function
+        if hasattr(fn, "model_dump"):
+            fn = fn.model_dump()
+        if isinstance(fn, dict):
+            rendered.append(fn)
+    return rendered or None
 
 
 class AnthropicMessage(BaseModel):
@@ -701,6 +915,21 @@ class AnthropicMessagesRequest(BaseModel):
     tools: list[dict] | None = None
     tool_choice: Any | None = None
     stream: bool = False
+    temperature: float | None = None
+    top_p: float | None = None
+    seed: int | None = None
+    frequency_penalty: float | None = None
+    stop_sequences: list[str] | None = None
+    chat_template_kwargs: dict | None = None
+
+
+class AnthropicCountTokensRequest(BaseModel):
+    model: str = MODEL_NAME
+    messages: list[AnthropicMessage]
+    system: str | list[dict] | None = None
+    tools: list[dict] | None = None
+    tool_choice: Any | None = None
+    max_tokens: int | None = None
     temperature: float | None = None
     top_p: float | None = None
     seed: int | None = None
@@ -793,7 +1022,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
               extra_daemon_args: list[str] | None = None,
               lazy_draft: bool = False,
               verbose_daemon: bool = False,
-              force_no_thinking: bool = False) -> FastAPI:
+              force_no_thinking: bool = False,
+              think_max_tokens: int = 10000) -> FastAPI:
     import asyncio
     if _extra_daemon_has_target_sharding(extra_daemon_args):
         if prefix_cache_slots > 0 or prefill_cache_slots > 0:
@@ -984,6 +1214,103 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             }],
         }
 
+    # ── /props introspection ───────────────────────────────────────
+    # Captures Python-server state only; daemon (C++ test_dflash) build
+    # identity is intentionally out of scope for v1.
+
+    @app.get("/props")
+    def props():
+        caps = _capabilities(arch)
+        # Cache reads are lockless: a mutation under daemon_lock can tear
+        # in_use vs lifetime_hits across stats(). Acceptable for /props.
+        prefix_stats = prefix_cache.stats()
+        full_stats = prefix_cache.full_stats()
+        tool_stats = tool_memory.stats()
+        tokenizer_id = getattr(tokenizer, "name_or_path", None)
+        if not isinstance(tokenizer_id, str):
+            tokenizer_id = None
+        server = {
+            "name": "luce-dflash",
+            "version": SERVER_VERSION,
+            "props_schema": PROPS_SCHEMA,
+        }
+        pflash_props = _pflash_props(prefill_cfg)
+        speculative_enabled = caps["speculative_supported"]
+        if pflash_props["enabled"]:
+            speculative_mode = "pflash"
+        elif speculative_enabled:
+            speculative_mode = "dflash"
+        else:
+            speculative_mode = "off"
+        reasoning_default = None
+        reasoning_efforts = ["medium"] if caps["reasoning_supported"] else []
+        body = {
+            "default_generation_settings": {
+                "n_ctx": max_ctx,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "top_k": 0,
+                "min_p": 0.0,
+                "repeat_penalty": 1.0,
+            },
+            "model_alias": MODEL_NAME,
+            "model_path": str(target),
+            "build_info": (
+                f"{server['name']} v{server['version']} "
+                f"props_schema={server['props_schema']}"
+            ),
+            "speculative_mode": speculative_mode,
+            "server": server,
+            "model": {
+                "arch": arch,
+                "draft_path": str(draft) if draft is not None else None,
+                "tokenizer_id": tokenizer_id,
+            },
+            "runtime": {
+                "backend": _runtime_backend(bin_path),
+                "fa_window": _fa_window,
+                "kv_cache_k": _effective_kv_type("k", arch),
+                "kv_cache_v": _effective_kv_type("v", arch),
+                "lazy_draft": bool(lazy_draft),
+                # extra_daemon_args is only forwarded to the qwen35 daemon
+                # spawn (see cmd.extend above); the laguna path discards it,
+                # so report sharding off there regardless of what was passed.
+                "target_sharding": (
+                    arch not in _LAGUNA_ARCHES
+                    and _extra_daemon_has_target_sharding(extra_daemon_args)
+                ),
+            },
+            "reasoning": {
+                "supported": caps["reasoning_supported"],
+                "default": reasoning_default,
+                "supported_efforts": reasoning_efforts,
+            },
+            "speculative": {
+                "enabled": speculative_enabled,
+                "ddtree_budget": budget if speculative_enabled else None,
+            },
+            "sampling": {
+                "capabilities": {
+                    "supports_temperature": True,
+                    "supports_top_p": True,
+                    "supports_top_k": True,
+                    "supports_frequency_penalty": True,
+                    "supports_seed": True,
+                },
+            },
+            "pflash": pflash_props,
+            "prefix_cache": prefix_stats,
+            "full_cache": full_stats,
+            "tool_replay": tool_stats,
+            "daemon": {
+                "alive": daemon_proc.poll() is None,
+            },
+            "api": {
+                "endpoints": list(_API_ENDPOINTS),
+            },
+        }
+        return body
+
     def _ids_to_bin(ids: list[int]) -> Path:
         fd, path = tempfile.mkstemp(suffix=".bin")
         with os.fdopen(fd, "wb") as f:
@@ -1003,15 +1330,19 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         ``template_kwargs`` is passed through to ``apply_chat_template`` so callers
         can toggle template knobs like ``enable_thinking`` per-request.
 
-        Thinking is disabled by default, but Qwen3.6's no-thinking template
-        pre-fills a closed ``<think></think>`` block that can make the model emit
-        EOS immediately. We strip that trailing closed block before tokenization
-        so the assistant turn remains open without enabling think mode.
-        Deployments can opt in globally with DFLASH_ENABLE_THINKING=1 or
-        per request with ``chat_template_kwargs.enable_thinking``.
+        Thinking is disabled by default for plain chat because Qwen3.6's think
+        mode can reduce DFlash acceptance rates. Tool prompts need Qwen's
+        thinking template to reliably emit tool tokens, so tool-bearing requests
+        default to ``enable_thinking=True`` unless the client explicitly
+        overrides it. Deployments can also opt in globally with
+        DFLASH_ENABLE_THINKING=1. When thinking is disabled, Qwen3.6's
+        no-thinking template may pre-fill a closed ``<think></think>`` block;
+        we strip that trailing block before tokenization so the assistant turn
+        remains open.
         """
+        default_thinking = _default_chat_enable_thinking() or bool(tools_arg)
         tpl_kwargs: dict = {"tokenize": False, "add_generation_prompt": True,
-                            "enable_thinking": _default_chat_enable_thinking()}
+                            "enable_thinking": default_thinking}
         tpl_kwargs.update(
             {k: v for k, v in (template_kwargs or {}).items() if k in _ALLOWED_TEMPLATE_KWARGS}
         )
@@ -1064,7 +1395,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
 
         tools_arg = None
         if req.tools:
-            tools_arg = [t.model_dump() for t in req.tools]
+            tools_arg = _chat_template_tools(req.tools)
 
         path, ids, _prompt = _render_messages(msgs, req.chat_template_kwargs, tools_arg)
         started_in_thinking = bool(re.search(r"<think>\s*$", _prompt))
@@ -1143,6 +1474,32 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
     async def _collect_tokens_sync(r, n_gen, timing=None) -> list[int]:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, lambda: list(_token_stream(r, n_gen, timing)))
+
+    async def _drain_unfinished_stream(timing) -> bool:
+        """Drain daemon tokens after a client disconnects mid-stream.
+
+        The daemon writes all request tokens and a sentinel to one shared pipe.
+        If an HTTP stream is cancelled before the sentinel, releasing
+        daemon_lock would let the next request consume stale bytes and return
+        an empty completion. Keep draining even if cancellation is raised; the
+        caller can re-raise after cache cleanup and draft parking.
+        """
+        if timing.get("daemon_done"):
+            return False
+        log.warning("stream ended before daemon sentinel; draining daemon pipe")
+        cancelled = False
+        task = asyncio.create_task(asyncio.to_thread(_drain_until_sentinel, r_pipe))
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        try:
+            task.result()
+            timing["daemon_done"] = True
+        except Exception as exc:
+            log.warning("daemon pipe drain after stream close failed: %s", exc)
+        return cancelled
 
     async def _astream_tokens(r, n_gen, timing=None):
         generated = 0
@@ -1348,6 +1705,33 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
     def _max_tokens_for(req) -> int:
         return getattr(req, "max_completion_tokens", None) or req.max_tokens
 
+    def _phase1_gen_len(req, prompt_len: int) -> int:
+        """Cap for the thinking-phase daemon call.
+
+        When ``req.thinking`` opts into the thinking-budget envelope, phase 1
+        generates at most the server-configured ``--think-max-tokens`` worth
+        of reasoning before force-closing ``</think>`` and re-prompting for
+        the visible content. Without ``thinking``, phase 1 IS the whole
+        generation and we keep the legacy single-cap ``max_tokens``.
+        """
+        thinking = getattr(req, "thinking", None)
+        combined_cap = _max_tokens_for(req)
+        if thinking is None or thinking.type != "enabled":
+            return _gen_len_for(prompt_len, combined_cap)
+        # Phase 1 takes whichever is smaller: the server's configured
+        # think-cap, or the combined cap (we can't spend more on thinking
+        # than the whole budget allows).
+        return _gen_len_for(prompt_len, min(think_max_tokens, combined_cap))
+
+    def _phase2_gen_len(req, prompt_len: int, phase1_emitted: int) -> int:
+        """Cap for the post-think content daemon call.
+
+        The combined cap (``max_completion_tokens`` / ``max_tokens``) covers
+        both phases, so phase 2 gets whatever's left after phase 1.
+        """
+        content_cap = max(0, _max_tokens_for(req) - phase1_emitted)
+        return _gen_len_for(prompt_len, content_cap)
+
     async def _drain_abandoned_stream(kind: str, request_id: str,
                                       timing: dict) -> None:
         """Synchronize the daemon stream after an abandoned SSE response.
@@ -1502,6 +1886,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             return None
                         return f"data: {json.dumps(chunk({kind: text}))}\n\n"
 
+                    cancelled_while_draining = False
                     try:
                         async for tok_id in _astream_tokens(r_pipe, gen_len, timing):
                             completion_tokens += 1
@@ -1665,17 +2050,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                 try: prompt_bin.unlink()
                                 except Exception: pass
                         else:
-                            log.warning(
-                                "stream ended before daemon sentinel; "
-                                "retaining prompt .bin for in-flight daemon read")
-                            await _drain_abandoned_stream(
-                                "chat.stream", completion_id, timing)
+                            cancelled_while_draining = await _drain_unfinished_stream(timing)
 
                     inline_snap_ok = _consume_inline_snap_waiter(snap_waiter)
                     _confirm_or_abort_snap(
                         completion_tokens, full_snap_prep_ref[0], snap_prep,
                         prompt_ids, cur_bin, cur_ids, inline_snap_ok)
                     _park_draft_if_lazy(timing)
+                    if cancelled_while_draining:
+                        raise asyncio.CancelledError
 
                     yield f"data: {json.dumps(chunk({}, finish=finish_reason))}\n\n"
                     if include_usage:
@@ -1713,7 +2096,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 cur_bin = Path(cached_cur_bin)
                 cur_ids = None
                 prompt_len = cached_cur_ids_len
-                gen_len = _gen_len_for(prompt_len, _max_tokens_for(req))
+                gen_len = _phase1_gen_len(req, prompt_len)
                 if gen_len <= 0:
                     try: prompt_bin.unlink()
                     except Exception: pass
@@ -1728,7 +2111,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             req.chat_template_kwargs)
                 timing["compress"] = time.monotonic() - t_compress
                 prompt_len = len(cur_ids)
-                gen_len = _gen_len_for(prompt_len, _max_tokens_for(req))
+                gen_len = _phase1_gen_len(req, prompt_len)
                 if gen_len <= 0:
                     try: cur_bin.unlink()
                     except Exception: pass
@@ -1754,6 +2137,62 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             _confirm_or_abort_snap(
                 len(tokens), full_snap_prep_ref[0], snap_prep,
                 prompt_ids, cur_bin, cur_ids, inline_snap_ok)
+
+            # Phase 2 — content re-prompt after thinking-budget force close.
+            # Triggers only when (a) caller asked for separate budgets via
+            # `req.thinking`, (b) the chat template opened a `<think>` block
+            # we routed phase 1 tokens into, and (c) the model didn't emit
+            # `</think>` within the thinking budget. In that case the model
+            # never had a chance to write a clean answer; we re-prompt with
+            # the captured reasoning + closing tag + "Final answer:" hint
+            # and collect content tokens against the remaining cap.
+            phase2_tokens: list[int] = []
+            close_kind = "natural"
+            phase1_text = tokenizer.decode(tokens, skip_special_tokens=True)
+            thinking_cfg = getattr(req, "thinking", None)
+            need_phase2 = (
+                thinking_cfg is not None
+                and thinking_cfg.type == "enabled"
+                and started_in_thinking
+                and THINK_CLOSE_TAG not in phase1_text
+                and len(tokens) > 0
+            )
+            if need_phase2:
+                close_kind = "hard"
+                phase2_prefix = (
+                    "</think>\n\nFinal answer: "
+                )
+                # New context = original prompt ids + phase1 tokens + closing
+                # prefix tokens. We reuse the same tokenizer so the daemon's
+                # KV cache shape matches the verifier vocab.
+                closing_ids = tokenizer.encode(
+                    phase2_prefix, add_special_tokens=False,
+                )
+                ph2_prompt_ids = (
+                    list(cur_ids if cur_ids is not None else prompt_ids)
+                    + list(tokens) + list(closing_ids)
+                )
+                ph2_prompt_len = len(ph2_prompt_ids)
+                ph2_gen_len = _phase2_gen_len(req, ph2_prompt_len, len(tokens))
+                if ph2_gen_len > 0:
+                    ph2_bin = _ids_to_bin(ph2_prompt_ids)
+                    try:
+                        ph2_cmd = (
+                            f"{ph2_bin} {ph2_gen_len}"
+                            + _samp_suffix(req) + "\n"
+                        )
+                        try:
+                            _write_cmd(ph2_cmd, timing)
+                            phase2_tokens = await _collect_tokens_sync(
+                                r_pipe, ph2_gen_len, timing)
+                        except RuntimeError:
+                            # Daemon died between phases; surface phase 1
+                            # only rather than 500ing the whole request.
+                            phase2_tokens = []
+                    finally:
+                        try: ph2_bin.unlink()
+                        except Exception: pass
+
             _park_draft_if_lazy(timing)
 
         if full_hit is None:
@@ -1763,13 +2202,21 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             try: prompt_bin.unlink()
             except Exception: pass
 
-        text = tokenizer.decode(tokens, skip_special_tokens=True)
+        # phase1_text was already decoded above to decide phase 2. Reuse it
+        # so mocked tokenizers (test_server.py) don't see a duplicate decode
+        # call shifting their side_effect sequence.
+        text = phase1_text
+        phase2_text = tokenizer.decode(phase2_tokens, skip_special_tokens=True) if phase2_tokens else ""
         # Stop sequences
         stops = normalize_stop(req.stop)
         if stops:
             i = first_stop_match(text, stops)
             if i != -1:
                 text = text[:i]
+            if phase2_text:
+                j = first_stop_match(phase2_text, stops)
+                if j != -1:
+                    phase2_text = phase2_text[:j]
         # Parse reasoning and tool calls using the same effective thinking
         # setting that was used when rendering the prompt.
         thinking_enabled = _thinking_enabled(req.chat_template_kwargs)
@@ -1781,12 +2228,24 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             started_in_thinking=started_in_thinking,
         )
 
+        if close_kind == "hard" and phase2_text:
+            # Phase 2 produced a synthetic content reply against the captured
+            # reasoning. Treat phase 1 as pure reasoning (it never closed
+            # </think>) and phase 2 as the content body.
+            reasoning = (reasoning or "") + ("\n" if reasoning else "") + (cleaned or "")
+            cleaned = phase2_text.strip()
+            cleaned = "Final answer: " + cleaned if cleaned else ""
+
+        total_tokens = len(tokens) + len(phase2_tokens)
         msg: dict = {"role": "assistant"}
         # length cap hit when collected token count reached gen_len; otherwise
         # the daemon stopped naturally (EOS / stop-sequence). The previous code
         # always emitted "stop", which hid the truncation from clients like
         # open-webui that retry on finish_reason="length".
         finish_reason = "length" if len(tokens) >= gen_len else "stop"
+        if phase2_tokens and len(phase2_tokens) >= _phase2_gen_len(
+                req, prompt_len + len(tokens), len(tokens)):
+            finish_reason = "length"
         if reasoning:
             msg["reasoning_content"] = reasoning
         if tool_calls:
@@ -1804,19 +2263,31 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             elapsed, tok_s, finish_reason,
             _timing_summary(timing, len(tokens)),
         )
+        choice: dict = {
+            "index": 0,
+            "message": msg,
+            "finish_reason": finish_reason,
+        }
+        if thinking_cfg is not None and thinking_cfg.type == "enabled":
+            # finish_details mirrors ds4's eval_think_close_info — lets the
+            # bench/snapshot layer record *why* a turn ended without re-running
+            # the model. Only emitted when the caller opted into the
+            # thinking-budget envelope; legacy callers see unchanged shape.
+            choice["finish_details"] = {
+                "close_kind": close_kind,
+                "thinking_tokens": len(tokens),
+                "content_tokens": len(phase2_tokens),
+                "total_tokens": total_tokens,
+            }
         return JSONResponse({
             "id": completion_id,
             "object": "chat.completion",
             "created": created,
             "model": MODEL_NAME,
-            "choices": [{
-                "index": 0,
-                "message": msg,
-                "finish_reason": finish_reason,
-            }],
+            "choices": [choice],
             "usage": {"prompt_tokens": prompt_len,
-                      "completion_tokens": len(tokens),
-                      "total_tokens": prompt_len + len(tokens)},
+                      "completion_tokens": total_tokens,
+                      "total_tokens": prompt_len + total_tokens},
         })
 
     # ── Anthropic Messages API ──────────────────────────────────────────────
@@ -1980,6 +2451,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
 
                     out_tokens = 0
                     tokens: list[int] = []
+                    cancelled_while_draining = False
                     try:
                         async for tok_id in _astream_tokens(r_pipe, gen_len, timing):
                             out_tokens += 1
@@ -1993,17 +2465,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                 try: prompt_bin.unlink()
                                 except Exception: pass
                         else:
-                            log.warning(
-                                "stream ended before daemon sentinel; "
-                                "retaining prompt .bin for in-flight daemon read")
-                            await _drain_abandoned_stream(
-                                "messages.stream", msg_id, timing)
+                            cancelled_while_draining = await _drain_unfinished_stream(timing)
 
                     inline_snap_ok = _consume_inline_snap_waiter(snap_waiter)
                     _confirm_or_abort_snap(
                         out_tokens, full_snap_prep_ref[0], snap_prep,
                         prompt_ids, cur_bin, cur_ids, inline_snap_ok)
                     _park_draft_if_lazy(timing)
+                    if cancelled_while_draining:
+                        raise asyncio.CancelledError
 
                     text = tokenizer.decode(tokens, skip_special_tokens=True)
                     cleaned, tool_calls = parse_tool_calls(
@@ -2180,6 +2650,29 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                       "output_tokens": len(tokens)},
         })
 
+    @app.post("/v1/messages/count_tokens")
+    async def anthropic_count_tokens(req: AnthropicCountTokensRequest):
+        token_req = AnthropicMessagesRequest(
+            model=req.model or MODEL_NAME,
+            max_tokens=req.max_tokens or DEFAULT_MAX_TOKENS,
+            messages=req.messages,
+            system=req.system,
+            tools=req.tools,
+            tool_choice=req.tool_choice,
+            temperature=req.temperature,
+            top_p=req.top_p,
+            seed=req.seed,
+            frequency_penalty=req.frequency_penalty,
+            stop_sequences=req.stop_sequences,
+            chat_template_kwargs=req.chat_template_kwargs,
+        )
+        prompt_bin, prompt_ids, _raw_msgs, _started = _tokenize_anthropic(token_req)
+        try:
+            prompt_bin.unlink()
+        except OSError:
+            pass
+        return JSONResponse({"input_tokens": len(prompt_ids)})
+
     # ── Responses API (Codex wire protocol) ───────────────────────────
 
     def _map_responses_input(req: ResponsesCreateRequest
@@ -2275,7 +2768,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         messages, tools = _map_responses_input(req)
 
         # Build an internal ChatRequest
-        enable_thinking = False
+        enable_thinking = bool(tools)
         if req.reasoning and req.reasoning.effort and req.reasoning.effort != "low":
             enable_thinking = True
 
@@ -2559,6 +3052,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 completion_tokens = 0
                 tool_call_active = False
 
+                cancelled_while_draining = False
                 try:
                     async for tok_id in _astream_tokens(r_pipe, gen_len, timing):
                         completion_tokens += 1
@@ -2658,17 +3152,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             try: prompt_bin.unlink()
                             except Exception: pass
                     else:
-                        log.warning(
-                            "stream ended before daemon sentinel; "
-                            "retaining prompt .bin for in-flight daemon read")
-                        await _drain_abandoned_stream(
-                            "responses.stream", response_id, timing)
+                        cancelled_while_draining = await _drain_unfinished_stream(timing)
 
                 inline_snap_ok = _consume_inline_snap_waiter(snap_waiter)
                 _confirm_or_abort_snap(
                     completion_tokens, full_snap_prep_ref[0], snap_prep,
                     prompt_ids, cur_bin, cur_ids, inline_snap_ok)
                 _park_draft_if_lazy(timing)
+                if cancelled_while_draining:
+                    raise asyncio.CancelledError
 
                 # Build final output items
                 final_output: list[dict] = []
@@ -2858,6 +3350,18 @@ def main():
                     help="Server-level guard: prevent any request from enabling thinking mode "
                          "via chat_template_kwargs. Useful on hardware (e.g. gfx1151/Strix Halo) "
                          "where thinking chains consume n_gen budget without benefit.")
+    # Thinking-budget config — matches antirez/ds4 ds4_eval.c knob names.
+    # Per-request `thinking: {type: enabled}` opts in to the envelope; the
+    # actual budget values are server config, not wire fields, so clients
+    # don't need to invent custom JSON to drive it.
+    ap.add_argument("--think-max-tokens", type=int, default=10000,
+                    help="Cap on the thinking (phase-1) generation when a "
+                         "request opts into thinking. Mirrors ds4_eval.c's "
+                         "think_max_tokens. Default 10000.")
+    ap.add_argument("--default-max-tokens", type=int, default=DEFAULT_MAX_TOKENS,
+                    help="Default combined-cap (reasoning + content) used "
+                         "when a request omits max_tokens. Mirrors "
+                         "ds4_eval.c's --tokens default. Default 16000.")
     add_cli_flags(ap)
     args = ap.parse_args()
     prefill_cfg = config_from_args(args)
@@ -2926,6 +3430,12 @@ def main():
     if placement.cache_slots_disabled:
         print("  [cfg] target-gpus daemon mode disables prefix/full cache slots (snapshot protocol unsupported)")
 
+    # CLI override for the ChatRequest.max_tokens pydantic default. Mutating
+    # the FieldInfo default and rebuilding the schema makes the operator's
+    # choice stick when clients omit the field.
+    ChatRequest.model_fields["max_tokens"].default = args.default_max_tokens
+    ChatRequest.model_rebuild(force=True)
+
     app = build_app(args.target, draft, args.bin, args.budget, args.max_ctx,
                     tokenizer, stop_ids,
                     prefill_cfg=prefill_cfg if prefill_cfg.enabled else None,
@@ -2938,7 +3448,8 @@ def main():
                     extra_daemon_args=placement.daemon_args or None,
                     lazy_draft=args.lazy_draft,
                     verbose_daemon=args.verbose_daemon,
-                    force_no_thinking=args.no_thinking)
+                    force_no_thinking=args.no_thinking,
+                    think_max_tokens=args.think_max_tokens)
 
     import uvicorn
     logging.basicConfig(
