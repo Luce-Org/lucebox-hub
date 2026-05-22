@@ -19,14 +19,13 @@ from pathlib import Path
 from placement.backend_device import apply_backend_visible_devices
 from placement.test_dflash_args import TestDflashLaunchArgs
 
-
 ROOT = Path(__file__).resolve().parent.parent
 BIN_SUFFIX = ".exe" if os.name == "nt" else ""
 TARGET = os.environ.get(
     "DFLASH_TARGET",
     str(ROOT / "models" / "Qwen3.6-27B-Q4_K_M.gguf"),
 )
-_LOCAL_DRAFT_FILE = ROOT / "models" / "draft" / "dflash-draft-3.6-q8_0.gguf"
+_LOCAL_DRAFT_FILE = ROOT / "models" / "draft" / "dflash-draft-3.6-q4_k_m.gguf"
 _LOCAL_DRAFT_ROOT = ROOT / "models" / "draft"
 DRAFT = None
 TEST_DFLASH = os.environ.get(
@@ -35,6 +34,51 @@ TEST_DFLASH = os.environ.get(
 )
 TMPDIR = Path(tempfile.gettempdir()) / "dflash_bench"
 TMPDIR.mkdir(parents=True, exist_ok=True)
+
+AUTOTUNE_PREFLIGHT_PROMPTS = [
+    # This prompt is intentionally larger (~300 tokens) than the HumanEval
+    # stubs below (~120-180 each). It mirrors the prefill footprint of a
+    # realistic tool-using chat turn, which is where the chunked flash
+    # attention workspace allocator tends to OOM on 24 GB consumer GPUs
+    # running Qwen3.6-27B at high max_ctx.
+    (
+        "scheduler_run_spec",
+        "You are reviewing a Python task scheduler. It exposes a Scheduler "
+        "class with add_task, cancel_task, and run methods. Tasks have a "
+        "string id, a callable, a delay in seconds, and a retry policy "
+        "(max_attempts, backoff_factor).\n\n"
+        "Requirements:\n"
+        "  1. Schedule tasks to run after their delay using a single "
+        "background thread.\n"
+        "  2. cancel_task(id) returns True if cancelled before run, "
+        "False otherwise.\n"
+        "  3. Retry failed tasks up to max_attempts with exponential "
+        "backoff (delay * backoff_factor ** attempt).\n"
+        "  4. Log every state change at INFO level with task id, attempt "
+        "count, and outcome.\n"
+        "  5. run() returns when the task queue is empty.\n\n"
+        "Complete the run method below. Standard library only:\n\n"
+        "import heapq, logging, threading, time\n"
+        "from dataclasses import dataclass, field\n"
+        "from typing import Callable\n\n"
+        "@dataclass(order=True)\n"
+        "class _Task:\n"
+        "    when: float\n"
+        "    id: str = field(compare=False)\n"
+        "    fn: Callable = field(compare=False)\n"
+        "    attempts: int = field(default=0, compare=False)\n"
+        "    max_attempts: int = field(default=1, compare=False)\n"
+        "    backoff: float = field(default=2.0, compare=False)\n\n"
+        "class Scheduler:\n"
+        "    def __init__(self):\n"
+        "        self._heap: list = []\n"
+        "        self._cancelled: set = set()\n"
+        "        self._lock = threading.Lock()\n\n"
+        "    def run(self):\n"
+        "        log = logging.getLogger(__name__)\n"
+        "        while True:",
+    ),
+]
 
 PROMPTS = [
     # (name, source_code)
@@ -55,9 +99,11 @@ PROMPTS = [
         "separate_paren_groups",
         "from typing import List\n\n"
         "def separate_paren_groups(paren_string: str) -> List[str]:\n"
-        '    """ Input to this function is a string containing multiple groups of nested parentheses. Your goal is to\n'
+        '    """ Input to this function is a string containing multiple groups of nested '
+        "parentheses. Your goal is to\n"
         "    separate those group into separate strings and return the list of those.\n"
-        "    Separate groups are balanced (each open brace is properly closed) and not nested within each other\n"
+        "    Separate groups are balanced (each open brace is properly closed) and not "
+        "nested within each other\n"
         "    Ignore any spaces in the input string.\n"
         "    >>> separate_paren_groups('( ) (( )) (( )( ))')\n"
         "    ['()', '(())', '(()())']\n"
@@ -84,8 +130,10 @@ PROMPTS = [
         "below_zero",
         "from typing import List\n\n"
         "def below_zero(operations: List[int]) -> bool:\n"
-        '    """ You\'re given a list of deposit and withdrawal operations on a bank account that starts with\n'
-        "    zero balance. Your task is to detect if at any point the balance of account fallls below zero, and\n"
+        '    """ You\'re given a list of deposit and withdrawal operations on a bank '
+        "account that starts with\n"
+        "    zero balance. Your task is to detect if at any point the balance of "
+        "account fallls below zero, and\n"
         "    at that point function should return True. Otherwise it should return False.\n"
         "    >>> below_zero([1, 2, 3])\n"
         "    False\n"
@@ -113,7 +161,8 @@ PROMPTS = [
         "intersperse",
         "from typing import List\n\n"
         "def intersperse(numbers: List[int], delimeter: int) -> List[int]:\n"
-        "    \"\"\" Insert a number 'delimeter' between every two consecutive elements of input list `numbers'\n"
+        "    \"\"\" Insert a number 'delimeter' between every two consecutive elements "
+        "of input list `numbers'\n"
         "    >>> intersperse([], 4)\n"
         "    []\n"
         "    >>> intersperse([1, 2, 3], 4)\n"
@@ -126,7 +175,8 @@ PROMPTS = [
         "parse_nested_parens",
         "from typing import List\n\n"
         "def parse_nested_parens(paren_string: str) -> List[int]:\n"
-        '    """ Input to this function is a string represented multiple groups for nested parentheses separated by spaces.\n'
+        '    """ Input to this function is a string represented multiple groups for '
+        "nested parentheses separated by spaces.\n"
         "    For each of the group, output the deepest level of nesting of parentheses.\n"
         "    E.g. (()()) has maximum two levels of nesting while ((())) has three.\n"
         "    >>> parse_nested_parens('(()()) ((())) () ((())()())')\n"
@@ -153,7 +203,8 @@ PROMPTS = [
         "sum_product",
         "from typing import List, Tuple\n\n"
         "def sum_product(numbers: List[int]) -> Tuple[int, int]:\n"
-        '    """ For a given list of integers, return a tuple consisting of a sum and a product of all the integers in a list.\n'
+        '    """ For a given list of integers, return a tuple consisting of a sum and '
+        "a product of all the integers in a list.\n"
         "    Empty sum should be equal to 0 and empty product should be equal to 1.\n"
         "    >>> sum_product([])\n"
         "    (0, 1)\n"
@@ -168,7 +219,8 @@ PROMPTS = [
         "rolling_max",
         "from typing import List\n\n"
         "def rolling_max(numbers: List[int]) -> List[int]:\n"
-        '    """ From a given list of integers, generate a list of rolling maximum element found until given moment\n'
+        '    """ From a given list of integers, generate a list of rolling maximum '
+        "element found until given moment\n"
         "    in the sequence.\n"
         "    >>> rolling_max([1, 2, 3, 2, 3, 4, 2])\n"
         "    [1, 2, 3, 3, 3, 4, 4]\n"
@@ -209,7 +261,8 @@ def _resolve_draft() -> str:
     raise FileNotFoundError(
         "draft model file not found. Expected one of:\n"
         f"  - {_LOCAL_DRAFT_FILE}\n"
-        "Download it as documented in the README, or set DFLASH_DRAFT to an explicit .safetensors/.gguf file or directory."
+        "Download it as documented in the README, or set DFLASH_DRAFT to an explicit "
+        ".safetensors/.gguf file or directory."
     )
 
 
@@ -272,7 +325,8 @@ def run_test_dflash(prompt_path: Path, n_gen: int, fast_rollback: bool,
         out,
     )
     m_decode_split = re.search(
-        r"\[target-split-dflash\] decode tokens=(\d+) time=(\d+(?:\.\d+)?) s speed=(\d+(?:\.\d+)?) tok/s",
+        r"\[target-split-dflash\] decode tokens=(\d+) time=(\d+(?:\.\d+)?) s "
+        r"speed=(\d+(?:\.\d+)?) tok/s",
         out,
     )
     m_decode_default = re.search(
@@ -322,7 +376,8 @@ def main():
     ap.add_argument("--draft-feature-mirror", action="store_true",
                     help="Use the draft-side target feature mirror path")
     ap.add_argument("--peer-access", action="store_true",
-                    help="Prefer CUDA P2P memcpy between GPUs when available (else host-staged copy)")
+                    help="Prefer CUDA P2P memcpy between GPUs when available "
+                         "(else host-staged copy)")
     ap.add_argument("--target-gpu", type=int, default=None,
                     help="Visible CUDA device id for the target backend")
     ap.add_argument("--draft-gpu", type=int, default=None,
@@ -370,7 +425,7 @@ def main():
     print(f"[bench] tokenizer = {args.target_tokenizer}")
 
     if not args.skip_tokenize:
-        print(f"[bench] tokenizing prompts via HF…")
+        print("[bench] tokenizing prompts via HF…")
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(args.target_tokenizer, trust_remote_code=True)
         for i, (name, p) in enumerate(PROMPTS):
@@ -421,18 +476,24 @@ def main():
     for i, (name, _) in enumerate(PROMPTS):
         path = _prompt_path(i, tok_slug)
         try:
-            r = run_test_dflash(path, args.n_gen,
-                                fast_rollback=(args.mode == "fast" and not args.target_split_dflash),
-                                ddtree_budget=args.ddtree_budget,
-                                ddtree_temp=args.ddtree_temp,
-                                ddtree_no_chain_seed=args.ddtree_no_chain_seed,
-                                extra_args=extra_args,
-                                extra_env=extra_env)
+            r = run_test_dflash(
+                path,
+                args.n_gen,
+                fast_rollback=(args.mode == "fast" and not args.target_split_dflash),
+                ddtree_budget=args.ddtree_budget,
+                ddtree_temp=args.ddtree_temp,
+                ddtree_no_chain_seed=args.ddtree_no_chain_seed,
+                extra_args=extra_args,
+                extra_env=extra_env,
+            )
         except Exception as e:
             print(f"  [{i:02d}] {name:26s}  FAILED: {e}")
             continue
         results.append((name, r))
-        prefill_s = f"{r['prefill_tok_s']:8.2f}" if r["prefill_tok_s"] is not None else f"{'n/a':>8s}"
+        prefill_s = (
+            f"{r['prefill_tok_s']:8.2f}"
+            if r["prefill_tok_s"] is not None else f"{'n/a':>8s}"
+        )
         print(
             f"  {name:26s}  {r['steps']:6d} {r['commit_per_step']:6.2f} "
             f"{r['pct']:6.1f} {prefill_s} {r['tok_s']:8.2f}"

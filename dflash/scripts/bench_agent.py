@@ -41,7 +41,7 @@ TARGET = os.environ.get(
     "DFLASH_TARGET",
     str(ROOT / "models" / "Qwen3.6-27B-Q4_K_M.gguf"),
 )
-_LOCAL_DRAFT_FILE = ROOT / "models" / "draft" / "dflash-draft-3.6-q8_0.gguf"
+_LOCAL_DRAFT_FILE = ROOT / "models" / "draft" / "dflash-draft-3.6-q4_k_m.gguf"
 _LOCAL_DRAFT_ROOT = ROOT / "models" / "draft"
 DRAFT = None
 TEST_DFLASH = os.environ.get("DFLASH_BIN", str(ROOT / "build" / f"test_dflash{BIN_SUFFIX}"))
@@ -175,8 +175,11 @@ def _parse_dflash(stdout: str) -> dict:
 
 def _parse_ar(stdout: str) -> dict:
     """Parse test_generate stdout → {decode_tps, n_gen}."""
-    m = re.search(r"\[gen\]\s+(\d+)\s+new tokens in\s+(\d+(?:\.\d+)?)\s*s\s*->\s*(\d+(?:\.\d+)?)\s+tok/s",
-                  stdout)
+    m = re.search(
+        r"\[gen\]\s+(\d+)\s+new tokens in\s+(\d+(?:\.\d+)?)\s*s\s*->\s*"
+        r"(\d+(?:\.\d+)?)\s+tok/s",
+        stdout,
+    )
     if not m:
         raise RuntimeError(f"test_generate parse failed:\n{stdout[-1500:]}")
     return {

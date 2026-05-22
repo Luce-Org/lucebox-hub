@@ -25,7 +25,7 @@ TARGET = os.environ.get(
     "DFLASH_TARGET",
     str(ROOT / "models" / "Qwen3.6-27B-Q4_K_M.gguf"),
 )
-_LOCAL_DRAFT_FILE = ROOT / "models" / "draft" / "dflash-draft-3.6-q8_0.gguf"
+_LOCAL_DRAFT_FILE = ROOT / "models" / "draft" / "dflash-draft-3.6-q4_k_m.gguf"
 _LOCAL_DRAFT_ROOT = ROOT / "models" / "draft"
 DRAFT = None
 TEST_DFLASH = os.environ.get("DFLASH_BIN", str(ROOT / "build" / f"test_dflash{BIN_SUFFIX}"))
@@ -49,8 +49,27 @@ def _gsm_gold(x):
 
 BENCHES = [
     ("HumanEval", "openai_humaneval", None, "test", lambda x: x["prompt"], None, N_GEN),
-    ("GSM8K", "gsm8k", "main", "test", lambda x: f"Question: {x['question']}\nAnswer: ", _gsm_gold, 1024),
-    ("Math500", "HuggingFaceH4/MATH-500", None, "test", lambda x: f"Problem: {x['problem']}\nSolution: Put your final answer in \\boxed{{}}.\n", lambda x: x["answer"], 2048),
+    (
+        "GSM8K",
+        "gsm8k",
+        "main",
+        "test",
+        lambda x: f"Question: {x['question']}\nAnswer: ",
+        _gsm_gold,
+        1024,
+    ),
+    (
+        "Math500",
+        "HuggingFaceH4/MATH-500",
+        None,
+        "test",
+        lambda x: (
+            f"Problem: {x['problem']}\n"
+            "Solution: Put your final answer in \\boxed{}.\n"
+        ),
+        lambda x: x["answer"],
+        2048,
+    ),
 ]
 
 
@@ -72,7 +91,10 @@ def _resolve_draft() -> str:
         found = _find_draft_model(Path(env))
         if found:
             return found
-        raise FileNotFoundError(f"DFLASH_DRAFT does not point to a DFlash draft GGUF or model.safetensors: {env}")
+        raise FileNotFoundError(
+            "DFLASH_DRAFT does not point to a DFlash draft GGUF or "
+            f"model.safetensors: {env}"
+        )
 
     for candidate in (_LOCAL_DRAFT_FILE, _LOCAL_DRAFT_ROOT):
         found = _find_draft_model(candidate)
@@ -82,7 +104,8 @@ def _resolve_draft() -> str:
     raise FileNotFoundError(
         "DFlash draft GGUF or model.safetensors not found. Expected one of:\n"
         f"  - {_LOCAL_DRAFT_FILE}\n"
-        "Download it as documented in the README, or set DFLASH_DRAFT to an explicit file or directory."
+        "Download it as documented in the README, or set DFLASH_DRAFT to an "
+        "explicit file or directory."
     )
 
 
@@ -131,7 +154,7 @@ def _auto_max_ctx(n_prompt, n_gen: int = N_GEN):
 
 def run_df(path: Path, n_prompt, n_gen: int = N_GEN):
     max_ctx = _auto_max_ctx(n_prompt, n_gen)
-    out_bin = TMPDIR / f"df_out.bin"
+    out_bin = TMPDIR / "df_out.bin"
     r = _run_checked(
         [
             TEST_DFLASH,
@@ -406,11 +429,14 @@ def main():
         ds = load_dataset(ds_name, cfg, split=split)
         ds_selected = ds.shuffle(seed=42).select(range(N_SAMPLE))
         prompt_list = [extract(s) for s in ds_selected]
-        gold_list = [gold_extract(s) for s in ds_selected] if gold_extract else [None] * len(prompt_list)
+        gold_list = (
+            [gold_extract(s) for s in ds_selected]
+            if gold_extract else [None] * len(prompt_list)
+        )
 
         ar_tps, df_tps, df_al = [], [], []
         n_score_correct, n_scored = 0, 0
-        for i, (p, gold) in enumerate(zip(prompt_list, gold_list)):
+        for i, (p, gold) in enumerate(zip(prompt_list, gold_list, strict=True)):
             path = TMPDIR / f"b_{name}_{i:02d}.bin"
             n = tokenize(tok, _wrap_prompt(p), path)
             if n == 0 or n > 3500:
@@ -438,7 +464,11 @@ def main():
             if df > 0:
                 df_tps.append(df)
                 df_al.append(al)
-            print(f"  [{i+1:02d}/{N_SAMPLE}] n_tok={n:4d}  AR={ar:6.2f}  DFlash={df:7.2f}  AL={al:5.2f}{score_detail}", flush=True)
+            print(
+                f"  [{i+1:02d}/{N_SAMPLE}] n_tok={n:4d}  AR={ar:6.2f}  "
+                f"DFlash={df:7.2f}  AL={al:5.2f}{score_detail}",
+                flush=True,
+            )
         ar_m = sum(ar_tps) / len(ar_tps) if ar_tps else 0
         df_m = sum(df_tps) / len(df_tps) if df_tps else 0
         al_m = sum(df_al) / len(df_al) if df_al else 0
@@ -446,15 +476,24 @@ def main():
         results[name] = {"ar": ar_m, "dflash": df_m, "al": al_m,
                          "speedup": df_m / ar_m if ar_m else 0,
                          "score": score_str}
-        summary = f"  {name} mean: AR={ar_m:.2f}  DFlash={df_m:.2f}  AL={al_m:.2f}  {results[name]['speedup']:.2f}x"
+        summary = (
+            f"  {name} mean: AR={ar_m:.2f}  DFlash={df_m:.2f}  "
+            f"AL={al_m:.2f}  {results[name]['speedup']:.2f}x"
+        )
         if score_str:
             summary += f"  score={score_str} ({n_score_correct/n_scored*100:.0f}%)"
         print(summary, flush=True)
 
     print("\n[bench] === SUMMARY ===")
-    print(f"{'Task':12s}  {'AR':>8s}  {'DFlash':>8s}  {'AL':>6s}  {'Speedup':>8s}  {'Score':>8s}")
+    print(
+        f"{'Task':12s}  {'AR':>8s}  {'DFlash':>8s}  {'AL':>6s}  "
+        f"{'Speedup':>8s}  {'Score':>8s}"
+    )
     for name, r in results.items():
-        print(f"{name:12s}  {r['ar']:8.2f}  {r['dflash']:8.2f}  {r['al']:6.2f}  {r['speedup']:7.2f}x  {r.get('score',''):>8s}")
+        print(
+            f"{name:12s}  {r['ar']:8.2f}  {r['dflash']:8.2f}  "
+            f"{r['al']:6.2f}  {r['speedup']:7.2f}x  {r.get('score',''):>8s}"
+        )
 
     out_json = TMPDIR / "bench_llm_results.json"
     with open(out_json, "w") as f:

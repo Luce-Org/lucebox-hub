@@ -61,7 +61,7 @@ def stream_chat(url: str, messages: list[dict], max_tokens: int,
         "stream": True,
     }
     if thinking:
-        body["thinking"] = {"type": "enabled", "budget_tokens": 4096}
+        body["thinking"] = {"type": "enabled"}
 
     data = json.dumps(body).encode()
     req = urllib.request.Request(
