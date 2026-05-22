@@ -217,7 +217,14 @@ def semantic_hint_present(
         found_lines = parse_line_spec(text)
         return bool(expected_lines & found_lines)
     expected = {str(int(answer)) for answer in expected_answers(case)}
-    found = {str(int(match.group(0))) for match in re.finditer(r"-?\d+", text)}
+    # Cap digit length: a degenerate model output can emit a 16000-digit run
+    # which trips Python 3.11+'s 4300-digit `int()` limit. Real answers fit
+    # in 20 digits; longer matches can never equal an expected answer.
+    found = {
+        str(int(match.group(0)))
+        for match in re.finditer(r"-?\d+", text)
+        if len(match.group(0).lstrip("-")) <= 20
+    }
     return bool(expected & found)
 
 
