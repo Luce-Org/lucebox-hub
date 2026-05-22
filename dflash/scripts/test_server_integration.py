@@ -837,9 +837,12 @@ class TestThinkingBudget:
     request opted in via `thinking: {type: "enabled"}`. Mirrors
     docs/specs/thinking-budget.md:43-58.
 
-    The C++ server currently lacks phase-2 reprompt (TODO), so close_kind
-    will be "natural" for all cases. Once phase-2 lands, add a test that
-    forces phase-1 truncation and asserts close_kind == "hard"."""
+    Level 1 phase-1/phase-2 reprompt is now wired up: when the model
+    fails to emit </think> within --think-max-tokens, the server force-
+    closes via a synthetic "</think>\\n\\nFinal answer: " reprompt and
+    runs phase-2 for the remaining budget. close_kind reflects the path
+    taken ("natural" for self-close, "hard" for force-close).
+    """
 
     @pytest.mark.slow
     def test_finish_details_present_when_thinking_opted_in(self):
@@ -875,3 +878,58 @@ class TestThinkingBudget:
         choice = r.json()["choices"][0]
         assert "finish_details" not in choice, \
             "finish_details should only appear when thinking is opted in"
+
+    @pytest.mark.slow
+    def test_close_kind_natural_when_model_self_closes(self):
+        """An easy prompt with a generous budget should let the model emit
+        </think> well within --think-max-tokens, producing close_kind="natural"
+        (no phase-2 reprompt fires)."""
+        body = {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content":
+                          "What is 2+2? Answer in one word."}],
+            "max_tokens": 4096,
+            "thinking": {"type": "enabled"},
+            "temperature": 0,
+        }
+        r = post_json("/v1/chat/completions", body)
+        assert r.status_code == 200
+        fd = r.json()["choices"][0]["finish_details"]
+        assert fd["close_kind"] == "natural", \
+            f"expected natural close, got {fd['close_kind']}"
+        assert fd["content_tokens"] >= 0
+        # Phase-2 did not fire — content_tokens stays 0 when the model
+        # self-closes (all generated tokens are reasoning + content interleaved
+        # via the emitter on the phase-1 stream).
+        assert fd["content_tokens"] == 0
+        assert fd["thinking_tokens"] == fd["total_tokens"]
+
+    @pytest.mark.skipif(
+        os.environ.get("THINK_MAX_TOKENS_LOW") != "1",
+        reason="requires server started with very low --think-max-tokens "
+               "(set THINK_MAX_TOKENS_LOW=1 to enable when the running "
+               "server was launched with e.g. --think-max-tokens 32)",
+    )
+    @pytest.mark.slow
+    def test_close_kind_hard_on_phase2_trigger(self):
+        """A think-heavy prompt with a deliberately tiny --think-max-tokens
+        should trigger phase-2: the model can't finish reasoning in time,
+        the server force-closes </think> and runs a Final-answer reprompt."""
+        body = {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content":
+                          "Reason step by step about the following: list the "
+                          "first 20 prime numbers, then explain why each is "
+                          "prime, then compute their sum. Be thorough."}],
+            "max_tokens": 4096,
+            "thinking": {"type": "enabled"},
+            "temperature": 0,
+        }
+        r = post_json("/v1/chat/completions", body)
+        assert r.status_code == 200
+        fd = r.json()["choices"][0]["finish_details"]
+        assert fd["close_kind"] == "hard", \
+            f"expected hard close, got {fd['close_kind']}"
+        assert fd["thinking_tokens"] > 0
+        assert fd["content_tokens"] > 0
+        assert fd["thinking_tokens"] + fd["content_tokens"] == fd["total_tokens"]
