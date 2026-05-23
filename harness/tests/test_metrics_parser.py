@@ -176,6 +176,16 @@ class TestExtractAcceptRateFromLog(unittest.TestCase):
         rate = extract_accept_rate_from_log(log)
         self.assertAlmostEqual(rate, 0.60)
 
+    def test_parses_plain_text_pflash_bandit_accept_line(self):
+        """Plain-text [pflash-bandit] accept=... lines → accept_rate returned."""
+        log = (
+            '[pflash-bandit] session=s1 turn=1 keep=0.1000->0.2000 ema=0.123 accept=0.347\n'
+            '[pflash-bandit] session=s1 turn=2 keep=0.2000->0.3000 ema=0.456 accept=0.812\n'
+        )
+        rate = extract_accept_rate_from_log(log)
+        self.assertIsNotNone(rate)
+        self.assertAlmostEqual(rate, 0.812)
+
     def test_falls_back_to_spec_decode_when_no_bandit(self):
         """No [pflash-bandit] lines → fall back to [spec-decode]."""
         log = (

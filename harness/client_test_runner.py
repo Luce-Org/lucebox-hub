@@ -168,7 +168,6 @@ SERVER_PROFILES: dict[str, ServerProfile] = {
             "--cache-type-v", "tq3_0",
             "--prefix-cache-slots", "0",
             "--prefill-cache-slots", "0",
-            "--lazy-draft",
         ),
         long_prompt=True,
     ),
@@ -186,7 +185,6 @@ SERVER_PROFILES: dict[str, ServerProfile] = {
             "--prefill-compression", "auto",
             "--prefill-threshold", "4096",
             "--prefill-keep-ratio", "0.10",
-            "--lazy-draft",
         ),
         needs_prefill_drafter=True,
         long_prompt=True,
@@ -508,6 +506,17 @@ def long_prompt() -> str:
         "optional PFlash compression without crashing the server.\n"
     )
     return unit * 180
+
+
+def claude_bandit_prompt() -> str:
+    return (
+        "Write an original short story of at least 700 words. "
+        "The story must be self-contained, vivid, and told in third person. "
+        "Center it on a lighthouse keeper repairing the lamp during a storm, "
+        "and give the story a clear beginning, middle, and ending. "
+        "Do not use bullet points or headings. "
+        "Keep going until the story is comfortably over 700 words."
+    )
 
 
 def unique_prompt(text: str, label: str) -> str:
@@ -2107,23 +2116,132 @@ class _BaseAdapter:
 _CLIENTS_DIR = Path(__file__).resolve().parent / "clients"
 
 
+def _start_session_inject_proxy(*, session_id: str, upstream: str) -> tuple[subprocess.Popen, str]:
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PFLASH_PROXY_PORT", "18082"))
+    log_dir = Path(tempfile.mkdtemp(prefix="claude-proxy-"))
+    log_path = log_dir / "proxy.log"
+    proxy_cmd = [
+        sys.executable,
+        str(_CLIENTS_DIR / "session_inject_proxy.py"),
+        "--host", host,
+        "--port", str(port),
+        "--upstream", upstream,
+        "--session-id", session_id,
+    ]
+    log_f = open(log_path, "w")
+    proc = subprocess.Popen(
+        proxy_cmd,
+        stdout=log_f,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    proc._lucebox_log_f = log_f  # type: ignore[attr-defined]
+    client_base_url = f"http://{host}:{port}"
+    if not wait_http(client_base_url, proc=proc, timeout=10):
+        tail_text = tail(log_path, 4000)
+        stop_proc(proc)
+        close_server_log(proc)
+        raise RuntimeError(
+            f"session-inject proxy failed to start on {client_base_url}; log: {tail_text}"
+        )
+    return proc, client_base_url
+
+
 class ClaudeCodeAdapter(_BaseAdapter):
     client = "claude_code"
     binary = "claude"
 
-    def live_run(self, *, session_id: str, prompt: str = "", **kwargs: Any) -> AdapterResult:
-        script = _CLIENTS_DIR / "run_claude_code.sh"
-        return super().live_run(
-            session_id=session_id,
-            run_script=script,
-            prompt=prompt or "Reply with exactly: lucebox-bandit-ok",
-            **kwargs,
-        )
+    def live_run(self, *, session_id: str, prompt: str = "", timeout: int = 420, **kwargs: Any) -> AdapterResult:
+        _prompt = prompt or claude_bandit_prompt()
+        base_url = os.environ.get("BASE_URL", "http://127.0.0.1:18080")
+        model_id = os.environ.get("MODEL_ID", "luce-dflash")
+        api_key = os.environ.get("API_KEY", "sk-lucebox")
+        claude_bin = os.environ.get("CLAUDE_BIN", self.binary)
+        claude_tools = os.environ.get("CLAUDE_TOOLS", "default")
+        client_base_url = base_url
+        proxy_proc: subprocess.Popen | None = None
+
+        try:
+            if session_id:
+                proxy_proc, client_base_url = _start_session_inject_proxy(
+                    session_id=session_id,
+                    upstream=base_url,
+                )
+
+            with tempfile.TemporaryDirectory(prefix="claude-home-") as home_dir:
+                env = os.environ.copy()
+                env.update({
+                    "LUCEBOX_SERVER_BACKEND": "cpp",
+                    "HOME": home_dir,
+                    "ANTHROPIC_API_KEY": api_key,
+                    "ANTHROPIC_BASE_URL": client_base_url,
+                    "CLAUDE_CODE_API_BASE_URL": client_base_url,
+                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                    "CLAUDE_CODE_DISABLE_TELEMETRY": "1",
+                    "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": "1",
+                })
+                cmd = [
+                    claude_bin,
+                    "--print",
+                    "--output-format", "json",
+                    "--model", model_id,
+                    "--tools", claude_tools,
+                    "--permission-mode", "dontAsk",
+                    "--no-session-persistence",
+                    _prompt,
+                ]
+                t0 = time.perf_counter()
+                try:
+                    proc = subprocess.run(
+                        cmd,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                        stdin=subprocess.DEVNULL,
+                    )
+                    wall = time.perf_counter() - t0
+                    return AdapterResult(
+                        client=self.client,
+                        preflight_ok=True,
+                        session_id=session_id,
+                        session_id_captured=True,
+                        wall_s=round(wall, 3),
+                        exit_code=proc.returncode,
+                    )
+                except subprocess.TimeoutExpired:
+                    return AdapterResult(
+                        client=self.client,
+                        preflight_ok=True,
+                        session_id=session_id,
+                        exit_code=124,
+                        error="timeout",
+                    )
+                except Exception as exc:
+                    return AdapterResult(
+                        client=self.client,
+                        preflight_ok=True,
+                        session_id=session_id,
+                        exit_code=1,
+                        error=repr(exc),
+                    )
+        finally:
+            if proxy_proc is not None:
+                stop_proc(proxy_proc)
+                close_server_log(proxy_proc)
 
 
 class HermesAdapter(_BaseAdapter):
     client = "hermes"
     binary = "hermes"
+
+    def preflight_check(self) -> AdapterResult:
+        return AdapterResult(
+            client=self.client,
+            preflight_ok=False,
+            error="HERMES_CONFIG_BUG: see .notes/harness-followups.md",
+        )
 
     def live_run(self, *, session_id: str, prompt: str = "", timeout: int = 420, **kwargs: Any) -> AdapterResult:
         _prompt = prompt or "Reply with exactly: lucebox-bandit-ok"
@@ -2410,6 +2528,16 @@ class OpenCodeAdapter(_BaseAdapter):
     client = "opencode"
     binary = "opencode"
 
+    def preflight_check(self) -> AdapterResult:
+        return AdapterResult(
+            client=self.client,
+            preflight_ok=False,
+            error=(
+                "PROVIDER_CONFIG_BUG: opencode.json model registration not yet working "
+                "— see .notes/harness-followups.md"
+            ),
+        )
+
     def live_run(self, *, session_id: str, prompt: str = "", timeout: int = 300, **kwargs: Any) -> AdapterResult:
         _prompt = prompt or "Reply with exactly: lucebox-bandit-ok"
         base_url = os.environ.get("BASE_URL", "http://127.0.0.1:18080")
@@ -2509,7 +2637,6 @@ BANDIT_SERVER_PROFILE = ServerProfile(
         "--prefill-compression", "auto",
         "--prefill-threshold", "4096",
         "--prefill-keep-ratio", "0.10",
-        "--lazy-draft",
     ),
     needs_prefill_drafter=True,
 )

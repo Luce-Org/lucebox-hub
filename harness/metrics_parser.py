@@ -16,6 +16,7 @@ from typing import Optional
 _SPEC_DECODE_RE = re.compile(
     r"\[spec-decode\].*?steps=(\d+)\s+accepted=(\d+)/(\d+)"
 )
+_PFLASH_BANDIT_ACCEPT_RE = re.compile(r"\[pflash-bandit\].*?\baccept=([0-9]*\.?[0-9]+)")
 
 
 @dataclass
@@ -89,10 +90,12 @@ def extract_accept_rate_from_log(log_text: str) -> Optional[float]:
 
     Strategy:
     1. Scan for [pflash-bandit] JSONL lines — use the LAST one (converged state).
-    2. Fall back to [spec-decode] lines — use the LAST one.
-    3. Return None if neither is present.
+    2. Fall back to plain-text [pflash-bandit] accept=... lines — use the LAST one.
+    3. Fall back to [spec-decode] lines — use the LAST one.
+    4. Return None if neither is present.
     """
     last_bandit: Optional[BanditRunMetrics] = None
+    last_plain_bandit: Optional[float] = None
     last_spec: Optional[BanditRunMetrics] = None
 
     for line in log_text.splitlines():
@@ -104,6 +107,12 @@ def extract_accept_rate_from_log(log_text: str) -> Optional[float]:
                 m = parse_bandit_log_line(stripped[json_start:])
                 if m is not None and m.accept_rate is not None:
                     last_bandit = m
+        plain_match = _PFLASH_BANDIT_ACCEPT_RE.search(stripped)
+        if plain_match:
+            try:
+                last_plain_bandit = float(plain_match.group(1))
+            except ValueError:
+                pass
         # [spec-decode] plain-text lines
         if "[spec-decode]" in stripped:
             m2 = parse_spec_decode_line(stripped)
@@ -112,6 +121,8 @@ def extract_accept_rate_from_log(log_text: str) -> Optional[float]:
 
     if last_bandit is not None:
         return last_bandit.accept_rate
+    if last_plain_bandit is not None:
+        return last_plain_bandit
     if last_spec is not None:
         return last_spec.accept_rate
     return None

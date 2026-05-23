@@ -9,10 +9,13 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 HARNESS_DIR = Path(__file__).resolve().parent.parent
 if str(HARNESS_DIR.parent) not in sys.path:
@@ -58,6 +61,59 @@ class TestAdapterInvokeSessionId(unittest.TestCase):
         result = adapter.dry_run(session_id="codex-sess-001")
         self.assertIsInstance(result, AdapterResult)
         self.assertEqual(result.session_id, "codex-sess-001")
+
+
+class TestClaudeCodeAdapterLiveRun(unittest.TestCase):
+    """ClaudeCodeAdapter live_run should invoke claude directly, not shell out to a wrapper."""
+
+    def test_live_run_invokes_claude_directly_with_long_prompt(self):
+        adapter = ClaudeCodeAdapter()
+        captured: dict[str, object] = {}
+
+        class _FakeProc:
+            returncode = 0
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+            return _FakeProc()
+
+        with patch.dict(
+            os.environ,
+            {
+                "BASE_URL": "http://127.0.0.1:18080",
+                "API_KEY": "sk-lucebox",
+                "MODEL_ID": "luce-dflash",
+                "CLAUDE_BIN": "/usr/bin/claude",
+                "CLAUDE_TOOLS": "default",
+            },
+            clear=False,
+        ), patch("harness.client_test_runner.subprocess.run", side_effect=fake_run):
+            result = adapter.live_run(session_id="", prompt="")
+
+        self.assertTrue(result.preflight_ok)
+        self.assertEqual(result.exit_code, 0)
+        self.assertIsNone(result.error)
+
+        cmd = captured["cmd"]
+        kwargs = captured["kwargs"]
+        self.assertIsInstance(cmd, list)
+        self.assertEqual(cmd[0], "/usr/bin/claude")
+        self.assertIn("--print", cmd)
+        self.assertIn("--output-format", cmd)
+        self.assertIn("--model", cmd)
+        self.assertIn("--no-session-persistence", cmd)
+        self.assertIn("at least 700 words", cmd[-1])
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+
+        env = kwargs["env"]
+        self.assertEqual(env["LUCEBOX_SERVER_BACKEND"], "cpp")
+        self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-lucebox")
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:18080")
+        self.assertEqual(env["CLAUDE_CODE_API_BASE_URL"], "http://127.0.0.1:18080")
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"], "1")
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_TELEMETRY"], "1")
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK"], "1")
 
 
 class TestAdapterPreflightMissingBinary(unittest.TestCase):
@@ -203,8 +259,8 @@ class TestRunBanditWiresAcceptRate(unittest.TestCase):
         )
 
         log_content = (
-            "[pflash] 18517 -> 1809 -> 1821 tokens (9.8% kept)\n"
-            "[spec-decode] tokens=7 steps=16 accepted=3/16 (18.75%)\n"
+            "[pflash-bandit] session=claude_code-C_bandit turn=1 keep=0.1000->0.1200 "
+            "ema=0.250 accept=0.312\n"
         )
         with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
             f.write(log_content)
@@ -235,13 +291,31 @@ class TestRunBanditWiresAcceptRate(unittest.TestCase):
                 results[0].accept_rate,
                 msg="run_bandit must wire accept_rate from server_log_path",
             )
-            self.assertAlmostEqual(results[0].accept_rate, 3.0 / 16.0)
+            self.assertAlmostEqual(results[0].accept_rate, 0.312)
             rows = list(csv.DictReader(io.StringIO(buf.getvalue())))
-            self.assertEqual(rows[0]["accept_rate"], str(3.0 / 16.0))
+            self.assertEqual(rows[0]["accept_rate"], str(0.312))
         finally:
             if original is not None:
                 _ADAPTER_REGISTRY["claude_code"] = original
             log_path.unlink(missing_ok=True)
+
+
+class TestAdapterSkipReasons(unittest.TestCase):
+    """Hermes/OpenCode are intentionally preflight-skipped until config is fixed."""
+
+    def test_hermes_preflight_reports_config_bug(self):
+        adapter = HermesAdapter()
+        result = adapter.preflight_check()
+        self.assertFalse(result.preflight_ok)
+        self.assertIsNotNone(result.error)
+        self.assertIn("HERMES_CONFIG_BUG", result.error or "")
+
+    def test_opencode_preflight_reports_provider_config_bug(self):
+        adapter = OpenCodeAdapter()
+        result = adapter.preflight_check()
+        self.assertFalse(result.preflight_ok)
+        self.assertIsNotNone(result.error)
+        self.assertIn("PROVIDER_CONFIG_BUG", result.error or "")
 
 
 class TestBanditServerProfileHasPflash(unittest.TestCase):
@@ -280,6 +354,7 @@ class TestBanditServerProfileHasPflash(unittest.TestCase):
             "--verify-mode",
             "--prefix-cache-slots",
             "--prefill-cache-slots",
+            "--lazy-draft",
         }
         args = list(BANDIT_SERVER_PROFILE.args)
         present = forbidden.intersection(args)
