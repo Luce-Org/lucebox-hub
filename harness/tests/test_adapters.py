@@ -117,5 +117,36 @@ class TestBanditMatrix5AdaptersCSV(unittest.TestCase):
                           msg=f"preflight_ok must be True/False, got: {row['preflight_ok']!r}")
 
 
+class TestBanditCLI(unittest.TestCase):
+    """CLI-level smoke tests for the bandit subcommand."""
+
+    def _run_bandit_cli(self, *args: str) -> tuple[int, str]:
+        """Run client_test_runner as a subprocess, return (rc, stdout)."""
+        import subprocess
+        import sys
+        result = subprocess.run(
+            [sys.executable, "-m", "harness.client_test_runner", *args],
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).resolve().parent.parent.parent),
+        )
+        return result.returncode, result.stdout
+
+    def test_adapter_flag_dry_run_prints_planned_invocation(self):
+        """--adapter claude_code --dry-run prints planned invocation (exit-gate for commit 7)."""
+        rc, out = self._run_bandit_cli("bandit", "--adapter", "claude_code", "--dry-run")
+        self.assertEqual(rc, 0)
+        self.assertIn("claude_code", out)
+        self.assertIn("True", out)  # preflight_ok
+
+    def test_top_level_clients_flag_triggers_bandit(self):
+        """Top-level --clients/--condition flags work without 'bandit' subcommand."""
+        rc, out = self._run_bandit_cli(
+            "--condition", "C_bandit", "--clients", "claude_code", "--dry-run",
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("claude_code", out)
+
+
 if __name__ == "__main__":
     unittest.main()

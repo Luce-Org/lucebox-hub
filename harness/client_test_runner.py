@@ -2081,11 +2081,18 @@ def run_bandit(
 
 
 def cmd_bandit(args: argparse.Namespace) -> int:
-    clients = [c.strip() for c in args.clients.split(",") if c.strip()]
+    raw_clients = getattr(args, "clients", None) or getattr(args, "adapter", None)
+    if not raw_clients:
+        raise SystemExit("--clients or --adapter is required for the bandit subcommand")
+    if raw_clients == "all":
+        clients = list(_ADAPTER_REGISTRY)
+    else:
+        clients = [c.strip() for c in raw_clients.split(",") if c.strip()]
     run_bandit(
         clients=clients,
         condition=args.condition,
         dry_run=args.dry_run,
+        session_id=getattr(args, "session_id", None),
     )
     return 0
 
@@ -2147,9 +2154,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.set_defaults(func=cmd_bench)
 
     p_bandit = sub.add_parser("bandit", help="Run bandit condition against selected clients")
-    p_bandit.add_argument("--condition", required=True, help="Bandit condition name")
-    p_bandit.add_argument("--clients", required=True,
+    p_bandit.add_argument("--condition", default="C_bandit", help="Bandit condition name")
+    p_bandit.add_argument("--clients", default=None,
                           help="Comma-separated client names or 'all'")
+    p_bandit.add_argument("--adapter", default=None,
+                          help="Single adapter name (alias for --clients with one entry)")
     p_bandit.add_argument("--dry-run", action="store_true",
                           help="Preflight only; emit planned CSV without running clients")
     p_bandit.add_argument("--session-id", default=None)
