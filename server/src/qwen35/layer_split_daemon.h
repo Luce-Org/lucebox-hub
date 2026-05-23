@@ -1,6 +1,6 @@
 // layer_split_daemon.h — Layer-split request handler for qwen35 daemon mode.
 //
-// run_target_layer_split_request() handles a single inference request:
+// run_qwen35_layer_split_request() handles a single inference request:
 // prefill → (optional spec-decode or AR decode) → output.
 
 #pragma once
@@ -22,8 +22,8 @@ namespace dflash::common {
 // Runs prefill, then either spec-decode (if run_dflash && draft available)
 // or plain AR decode.  Emits tokens to stream_fd and optionally writes
 // the full sequence to out_path.
-bool run_target_layer_split_request(
-        std::vector<TargetLayerSplitShard> & shards,
+bool run_qwen35_layer_split_request(
+        std::vector<Qwen35LayerSplitShard> & shards,
         DraftWeights * draft_weights,
         ggml_backend_t draft_backend,
         int draft_gpu,

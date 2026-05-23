@@ -1,11 +1,11 @@
 // dflash_layer_split_runtime.h — target-agnostic runtime types for the
-// DFlash layer-split pipeline.
+// target layer-split pipeline.
 //
-// Hosts the small pieces that are reused by every architecture's layer-split
-// driver: a runtime-configuration struct (replaces former globals) and an
-// activation double-buffer used to ferry hidden states between shards.
-// Architecture-specific shard layouts (e.g. qwen35's TargetLayerSplitShard
-// that embeds TargetWeights/TargetCache) live in their own headers.
+// Hosts the small runtime pieces reused by layer-split drivers: a
+// runtime-configuration struct and the activation double-buffer used to ferry
+// hidden states between shards. Shared placement/load-plan/shard metadata lives
+// in common/layer_split_utils.h; architecture-specific shard payloads keep their
+// own weights/cache/graph types.
 
 #pragma once
 

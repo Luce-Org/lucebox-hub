@@ -5,9 +5,7 @@
 #include "common/dflash_spec_decode.h"
 #include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
-#include "common/peer_access.h"
 #include "common/sampler.h"
-#include "common/snapshot_backend.h"
 #include "qwen35/layer_split_forward.h"
 #include "qwen35/qwen35_layer_split_dflash_target.h"
 #include "qwen3/qwen3_drafter.h"
@@ -50,44 +48,21 @@ bool Qwen35LayerSplitAdapter::init() {
     }
 
     shards_.resize(cfg_.device.layer_split_gpus.size());
-    for (size_t i = 0; i < shards_.size(); ++i) {
-        auto & shard = shards_[i];
-        shard.gpu = cfg_.device.layer_split_gpus[i];
-        shard.layer_begin = ranges[i].first;
-        shard.layer_end = ranges[i].second;
-        shard.backend = ggml_backend_cuda_init(shard.gpu);
-        if (!shard.backend) {
-            std::fprintf(stderr,
-                "[target-split] backend init failed gpu=%d\n", shard.gpu);
-            return false;
-        }
+    auto shard_metas = layer_split_shard_metas(shards_);
+    if (!init_layer_split_shard_metas(
+            shard_metas, cfg_.device.layer_split_gpus, ranges, "target-split")) {
+        return false;
     }
 
-    if (cfg_.device.peer_access) {
-        for (size_t i = 0; i < cfg_.device.layer_split_gpus.size(); ++i) {
-            for (size_t j = i + 1; j < cfg_.device.layer_split_gpus.size(); ++j) {
-                (void)enable_peer_access_pair(cfg_.device.layer_split_gpus[i],
-                                              cfg_.device.layer_split_gpus[j]);
-            }
-        }
-    }
+    (void)enable_layer_split_peer_access(
+        cfg_.device.layer_split_gpus, cfg_.device.peer_access);
 
-    snapshot_backends_.resize(shards_.size(), nullptr);
-    for (size_t i = 0; i < shards_.size(); ++i) {
-        snapshot_backends_[i] = create_snapshot_backend(shards_[i].backend);
-        if (!snapshot_backends_[i]) {
-            std::fprintf(stderr,
-                "[target-split] snapshot backend init failed gpu=%d\n",
-                shards_[i].gpu);
-            return false;
-        }
-    }
+    if (!init_layer_split_snapshot_backends(
+            shard_metas, snapshot_backends_, "target-split")) return false;
 
     for (auto & shard : shards_) {
-        TargetLoadPlan plan;
-        plan.layer_begin = shard.layer_begin;
-        plan.layer_end = shard.layer_end;
-        plan.load_output = (&shard == &shards_.back());
+        const TargetLoadPlan plan =
+            make_layer_split_load_plan(shard, &shard == &shards_.back());
         if (!load_target_gguf_partial(cfg_.target_path, shard.backend, plan,
                                       shard.weights) ||
             !create_target_cache_partial(shard.weights, cfg_.device.max_ctx,
@@ -204,7 +179,7 @@ bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
     if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
         ubatch = std::max(1, std::atoi(s));
     }
-    return run_target_layer_split_forward(
+    return run_qwen35_layer_split_forward(
         shards_, shards_.front().weights, prompt, base_pos, ubatch, last_tok,
         cfg_.kq_stride_pad, /*fa_window=*/0,
         (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
@@ -297,7 +272,7 @@ bool Qwen35LayerSplitAdapter::decode_ar(
     for (int i = 1; i < n_gen; ++i) {
         std::vector<int32_t> one(1, last_tok);
         int next_tok = -1;
-        if (!run_target_layer_split_forward(
+        if (!run_qwen35_layer_split_forward(
                 shards_, shards_.front().weights, one, committed, 1, next_tok,
                 cfg_.kq_stride_pad, cfg_.fa_window,
                 cfg_.run_dflash ? &feature_ring_ : nullptr)) {
@@ -403,16 +378,14 @@ void Qwen35LayerSplitAdapter::shutdown() {
         for (auto & snap : slot) free_prefix_snapshot(snap);
     }
     prefix_snapshots_.clear();
-    for (size_t i = 0; i < snapshot_backends_.size() && i < shards_.size(); ++i) {
-        free_snapshot_backend(snapshot_backends_[i], shards_[i].backend);
-    }
-    snapshot_backends_.clear();
+    auto shard_metas = layer_split_shard_metas(shards_);
+    free_layer_split_snapshot_backends(shard_metas, snapshot_backends_);
     if (draft_backend_owned_ && draft_backend_) {
         ggml_backend_free(draft_backend_);
     }
     draft_backend_ = nullptr;
     draft_backend_owned_ = false;
-    free_target_layer_split_shards(shards_);
+    free_qwen35_layer_split_shards(shards_);
 }
 
 }  // namespace dflash::common
