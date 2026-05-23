@@ -306,12 +306,15 @@ class TestRunBanditWiresAcceptRate(unittest.TestCase):
 class TestAdapterSkipReasons(unittest.TestCase):
     """Hermes/OpenCode are intentionally preflight-skipped until config is fixed."""
 
-    def test_hermes_preflight_reports_config_bug(self):
+    def test_hermes_preflight_passes_when_binary_present(self):
+        """HermesAdapter.preflight_check succeeds when 'hermes' binary is available."""
+        import shutil
+        if not shutil.which("hermes"):
+            self.skipTest("hermes binary not on PATH")
         adapter = HermesAdapter()
         result = adapter.preflight_check()
-        self.assertFalse(result.preflight_ok)
-        self.assertIsNotNone(result.error)
-        self.assertIn("HERMES_CONFIG_BUG", result.error or "")
+        # When the binary is present and --version exits 0, preflight passes
+        self.assertTrue(result.preflight_ok, msg=f"preflight failed: {result.error}")
 
     def test_opencode_preflight_reports_provider_config_bug(self):
         adapter = OpenCodeAdapter()

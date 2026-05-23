@@ -2118,7 +2118,9 @@ _CLIENTS_DIR = Path(__file__).resolve().parent / "clients"
 
 def _start_session_inject_proxy(*, session_id: str, upstream: str) -> tuple[subprocess.Popen, str]:
     host = os.environ.get("HOST", "127.0.0.1")
-    port = int(os.environ.get("PFLASH_PROXY_PORT", "18082"))
+    # Use PFLASH_PROXY_PORT if set, otherwise pick a free port to avoid collisions
+    proxy_port_env = os.environ.get("PFLASH_PROXY_PORT", "")
+    port = int(proxy_port_env) if proxy_port_env else free_port()
     log_dir = Path(tempfile.mkdtemp(prefix="claude-proxy-"))
     log_path = log_dir / "proxy.log"
     proxy_cmd = [
@@ -2237,57 +2239,130 @@ class HermesAdapter(_BaseAdapter):
     binary = "hermes"
 
     def preflight_check(self) -> AdapterResult:
-        return AdapterResult(
-            client=self.client,
-            preflight_ok=False,
-            error="HERMES_CONFIG_BUG: see .notes/harness-followups.md",
-        )
+        env = self.preflight_env()
+        if not _shutil.which(self.binary, path=env.get("PATH")):
+            return AdapterResult(
+                client=self.client,
+                preflight_ok=False,
+                error=(
+                    f"PREFLIGHT FAIL: '{self.binary}' not found on PATH. "
+                    "Install via the hermes install script."
+                ),
+            )
+        try:
+            result = subprocess.run(
+                [self.binary, "--version"],
+                capture_output=True, text=True, timeout=5,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error="PREFLIGHT FAIL: 'hermes --version' timed out (5s).",
+            )
+        except Exception as exc:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error=f"PREFLIGHT FAIL: 'hermes --version' raised {exc!r}.",
+            )
+        if result.returncode != 0:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error=(
+                    f"PREFLIGHT FAIL: 'hermes --version' exited {result.returncode}. "
+                    f"stderr: {result.stderr.strip()!r}"
+                ),
+            )
+        return AdapterResult(client=self.client, preflight_ok=True)
 
     def live_run(self, *, session_id: str, prompt: str = "", timeout: int = 420, **kwargs: Any) -> AdapterResult:
+        import tempfile as _tmpfile
         _prompt = prompt or "Reply with exactly: lucebox-bandit-ok"
         base_url = os.environ.get("BASE_URL", "http://127.0.0.1:18080")
         model_id = os.environ.get("MODEL_ID", "luce-dflash")
         api_key = os.environ.get("API_KEY", "sk-lucebox")
         hermes_bin = os.environ.get("HERMES_BIN", self.binary)
         max_turns = os.environ.get("HERMES_MAX_TURNS", "40")
-        env = os.environ.copy()
-        env.update({
-            "LUCEBOX_SERVER_BACKEND": "cpp",
-            "PFLASH_SESSION_ID": session_id,
-            "OPENAI_API_KEY": api_key,
-            "OPENAI_BASE_URL": f"{base_url}/v1",
-            "HERMES_INFERENCE_PROVIDER": "lucebox",
-            "HERMES_INFERENCE_MODEL": model_id,
-            "HERMES_ACCEPT_HOOKS": "1",
-            "HERMES_API_TIMEOUT": "600",
-            "HERMES_API_CALL_STALE_TIMEOUT": "600",
-            "NO_COLOR": "1",
-        })
-        cmd = [
-            hermes_bin, "chat",
-            "--quiet",
-            "--provider", "lucebox",
-            "--model", model_id,
-            "--accept-hooks",
-            "--yolo",
-            "--max-turns", max_turns,
-            "--source", "lucebox-harness",
-            "--query", _prompt,
-        ]
-        t0 = time.perf_counter()
+
+        proxy_proc: subprocess.Popen | None = None
         try:
-            proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
-            wall = time.perf_counter() - t0
-            return AdapterResult(
-                client=self.client, preflight_ok=True, session_id=session_id,
-                session_id_captured=True, wall_s=round(wall, 3), exit_code=proc.returncode,
-            )
-        except subprocess.TimeoutExpired:
-            return AdapterResult(client=self.client, preflight_ok=True, session_id=session_id,
-                                 exit_code=124, error="timeout")
-        except Exception as exc:
-            return AdapterResult(client=self.client, preflight_ok=True, session_id=session_id,
-                                 exit_code=1, error=repr(exc))
+            # Inject session_id via proxy so [pflash-bandit] lines fire in server.log
+            if session_id:
+                proxy_proc, client_base_url = _start_session_inject_proxy(
+                    session_id=session_id,
+                    upstream=base_url,
+                )
+            else:
+                client_base_url = base_url
+
+            with _tmpfile.TemporaryDirectory(prefix="hermes-home-") as hermes_home_str:
+                hermes_home = Path(hermes_home_str)
+                # Write config pointing at proxy (or server directly)
+                config_text = (
+                    f"model:\n"
+                    f"  default: {model_id}\n"
+                    f"  provider: lucebox\n"
+                    f"  context_length: 65536\n"
+                    f"providers:\n"
+                    f"  lucebox:\n"
+                    f"    name: Lucebox\n"
+                    f"    base_url: {client_base_url}/v1\n"
+                    f"    api_key: {api_key}\n"
+                    f"    api_mode: chat_completions\n"
+                    f"    model: {model_id}\n"
+                    f"    max_tokens: 4096\n"
+                    f"auxiliary:\n"
+                    f"  compression:\n"
+                    f"    context_length: 65536\n"
+                    f"toolsets:\n"
+                    f"  - all\n"
+                    f"agent:\n"
+                    f"  max_turns: 40\n"
+                )
+                (hermes_home / "config.yaml").write_text(config_text)
+                env = os.environ.copy()
+                env.update({
+                    "LUCEBOX_SERVER_BACKEND": "cpp",
+                    "PFLASH_SESSION_ID": session_id,
+                    "OPENAI_API_KEY": api_key,
+                    "OPENAI_BASE_URL": f"{client_base_url}/v1",
+                    "HERMES_HOME": str(hermes_home),
+                    "HERMES_INFERENCE_PROVIDER": "lucebox",
+                    "HERMES_INFERENCE_MODEL": model_id,
+                    "HERMES_ACCEPT_HOOKS": "1",
+                    "HERMES_API_TIMEOUT": "600",
+                    "HERMES_API_CALL_STALE_TIMEOUT": "600",
+                    "NO_COLOR": "1",
+                })
+                cmd = [
+                    hermes_bin, "chat",
+                    "--quiet",
+                    "--provider", "lucebox",
+                    "--model", model_id,
+                    "--accept-hooks",
+                    "--yolo",
+                    "--max-turns", max_turns,
+                    "--source", "lucebox-harness",
+                    "--query", _prompt,
+                ]
+                t0 = time.perf_counter()
+                try:
+                    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
+                    wall = time.perf_counter() - t0
+                    return AdapterResult(
+                        client=self.client, preflight_ok=True, session_id=session_id,
+                        session_id_captured=True, wall_s=round(wall, 3), exit_code=proc.returncode,
+                    )
+                except subprocess.TimeoutExpired:
+                    return AdapterResult(client=self.client, preflight_ok=True, session_id=session_id,
+                                         exit_code=124, error="timeout")
+                except Exception as exc:
+                    return AdapterResult(client=self.client, preflight_ok=True, session_id=session_id,
+                                         exit_code=1, error=repr(exc))
+        finally:
+            if proxy_proc is not None:
+                stop_proc(proxy_proc)
+                close_server_log(proxy_proc)
 
 
 class CodexAdapter(_BaseAdapter):
