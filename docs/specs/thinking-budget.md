@@ -57,6 +57,147 @@ When the request opts in:
 `total_tokens`) still appears in the response when the request opted in
 to the budget envelope.
 
+## Response shape — multi-dialect aliasing
+
+The reasoning text is the same content under every reasoning-capable
+API; different providers just chose different field names. dflash emits
+the DeepSeek-style field as the primary (because that's what dflash has
+emitted since v1 and what existing Qwen/DeepSeek tooling expects), plus
+the OpenRouter / Anthropic / OpenAI aliases for cross-provider
+compatibility.
+
+### Comparison across providers
+
+| API | Reasoning text field | Reasoning token count |
+|---|---|---|
+| OpenAI o1/o3 | *not exposed* (hidden tokens) | `usage.completion_tokens_details.reasoning_tokens` |
+| Anthropic Claude | `content[]: {type:"thinking", thinking:"...", signature:"..."}` (block) | `usage.thinking_tokens` |
+| DeepSeek R1 | `message.reasoning_content` (flat string) | inferred from totals |
+| Qwen3 native | inline `<think>...</think>` in `message.content` | not exposed |
+| OpenRouter | `message.reasoning` (flat) + `message.reasoning_details[]` (structured) | `usage.completion_tokens_details.reasoning_tokens` |
+| **dflash (planned)** | `message.reasoning_content` (primary) + `message.reasoning` (alias) + `message.reasoning_details[]` (structured) | `usage.completion_tokens_details.reasoning_tokens` + dflash-specific `finish_details.thinking_tokens` |
+
+OpenRouter is the broadest aggregator (routes to DeepSeek, Anthropic,
+OpenAI-shape providers like DeepInfra/Chutes, plus self-served models)
+so they had to define a normalized shape that catches everything below.
+We adopt their normalization as the secondary shape on top of our
+existing DeepSeek-style primary.
+
+### Field emissions (non-streaming `/v1/chat/completions`)
+
+When the request opted into thinking and the model produced reasoning,
+dflash emits **all of the following** in the response, carrying the
+same reasoning text under different keys for client-side compatibility:
+
+```json
+{
+  "choices": [{
+    "message": {
+      "role": "assistant",
+      "content": "Final visible answer.",
+      "reasoning_content": "Phase-1 reasoning text...",
+      "reasoning":          "Phase-1 reasoning text...",
+      "reasoning_details": [
+        {"type": "reasoning.text", "text": "Phase-1 reasoning text..."}
+      ]
+    },
+    "finish_reason": "stop",
+    "finish_details": {
+      "close_kind": "natural",
+      "thinking_tokens": 8421,
+      "content_tokens": 312,
+      "total_tokens": 8733
+    }
+  }],
+  "usage": {
+    "prompt_tokens": 201,
+    "completion_tokens": 8733,
+    "total_tokens": 8934,
+    "completion_tokens_details": {
+      "reasoning_tokens": 8421
+    }
+  }
+}
+```
+
+Field-by-field notes:
+
+- **`message.reasoning_content`** — stays the primary. DeepSeek R1
+  shape; dflash's existing field. Qwen-gateway and DeepSeek-aware
+  tooling reads this.
+- **`message.reasoning`** — alias of `reasoning_content`. Same string.
+  Catches OpenRouter SDKs, generic gateway clients, and the bench's
+  fallback chain.
+- **`message.reasoning_details`** — list of typed reasoning blocks.
+  Today always exactly one `{type: "reasoning.text", text: ...}` block
+  with the full reasoning. The list shape is intentional: when dflash
+  exposes phase-1 + phase-2 separately in a future version, the same
+  field carries `[{phase:1, type:"reasoning.text", text:...}, {phase:2, type:"reasoning.text", text:...}]`
+  without breaking clients.
+- **`usage.completion_tokens_details.reasoning_tokens`** — OpenAI o1/o3
+  standard location, also OpenRouter's normalized shape. Mirrors the
+  same count as `finish_details.thinking_tokens`. The two are kept in
+  sync and emitted together.
+- **`finish_details`** — stays. It's a dflash-specific operator-visibility
+  extension that carries *why* thinking closed (`natural` / `soft` /
+  `hard`), which no provider above us exposes. Useful for diagnosing
+  long-think failures and budget exhaustion.
+
+### Why alias rather than replace
+
+`reasoning_content` is what the existing dflash impl emits, what the
+existing bench reads as primary, and what DeepSeek-format tooling
+expects. Replacing it with `reasoning` would break DeepSeek-format
+clients. Emitting both is cheap (~15 LOC in `http_server.cpp` to alias
+the same string under multiple keys; a few more to plumb
+`reasoning_tokens` into the existing usage block) and unlocks a much
+wider client surface:
+
+- OpenRouter SDKs and apps reading `message.reasoning` work directly.
+- DeepSeek/Qwen tooling reading `message.reasoning_content` keeps
+  working.
+- Anthropic-block-aware tooling walking `message.reasoning_details` for
+  typed blocks works.
+- OpenAI billing/quota dashboards reading
+  `usage.completion_tokens_details.reasoning_tokens` see real numbers.
+
+### Bench fallback chain
+
+`bench_http_capability.py` should read reasoning text from the response
+in priority order, taking the first non-empty match:
+
+```python
+reasoning = (
+    msg.get("reasoning_content")                  # DeepSeek / dflash primary
+    or msg.get("reasoning")                       # OpenRouter / dflash alias
+    or "\n".join(
+        d.get("text", "") for d in msg.get("reasoning_details", [])
+        if isinstance(d, dict) and d.get("type") == "reasoning.text"
+    )                                              # Anthropic-block / OR-structured / future dflash multi-phase
+    or ""
+)
+```
+
+This makes cross-server runs (sindri vs vidar vs OpenRouter vs an
+upstream-format Anthropic endpoint) directly comparable — same
+extraction code, just different field-name routing per backend.
+Observed motivation: a 2026-05-23 OR run against `qwen/qwen3.6-27b`
+emitted ~4000 reasoning tokens that the bench discarded as
+`reasoning_content=""` because OR puts them under `message.reasoning`.
+The fallback recovers them.
+
+### Implementation status
+
+- **`reasoning_content` primary** — shipped (v1, kept in v2).
+- **`reasoning` alias** — planned, not yet emitted.
+- **`reasoning_details` list** — planned, not yet emitted.
+- **`completion_tokens_details.reasoning_tokens`** — planned, not yet
+  emitted (count is already tracked internally as `phase1_tokens` /
+  `finish_details.thinking_tokens`; just needs surfacing into the usage
+  block).
+- **Bench fallback chain** — planned; one-function patch in
+  `bench_http_capability.py`. Lands independently of the server change.
+
 ## Why the redesign
 
 v1 (per-request `thinking.budget_tokens` + `hard_max_tokens` JSON
