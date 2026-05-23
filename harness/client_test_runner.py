@@ -2115,6 +2115,24 @@ class _BaseAdapter:
 
 _CLIENTS_DIR = Path(__file__).resolve().parent / "clients"
 
+# Node version preference order — same heuristic as commit 2600108 in run_pi.sh / run_codex.sh.
+_NVM_NODE_VERSIONS = ["v24.13.0", "v22.17.0", "v20.18.0"]
+
+
+def _resolve_nvm_bin(binary: str) -> str:
+    """Return the direct nvm node-bin path for *binary*, bypassing asdf shims.
+
+    Tries each entry in _NVM_NODE_VERSIONS in order; returns the first that
+    contains an executable named *binary*. Falls back to *binary* unchanged so
+    the adapter can still run (shim may work for some setups).
+    """
+    nvm_root = Path.home() / ".nvm" / "versions" / "node"
+    for ver in _NVM_NODE_VERSIONS:
+        candidate = nvm_root / ver / "bin" / binary
+        if candidate.is_file() or candidate.is_symlink():
+            return str(candidate)
+    return binary  # fallback: hope it's on PATH directly
+
 
 def _start_session_inject_proxy(*, session_id: str, upstream: str) -> tuple[subprocess.Popen, str]:
     host = os.environ.get("HOST", "127.0.0.1")
@@ -2370,14 +2388,8 @@ class CodexAdapter(_BaseAdapter):
     binary = "codex"
 
     def preflight_env(self) -> dict[str, str]:
-        """Use a temp HOME so preflight matches the isolation live_run applies."""
-        import tempfile as _tempfile
-        env = os.environ.copy()
-        # Use a short-lived empty HOME — mirrors what live_run does with tempfile.TemporaryDirectory
-        tmp = _tempfile.mkdtemp(prefix="codex-preflight-")
-        env["HOME"] = tmp
-        env["CODEX_HOME"] = tmp
-        return env
+        """Use real HOME for preflight — asdf shims need the real HOME to resolve node."""
+        return os.environ.copy()
 
     def preflight_check(self) -> AdapterResult:
         # codex does not support --version; use --help which exits 0 when the shim is healthy
@@ -2419,7 +2431,9 @@ class CodexAdapter(_BaseAdapter):
         base_url = os.environ.get("BASE_URL", "http://127.0.0.1:18080")
         model_id = os.environ.get("MODEL_ID", "luce-dflash")
         api_key = os.environ.get("API_KEY", "sk-lucebox")
-        codex_bin = os.environ.get("CODEX_BIN", self.binary)
+        # Prefer CODEX_BIN override; fall back to direct nvm path — the default
+        # symlink via ~/.local/bin/codex breaks when HOME is overridden to a temp dir.
+        codex_bin = os.environ.get("CODEX_BIN") or _resolve_nvm_bin("codex")
         sandbox = os.environ.get("CODEX_SANDBOX", "danger-full-access")
         wire_api = os.environ.get("CODEX_WIRE_API", "responses")
         # Write codex config to a temp dir so we don't pollute HOME
@@ -2439,6 +2453,10 @@ class CodexAdapter(_BaseAdapter):
                 f'wire_api = "{wire_api}"\n'
             )
             env = os.environ.copy()
+            # Prepend the nvm node bin dir so codex can find node when HOME is overridden.
+            nvm_bin_dir = str(Path(codex_bin).parent) if codex_bin != "codex" else ""
+            if nvm_bin_dir:
+                env["PATH"] = nvm_bin_dir + ":" + env.get("PATH", "")
             env.update({
                 "LUCEBOX_SERVER_BACKEND": "cpp",
                 "PFLASH_SESSION_ID": session_id,
@@ -2476,12 +2494,8 @@ class PiAdapter(_BaseAdapter):
     binary = "pi"
 
     def preflight_env(self) -> dict[str, str]:
-        """Use a temp HOME so preflight matches the isolation live_run applies."""
-        import tempfile as _tempfile
-        env = os.environ.copy()
-        tmp = _tempfile.mkdtemp(prefix="pi-preflight-")
-        env["HOME"] = tmp
-        return env
+        """Use real HOME for preflight — asdf shims need the real HOME to resolve node."""
+        return os.environ.copy()
 
     def preflight_check(self) -> AdapterResult:
         # pi --version may fail if asdf shim is stale; probe with --help
@@ -2525,7 +2539,9 @@ class PiAdapter(_BaseAdapter):
         api_key = os.environ.get("API_KEY", "sk-lucebox")
         max_ctx = os.environ.get("MAX_CTX", "65536")
         max_tokens = os.environ.get("MAX_TOKENS", "2048")
-        pi_bin = os.environ.get("PI_BIN", self.binary)
+        # Prefer PI_BIN override; fall back to direct nvm path — asdf shim for pi
+        # requires asdf runtime state which breaks under an isolated HOME.
+        pi_bin = os.environ.get("PI_BIN") or _resolve_nvm_bin("pi")
         pi_tools = os.environ.get("PI_TOOLS", "read,grep,find,ls")
         provider_api = os.environ.get("PROVIDER_API", "openai-responses")
         import tempfile, json as _json
@@ -2563,6 +2579,11 @@ class PiAdapter(_BaseAdapter):
                 }
             }))
             env = os.environ.copy()
+            # Prepend the nvm node bin dir so the pi Node.js binary resolves correctly
+            # even though HOME is overridden (which breaks asdf shim state).
+            nvm_bin_dir = str(Path(pi_bin).parent) if pi_bin != "pi" else ""
+            if nvm_bin_dir:
+                env["PATH"] = nvm_bin_dir + ":" + env.get("PATH", "")
             env.update({
                 "LUCEBOX_SERVER_BACKEND": "cpp",
                 "PFLASH_SESSION_ID": session_id,
@@ -2603,15 +2624,54 @@ class OpenCodeAdapter(_BaseAdapter):
     client = "opencode"
     binary = "opencode"
 
+    def preflight_env(self) -> dict[str, str]:
+        """Include the nvm node bin dir so opencode resolves without asdf."""
+        env = os.environ.copy()
+        nvm_bin = _resolve_nvm_bin("opencode")
+        if nvm_bin != "opencode":
+            env["PATH"] = str(Path(nvm_bin).parent) + ":" + env.get("PATH", "")
+        return env
+
     def preflight_check(self) -> AdapterResult:
-        return AdapterResult(
-            client=self.client,
-            preflight_ok=False,
-            error=(
-                "PROVIDER_CONFIG_BUG: opencode.json model registration not yet working "
-                "— see .notes/harness-followups.md"
-            ),
-        )
+        """Detect opencode via its direct nvm path; fall back to PATH scan."""
+        nvm_path = _resolve_nvm_bin("opencode")
+        candidate = Path(nvm_path)
+        if not (candidate.exists() or _shutil.which("opencode")):
+            return AdapterResult(
+                client=self.client,
+                preflight_ok=False,
+                error=(
+                    "PREFLIGHT FAIL: 'opencode' not found in nvm paths or on PATH. "
+                    "Install with: npm install -g opencode-ai"
+                ),
+            )
+        # Probe with --version to confirm the binary is healthy
+        bin_path = nvm_path if candidate.exists() else "opencode"
+        try:
+            result = subprocess.run(
+                [bin_path, "--version"],
+                capture_output=True, text=True, timeout=10,
+                env=self.preflight_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error="PREFLIGHT FAIL: 'opencode --version' timed out (10s).",
+            )
+        except Exception as exc:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error=f"PREFLIGHT FAIL: 'opencode --version' raised {exc!r}.",
+            )
+        if result.returncode != 0:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error=(
+                    f"PREFLIGHT FAIL: 'opencode --version' exited {result.returncode}. "
+                    f"stderr: {result.stderr.strip()!r}"
+                ),
+            )
+        return AdapterResult(client=self.client, preflight_ok=True)
 
     def live_run(self, *, session_id: str, prompt: str = "", timeout: int = 300, **kwargs: Any) -> AdapterResult:
         _prompt = prompt or "Reply with exactly: lucebox-bandit-ok"
@@ -2620,17 +2680,21 @@ class OpenCodeAdapter(_BaseAdapter):
         api_key = os.environ.get("API_KEY", "sk-lucebox")
         max_ctx = os.environ.get("MAX_CTX", "86016")
         max_tokens = os.environ.get("MAX_TOKENS", "2048")
-        opencode_bin = os.environ.get("OPENCODE_BIN", self.binary)
+        # Prefer the OPENCODE_BIN env override; fall back to direct nvm path to avoid
+        # asdf shim resolution failures when HOME is overridden.
+        opencode_bin = os.environ.get("OPENCODE_BIN") or _resolve_nvm_bin("opencode")
         import tempfile, json as _json
         with tempfile.TemporaryDirectory() as home_dir:
             config_dir = Path(home_dir) / ".config"
+            # opencode reads its global config from XDG_CONFIG_HOME/opencode/opencode.json
+            # NOT from the project dir opencode.json (which is only for project-level overrides).
+            opencode_config_dir = config_dir / "opencode"
             data_dir = Path(home_dir) / ".local" / "share"
             project_dir = Path(home_dir) / "project"
-            config_dir.mkdir(parents=True)
+            opencode_config_dir.mkdir(parents=True)
             data_dir.mkdir(parents=True)
             project_dir.mkdir()
-            (project_dir / "opencode.json").write_text(_json.dumps({
-                "$schema": "https://opencode.ai/config.json",
+            opencode_cfg = {
                 "model": f"lucebox/{model_id}",
                 "small_model": f"lucebox/{model_id}",
                 "provider": {
@@ -2652,8 +2716,14 @@ class OpenCodeAdapter(_BaseAdapter):
                     }
                 },
                 "tools": {"write": False, "bash": False},
-            }))
+            }
+            (opencode_config_dir / "opencode.json").write_text(_json.dumps(opencode_cfg))
             env = os.environ.copy()
+            # Prepend the nvm node bin dir so opencode.exe can find node even
+            # though HOME is overridden (which breaks ~/.local/bin and asdf shims).
+            nvm_bin_dir = str(Path(opencode_bin).parent) if opencode_bin != "opencode" else ""
+            if nvm_bin_dir:
+                env["PATH"] = nvm_bin_dir + ":" + env.get("PATH", "")
             env.update({
                 "LUCEBOX_SERVER_BACKEND": "cpp",
                 "PFLASH_SESSION_ID": session_id,
