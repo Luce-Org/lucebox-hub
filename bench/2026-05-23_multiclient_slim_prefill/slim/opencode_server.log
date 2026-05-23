@@ -1,0 +1,98 @@
+[server] loading tokenizer from /home/peppi/models/qwen3.6-27b-q3ks/Qwen3.6-27B-Q3_K_S.gguf
+[tokenizer] added_tokens: 33 special tokens
+[tokenizer] loaded vocab=248320 merges=247587 bos=248044 eos=248046 eot=248046 pre=qwen35
+[server] loading pflash drafter tokenizer from /home/peppi/models/Qwen3-0.6B-BF16.gguf
+[tokenizer] added_tokens: 26 special tokens
+[tokenizer] loaded vocab=151936 merges=151387 bos=151643 eos=151645 eot=151645 pre=qwen2
+[server] pflash: mode=auto threshold=4096 keep=0.050 skip_park=1
+[server] creating backend...
+[backend_factory] detected arch=qwen35
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 24575 MiB):
+  Device 0: NVIDIA GeForce RTX 3090, compute capability 8.6, VMM: yes, VRAM: 24575 MiB
+[draft GGUF] SWA layers: 4/5 (window=2048)
+
+[server] ╭─── Configuration ───────────────────────────────────╮
+[server] │  host            = 127.0.0.1
+[server] │  port            = 53803
+[server] │  model           = /home/peppi/models/qwen3.6-27b-q3ks/Qwen3.6-27B-Q3_K_S.gguf
+[server] │  draft           = /home/peppi/models/qwen3.6-27b-dflash/dflash-draft-3.6-q4_k_m.gguf
+[server] │  model_name      = dflash
+[server] │  max_ctx         = 49152
+[server] │  max_tokens      = 4096
+[server] │  gpu             = 0
+[server] │  draft_gpu       = 0
+[server] │  chunk           = 512
+[server] │  fa_window       = 2048
+[server] │  ddtree          = off
+[server] │  ddtree_budget   = 64
+[server] │  cors            = ON
+[server] │  cache_type_k    = tq3_0
+[server] │  cache_type_v    = tq3_0
+[server] │  pflash          = auto
+[server] │  pflash_threshold= 4096
+[server] │  pflash_keep     = 0.050
+[server] │  pflash_drafter  = /home/peppi/models/Qwen3-0.6B-BF16.gguf
+[server] │  pflash_skip_park= ON
+[server] │  fp_use_bsa      = ON
+[server] │  fp_alpha        = 0.85
+[server] ╰─────────────────────────────────────────────────────╯
+
+[pc] enabled: cap=32 family=qwen
+[server] listening on http://127.0.0.1:53803
+[snap] alloc right-sized: cur_pos=542 buf=183.50 MiB backend=CPU
+[loader] eos_id=248046 eos_chat_id=-1
+[target] target loaded: layers [0,64) output=1, 850 tensors on GPU 10.73 GiB, tok_embd 521 MiB CPU-only (q3_K)
+[draft]  loaded
+[snap] inline slot=0 cur_pos=542
+[spec-decode] tokens=5 time=0.235 s speed=21.27 tok/s steps=2 accepted=4/32 (12.5%) avg_commit=2.50
+[prefill] tokens=604 time=1.017 s
+[pc] inline-snap committed slot=0 prefix_len=542
+[compress] loading drafter from /home/peppi/models/Qwen3-0.6B-BF16.gguf ...
+[drafter-loader] arch prefix=qwen3. qk_norm=yes
+[qwen3-0.6b] detected weight type: BF16
+[drafter-loader] PFLASH_DRAFTER_SLIM=1: allocating 7/28 layers, skipping output.weight. Saves ~905 MB vs full load.
+[drafter] loaded qwen3-0.6b BF16: n_layer=28 n_head=16 n_kv=8 n_embd=1024 n_ff=3072 head_dim=128 vocab=151936
+[compress] drafter ready
+[qwen3-0.6b-fp] layer 1/7 done (A_setup=0.000s A_alloc=0.000s A_compute=0.078s FP=0.003s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] layer 7/7 done (A_setup=0.000s A_alloc=0.001s A_compute=0.104s FP=0.012s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] forward 0.23s (S=5344, A_setup=0.00s A_alloc=0.00s A_compute=0.10s FP=0.01s B_warm=0.00s B_setup=0.00s B_alloc=0.00s B_copy_in=0.00s B_norm=0.00s B_compute=0.00s B_copy_out=0.00s)  tail-score 0.04s (layers 0-6)  total 0.27s
+[drafter] forward+score in 0.31s S=5344
+[drafter] score_and_compress total 0.31s S=5344 kept=256 (8/167 chunks, forced=7)
+[compress] 5344 -> 256 tokens
+[pflash] 5422 -> 256 -> 268 tokens (4.9% kept)
+[snap] alloc right-sized: cur_pos=206 buf=162.50 MiB backend=CPU
+[snap] inline slot=1 cur_pos=206
+[spec-decode] tokens=209 time=4.651 s speed=44.94 tok/s steps=38 accepted=172/608 (28.3%) avg_commit=5.50
+[prefill] tokens=268 time=0.388 s
+[pc] inline-snap committed slot=1 prefix_len=206
+[pc] lookup hit slot=0 prefix_len=542 (of 657 total)
+[spec-decode] tokens=12 time=0.490 s speed=24.48 tok/s steps=4 accepted=9/64 (14.1%) avg_commit=3.00
+[prefill] tokens=657 time=0.153 s
+[qwen3-0.6b-fp] layer 1/7 done (A_setup=0.000s A_alloc=0.001s A_compute=0.008s FP=0.001s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] layer 7/7 done (A_setup=0.000s A_alloc=0.001s A_compute=0.037s FP=0.010s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] forward 0.17s (S=5397, A_setup=0.00s A_alloc=0.00s A_compute=0.04s FP=0.01s B_warm=0.00s B_setup=0.00s B_alloc=0.00s B_copy_in=0.00s B_norm=0.00s B_compute=0.00s B_copy_out=0.00s)  tail-score 0.04s (layers 0-6)  total 0.20s
+[drafter] forward+score in 0.24s S=5397
+[drafter] score_and_compress total 0.24s S=5397 kept=245 (8/169 chunks, forced=7)
+[compress] 5397 -> 245 tokens
+[pflash] 5475 -> 245 -> 256 tokens (4.7% kept)
+[snap] alloc right-sized: cur_pos=141 buf=158.44 MiB backend=CPU
+[snap] inline slot=2 cur_pos=141
+[spec-decode] tokens=416 time=7.432 s speed=55.97 tok/s steps=61 accepted=357/976 (36.6%) avg_commit=6.82
+[prefill] tokens=256 time=0.390 s
+[pc] inline-snap committed slot=2 prefix_len=141
+[pc] lookup hit slot=0 prefix_len=542 (of 617 total)
+[spec-decode] tokens=7 time=0.240 s speed=29.12 tok/s steps=2 accepted=6/32 (18.8%) avg_commit=3.50
+[prefill] tokens=617 time=0.104 s
+[qwen3-0.6b-fp] layer 1/7 done (A_setup=0.000s A_alloc=0.000s A_compute=0.008s FP=0.002s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] layer 7/7 done (A_setup=0.000s A_alloc=0.001s A_compute=0.034s FP=0.010s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] forward 0.16s (S=5358, A_setup=0.00s A_alloc=0.00s A_compute=0.03s FP=0.01s B_warm=0.00s B_setup=0.00s B_alloc=0.00s B_copy_in=0.00s B_norm=0.00s B_compute=0.00s B_copy_out=0.00s)  tail-score 0.04s (layers 0-6)  total 0.19s
+[drafter] forward+score in 0.23s S=5358
+[drafter] score_and_compress total 0.23s S=5358 kept=238 (8/168 chunks, forced=7)
+[compress] 5358 -> 238 tokens
+[pflash] 5436 -> 238 -> 249 tokens (4.6% kept)
+[snap] alloc right-sized: cur_pos=174 buf=160.50 MiB backend=CPU
+[snap] inline slot=3 cur_pos=174
+[spec-decode] tokens=196 time=2.001 s speed=97.94 tok/s steps=17 accepted=186/272 (68.4%) avg_commit=11.53
+[prefill] tokens=249 time=0.366 s
+[pc] inline-snap committed slot=3 prefix_len=174
+[drafter] freed

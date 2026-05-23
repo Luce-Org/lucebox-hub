@@ -1,0 +1,4 @@
+client,turn,session_id,prompt,keep_before,accept_rate,keep_after,ema,wall_s
+opencode,1,bandit-opencode-1779575529,decode_check.txt,,,,,8.127
+opencode,2,bandit-opencode-1779575529,logic_check.txt,,,,,10.463
+opencode,3,bandit-opencode-1779575529,math_check.txt,,,,,9.955

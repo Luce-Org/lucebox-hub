@@ -1,0 +1,4 @@
+client,condition,turn,session_id,prompt_name,prompt_tokens_in,prompt_tokens_after_pflash,prefill_time_logged_s,prefill_time_est_s,decode_time_s,output_tokens,accept_rate,wall_s,ok_done
+pi,slim,1,bandit-pi-1779575622,decode_check.txt,2099,2099,2.61,3.123,3.114,117,0.2582,6.237,
+pi,slim,2,bandit-pi-1779575622,logic_check.txt,2152,2152,0.16,0.685,10.9,463,0.3109,11.585,
+pi,slim,3,bandit-pi-1779575622,math_check.txt,2113,2113,0.112,0.68,3.134,131,0.3304,3.814,

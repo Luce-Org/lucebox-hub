@@ -1,0 +1,71 @@
+{
+  "conditions": {
+    "baseline": {
+      "condition": "baseline",
+      "vram_before": 1348,
+      "vram_target_loaded": 13496,
+      "vram_after_drafter": 16401,
+      "vram_drafter_cost_mb": 2905,
+      "vram_final": 1330,
+      "niah": {
+        "needles_found": 3,
+        "total": 3,
+        "runs": [
+          {
+            "ok": true,
+            "elapsed": 2.5485689640045166,
+            "text": "ALPINE-7749"
+          },
+          {
+            "ok": true,
+            "elapsed": 2.4607436656951904,
+            "text": "ALPINE-7749"
+          },
+          {
+            "ok": true,
+            "elapsed": 2.449273109436035,
+            "text": "ALPINE-7749"
+          }
+        ]
+      },
+      "accept_rate": -1.0
+    },
+    "slim": {
+      "condition": "slim",
+      "vram_before": 1330,
+      "vram_target_loaded": 13479,
+      "vram_after_drafter": 15475,
+      "vram_drafter_cost_mb": 1996,
+      "vram_final": 1332,
+      "niah": {
+        "needles_found": 3,
+        "total": 3,
+        "runs": [
+          {
+            "ok": true,
+            "elapsed": 2.555762529373169,
+            "text": "ALPINE-7749"
+          },
+          {
+            "ok": true,
+            "elapsed": 5.479578256607056,
+            "text": "ALPINE-7749"
+          },
+          {
+            "ok": true,
+            "elapsed": 2.590205669403076,
+            "text": "ALPINE-7749"
+          }
+        ]
+      },
+      "accept_rate": -1.0
+    }
+  },
+  "gate1_niah": true,
+  "gate2_accept_rate": null,
+  "gate3_vram_mb": true,
+  "vram_saved_mb": 909,
+  "baseline_drafter_cost_mb": 2905,
+  "slim_drafter_cost_mb": 1996,
+  "verdict": "WIN"
+}

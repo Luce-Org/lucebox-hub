@@ -1,0 +1,76 @@
+[server] loading tokenizer from /home/peppi/models/qwen3.6-27b-q3ks/Qwen3.6-27B-Q3_K_S.gguf
+[tokenizer] added_tokens: 33 special tokens
+[tokenizer] loaded vocab=248320 merges=247587 bos=248044 eos=248046 eot=248046 pre=qwen35
+[server] loading pflash drafter tokenizer from /home/peppi/models/Qwen3-0.6B-BF16.gguf
+[tokenizer] added_tokens: 26 special tokens
+[tokenizer] loaded vocab=151936 merges=151387 bos=151643 eos=151645 eot=151645 pre=qwen2
+[server] pflash: mode=always threshold=32000 keep=0.050 skip_park=1
+[server] creating backend...
+[backend_factory] detected arch=qwen35
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 24575 MiB):
+  Device 0: NVIDIA GeForce RTX 3090, compute capability 8.6, VMM: yes, VRAM: 24575 MiB
+
+[server] ╭─── Configuration ───────────────────────────────────╮
+[server] │  host            = 127.0.0.1
+[server] │  port            = 18099
+[server] │  model           = /home/peppi/models/qwen3.6-27b-q3ks/Qwen3.6-27B-Q3_K_S.gguf
+[server] │  draft           = (none)
+[server] │  model_name      = dflash
+[server] │  max_ctx         = 40960
+[server] │  max_tokens      = 4096
+[server] │  gpu             = 0
+[server] │  draft_gpu       = 0
+[server] │  chunk           = 512
+[server] │  fa_window       = 2048
+[server] │  ddtree          = off
+[server] │  ddtree_budget   = 64
+[server] │  cors            = ON
+[server] │  cache_type_k    = tq3_0 (auto)
+[server] │  cache_type_v    = tq3_0 (auto)
+[server] │  pflash          = always
+[server] │  pflash_threshold= 32000
+[server] │  pflash_keep     = 0.050
+[server] │  pflash_drafter  = /home/peppi/models/Qwen3-0.6B-BF16.gguf
+[server] │  pflash_skip_park= ON
+[server] │  fp_use_bsa      = ON
+[server] │  fp_alpha        = 0.85
+[server] ╰─────────────────────────────────────────────────────╯
+
+[pc] enabled: cap=32 family=qwen
+[server] listening on http://127.0.0.1:18099
+[compress] loading drafter from /home/peppi/models/Qwen3-0.6B-BF16.gguf ...
+[drafter-loader] arch prefix=qwen3. qk_norm=yes
+[qwen3-0.6b] detected weight type: BF16
+[drafter] loaded qwen3-0.6b BF16: n_layer=28 n_head=16 n_kv=8 n_embd=1024 n_ff=3072 head_dim=128 vocab=151936
+[compress] drafter ready
+[qwen3-0.6b-fp] layer 1/7 done (A_setup=0.000s A_alloc=0.000s A_compute=0.022s FP=0.002s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] layer 7/7 done (A_setup=0.000s A_alloc=0.000s A_compute=0.023s FP=0.002s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] forward 0.12s (S=15, A_setup=0.00s A_alloc=0.00s A_compute=0.02s FP=0.00s B_warm=0.00s B_setup=0.00s B_alloc=0.00s B_copy_in=0.00s B_norm=0.00s B_compute=0.00s B_copy_out=0.00s)  tail-score 0.03s (layers 0-6)  total 0.15s
+[drafter] forward+score in 0.16s S=15
+[drafter] score_and_compress total 0.16s S=15 kept=15 (1/1 chunks, forced=1)
+[compress] 15 -> 15 tokens
+[pflash] 15 -> 15 -> 15 tokens (100.0% kept)
+[qwen3-0.6b-fp] layer 1/7 done (A_setup=0.000s A_alloc=0.000s A_compute=0.022s FP=0.009s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] layer 7/7 done (A_setup=0.000s A_alloc=0.001s A_compute=0.131s FP=0.062s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] forward 0.62s (S=22239, A_setup=0.00s A_alloc=0.00s A_compute=0.13s FP=0.06s B_warm=0.00s B_setup=0.00s B_alloc=0.00s B_copy_in=0.00s B_norm=0.00s B_compute=0.00s B_copy_out=0.00s)  tail-score 0.14s (layers 0-6)  total 0.76s
+[drafter] forward+score in 0.85s S=22239
+[drafter] score_and_compress total 0.85s S=22239 kept=1183 (37/695 chunks, forced=37)
+[compress] 22239 -> 1183 tokens
+[pflash] 22239 -> 1183 -> 1183 tokens (5.3% kept)
+[qwen3-0.6b-fp] layer 1/7 done (A_setup=0.000s A_alloc=0.000s A_compute=0.021s FP=0.009s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] layer 7/7 done (A_setup=0.000s A_alloc=0.001s A_compute=0.130s FP=0.065s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] forward 0.63s (S=22239, A_setup=0.00s A_alloc=0.00s A_compute=0.13s FP=0.07s B_warm=0.00s B_setup=0.00s B_alloc=0.00s B_copy_in=0.00s B_norm=0.00s B_compute=0.00s B_copy_out=0.00s)  tail-score 0.14s (layers 0-6)  total 0.77s
+[drafter] forward+score in 0.87s S=22239
+[drafter] score_and_compress total 0.87s S=22239 kept=1183 (37/695 chunks, forced=37)
+[compress] 22239 -> 1183 tokens
+[pflash] 22239 -> 1183 -> 1183 tokens (5.3% kept)
+[qwen3-0.6b-fp] layer 1/7 done (A_setup=0.000s A_alloc=0.000s A_compute=0.021s FP=0.009s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] layer 7/7 done (A_setup=0.000s A_alloc=0.001s A_compute=0.129s FP=0.063s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] forward 0.62s (S=22239, A_setup=0.00s A_alloc=0.00s A_compute=0.13s FP=0.06s B_warm=0.00s B_setup=0.00s B_alloc=0.00s B_copy_in=0.00s B_norm=0.00s B_compute=0.00s B_copy_out=0.00s)  tail-score 0.14s (layers 0-6)  total 0.76s
+[drafter] forward+score in 0.85s S=22239
+[drafter] score_and_compress total 0.86s S=22239 kept=1183 (37/695 chunks, forced=37)
+[compress] 22239 -> 1183 tokens
+[pflash] 22239 -> 1183 -> 1183 tokens (5.3% kept)
+[loader] eos_id=248046 eos_chat_id=-1
+[target] target loaded: layers [0,64) output=1, 850 tensors on GPU 10.73 GiB, tok_embd 521 MiB CPU-only (q3_K)
+[drafter] freed

@@ -1,0 +1,30 @@
+{
+  "condition": "slim",
+  "vram_before": 1330,
+  "vram_target_loaded": 13479,
+  "vram_after_drafter": 15475,
+  "vram_drafter_cost_mb": 1996,
+  "vram_final": 1332,
+  "niah": {
+    "needles_found": 3,
+    "total": 3,
+    "runs": [
+      {
+        "ok": true,
+        "elapsed": 2.555762529373169,
+        "text": "ALPINE-7749"
+      },
+      {
+        "ok": true,
+        "elapsed": 5.479578256607056,
+        "text": "ALPINE-7749"
+      },
+      {
+        "ok": true,
+        "elapsed": 2.590205669403076,
+        "text": "ALPINE-7749"
+      }
+    ]
+  },
+  "accept_rate": -1.0
+}

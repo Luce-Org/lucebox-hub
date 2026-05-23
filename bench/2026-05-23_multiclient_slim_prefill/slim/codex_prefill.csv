@@ -1,0 +1,4 @@
+client,condition,turn,session_id,prompt_name,prompt_tokens_in,prompt_tokens_after_pflash,prefill_time_logged_s,prefill_time_est_s,decode_time_s,output_tokens,accept_rate,wall_s,ok_done
+codex,slim,1,bandit-codex-1779575661,decode_check.txt,9861,485,0.836,2.984,3.596,164,0.2931,6.58,
+codex,slim,2,bandit-codex-1779575661,logic_check.txt,9924,483,0.62,2.399,20.757,1107,0.39,23.156,
+codex,slim,3,bandit-codex-1779575661,math_check.txt,9870,499,0.114,2.214,4.219,281,0.4754,6.433,

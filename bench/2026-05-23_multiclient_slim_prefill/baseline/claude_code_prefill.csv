@@ -1,0 +1,4 @@
+client,condition,turn,session_id,prompt_name,prompt_tokens_in,prompt_tokens_after_pflash,prefill_time_logged_s,prefill_time_est_s,decode_time_s,output_tokens,accept_rate,wall_s,ok_done
+claude_code,baseline,1,bandit-claude_code-1779573778,decode_check.txt,8766,416,0.786,2.02,0.108,1,0.0625,2.128,
+claude_code,baseline,2,bandit-claude_code-1779573778,logic_check.txt,8766,416,0.054,0.884,0.108,1,0.0625,0.992,
+claude_code,baseline,3,bandit-claude_code-1779573778,math_check.txt,8766,416,0.051,0.877,0.105,1,0.0625,0.982,

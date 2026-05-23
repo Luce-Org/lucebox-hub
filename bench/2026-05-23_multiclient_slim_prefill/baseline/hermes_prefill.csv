@@ -1,0 +1,4 @@
+client,condition,turn,session_id,prompt_name,prompt_tokens_in,prompt_tokens_after_pflash,prefill_time_logged_s,prefill_time_est_s,decode_time_s,output_tokens,accept_rate,wall_s,ok_done
+hermes,baseline,1,bandit-hermes-1779573795,decode_check.txt,14182,700,1.047,4.623,5.621,244,0.269,10.244,
+hermes,baseline,2,bandit-hermes-1779573795,logic_check.txt,14232,713,0.866,4.193,9.603,553,0.3972,13.796,
+hermes,baseline,3,bandit-hermes-1779573795,math_check.txt,14196,713,0.974,4.077,1.827,93,0.3942,5.904,

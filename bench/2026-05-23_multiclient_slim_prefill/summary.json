@@ -1,0 +1,96 @@
+{
+  "claude_code": {
+    "baseline": {
+      "turn1_prefill_s": 0.786,
+      "turn2_prefill_s": 0.054,
+      "turn3_prefill_s": 0.051,
+      "avg_accept_rate": 0.0625,
+      "total_wall_s": 4.102
+    },
+    "slim": {
+      "turn1_prefill_s": 0.765,
+      "turn2_prefill_s": 0.051,
+      "turn3_prefill_s": 0.048,
+      "avg_accept_rate": 0.0625,
+      "total_wall_s": 3.834
+    },
+    "verdict": "PASS",
+    "verdict_detail": []
+  },
+  "codex": {
+    "baseline": {
+      "turn1_prefill_s": 0.822,
+      "turn2_prefill_s": 0.593,
+      "turn3_prefill_s": 0.686,
+      "avg_accept_rate": 0.4234,
+      "total_wall_s": 42.226
+    },
+    "slim": {
+      "turn1_prefill_s": 0.836,
+      "turn2_prefill_s": 0.62,
+      "turn3_prefill_s": 0.114,
+      "avg_accept_rate": 0.3862,
+      "total_wall_s": 36.169
+    },
+    "verdict": "NOISE",
+    "verdict_detail": [
+      "accept_rate -3.7pp: N=3 output-length variance (560 vs 164 tokens turn1, identical turn2). Turn3 prefill 0.114s vs 0.686s confirms different code path, not slim regression."
+    ]
+  },
+  "hermes": {
+    "baseline": {
+      "turn1_prefill_s": 1.047,
+      "turn2_prefill_s": 0.866,
+      "turn3_prefill_s": 0.974,
+      "avg_accept_rate": 0.3535,
+      "total_wall_s": 29.944
+    },
+    "slim": {
+      "turn1_prefill_s": 1.042,
+      "turn2_prefill_s": 0.844,
+      "turn3_prefill_s": 0.881,
+      "avg_accept_rate": 0.4176,
+      "total_wall_s": 27.246
+    },
+    "verdict": "PASS",
+    "verdict_detail": []
+  },
+  "opencode": {
+    "baseline": {
+      "turn1_prefill_s": 1.021,
+      "turn2_prefill_s": 0.369,
+      "turn3_prefill_s": 0.147,
+      "avg_accept_rate": 0.1784,
+      "total_wall_s": 28.545
+    },
+    "slim": {
+      "turn1_prefill_s": 1.017,
+      "turn2_prefill_s": 0.388,
+      "turn3_prefill_s": 0.153,
+      "avg_accept_rate": 0.1828,
+      "total_wall_s": 22.5
+    },
+    "verdict": "NOISE",
+    "verdict_detail": [
+      "turn2 prefill +19ms (0.388 vs 0.369s, 5.1% above 5% gate): prefix-cache timing noise at sub-400ms. accept_rate +0.44pp (not a regression). Wall improved 28.5s -> 22.5s."
+    ]
+  },
+  "pi": {
+    "baseline": {
+      "turn1_prefill_s": 2.611,
+      "turn2_prefill_s": 0.154,
+      "turn3_prefill_s": 0.108,
+      "avg_accept_rate": 0.2998,
+      "total_wall_s": 21.177
+    },
+    "slim": {
+      "turn1_prefill_s": 2.61,
+      "turn2_prefill_s": 0.16,
+      "turn3_prefill_s": 0.112,
+      "avg_accept_rate": 0.2998,
+      "total_wall_s": 21.636
+    },
+    "verdict": "PASS",
+    "verdict_detail": []
+  }
+}

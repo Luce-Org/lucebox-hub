@@ -1,0 +1,4 @@
+client,turn,session_id,prompt,keep_before,accept_rate,keep_after,ema,wall_s
+hermes,1,bandit-hermes-1779573795,decode_check.txt,,,,,10.244
+hermes,2,bandit-hermes-1779573795,logic_check.txt,,,,,13.796
+hermes,3,bandit-hermes-1779573795,math_check.txt,,,,,5.904

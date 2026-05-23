@@ -1,0 +1,4 @@
+client,turn,session_id,prompt,keep_before,accept_rate,keep_after,ema,wall_s
+pi,1,bandit-pi-1779575622,decode_check.txt,,,,,6.237
+pi,2,bandit-pi-1779575622,logic_check.txt,,,,,11.585
+pi,3,bandit-pi-1779575622,math_check.txt,,,,,3.814

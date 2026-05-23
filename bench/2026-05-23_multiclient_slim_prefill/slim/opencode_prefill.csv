@@ -1,0 +1,4 @@
+client,condition,turn,session_id,prompt_name,prompt_tokens_in,prompt_tokens_after_pflash,prefill_time_logged_s,prefill_time_est_s,decode_time_s,output_tokens,accept_rate,wall_s,ok_done
+opencode,slim,1,bandit-opencode-1779575584,decode_check.txt,604,604,1.017,7.796,0.235,5,0.125,8.031,
+opencode,slim,2,bandit-opencode-1779575584,logic_check.txt,5422,268,0.388,5.444,4.651,209,0.2829,10.095,
+opencode,slim,3,bandit-opencode-1779575584,math_check.txt,657,657,0.153,3.884,0.49,12,0.1406,4.374,
