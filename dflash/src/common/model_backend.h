@@ -46,6 +46,27 @@ struct DaemonIO {
 
 // ─── Generate request/result ────────────────────────────────────────────
 
+// Thinking-budget force-close hook. Mirrors antirez/ds4 ds4_eval.c's
+// hard_limit_reply_budget semantics: when the budget remaining (n_gen
+// minus tokens committed so far) falls to hard_limit_remaining, the
+// next sampled token gets overridden with close_token_id, giving the
+// model the remaining budget to write a visible answer following
+// </think>.
+//
+// This is "Level 2" of our thinking-budget migration: in-process
+// mid-stream force-close, KV-continuous. Beats Level 1's phase-2
+// reprompt because the model never sees a fresh prefill — its KV
+// state continues naturally after the injected close.
+//
+// Current implementation: AR-decode only. When budget_hook is set,
+// backends MAY route generation through their AR path (skipping spec
+// decode) — the perf trade-off is acceptable since this only kicks in
+// for thinking-enabled requests. Spec-decode integration is a follow-up.
+struct BudgetHook {
+    int32_t close_token_id        = -1;  // -1 = disabled
+    int     hard_limit_remaining  = 0;   // force when (n_gen - committed) <= this
+};
+
 struct GenerateRequest {
     std::vector<int32_t>       prompt;
     int                        n_gen       = 0;
@@ -65,6 +86,8 @@ struct GenerateRequest {
     // When non-null, the spec decode loop uses these as draft overrides,
     // bypassing draft model computation for covered positions.
     const std::vector<int32_t> * hint_tokens = nullptr;
+    // Optional thinking-budget hook — see BudgetHook docs above.
+    BudgetHook                 budget_hook;
 };
 
 struct GenerateResult {

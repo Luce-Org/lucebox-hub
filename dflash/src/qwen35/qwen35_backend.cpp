@@ -501,7 +501,15 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
     // Decode (speculative)
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
-        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io, req.hint_tokens)) {
+        // When a budget hook is set (thinking-enabled requests with
+        // hard-limit force-close), route through AR. Spec-decode
+        // integration of the BudgetHook is a follow-up — for now, take
+        // the perf hit for correctness. AR still works; we just lose
+        // spec-decode's tok/s for thinking turns.
+        bool budget_force_ar = (req.budget_hook.close_token_id >= 0);
+        if (budget_force_ar
+                ? !do_ar_decode(committed, req.n_gen, result.tokens, out_io, req.budget_hook)
+                : !do_spec_decode(committed, req.n_gen, result.tokens, out_io, req.hint_tokens)) {
             result.error = "decode";
             return result;
         }
@@ -562,7 +570,15 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
     // Decode
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
-        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io, req.hint_tokens)) {
+        // When a budget hook is set (thinking-enabled requests with
+        // hard-limit force-close), route through AR. Spec-decode
+        // integration of the BudgetHook is a follow-up — for now, take
+        // the perf hit for correctness. AR still works; we just lose
+        // spec-decode's tok/s for thinking turns.
+        bool budget_force_ar = (req.budget_hook.close_token_id >= 0);
+        if (budget_force_ar
+                ? !do_ar_decode(committed, req.n_gen, result.tokens, out_io, req.budget_hook)
+                : !do_spec_decode(committed, req.n_gen, result.tokens, out_io, req.hint_tokens)) {
             result.error = "decode";
             return result;
         }
@@ -716,7 +732,29 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
 
 bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                   std::vector<int32_t> & out_tokens,
-                                  const DaemonIO & io) {
+                                  const DaemonIO & io,
+                                  const BudgetHook & budget_hook) {
+    // Budget hook state: set to true once we've injected the close token
+    // so we don't inject it twice on subsequent iterations (the model
+    // continues generating after the injection to write the visible
+    // answer in the remaining budget).
+    bool budget_close_injected = false;
+    auto maybe_force_close = [&](int32_t & tok, int committed_now) {
+        if (budget_close_injected) return;
+        if (budget_hook.close_token_id < 0) return;
+        int remaining = n_gen - committed_now;
+        if (remaining <= budget_hook.hard_limit_remaining &&
+            tok != budget_hook.close_token_id) {
+            std::fprintf(stderr,
+                "[budget-hook] force-close at committed=%d/%d (remaining=%d "
+                "<= hard_limit=%d): overriding sampled token %d with close=%d\n",
+                committed_now, n_gen, remaining,
+                budget_hook.hard_limit_remaining, tok,
+                budget_hook.close_token_id);
+            tok = budget_hook.close_token_id;
+            budget_close_injected = true;
+        }
+    };
     if (n_gen <= 0) return true;
 
     const int hidden = w_.n_embd;
@@ -739,6 +777,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         } else {
             first_tok = cache_.last_tok;
         }
+        maybe_force_close(first_tok, committed);
         out_tokens.push_back(first_tok);
         io.emit(first_tok);
         if (IS_EOS_TOK(first_tok, w_)) return true;
@@ -781,6 +820,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                 if (logits_buf[j] > best) { best = logits_buf[j]; next_tok = j; }
             }
         }
+        maybe_force_close(next_tok, committed);
 
         out_tokens.push_back(next_tok);
         io.emit(next_tok);

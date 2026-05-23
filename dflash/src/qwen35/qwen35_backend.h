@@ -177,9 +177,13 @@ private:
                         const std::vector<int32_t> * hint_tokens = nullptr);
 
     // AR decode fallback (no draft model or sampling mode).
+    // budget_hook (when close_token_id >= 0) overrides the next sampled
+    // token with close_token_id once (n_gen - committed) <= hard_limit.
+    // Mirrors antirez/ds4 ds4_eval.c's hard_limit_reply_budget.
     bool do_ar_decode(int committed, int n_gen,
                       std::vector<int32_t> & out_tokens,
-                      const DaemonIO & io);
+                      const DaemonIO & io,
+                      const BudgetHook & budget_hook = {});
 
     // Chain-mode verify (single batch of q_len tokens).
     int verify_chain(int committed, const int32_t * draft_tok, int q_len);

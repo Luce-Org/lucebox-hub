@@ -58,6 +58,21 @@ struct ServerConfig {
     // (CLI flag + finish_details emission) so consumers can probe + plan.
     int         think_max_tokens    = 10000;
     int         default_max_tokens  = 16000;
+    // Level 2 force-close (in-process, KV-continuous). When > 0 AND the
+    // request opted into thinking, the backend's AR decode overrides
+    // the next sampled token with `</think>` once (n_gen - committed)
+    // <= hard_limit_reply_budget. Matches ds4_eval.c's hard_limit_reply
+    // _budget default of 512. 0 disables the hook (falls back to Level
+    // 1 phase-2 reprompt only).
+    int         hard_limit_reply_budget = 512;
+
+    // Token IDs resolved at server startup for the model's
+    // </think> close tag (typically a single special token for Qwen3.6,
+    // id 248069). When non-empty, used as the close_token_id for
+    // BudgetHook. server_main populates this from the tokenizer after
+    // loading; HttpServer just forwards into GenerateRequest.budget_hook
+    // when thinking is opted in.
+    int32_t     think_close_token_id = -1;
 
     // /props introspection inputs — captured at startup by server_main so
     // the /props handler doesn't need to crack open BackendArgs or env.

@@ -125,6 +125,12 @@ static void print_usage(const char * prog) {
         "                             via thinking:{type:enabled} (default: 10000)\n"
         "  --default-max-tokens <N>   Combined cap when request omits max_tokens\n"
         "                             (default: 16000, matches antirez/ds4 ds4_eval.c)\n"
+        "  --hard-limit-reply-budget <N>\n"
+        "                             Level 2 force-close: when this many tokens\n"
+        "                             remain (of the combined cap), inject </think>\n"
+        "                             so the model gets that budget to write the\n"
+        "                             visible answer. Mirrors ds4_eval.c's\n"
+        "                             hard_limit_reply_budget. 0 disables. (default: 512)\n"
         "\n"
         "KV cache:\n"
         "  --cache-type-k <type>  KV cache K type (f16,bf16,q4_0,q4_1,q5_0,q5_1,q8_0,tq3_0)\n"
@@ -238,6 +244,8 @@ int main(int argc, char ** argv) {
             sconfig.think_max_tokens = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--default-max-tokens") == 0 && i + 1 < argc) {
             sconfig.default_max_tokens = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--hard-limit-reply-budget") == 0 && i + 1 < argc) {
+            sconfig.hard_limit_reply_budget = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--prefill-compression") == 0 && i + 1 < argc) {
             const char * mode = argv[++i];
             if (std::strcmp(mode, "auto") == 0)
@@ -485,6 +493,29 @@ int main(int argc, char ** argv) {
     // Tokenizer ID: best-effort. The Tokenizer class doesn't currently
     // expose the GGUF metadata key it was loaded from, so leave empty
     // and let /props report null. (Add a getter on Tokenizer later.)
+
+    // Resolve `</think>` close-tag token for Level 2 force-close. For
+    // Qwen3.6 this is a single special token (id 248069); other archs
+    // may not have it, in which case the hook is disabled (close_id = -1).
+    // The encode() path picks up the special-token mapping the tokenizer
+    // built at load_from_gguf time.
+    if (sconfig.hard_limit_reply_budget > 0) {
+        auto close_ids = tokenizer.encode("</think>");
+        if (close_ids.size() == 1) {
+            sconfig.think_close_token_id = close_ids[0];
+            std::fprintf(stderr,
+                "[server] level-2 force-close: </think> = token %d, "
+                "hard_limit_reply_budget = %d\n",
+                sconfig.think_close_token_id, sconfig.hard_limit_reply_budget);
+        } else {
+            std::fprintf(stderr,
+                "[server] level-2 force-close DISABLED: </think> tokenizes "
+                "to %zu tokens (expected 1); multi-token close not yet "
+                "supported. Falling back to Level 1 phase-2 reprompt only.\n",
+                close_ids.size());
+            sconfig.think_close_token_id = -1;
+        }
+    }
 
     HttpServer server(*backend, tokenizer, sconfig);
     server.set_chat_format(chat_format_for_arch(arch));
