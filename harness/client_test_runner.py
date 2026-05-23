@@ -1035,17 +1035,38 @@ def start_server(
     log_dir = work_dir / "server-logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{profile.name}-{int(time.time())}-{port}.log"
-    args = [
-        sys.executable,
-        "-u",
-        str(ROOT / "dflash" / "scripts" / "server.py"),
-        "--host", "127.0.0.1",
-        "--port", str(port),
-        "--target", str(target),
-        "--draft", str(draft),
-        "--bin", str(bin_path),
-        *profile.args,
-    ]
+    backend = os.environ.get("LUCEBOX_SERVER_BACKEND", "cpp")
+    if backend == "python":
+        server_py = ROOT / "dflash" / "scripts" / "server.py"
+        args = [
+            sys.executable,
+            "-u",
+            str(server_py),
+            "--host", "127.0.0.1",
+            "--port", str(port),
+            "--target", str(target),
+            "--draft", str(draft),
+            "--bin", str(bin_path),
+            *profile.args,
+        ]
+    else:
+        # cpp backend (default): use the native dflash_server binary
+        cpp_bin_env = os.environ.get("DFLASH_SERVER_BIN", "")
+        cpp_bin = Path(cpp_bin_env) if cpp_bin_env else (ROOT / "dflash" / "build" / "dflash_server")
+        if not cpp_bin.exists():
+            raise RuntimeError(
+                f"C++ server binary not found: {cpp_bin}\n"
+                "Build it with `cmake --build dflash/build` or set DFLASH_SERVER_BIN, "
+                "or set LUCEBOX_SERVER_BACKEND=python to use the Python fallback."
+            )
+        args = [
+            str(cpp_bin),
+            "--host", "127.0.0.1",
+            "--port", str(port),
+            "--target", str(target),
+            "--draft", str(draft),
+            *profile.args,
+        ]
     if profile.needs_prefill_drafter:
         if prefill_drafter is None:
             raise HarnessError(f"profile {profile.name} requires --prefill-drafter")
