@@ -13,7 +13,6 @@
 #include <string>
 
 using namespace dflash::common;
-using namespace dflash;
 
 // ─── Test framework (ds4 style) ──────────────────────────────────────────────
 

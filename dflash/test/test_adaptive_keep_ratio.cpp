@@ -9,7 +9,7 @@
 #include <cstdio>
 #include <string>
 
-using namespace dflash;
+using namespace dflash::common;
 
 // ─── Test framework (ds4 style) ───────────────────────────────────────────────
 

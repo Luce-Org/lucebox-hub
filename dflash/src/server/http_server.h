@@ -174,7 +174,7 @@ private:
     DiskPrefixCache  disk_cache_;
 
     // Per-session adaptive keep_ratio bandit state.
-    dflash::HttpServerSessions sessions_;
+    HttpServerSessions sessions_;
 
     // Track prompt tokens for each snapshot slot (for shutdown save).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;

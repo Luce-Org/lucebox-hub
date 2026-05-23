@@ -5,7 +5,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace dflash {
+namespace dflash::common {
 
 struct AdaptiveKeepRatioState {
     float ema        = 0.0f;
@@ -58,6 +58,12 @@ public:
         return (it == sessions_.end()) ? AdaptiveKeepRatioState{}.last_keep : it->second.last_keep;
     }
 
+    float get_ema(const std::string & session_id) const {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = sessions_.find(session_id);
+        return (it == sessions_.end()) ? 0.0f : it->second.ema;
+    }
+
     int turn_count(const std::string& session_id) const {
         std::lock_guard<std::mutex> lock(mu_);
         auto it = sessions_.find(session_id);
@@ -74,4 +80,4 @@ private:
     std::unordered_map<std::string, AdaptiveKeepRatioState> sessions_;
 };
 
-}  // namespace dflash
+}  // namespace dflash::common
