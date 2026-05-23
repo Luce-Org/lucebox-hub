@@ -1053,6 +1053,23 @@ void HttpServer::worker_loop() {
                 return true;
             }
 
+            // Qwen3.6 thinking tokens: <think> (id 248068) and </think> (id 248069)
+            // are SINGLE special tokens in the added_tokens vocab. Without this
+            // mapping they hit the generic "skip <...>" filter below and get
+            // silently dropped — which means the emitter never sees the
+            // reasoning→content transition and stuffs everything into
+            // reasoning_content with empty visible content. Forward the text
+            // form into the emitter so parse_reasoning() can split correctly.
+            if (raw == "<think>" || raw == "</think>") {
+                if (req.stream) {
+                    auto chunks = emitter.emit_token(
+                        raw == "</think>" ? "</think>\n" : "<think>");
+                    for (const auto & chunk : chunks)
+                        if (!send_all(fd, chunk.data(), chunk.size())) { client_disconnected = true; return false; }
+                }
+                return true;
+            }
+
             // Skip other special tokens (starting with <|, or any <...> except byte-fallback)
             if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|') return true;
             if (raw.size() >= 2 && raw[0] == '<' && raw.back() == '>') {
@@ -1285,6 +1302,15 @@ void HttpServer::worker_loop() {
                     // Gemma4 channel → think mapping
                     if (raw == "<|channel>") { emitter.emit_token("<think>"); continue; }
                     if (raw == "<channel|>") { emitter.emit_token("</think>\n"); continue; }
+                    // Qwen3.6 thinking tokens (id 248068 / 248069) — must
+                    // forward as text so the emitter transitions
+                    // reasoning→content. Without this the generic <...>
+                    // strip below drops them silently, leaving content
+                    // empty and the model's whole answer wedged in
+                    // reasoning_content. Mirrors the streaming-path fix
+                    // above.
+                    if (raw == "<think>") { emitter.emit_token("<think>"); continue; }
+                    if (raw == "</think>") { emitter.emit_token("</think>\n"); continue; }
                     if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|') continue;
                     if (raw.size() >= 2 && raw[0] == '<' && raw.back() == '>') {
                         if (!(raw.size() == 6 && raw[1] == '0' && raw[2] == 'x'))
