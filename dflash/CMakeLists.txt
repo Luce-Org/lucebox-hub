@@ -758,5 +758,17 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${DFLASH27B_SRC_INCLUDE_DIRS})
     endif()
+    # Pure CPU tests for slim drafter and score_range (no GPU required).
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_early_exit_score_range.cpp")
+        add_executable(test_drafter_early_exit_score_range
+            test/test_drafter_early_exit_score_range.cpp)
+        target_include_directories(test_drafter_early_exit_score_range PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS})
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_slim_vram.cpp")
+        add_executable(test_drafter_slim_vram test/test_drafter_slim_vram.cpp)
+        target_include_directories(test_drafter_slim_vram PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS})
+    endif()
     endif()
 endif()
