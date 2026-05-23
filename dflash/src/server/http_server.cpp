@@ -223,6 +223,125 @@ static json build_props_body(const ServerConfig & config,
     return body;
 }
 
+json parse_responses_arguments(const json & item) {
+    if (!item.contains("arguments")) return json::object();
+    const auto & arguments = item["arguments"];
+    if (arguments.is_object()) return arguments;
+    if (arguments.is_string()) {
+        try {
+            return json::parse(arguments.get<std::string>());
+        } catch (const std::exception &) {
+            return json::object();
+        }
+    }
+    return json::object();
+}
+
+std::string render_tool_call_xml(const std::string & name, const json & arguments) {
+    std::string out = "<function=" + name + ">\n";
+    if (arguments.is_object()) {
+        for (const auto & [key, value] : arguments.items()) {
+            out += "<parameter=" + key + ">\n";
+            out += value.is_string() ? value.get<std::string>() : value.dump();
+            out += "\n</parameter>\n";
+        }
+    }
+    out += "</function>\n";
+    return out;
+}
+
+std::vector<ChatMessage> normalize_chat_messages(
+    const json & messages,
+    ApiFormat format,
+    ToolMemory & tool_memory) {
+    std::vector<ChatMessage> chat_msgs;
+    std::vector<std::string> system_parts;
+
+    if (messages.is_array()) {
+        for (const auto & m : messages) {
+            if (format == ApiFormat::RESPONSES && m.is_object()) {
+                std::string item_type = m.value("type", "message");
+                if (item_type == "function_call") {
+                    std::string call_id = m.value("call_id", m.value("id", ""));
+                    std::string raw;
+                    if (!call_id.empty()) {
+                        raw = tool_memory.lookup({call_id});
+                    }
+                    if (raw.empty()) {
+                        raw = render_tool_call_xml(m.value("name", ""),
+                                                   parse_responses_arguments(m));
+                    }
+                    chat_msgs.push_back({"assistant", raw});
+                    continue;
+                }
+                if (item_type == "function_call_output") {
+                    std::string output;
+                    if (m.contains("output") && m["output"].is_string()) {
+                        output = m["output"].get<std::string>();
+                    } else if (m.contains("output")) {
+                        output = m["output"].dump();
+                    }
+                    chat_msgs.push_back({"tool", output,
+                                         m.value("call_id", m.value("id", ""))});
+                    continue;
+                }
+            }
+
+            ChatMessage cm;
+            cm.role = m.value("role", "user");
+
+            bool replayed = false;
+            if (cm.role == "assistant" && m.contains("tool_calls") &&
+                m["tool_calls"].is_array() && !m["tool_calls"].empty()) {
+                std::vector<std::string> call_ids;
+                for (const auto & tc : m["tool_calls"]) {
+                    std::string id = tc.value("id", "");
+                    if (!id.empty()) call_ids.push_back(id);
+                }
+                std::string raw = tool_memory.lookup(call_ids);
+                if (!raw.empty()) {
+                    cm.content = raw;
+                    replayed = true;
+                }
+            }
+
+            if (!replayed) {
+                if (m.contains("content") && m["content"].is_string()) {
+                    cm.content = m["content"].get<std::string>();
+                } else if (m.contains("content") && m["content"].is_array()) {
+                    for (const auto & part : m["content"]) {
+                        std::string ptype = part.value("type", "");
+                        if (ptype == "text" || ptype == "input_text" ||
+                            ptype == "output_text") {
+                            cm.content += part.value("text", "");
+                        }
+                    }
+                }
+            }
+
+            if (format == ApiFormat::RESPONSES &&
+                (cm.role == "system" || cm.role == "developer")) {
+                system_parts.push_back(cm.content);
+            } else {
+                chat_msgs.push_back(std::move(cm));
+            }
+        }
+    } else if (messages.is_string()) {
+        chat_msgs.push_back({"user", messages.get<std::string>()});
+    }
+
+    if (!system_parts.empty()) {
+        std::string merged_system;
+        for (size_t i = 0; i < system_parts.size(); i++) {
+            if (i) merged_system += "\n\n";
+            merged_system += system_parts[i];
+        }
+        chat_msgs.insert(chat_msgs.begin(), {"system", merged_system});
+    }
+
+    return chat_msgs;
+}
+
 // ─── HttpServer ─────────────────────────────────────────────────────────
 
 HttpServer::HttpServer(ModelBackend & backend,
@@ -503,6 +622,19 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             req.sampler.seed = body["seed"].get<uint64_t>();
         }
 
+        // OpenAI-style additive penalties.
+        req.sampler.freq_pen = body.value("frequency_penalty", 0.0f);
+        req.sampler.pres_pen = body.value("presence_penalty", 0.0f);
+
+        // HuggingFace-style multiplicative repetition penalty (also used by
+        // vLLM, llama.cpp, etc.). Accepts both "repetition_penalty" and
+        // the shorter "rep_pen" for daemon compatibility.
+        req.sampler.rep_pen = body.value("repetition_penalty",
+                              body.value("rep_pen", 1.0f));
+        if (body.contains("rep_window")) {
+            req.sampler.rep_window = body["rep_window"].get<int>();
+        }
+
         // Tools.
         if (body.contains("tools")) {
             req.tools = body["tools"];
@@ -626,48 +758,8 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         }
 
         // Render messages to text and tokenize.
-        std::vector<ChatMessage> chat_msgs;
-        if (req.messages.is_array()) {
-            for (const auto & m : req.messages) {
-                ChatMessage cm;
-                cm.role = m.value("role", "user");
-
-                // Check for tool memory replay on assistant messages with tool_calls.
-                bool replayed = false;
-                if (cm.role == "assistant" && m.contains("tool_calls") &&
-                    m["tool_calls"].is_array() && !m["tool_calls"].empty()) {
-                    // Extract call IDs for tool memory lookup.
-                    std::vector<std::string> call_ids;
-                    for (const auto & tc : m["tool_calls"]) {
-                        std::string id = tc.value("id", "");
-                        if (!id.empty()) call_ids.push_back(id);
-                    }
-                    std::string raw = tool_memory_.lookup(call_ids);
-                    if (!raw.empty()) {
-                        cm.content = raw;
-                        replayed = true;
-                    }
-                }
-
-                if (!replayed) {
-                    if (m.contains("content") && m["content"].is_string()) {
-                        cm.content = m["content"].get<std::string>();
-                    } else if (m.contains("content") && m["content"].is_array()) {
-                        // Multi-part content (text parts only for now).
-                        for (const auto & part : m["content"]) {
-                            std::string ptype = part.value("type", "");
-                            if (ptype == "text" || ptype == "input_text") {
-                                cm.content += part.value("text", "");
-                            }
-                        }
-                    }
-                }
-                chat_msgs.push_back(std::move(cm));
-            }
-        } else if (req.messages.is_string()) {
-            // Simple string input (Responses API shorthand).
-            chat_msgs.push_back({"user", req.messages.get<std::string>()});
-        }
+        std::vector<ChatMessage> chat_msgs =
+            normalize_chat_messages(req.messages, req.format, tool_memory_);
 
         // Determine thinking mode BEFORE rendering so the template can inject
         // the <think>\n\n</think>\n\n block when thinking is disabled.
@@ -923,7 +1015,7 @@ void HttpServer::worker_loop() {
         gen_req.prompt = effective_prompt;
         gen_req.n_gen = phase1_cap;
         gen_req.sampler = req.sampler;
-        gen_req.do_sample = req.sampler.temp > 0.0f;
+        gen_req.do_sample = req.sampler.needs_logit_processing();
         gen_req.stream = false;  // we handle streaming via on_token callback
 
         // Level 2 force-close: when thinking is opted in, the server is

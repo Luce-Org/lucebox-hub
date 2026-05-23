@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -18,6 +19,7 @@ int sample_logits(const float * logits_in,
     std::vector<std::pair<float, int>> cand(vocab);
     for (int i = 0; i < vocab; i++) cand[i] = {logits_in[i], i};
 
+    // Multiplicative repetition penalty (HuggingFace-style).
     if (cfg.rep_pen > 1.0f && !history.empty()) {
         const int win  = std::min((int)history.size(), cfg.rep_window);
         const int from = (int)history.size() - win;
@@ -31,6 +33,21 @@ int sample_logits(const float * logits_in,
         }
     }
 
+    // OpenAI-style additive frequency and presence penalties.
+    if ((cfg.freq_pen != 0.0f || cfg.pres_pen != 0.0f) && !history.empty()) {
+        const int win  = std::min((int)history.size(), cfg.rep_window);
+        const int from = (int)history.size() - win;
+        std::unordered_map<int, int> counts;
+        for (int i = from; i < (int)history.size(); i++) counts[history[i]]++;
+        for (auto & c : cand) {
+            auto it = counts.find(c.second);
+            if (it != counts.end()) {
+                c.first -= cfg.freq_pen * it->second;
+                c.first -= cfg.pres_pen;
+            }
+        }
+    }
+
     if (cfg.top_k > 0 && cfg.top_k < vocab) {
         std::partial_sort(cand.begin(), cand.begin() + cfg.top_k, cand.end(),
                           [](auto & a, auto & b){ return a.first > b.first; });
@@ -38,6 +55,11 @@ int sample_logits(const float * logits_in,
     } else {
         std::sort(cand.begin(), cand.end(),
                   [](auto & a, auto & b){ return a.first > b.first; });
+    }
+
+    // temp=0 → deterministic argmax (after penalties have been applied above).
+    if (cfg.temp <= 0.0f) {
+        return cand.front().second;
     }
 
     const float inv_t = 1.0f / std::max(1e-3f, cfg.temp);
@@ -81,17 +103,19 @@ bool parse_sampler_token(std::string & line, SamplerCfg & out) {
                           ? line.substr(pos + 6)
                           : line.substr(pos + 6, end - (pos + 6));
     line.erase(pos, (end == std::string::npos ? std::string::npos : end - pos));
-    float t = 0.0f, tp = 1.0f, rp = 1.0f;
+    float t = 0.0f, tp = 1.0f, rp = 1.0f, fp = 0.0f, pp = 0.0f;
     int   tk = 0;
     unsigned long long sd = 0;
-    int n = std::sscanf(tok.c_str(), "%f,%f,%d,%f,%llu",
-                        &t, &tp, &tk, &rp, &sd);
+    int n = std::sscanf(tok.c_str(), "%f,%f,%d,%f,%llu,%f,%f",
+                        &t, &tp, &tk, &rp, &sd, &fp, &pp);
     if (n < 1) return false;
-    out.temp    = t;
-    out.top_p   = tp;
-    out.top_k   = tk;
-    out.rep_pen = rp;
-    out.seed    = sd;
+    out.temp     = t;
+    out.top_p    = tp;
+    out.top_k    = tk;
+    out.rep_pen  = rp;
+    out.seed     = sd;
+    out.freq_pen = fp;
+    out.pres_pen = pp;
     return true;
 }
 

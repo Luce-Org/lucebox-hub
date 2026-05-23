@@ -210,6 +210,184 @@ class TestChatCompletionsNonStreaming:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Sampling parameters (temperature, top_p, penalties, seed)
+# ═══════════════════════════════════════════════════════════════════
+
+class TestSamplingParameters:
+    """Validate that sampling parameters are accepted and affect output."""
+
+    def test_temperature_nonzero_accepted(self):
+        """Non-zero temperature should produce a valid response."""
+        r = post_json("/v1/chat/completions", {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "Write a random word."}],
+            "stream": False,
+            "max_tokens": 16,
+            "temperature": 0.7,
+        })
+        assert r.status_code == 200
+        content = r.json()["choices"][0]["message"]["content"]
+        assert len(content) > 0
+
+    def test_seed_reproducibility(self):
+        """Same seed + same temperature should produce identical output."""
+        body = {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "Pick a number between 1 and 100."}],
+            "stream": False,
+            "max_tokens": 16,
+            "temperature": 0.8,
+            "seed": 42,
+        }
+        r1 = post_json("/v1/chat/completions", body)
+        r2 = post_json("/v1/chat/completions", body)
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        assert (r1.json()["choices"][0]["message"]["content"]
+                == r2.json()["choices"][0]["message"]["content"])
+
+    def test_top_p_accepted(self):
+        """top_p parameter should be accepted and produce output."""
+        r = post_json("/v1/chat/completions", {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "Say something."}],
+            "stream": False,
+            "max_tokens": 16,
+            "temperature": 0.5,
+            "top_p": 0.9,
+        })
+        assert r.status_code == 200
+        assert len(r.json()["choices"][0]["message"]["content"]) > 0
+
+    def test_top_k_accepted(self):
+        """top_k parameter should be accepted."""
+        r = post_json("/v1/chat/completions", {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "Hello."}],
+            "stream": False,
+            "max_tokens": 8,
+            "temperature": 0.5,
+            "top_k": 10,
+        })
+        assert r.status_code == 200
+        assert len(r.json()["choices"][0]["message"]["content"]) > 0
+
+    def test_frequency_penalty_accepted(self):
+        """frequency_penalty should be accepted and produce output."""
+        r = post_json("/v1/chat/completions", {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "Say hello."}],
+            "stream": False,
+            "max_tokens": 32,
+            "temperature": 0.5,
+            "frequency_penalty": 0.5,
+        })
+        assert r.status_code == 200
+        assert len(r.json()["choices"][0]["message"]["content"]) > 0
+
+    def test_presence_penalty_accepted(self):
+        """presence_penalty should be accepted and produce output."""
+        r = post_json("/v1/chat/completions", {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "Say hello."}],
+            "stream": False,
+            "max_tokens": 32,
+            "temperature": 0.5,
+            "presence_penalty": 0.5,
+        })
+        assert r.status_code == 200
+        assert len(r.json()["choices"][0]["message"]["content"]) > 0
+
+    def test_presence_penalty_encourages_diversity(self):
+        """High presence_penalty should encourage diverse tokens."""
+        prompt = "List five animals."
+        base = {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "max_tokens": 64,
+            "temperature": 0.3,
+            "seed": 100,
+        }
+        # With high presence penalty, output should have more unique words
+        r = post_json("/v1/chat/completions", {**base, "presence_penalty": 1.5})
+        assert r.status_code == 200
+        text = r.json()["choices"][0]["message"]["content"]
+        words = text.lower().split()
+        # At least some word diversity (not all same word)
+        unique_ratio = len(set(words)) / max(len(words), 1)
+        assert unique_ratio > 0.3
+
+    def test_repetition_penalty_accepted(self):
+        """repetition_penalty (HF-style multiplicative) should be accepted."""
+        r = post_json("/v1/chat/completions", {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "Hello."}],
+            "stream": False,
+            "max_tokens": 16,
+            "temperature": 0.5,
+            "repetition_penalty": 1.2,
+        })
+        assert r.status_code == 200
+        assert len(r.json()["choices"][0]["message"]["content"]) > 0
+
+    def test_all_sampling_params_combined(self):
+        """All sampling parameters together should produce valid output."""
+        r = post_json("/v1/chat/completions", {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "Tell me a joke."}],
+            "stream": False,
+            "max_tokens": 64,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "top_k": 40,
+            "frequency_penalty": 0.3,
+            "presence_penalty": 0.3,
+            "repetition_penalty": 1.1,
+            "seed": 99,
+        })
+        assert r.status_code == 200
+        content = r.json()["choices"][0]["message"]["content"]
+        assert len(content) > 0
+
+    def test_sampling_params_in_streaming(self):
+        """Sampling parameters should work in streaming mode too."""
+        r = post_stream("/v1/chat/completions", {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "Say something creative."}],
+            "stream": True,
+            "max_tokens": 32,
+            "temperature": 0.9,
+            "top_p": 0.95,
+            "frequency_penalty": 0.5,
+            "presence_penalty": 0.5,
+        })
+        assert r.status_code == 200
+        events = parse_sse_events(r)
+        # Should have content chunks and end with DONE
+        assert any(e == ("done", None) for e in events)
+        content = ""
+        for _, e in events:
+            if e and isinstance(e, dict) and e.get("choices"):
+                delta = e["choices"][0].get("delta", {})
+                content += delta.get("content", "")
+        assert len(content) > 0
+
+    def test_negative_frequency_penalty_boosts_repetition(self):
+        """Negative frequency_penalty should allow/encourage repetition."""
+        r = post_json("/v1/chat/completions", {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "Repeat 'test' many times."}],
+            "stream": False,
+            "max_tokens": 32,
+            "temperature": 0.3,
+            "frequency_penalty": -1.0,
+        })
+        assert r.status_code == 200
+        assert len(r.json()["choices"][0]["message"]["content"]) > 0
+
+
+# ═══════════════════════════════════════════════════════════════════
 # POST /v1/chat/completions — streaming
 # ═══════════════════════════════════════════════════════════════════
 

@@ -16,6 +16,7 @@
 //   - Logit softcapping: tanh(logits/cap)*cap
 
 #include "gemma4_internal.h"
+#include "common/gpu_runtime_compat.h"
 #include "dflash27b.h"
 #include "flashprefill.h"
 

@@ -13,6 +13,8 @@ namespace dflash::common {
 static const char THINK_OPEN[]  = "<think>";
 static const char THINK_CLOSE[] = "</think>";
 static const char TOOL_OPEN[]   = "<tool_call>";
+static const char FUNCTION_OPEN[] = "<function=";
+static const char TOOL_CODE_OPEN[] = "<tool_code>";
 static constexpr size_t THINK_OPEN_LEN  = 7;
 static constexpr size_t THINK_CLOSE_LEN = 8;
 static constexpr size_t TOOL_OPEN_LEN   = 11;
@@ -314,16 +316,20 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
         }
 
         // mode_ == StreamMode::CONTENT
-        // Look for <think>, </think>, or <tool_call>
+        // Look for <think>, </think>, or any supported tool-call opener.
         size_t think_idx = window_.find(THINK_OPEN);
         size_t think_close_idx = window_.find(THINK_CLOSE);
         size_t tool_idx = window_.find(TOOL_OPEN);
+        size_t function_idx = window_.find(FUNCTION_OPEN);
+        size_t tool_code_idx = window_.find(TOOL_CODE_OPEN);
 
-        struct Hit { size_t pos; int type; };  // type: 0=think, 1=think_close, 2=tool
+        struct Hit { size_t pos; int type; };  // type: 0=think, 1=think_close, 2=tool-ish
         std::vector<Hit> hits;
         if (think_idx != std::string::npos)       hits.push_back({think_idx, 0});
         if (think_close_idx != std::string::npos) hits.push_back({think_close_idx, 1});
         if (tool_idx != std::string::npos)        hits.push_back({tool_idx, 2});
+        if (function_idx != std::string::npos)    hits.push_back({function_idx, 2});
+        if (tool_code_idx != std::string::npos)   hits.push_back({tool_code_idx, 2});
 
         if (!hits.empty()) {
             std::sort(hits.begin(), hits.end(),
@@ -343,7 +349,8 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
                 // </think> in content — just skip it
                 window_ = window_.substr(h.pos + THINK_CLOSE_LEN);
             } else {
-                // <tool_call>
+                // Tool-call shapes can start with <tool_call>, bare
+                // <function=...>, or <tool_code> JSON wrappers.
                 tool_buffer_ = window_.substr(h.pos);
                 window_.clear();
                 mode_ = StreamMode::TOOL_BUFFER;

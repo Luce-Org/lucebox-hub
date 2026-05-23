@@ -768,7 +768,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     // nonzero KV offsets, and committed then no longer describes chunk size.
     {
         int32_t first_tok;
-        if (sampler_.temp > 0) {
+        if (sampler_.needs_logit_processing()) {
             if (!prefill_last_logits_valid_) return false;
             ggml_backend_tensor_get(sg_.logits, logits_buf.data(), prefill_last_logits_offset_,
                                     sizeof(float) * vocab);
@@ -810,7 +810,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         ggml_backend_tensor_get(sg_.logits, logits_buf.data(), 0,
                                 sizeof(float) * vocab);
         int32_t next_tok;
-        if (sampler_.temp > 0) {
+        if (sampler_.needs_logit_processing()) {
             next_tok = sample_logits(logits_buf.data(), vocab, sampler_,
                                       out_tokens, sampler_rng_);
         } else {
@@ -852,11 +852,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // Check if we can use speculative decode:
     // - draft model loaded and not parked
     // - feature mirror initialized
-    // - greedy decoding (temp == 0) — spec decode uses argmax verification
+    // - greedy decoding (no logit processing) — spec decode uses argmax verification
     const bool can_spec = cfg_.draft_path
         && !draft_parked_
         && feature_mirror_.target_feat
-        && sampler_.temp == 0.0f;
+        && !sampler_.needs_logit_processing();
 
     if (!can_spec) {
         // AR fallback consumes the final prefill position itself, then advances

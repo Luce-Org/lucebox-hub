@@ -461,7 +461,7 @@ bool Qwen3Backend::do_decode(int committed, int n_gen,
 
         // Sample next token
         int32_t next;
-        if (sampler_.temp > 0) {
+        if (sampler_.needs_logit_processing()) {
             next = sample_logits(logits.data(), vocab, sampler_,
                                  out_tokens, sampler_rng_);
         } else {
@@ -596,7 +596,7 @@ GenerateResult Qwen3Backend::generate(const GenerateRequest & req,
 
         // Sample first token
         int32_t first;
-        if (sampler_.temp > 0) {
+        if (sampler_.needs_logit_processing()) {
             first = sample_logits(logits.data(), vocab, sampler_,
                                   result.tokens, sampler_rng_);
         } else {
@@ -763,7 +763,7 @@ GenerateResult Qwen3Backend::restore_and_generate(int slot,
 
         // Sample first token
         int32_t first;
-        if (sampler_.temp > 0) {
+        if (sampler_.needs_logit_processing()) {
             first = sample_logits(logits.data(), vocab, sampler_,
                                   result.tokens, sampler_rng_);
         } else {

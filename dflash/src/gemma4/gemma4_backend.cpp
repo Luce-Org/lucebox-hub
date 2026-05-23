@@ -282,7 +282,7 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
 
         // Sample
         int32_t next;
-        if (sampler_.temp > 0) {
+        if (sampler_.needs_logit_processing()) {
             next = sample_logits(logits.data(), vocab, sampler_,
                                  out_tokens, sampler_rng_);
         } else {
@@ -526,7 +526,7 @@ GenerateResult Gemma4Backend::generate(const GenerateRequest & req,
         const bool can_spec = dflash_target_
             && !draft_parked_
             && feature_mirror_.target_feat
-            && sampler_.temp == 0.0f;
+            && !sampler_.needs_logit_processing();
 
         if (can_spec) {
             if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io)) {
@@ -553,7 +553,7 @@ GenerateResult Gemma4Backend::generate(const GenerateRequest & req,
 
             // Sample first token
             int32_t first;
-            if (sampler_.temp > 0) {
+            if (sampler_.needs_logit_processing()) {
                 first = sample_logits(logits.data(), vocab, sampler_,
                                        result.tokens, sampler_rng_);
             } else {

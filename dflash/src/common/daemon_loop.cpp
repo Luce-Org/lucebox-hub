@@ -256,7 +256,7 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
 
         SamplerCfg sampler{};
         const bool have_sampler = parse_sampler_token(line, sampler);
-        const bool do_sample    = have_sampler && sampler.temp > 0.0f;
+        const bool do_sample    = have_sampler && sampler.needs_logit_processing();
 
         if (backend.is_target_parked()) {
             std::fprintf(stderr,
