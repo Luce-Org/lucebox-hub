@@ -83,7 +83,7 @@ private:
     bool snapshot_slot_valid(int slot) const;
 
     Qwen35LayerSplitAdapterConfig cfg_;
-    std::vector<TargetLayerSplitShard> shards_;
+    std::vector<Qwen35LayerSplitShard> shards_;
     ggml_backend_t draft_backend_ = nullptr;
     bool draft_backend_owned_ = false;
     DraftWeights draft_weights_;

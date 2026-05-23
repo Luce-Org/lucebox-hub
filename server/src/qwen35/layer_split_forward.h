@@ -35,8 +35,8 @@ bool compute_target_split_argmax(
 // Run a full forward pass through all shards, writing K/V into each shard's
 // cache.  Returns the argmax of the last token in `last_tok`.
 // Optionally captures features into `feature_ring` / remote draft.
-bool run_target_layer_split_forward(
-        std::vector<TargetLayerSplitShard> & shards,
+bool run_qwen35_layer_split_forward(
+        std::vector<Qwen35LayerSplitShard> & shards,
         const TargetWeights & embed_source,
         const std::vector<int32_t> & tokens,
         int base_pos,
@@ -50,6 +50,6 @@ bool run_target_layer_split_forward(
         DFlashDraftIpcClient * remote_draft = nullptr);
 
 // Free all shards (weights, cache, backend).
-void free_target_layer_split_shards(std::vector<TargetLayerSplitShard> & shards);
+void free_qwen35_layer_split_shards(std::vector<Qwen35LayerSplitShard> & shards);
 
 } // namespace dflash::common
