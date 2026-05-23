@@ -1958,6 +1958,7 @@ class AdapterResult:
     wall_s: float | None = None
     exit_code: int | None = None
     error: str | None = None
+    server_log_path: Path | None = None
 
 
 class ClientAdapter(Protocol):
@@ -2505,6 +2506,14 @@ def run_bandit(
                 continue
             sid = session_id or f"{name}-{condition}"
             result = adapter.live_run(session_id=sid)
+            # Populate accept_rate from server log if not already set
+            if result.accept_rate is None and result.server_log_path is not None:
+                try:
+                    from harness.metrics_parser import extract_accept_rate_from_log
+                    log_text = result.server_log_path.read_text(errors="replace")
+                    result.accept_rate = extract_accept_rate_from_log(log_text)
+                except Exception:
+                    pass
             results.append(result)
 
     # Write CSV

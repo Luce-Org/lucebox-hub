@@ -10,6 +10,7 @@ import csv
 import io
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -115,6 +116,74 @@ class TestBanditMatrix5AdaptersCSV(unittest.TestCase):
         for row in rows:
             self.assertIn(row["preflight_ok"], ("True", "False"),
                           msg=f"preflight_ok must be True/False, got: {row['preflight_ok']!r}")
+
+
+class TestAcceptRatePopulatedFromLog(unittest.TestCase):
+    """Blocker #6: accept_rate must be non-None when server_log_path contains matching lines."""
+
+    def test_accept_rate_from_spec_decode_log(self):
+        """AdapterResult.accept_rate is populated from a server log with [spec-decode] lines."""
+        from harness.client_test_runner import AdapterResult
+        from harness.metrics_parser import extract_accept_rate_from_log
+
+        log_content = (
+            "2026-05-23 INFO server started\n"
+            "[spec-decode] tokens=200 time=10.0 s speed=20.0 tok/s steps=5 accepted=4/5\n"
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            f.write(log_content)
+            log_path = Path(f.name)
+        try:
+            result = AdapterResult(
+                client="claude_code",
+                preflight_ok=True,
+                session_id="test-sess-001",
+                session_id_captured=True,
+                wall_s=10.5,
+                exit_code=0,
+                server_log_path=log_path,
+            )
+            # Simulate what run_bandit does after live_run
+            if result.accept_rate is None and result.server_log_path is not None:
+                log_text = result.server_log_path.read_text(errors="replace")
+                result.accept_rate = extract_accept_rate_from_log(log_text)
+
+            self.assertIsNotNone(result.accept_rate,
+                                 "accept_rate must be non-None after wiring metrics_parser")
+            self.assertAlmostEqual(result.accept_rate, 0.8)
+        finally:
+            log_path.unlink(missing_ok=True)
+
+    def test_accept_rate_from_bandit_json_log(self):
+        """AdapterResult.accept_rate is populated from [pflash-bandit] JSON log lines."""
+        from harness.client_test_runner import AdapterResult
+        from harness.metrics_parser import extract_accept_rate_from_log
+
+        log_content = (
+            "2026-05-23 INFO startup\n"
+            '[pflash-bandit] {"accept_rate": 0.62, "session_id": "s42"}\n'
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            f.write(log_content)
+            log_path = Path(f.name)
+        try:
+            result = AdapterResult(
+                client="hermes",
+                preflight_ok=True,
+                session_id="test-sess-002",
+                session_id_captured=True,
+                wall_s=15.0,
+                exit_code=0,
+                server_log_path=log_path,
+            )
+            if result.accept_rate is None and result.server_log_path is not None:
+                log_text = result.server_log_path.read_text(errors="replace")
+                result.accept_rate = extract_accept_rate_from_log(log_text)
+
+            self.assertIsNotNone(result.accept_rate)
+            self.assertAlmostEqual(result.accept_rate, 0.62)
+        finally:
+            log_path.unlink(missing_ok=True)
 
 
 class TestBanditCLI(unittest.TestCase):

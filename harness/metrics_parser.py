@@ -2,13 +2,20 @@
 
 Parses JSONL log lines emitted by the adaptive bandit / client harness.
 All optional fields use None instead of sentinel strings like "N/A".
+Also parses [spec-decode] plain-text log lines for accept_rate fallback.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Optional
+
+# Matches: [spec-decode] tokens=123 time=4.56 s speed=27.1 tok/s steps=10 accepted=8/10
+_SPEC_DECODE_RE = re.compile(
+    r"\[spec-decode\].*?steps=(\d+)\s+accepted=(\d+)/(\d+)"
+)
 
 
 @dataclass
@@ -49,6 +56,24 @@ def parse_bandit_log_line(line: str) -> Optional[BanditRunMetrics]:
     )
 
 
+def parse_spec_decode_line(line: str) -> Optional[BanditRunMetrics]:
+    """Parse a [spec-decode] plain-text log line.
+
+    Example input:
+        [spec-decode] tokens=312 time=18.50 s speed=16.9 tok/s steps=10 accepted=8/10
+
+    Returns BanditRunMetrics with accept_rate=accepted/total, or None if no match.
+    """
+    m = _SPEC_DECODE_RE.search(line)
+    if not m:
+        return None
+    accepted = int(m.group(2))
+    total = int(m.group(3))
+    if total == 0:
+        return None
+    return BanditRunMetrics(accept_rate=float(accepted) / float(total))
+
+
 def parse_bandit_log(text: str) -> list[BanditRunMetrics]:
     """Parse a multi-line log string. Skips non-record lines."""
     results = []
@@ -57,3 +82,36 @@ def parse_bandit_log(text: str) -> list[BanditRunMetrics]:
         if m is not None:
             results.append(m)
     return results
+
+
+def extract_accept_rate_from_log(log_text: str) -> Optional[float]:
+    """Extract the best accept_rate signal from a server log.
+
+    Strategy:
+    1. Scan for [pflash-bandit] JSONL lines — use the LAST one (converged state).
+    2. Fall back to [spec-decode] lines — use the LAST one.
+    3. Return None if neither is present.
+    """
+    last_bandit: Optional[BanditRunMetrics] = None
+    last_spec: Optional[BanditRunMetrics] = None
+
+    for line in log_text.splitlines():
+        stripped = line.strip()
+        # [pflash-bandit] lines embed JSON after the prefix
+        if "[pflash-bandit]" in stripped:
+            json_start = stripped.find("{")
+            if json_start != -1:
+                m = parse_bandit_log_line(stripped[json_start:])
+                if m is not None and m.accept_rate is not None:
+                    last_bandit = m
+        # [spec-decode] plain-text lines
+        if "[spec-decode]" in stripped:
+            m2 = parse_spec_decode_line(stripped)
+            if m2 is not None:
+                last_spec = m2
+
+    if last_bandit is not None:
+        return last_bandit.accept_rate
+    if last_spec is not None:
+        return last_spec.accept_rate
+    return None
