@@ -8,8 +8,11 @@
 #include "laguna_backend.h"
 #include "qwen3_backend.h"
 #include "gemma4_backend.h"
+#include "layer_split_backend.h"
+#include "qwen35_layer_split_adapter.h"
 
 #include <cstdio>
+#include <algorithm>
 
 namespace dflash::common {
 
@@ -42,6 +45,30 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
     std::fprintf(stderr, "[backend_factory] detected arch=%s\n", arch.c_str());
 
     if (arch == "qwen35") {
+        if (args.device.is_layer_split()) {
+            Qwen35LayerSplitAdapterConfig cfg;
+            cfg.target_path        = args.model_path;
+            cfg.draft_path         = args.draft_path;
+            cfg.device             = args.device;
+            cfg.draft_gpu          = args.draft_device.gpu;
+            cfg.remote_draft       = args.remote_draft;
+            cfg.fa_window          = args.fa_window;
+            cfg.kq_stride_pad      = args.kq_stride_pad;
+            cfg.draft_ctx_max      = args.draft_ctx_max;
+            cfg.max_verify_tokens  = args.ddtree_mode
+                ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, args.ddtree_budget + 1)
+                : DFLASH27B_DRAFT_BLOCK_SIZE;
+            cfg.run_dflash         = args.draft_path != nullptr;
+
+            auto adapter = std::make_unique<Qwen35LayerSplitAdapter>(cfg);
+            auto backend = std::make_unique<LayerSplitBackend>(std::move(adapter));
+            if (!backend->init()) {
+                std::fprintf(stderr, "[backend_factory] LayerSplitBackend(qwen35) init failed\n");
+                return nullptr;
+            }
+            return backend;
+        }
+
         Qwen35Config cfg;
         cfg.target_path        = args.model_path;
         cfg.draft_path         = args.draft_path;

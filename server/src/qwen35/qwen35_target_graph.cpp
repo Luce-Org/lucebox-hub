@@ -1304,6 +1304,7 @@ bool snapshot_target_cache(const TargetWeights & w,
         for (int i = 0; i < n_full_attn; i++) {
             ggml_tensor * sk = cache.attn_k[i];
             ggml_tensor * sv = cache.attn_v[i];
+            if (!sk || !sv) continue;
             ggml_tensor * K = ggml_new_tensor_3d(snap.ctx, sk->type, sk->ne[0], snap_pos, sk->ne[2]);
             ggml_tensor * V = ggml_new_tensor_3d(snap.ctx, sv->type, sv->ne[0], snap_pos, sv->ne[2]);
             char name[64];
@@ -1317,6 +1318,7 @@ bool snapshot_target_cache(const TargetWeights & w,
         for (int i = 0; i < n_delta; i++) {
             ggml_tensor * ss = cache.ssm_state[i];
             ggml_tensor * cs = cache.conv_state[i];
+            if (!ss || !cs) continue;
             ggml_tensor * S = ggml_new_tensor_3d(snap.ctx, ss->type, ss->ne[0], ss->ne[1], ss->ne[2]);
             ggml_tensor * C = ggml_new_tensor_2d(snap.ctx, cs->type, cs->ne[0], cs->ne[1]);
             char name[64];
@@ -1327,11 +1329,13 @@ bool snapshot_target_cache(const TargetWeights & w,
         }
 
         // Right-sized target_feat: [fc_in, min(snap_pos, target_feat_cap)]
-        {
+        if (cache.target_feat) {
             ggml_tensor * tf = cache.target_feat;
             const int feat_len = std::min(snap_pos, cache.target_feat_cap);
             snap.target_feat_snap = ggml_new_tensor_2d(snap.ctx, tf->type, tf->ne[0], feat_len);
             ggml_set_name(snap.target_feat_snap, "snap_target_feat");
+        } else {
+            snap.target_feat_snap = nullptr;
         }
 
         snap.buf = ggml_backend_alloc_ctx_tensors(snap.ctx, backend);
@@ -1358,6 +1362,7 @@ bool snapshot_target_cache(const TargetWeights & w,
         ggml_tensor * dk = snap.attn_k_snap[i];
         ggml_tensor * sv = cache.attn_v[i];
         ggml_tensor * dv = snap.attn_v_snap[i];
+        if (!sk || !dk || !sv || !dv) continue;
         const size_t k_strip = (size_t)snap_pos * sk->nb[1];
         const size_t v_strip = (size_t)snap_pos * sv->nb[1];
         for (int kh = 0; kh < (int)sk->ne[2]; kh++) {
@@ -1374,12 +1379,16 @@ bool snapshot_target_cache(const TargetWeights & w,
 
     // SSM/conv: full copy (fixed-size, same shapes).
     for (int i = 0; i < n_delta; i++) {
+        if (!cache.ssm_state[i] || !snap.ssm_state_snap[i] ||
+            !cache.conv_state[i] || !snap.conv_state_snap[i]) {
+            continue;
+        }
         ggml_backend_tensor_copy(cache.ssm_state[i],  snap.ssm_state_snap[i]);
         ggml_backend_tensor_copy(cache.conv_state[i], snap.conv_state_snap[i]);
     }
 
     // target_feat: partial copy of first min(snap_pos, cap) rows.
-    {
+    if (cache.target_feat && snap.target_feat_snap) {
         const size_t feat_nbytes = ggml_nbytes(snap.target_feat_snap);
         ggml_backend_tensor_get(cache.target_feat, snap.target_feat_snap->data, 0, feat_nbytes);
     }
@@ -1428,6 +1437,11 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache) {
         ggml_tensor * dk = cache.attn_k[i];
         ggml_tensor * sv = snap.attn_v_snap[i];
         ggml_tensor * dv = cache.attn_v[i];
+        if ((!sk || !sv) != (!dk || !dv)) {
+            set_last_error("restore_target_cache: KV shard layout mismatch");
+            return false;
+        }
+        if (!sk || !dk || !sv || !dv) continue;
         const size_t k_strip = (size_t)snap_pos * sk->nb[1];
         const size_t v_strip = (size_t)snap_pos * sv->nb[1];
         for (int kh = 0; kh < (int)sk->ne[2]; kh++) {
@@ -1444,12 +1458,21 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache) {
 
     // SSM/conv: full copy (fixed-size).
     for (int i = 0; i < n_delta; i++) {
+        if ((!snap.ssm_state_snap[i] || !snap.conv_state_snap[i]) !=
+            (!cache.ssm_state[i] || !cache.conv_state[i])) {
+            set_last_error("restore_target_cache: recurrent shard layout mismatch");
+            return false;
+        }
+        if (!snap.ssm_state_snap[i] || !cache.ssm_state[i] ||
+            !snap.conv_state_snap[i] || !cache.conv_state[i]) {
+            continue;
+        }
         ggml_backend_tensor_copy(snap.ssm_state_snap[i],  cache.ssm_state[i]);
         ggml_backend_tensor_copy(snap.conv_state_snap[i], cache.conv_state[i]);
     }
 
     // target_feat: partial copy of stored rows.
-    {
+    if (cache.target_feat && snap.target_feat_snap) {
         const size_t feat_nbytes = ggml_nbytes(snap.target_feat_snap);
         ggml_backend_tensor_set(cache.target_feat, snap.target_feat_snap->data, 0, feat_nbytes);
     }

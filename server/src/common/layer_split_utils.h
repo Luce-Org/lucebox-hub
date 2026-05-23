@@ -23,9 +23,11 @@ std::vector<std::pair<int,int>> compute_layer_ranges(
     const std::vector<double> & weights);
 
 // Validate a DevicePlacement against system constraints.
+// If device_count is negative, only validates structural constraints that do
+// not require querying the runtime-visible GPU count.
 // Returns empty string on success, error description on failure.
 std::string validate_device_placement(
     const DevicePlacement & dp,
-    int cuda_device_count);
+    int device_count);
 
 }  // namespace dflash::common

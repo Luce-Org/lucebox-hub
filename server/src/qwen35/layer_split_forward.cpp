@@ -215,6 +215,10 @@ bool run_target_layer_split_forward(
     activation_pair_free(acts);
     if (!ok) return false;
     last_tok = argmax_tokens.empty() ? -1 : argmax_tokens.back();
+    for (auto & shard : shards) {
+        shard.cache.cur_pos = base_pos + n_tokens_total;
+        shard.cache.last_tok = last_tok;
+    }
     if (argmax_out) *argmax_out = std::move(argmax_tokens);
     if (logits_out) logits_out->clear();
     return true;

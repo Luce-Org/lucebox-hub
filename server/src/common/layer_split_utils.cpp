@@ -41,13 +41,19 @@ std::vector<std::pair<int,int>> compute_layer_ranges(
 
 std::string validate_device_placement(
     const DevicePlacement & dp,
-    int cuda_device_count)
+    int device_count)
 {
-    if (cuda_device_count <= 0) return "no CUDA devices available";
+    const bool validate_device_count = device_count >= 0;
+    if (validate_device_count && device_count == 0) {
+        return "no GPU devices available";
+    }
 
-    if (dp.gpu < 0 || dp.gpu >= cuda_device_count) {
-        return "primary gpu " + std::to_string(dp.gpu) +
-               " out of range [0, " + std::to_string(cuda_device_count) + ")";
+    if (dp.gpu < 0 ||
+        (validate_device_count && dp.gpu >= device_count)) {
+        return "primary gpu " + std::to_string(dp.gpu) + " out of range" +
+               (validate_device_count
+                    ? " [0, " + std::to_string(device_count) + ")"
+                    : "");
     }
 
     if (!dp.layer_split_gpus.empty()) {
@@ -57,9 +63,13 @@ std::string validate_device_placement(
 
         std::set<int> seen;
         for (int g : dp.layer_split_gpus) {
-            if (g < 0 || g >= cuda_device_count) {
+            if (g < 0 ||
+                (validate_device_count && g >= device_count)) {
                 return "layer_split gpu " + std::to_string(g) +
-                       " out of range [0, " + std::to_string(cuda_device_count) + ")";
+                       " out of range" +
+                       (validate_device_count
+                            ? " [0, " + std::to_string(device_count) + ")"
+                            : "");
             }
             if (!seen.insert(g).second) {
                 return "duplicate gpu " + std::to_string(g) + " in layer_split_gpus";
