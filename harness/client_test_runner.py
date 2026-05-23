@@ -1978,17 +1978,56 @@ class _BaseAdapter:
             self.binary = binary
 
     def preflight_check(self) -> AdapterResult:
-        ok = bool(_shutil.which(self.binary))
-        if ok:
-            return AdapterResult(client=self.client, preflight_ok=True)
-        return AdapterResult(
-            client=self.client,
-            preflight_ok=False,
-            error=(
-                f"PREFLIGHT ERROR: '{self.binary}' not found on PATH. "
-                "Hint: run 'asdf reshim' or install it and ensure it is on PATH."
-            ),
+        # shutil.which finds the path but asdf shims can be stale; probe with --version
+        if not _shutil.which(self.binary):
+            return AdapterResult(
+                client=self.client,
+                preflight_ok=False,
+                error=(
+                    f"PREFLIGHT FAIL: '{self.binary}' not found on PATH. "
+                    "Hint: run 'asdf reshim' or install it and ensure it is on PATH."
+                ),
+            )
+        try:
+            result = subprocess.run(
+                [self.binary, "--version"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except subprocess.TimeoutExpired:
+            return AdapterResult(
+                client=self.client,
+                preflight_ok=False,
+                error=f"PREFLIGHT FAIL: '{self.binary} --version' timed out (5s) — binary may be broken.",
+            )
+        except Exception as exc:
+            return AdapterResult(
+                client=self.client,
+                preflight_ok=False,
+                error=f"PREFLIGHT FAIL: '{self.binary} --version' raised {exc!r}.",
+            )
+        combined = (result.stdout + result.stderr).lower()
+        asdf_broken = result.returncode != 0 and (
+            "unknown command" in combined or "reshim" in combined
         )
+        if asdf_broken:
+            return AdapterResult(
+                client=self.client,
+                preflight_ok=False,
+                error=(
+                    f"PREFLIGHT FAIL: '{self.binary}' via asdf shim is stale — "
+                    f"try `asdf reshim node` then re-run. (stderr: {result.stderr.strip()!r})"
+                ),
+            )
+        if result.returncode != 0:
+            return AdapterResult(
+                client=self.client,
+                preflight_ok=False,
+                error=(
+                    f"PREFLIGHT FAIL: '{self.binary} --version' exited {result.returncode}. "
+                    f"stderr: {result.stderr.strip()!r}"
+                ),
+            )
+        return AdapterResult(client=self.client, preflight_ok=True)
 
     def dry_run(self, *, session_id: str) -> AdapterResult:
         return AdapterResult(
