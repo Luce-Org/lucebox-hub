@@ -940,8 +940,9 @@ void HttpServer::worker_loop() {
         // doesn't grow monotonically across requests with different sizes.
         backend_.release_scratch();
 
-        // Bandit: update per-session state after generation.
-        if (!req.session_id.empty() && result.accept_rate > 0.0f) {
+        // Bandit: update when spec decode actually ran — including 0-accept case,
+        // which signals the current keep_ratio is too low.
+        if (!req.session_id.empty() && result.spec_decode_ran) {
             float old_keep = sessions_.get_keep_ratio(req.session_id);
             int   old_turn = sessions_.turn_count(req.session_id);
             sessions_.update(req.session_id, result.accept_rate);

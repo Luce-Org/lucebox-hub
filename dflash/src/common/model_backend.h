@@ -75,7 +75,9 @@ struct GenerateResult {
     double                     decode_s    = 0.0;
     // DFlash chain accept rate: accepted_draft_tokens / total_draft_positions.
     // 0.0 when spec decode did not run (AR fallback or no draft model).
-    float                      accept_rate = 0.0f;
+    float                      accept_rate     = 0.0f;
+    // True when spec decode actually ran (accept_rate==0 still needs a bandit update).
+    bool                       spec_decode_ran = false;
 };
 
 // ─── Backend interface ──────────────────────────────────────────────────

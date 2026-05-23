@@ -171,11 +171,13 @@ private:
                    int kv_offset = 0);
 
     // Speculative decode loop: draft → verify → accept until EOS/max.
-    // out_accept_rate receives accepted/total draft token ratio (0.0 if not run).
+    // out_accept_rate receives accepted/total draft token ratio (0.0 if AR fallback).
+    // out_spec_ran is true when spec decode actually ran (even with 0 accepts).
     bool do_spec_decode(int committed, int n_gen,
                         std::vector<int32_t> & out_tokens,
                         const DaemonIO & io,
                         float & out_accept_rate,
+                        bool & out_spec_ran,
                         const std::vector<int32_t> * hint_tokens = nullptr);
 
     // AR decode fallback (no draft model or sampling mode).

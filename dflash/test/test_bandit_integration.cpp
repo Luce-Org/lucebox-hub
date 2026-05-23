@@ -139,29 +139,22 @@ static void multi_turn_reaches_upper_bound() {
                     "keep must not exceed kBanditKeepMax");
 }
 
-// Test 6: Zero accept_rate does not update the session (guard against
-// spurious 0.0 from non-spec-decode paths).
-// This tests the server-side guard: update() should only be called when
-// accept_rate > 0.  We verify behavior is the same as never calling it.
-static void zero_accept_rate_guard() {
-    HttpServerSessions sessions_guarded;
-    HttpServerSessions sessions_unguarded;
+// Test 6: Zero accept_rate with spec_decode_ran=true MUST update the bandit.
+// Previously, the guard was accept_rate>0, which silently skipped 0-accept
+// sessions — exactly the case where the bandit most needs to act (push keep up).
+// The fix uses spec_decode_ran as the gate; this test exercises the session layer
+// directly: update() with 0.0 must drive keep_ratio toward kBanditKeepMax.
+static void zero_accept_drives_keep_up() {
+    HttpServerSessions sessions;
 
-    // Guarded path: server only calls update when accept_rate > 0
-    // → sessions_guarded stays at default
-    // Unguarded: we still call update with 0.0
-    sessions_unguarded.update("s1", 0.0f);
+    float k0 = sessions.get_keep_ratio("s1");
+    // Simulate server calling update() because spec_decode_ran==true, accept==0
+    sessions.update("s1", 0.0f);
+    float k1 = sessions.get_keep_ratio("s1");
 
-    float k_guarded   = sessions_guarded.get_keep_ratio("s1");
-    float k_unguarded = sessions_unguarded.get_keep_ratio("s1");
-
-    // Both should be within valid bounds
-    TEST_ASSERT(k_guarded   >= kBanditKeepMin && k_guarded   <= kBanditKeepMax);
-    TEST_ASSERT(k_unguarded >= kBanditKeepMin && k_unguarded <= kBanditKeepMax);
-
-    // Guarded stays at default
-    TEST_ASSERT_MSG(approx_eq(k_guarded, AdaptiveKeepRatioState{}.last_keep),
-                    "guarded session should stay at default when not updated");
+    TEST_ASSERT(k1 >= kBanditKeepMin && k1 <= kBanditKeepMax);
+    TEST_ASSERT_MSG(k1 > k0, "zero accept must increase keep_ratio");
+    TEST_ASSERT(sessions.turn_count("s1") == 1);
 }
 
 // ─── main ────────────────────────────────────────────────────────────────────
@@ -174,7 +167,7 @@ int main() {
     RUN_TEST(isolated_sessions);
     RUN_TEST(multi_turn_reaches_lower_bound);
     RUN_TEST(multi_turn_reaches_upper_bound);
-    RUN_TEST(zero_accept_rate_guard);
+    RUN_TEST(zero_accept_drives_keep_up);
 
     std::fprintf(stderr, "\n%d tests, %d failures\n", test_count, test_failures);
     return (test_failures == 0) ? 0 : 1;

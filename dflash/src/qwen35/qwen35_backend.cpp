@@ -501,7 +501,7 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
     // Decode (speculative)
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
-        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io, result.accept_rate, req.hint_tokens)) {
+        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io, result.accept_rate, result.spec_decode_ran, req.hint_tokens)) {
             result.error = "decode";
             return result;
         }
@@ -562,7 +562,7 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
     // Decode
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
-        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io, result.accept_rate, req.hint_tokens)) {
+        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io, result.accept_rate, result.spec_decode_ran, req.hint_tokens)) {
             result.error = "decode";
             return result;
         }
@@ -799,8 +799,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io,
                                     float & out_accept_rate,
+                                    bool & out_spec_ran,
                                     const std::vector<int32_t> * hint_tokens) {
     out_accept_rate = 0.0f;
+    out_spec_ran    = false;
     const int hidden = w_.n_embd;
 
     // First token: use the argmax that do_prefill already sampled and stored.
@@ -827,6 +829,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         io.emit(-1);
         return ok;
     }
+
+    out_spec_ran = true;
 
     // ── DFlash spec-decode: draft → verify → accept → replay ──────────
 
