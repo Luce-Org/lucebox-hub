@@ -85,12 +85,4 @@ void free_layer_split_snapshot_backends(
     const std::vector<LayerSplitShardMeta *> & shards,
     std::vector<ggml_backend_t> & snapshot_backends);
 
-// Validate a DevicePlacement against system constraints.
-// If device_count is negative, only validates structural constraints that do
-// not require querying the runtime-visible GPU count.
-// Returns empty string on success, error description on failure.
-std::string validate_device_placement(
-    const DevicePlacement & dp,
-    int device_count);
-
 }  // namespace dflash::common
