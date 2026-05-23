@@ -165,6 +165,18 @@ static void unknown_session_returns_default() {
     TEST_ASSERT(mgr.turn_count("no-such-session") == 0);
 }
 
+static void get_ema_reflects_post_update_value() {
+    HttpServerSessions mgr;
+    TEST_ASSERT_MSG(approx_eq(mgr.get_ema("s1"), 0.0f), "unknown session ema is 0");
+    // First turn: ema seeds to observed directly
+    mgr.update("s1", 0.80f);
+    TEST_ASSERT_MSG(approx_eq(mgr.get_ema("s1"), 0.80f), "first-turn ema == observed");
+    // Second turn: ema = alpha*prev + (1-alpha)*observed
+    mgr.update("s1", 0.60f);
+    float expected = kBanditEmaAlpha * 0.80f + (1.0f - kBanditEmaAlpha) * 0.60f;
+    TEST_ASSERT_MSG(approx_eq(mgr.get_ema("s1"), expected), "second-turn ema correct");
+}
+
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -181,6 +193,7 @@ int main() {
     RUN_TEST(escalation_far_outside_band);
     RUN_TEST(sessions_isolated);
     RUN_TEST(unknown_session_returns_default);
+    RUN_TEST(get_ema_reflects_post_update_value);
 
     std::fprintf(stderr, "\n%d tests, %d failures\n", test_count, test_failures);
     return (test_failures == 0) ? 0 : 1;

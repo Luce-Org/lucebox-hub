@@ -946,13 +946,11 @@ void HttpServer::worker_loop() {
             int   old_turn = sessions_.turn_count(req.session_id);
             sessions_.update(req.session_id, result.accept_rate);
             float new_keep = sessions_.get_keep_ratio(req.session_id);
-            float ema_val  = kBanditEmaAlpha * result.accept_rate
-                             + (1.0f - kBanditEmaAlpha) * result.accept_rate;
-            (void)ema_val;  // reported via old_turn for now
+            float ema      = sessions_.get_ema(req.session_id);
             std::fprintf(stderr,
-                "[pflash-bandit] session=%s turn=%d keep=%.4f->%.4f (accept=%.3f)\n",
+                "[pflash-bandit] session=%s turn=%d keep=%.4f->%.4f ema=%.3f accept=%.3f\n",
                 req.session_id.c_str(), old_turn + 1,
-                old_keep, new_keep, result.accept_rate);
+                old_keep, new_keep, ema, result.accept_rate);
         }
 
 
