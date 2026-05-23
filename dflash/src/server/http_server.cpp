@@ -1284,9 +1284,10 @@ void HttpServer::worker_loop() {
         std::vector<int32_t> phase2_tokens;
         std::string close_kind = "natural";
 
-        // Diagnostic: log all phase-2 gate inputs so we can correlate
-        // probe-vs-bench, cache-on-vs-off, pflash-on-vs-off behavior
-        // when phase-2 fires inconsistently. Strip after Level 1 ships.
+        // Phase-2 gate diagnostic — compile out by default. Enable with
+        // -DDFLASH_DEBUG_PHASE2_GATE=1 to surface the gate-input dump
+        // again (useful when Level 1 / Level 2 behavior drifts).
+#ifdef DFLASH_DEBUG_PHASE2_GATE
         {
             std::vector<int32_t> tail_ids(
                 effective_prompt.size() >= 10
@@ -1294,10 +1295,8 @@ void HttpServer::worker_loop() {
                     : effective_prompt.begin(),
                 effective_prompt.end());
             std::string tail_text = tokenizer_.decode(tail_ids);
-            // Replace control chars in tail so the log line stays single-line.
             for (auto & ch : tail_text) {
-                if (ch == '\n') ch = '|';
-                else if (ch == '\r') ch = '|';
+                if (ch == '\n' || ch == '\r') ch = '|';
             }
             std::string phase1_decoded;
             if (!phase1_tokens.empty()) {
@@ -1319,6 +1318,7 @@ void HttpServer::worker_loop() {
                 req.max_output, phase1_cap, dbg_ph2_gen_len,
                 (int)dbg_close_found, tail_text.c_str());
         }
+#endif
 
         if (req.thinking_opt_in &&
             req.started_in_thinking &&
@@ -1471,9 +1471,26 @@ void HttpServer::worker_loop() {
                     }
                     msg["tool_calls"] = tcs;
                 }
+                // finish_reason: emitter only knows about "stop" / "tool_calls"
+                // (EOS / tool-call detection). It can't see that the daemon
+                // hit the n_gen cap. Compute "length" here from the
+                // committed-token counts vs the per-phase caps. Mirrors
+                // server.py:2245-2248. OpenAI/Anthropic clients (open-webui,
+                // Cline) gate retry logic on finish_reason="length".
+                std::string effective_finish_reason = emitter.finish_reason();
+                if (effective_finish_reason == "stop") {
+                    bool phase1_at_cap = (int)phase1_tokens.size() >= phase1_cap;
+                    int  ph2_cap_est   = std::max(0,
+                        req.max_output - (int)phase1_tokens.size());
+                    bool phase2_at_cap = !phase2_tokens.empty() &&
+                        (int)phase2_tokens.size() >= ph2_cap_est;
+                    if (phase1_at_cap || phase2_at_cap) {
+                        effective_finish_reason = "length";
+                    }
+                }
                 json choice = {
                     {"index", 0}, {"message", msg},
-                    {"finish_reason", emitter.finish_reason()}
+                    {"finish_reason", effective_finish_reason}
                 };
                 // finish_details — mirrors ds4_eval.c's eval_think_close_info.
                 // Emitted when the caller opted in to the thinking-budget
@@ -1546,11 +1563,26 @@ void HttpServer::worker_loop() {
                         });
                     }
                 }
+                // stop_reason: Anthropic's analog of finish_reason. Same
+                // length-vs-EOS distinction as OpenAI — Cline / Anthropic
+                // SDK gate retry on stop_reason=="max_tokens".
+                std::string anthropic_stop_reason;
+                {
+                    std::string er = emitter.finish_reason();
+                    bool phase1_at_cap = (int)phase1_tokens.size() >= phase1_cap;
+                    int  ph2_cap_est   = std::max(0,
+                        req.max_output - (int)phase1_tokens.size());
+                    bool phase2_at_cap = !phase2_tokens.empty() &&
+                        (int)phase2_tokens.size() >= ph2_cap_est;
+                    if (er == "tool_calls")            anthropic_stop_reason = "tool_use";
+                    else if (phase1_at_cap || phase2_at_cap) anthropic_stop_reason = "max_tokens";
+                    else                               anthropic_stop_reason = "end_turn";
+                }
                 resp = {
                     {"id", req.response_id}, {"type", "message"},
                     {"role", "assistant"}, {"model", req.model},
                     {"content", content},
-                    {"stop_reason", emitter.finish_reason() == "stop" ? "end_turn" : "tool_use"},
+                    {"stop_reason", anthropic_stop_reason},
                     {"usage", {
                         {"input_tokens", (int)req.prompt_tokens.size()},
                         {"output_tokens", total_completion_tokens}
