@@ -1978,9 +1978,19 @@ class _BaseAdapter:
         if binary is not None:
             self.binary = binary
 
+    def preflight_env(self) -> dict[str, str]:
+        """Return the environment that preflight_check should use.
+
+        Default: current process environment.
+        Override on adapters that mutate HOME in live_run so preflight
+        catches asdf shim breaks under the same HOME isolation.
+        """
+        return os.environ.copy()
+
     def preflight_check(self) -> AdapterResult:
         # shutil.which finds the path but asdf shims can be stale; probe with --version
-        if not _shutil.which(self.binary):
+        env = self.preflight_env()
+        if not _shutil.which(self.binary, path=env.get("PATH")):
             return AdapterResult(
                 client=self.client,
                 preflight_ok=False,
@@ -1993,6 +2003,7 @@ class _BaseAdapter:
             result = subprocess.run(
                 [self.binary, "--version"],
                 capture_output=True, text=True, timeout=5,
+                env=env,
             )
         except subprocess.TimeoutExpired:
             return AdapterResult(
@@ -2163,9 +2174,20 @@ class CodexAdapter(_BaseAdapter):
     client = "codex"
     binary = "codex"
 
+    def preflight_env(self) -> dict[str, str]:
+        """Use a temp HOME so preflight matches the isolation live_run applies."""
+        import tempfile as _tempfile
+        env = os.environ.copy()
+        # Use a short-lived empty HOME — mirrors what live_run does with tempfile.TemporaryDirectory
+        tmp = _tempfile.mkdtemp(prefix="codex-preflight-")
+        env["HOME"] = tmp
+        env["CODEX_HOME"] = tmp
+        return env
+
     def preflight_check(self) -> AdapterResult:
         # codex does not support --version; use --help which exits 0 when the shim is healthy
-        if not _shutil.which(self.binary):
+        env = self.preflight_env()
+        if not _shutil.which(self.binary, path=env.get("PATH")):
             return AdapterResult(
                 client=self.client, preflight_ok=False,
                 error=f"PREFLIGHT FAIL: 'codex' not found on PATH. Try `asdf reshim node` then re-run.",
@@ -2174,6 +2196,7 @@ class CodexAdapter(_BaseAdapter):
             result = subprocess.run(
                 [self.binary, "--help"],
                 capture_output=True, text=True, timeout=5,
+                env=env,
             )
         except subprocess.TimeoutExpired:
             return AdapterResult(
@@ -2257,9 +2280,18 @@ class PiAdapter(_BaseAdapter):
     client = "pi"
     binary = "pi"
 
+    def preflight_env(self) -> dict[str, str]:
+        """Use a temp HOME so preflight matches the isolation live_run applies."""
+        import tempfile as _tempfile
+        env = os.environ.copy()
+        tmp = _tempfile.mkdtemp(prefix="pi-preflight-")
+        env["HOME"] = tmp
+        return env
+
     def preflight_check(self) -> AdapterResult:
         # pi --version may fail if asdf shim is stale; probe with --help
-        if not _shutil.which(self.binary):
+        env = self.preflight_env()
+        if not _shutil.which(self.binary, path=env.get("PATH")):
             return AdapterResult(
                 client=self.client, preflight_ok=False,
                 error=f"PREFLIGHT FAIL: 'pi' not found on PATH. Try `asdf reshim node` then re-run.",
@@ -2268,6 +2300,7 @@ class PiAdapter(_BaseAdapter):
             result = subprocess.run(
                 [self.binary, "--help"],
                 capture_output=True, text=True, timeout=5,
+                env=env,
             )
         except subprocess.TimeoutExpired:
             return AdapterResult(

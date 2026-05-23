@@ -1,13 +1,17 @@
-"""Tests for preflight_require_bin in common.sh (seed #3).
+"""Tests for preflight_require_bin in common.sh (seed #3) and adapter HOME isolation (Blocker #7).
 
 Verifies that:
   - preflight_require_bin exits 78 with actionable message when binary missing
   - preflight_require_bin exits 0 when binary is found
+  - CodexAdapter.preflight_env() injects a temp HOME (HOME isolation)
+  - PiAdapter.preflight_env() injects a temp HOME (HOME isolation)
+  - preflight_check with an asdf-broken shim (outputs "unknown command") returns (False, reshim msg)
 """
 
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -119,6 +123,65 @@ class TestPreflightRequireBin(unittest.TestCase):
         self.assertEqual(result.returncode, 78, msg=f"stderr: {result.stderr}")
         combined = (result.stdout + result.stderr).lower()
         self.assertIn("asdf", combined)
+
+
+class TestAdapterPreflightHomeIsolation(unittest.TestCase):
+    """Blocker #7: preflight_env() injects temp HOME matching live_run isolation."""
+
+    def test_codex_preflight_env_has_temp_home(self):
+        """CodexAdapter.preflight_env() returns HOME != real HOME."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+        from harness.client_test_runner import CodexAdapter
+        adapter = CodexAdapter()
+        env = adapter.preflight_env()
+        self.assertIn("HOME", env)
+        self.assertNotEqual(env["HOME"], os.environ.get("HOME", ""),
+                            msg="preflight HOME must be isolated from real HOME")
+        self.assertIn("CODEX_HOME", env)
+        self.assertEqual(env["HOME"], env["CODEX_HOME"])
+
+    def test_pi_preflight_env_has_temp_home(self):
+        """PiAdapter.preflight_env() returns HOME != real HOME."""
+        from harness.client_test_runner import PiAdapter
+        adapter = PiAdapter()
+        env = adapter.preflight_env()
+        self.assertIn("HOME", env)
+        self.assertNotEqual(env["HOME"], os.environ.get("HOME", ""),
+                            msg="preflight HOME must be isolated from real HOME")
+
+    def test_base_adapter_preflight_env_uses_real_env(self):
+        """_BaseAdapter.preflight_env() returns current process environment."""
+        from harness.client_test_runner import ClaudeCodeAdapter
+        adapter = ClaudeCodeAdapter()
+        env = adapter.preflight_env()
+        # Should contain PATH from current process
+        self.assertEqual(env.get("PATH"), os.environ.get("PATH"))
+
+    def test_codex_preflight_catches_asdf_shim_break_via_stub(self):
+        """preflight_check returns (False, reshim msg) when binary outputs 'unknown command'.
+
+        Creates a fake 'codex' script that exits 0 but prints 'unknown command: node'
+        to stderr — simulating a stale asdf shim. Verifies preflight catches this.
+        """
+        from harness.client_test_runner import CodexAdapter
+        with tempfile.TemporaryDirectory() as fake_bin_dir:
+            fake_codex = Path(fake_bin_dir) / "codex"
+            fake_codex.write_text(
+                "#!/bin/sh\necho 'unknown command: node, perhaps reshim?' >&2\nexit 1\n"
+            )
+            fake_codex.chmod(fake_codex.stat().st_mode | stat.S_IEXEC)
+
+            adapter = CodexAdapter(binary=str(fake_codex))
+            result = adapter.preflight_check()
+
+        self.assertFalse(result.preflight_ok)
+        self.assertIsNotNone(result.error)
+        msg = (result.error or "").lower()
+        self.assertTrue(
+            "reshim" in msg or "asdf" in msg,
+            msg=f"Expected reshim/asdf hint in error, got: {result.error!r}",
+        )
 
 
 if __name__ == "__main__":
