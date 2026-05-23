@@ -135,6 +135,7 @@ struct CpuEmbedder {
     int64_t          n_embd = 0;
     int64_t          n_vocab = 0;
     size_t           row_bytes = 0;             // bytes per row in the quant format
+    std::vector<uint8_t> tok_embd_owned;        // optional owned tok_embd payload
 
     ~CpuEmbedder();
     // Dequantize N rows specified by `ids` into `out_f32` (shape [n_embd, n]).

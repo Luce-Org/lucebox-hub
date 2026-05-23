@@ -722,26 +722,21 @@ bool load_target_gguf_partial(const std::string & path,
         return false;
     }
 
-    // ── 5. Transfer mmap ownership to the CpuEmbedder so it can dequantize
-    //       rows on demand without uploading the full embedding table to GPU.
-    out.embedder.mmap_addr      = mm.addr;
-    out.embedder.mmap_len       = mm.len;
-#if defined(_WIN32)
-    out.embedder.mmap_hfile     = mm.hFile;
-    out.embedder.mmap_hmap      = mm.hMap;
-#else
-    out.embedder.mmap_fd        = mm.fd;
-#endif
+    // ── 5. Copy token_embd bytes to owned host memory so we do not keep the
+    //       entire GGUF mmap resident just for CPU embedding lookup.
     if (out.n_vocab <= 0) {
         set_last_error("invalid n_vocab in GGUF metadata (token embedder cannot be sized)");
         return false;
     }
-    out.embedder.tok_embd_bytes = (const uint8_t *)mm.addr + tok_embd_off;
+    out.embedder.tok_embd_owned.resize(tok_embd_sz);
+    std::memcpy(out.embedder.tok_embd_owned.data(),
+                (const uint8_t *)mm.addr + tok_embd_off,
+                tok_embd_sz);
+    out.embedder.tok_embd_bytes = out.embedder.tok_embd_owned.data();
     out.embedder.tok_embd_type  = tok_embd_type;
     out.embedder.n_embd         = out.n_embd;
     out.embedder.n_vocab        = out.n_vocab;
     out.embedder.row_bytes      = tok_embd_sz / (size_t)out.n_vocab;
-    mm.release();  // don't munmap on Mmap dtor — now owned by the embedder
 
     // Stash the total for callers that want to print it
     char summary[192];
