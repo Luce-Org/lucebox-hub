@@ -1059,11 +1059,13 @@ def start_server(
                 "Build it with `cmake --build dflash/build` or set DFLASH_SERVER_BIN, "
                 "or set LUCEBOX_SERVER_BACKEND=python to use the Python fallback."
             )
+        # dflash_server expects the target model as a positional argv[1];
+        # it has no --target flag and exits with usage if argv[1] starts with '-'.
         args = [
             str(cpp_bin),
+            str(target),
             "--host", "127.0.0.1",
             "--port", str(port),
-            "--target", str(target),
             "--draft", str(draft),
             *profile.args,
         ]
@@ -2496,17 +2498,14 @@ _CSV_COLUMNS = ["client", "preflight_ok", "session_id_captured", "accept_rate", 
 _DEFAULT_PFLASH_DRAFTER = Path("/home/peppi/models/Qwen3-0.6B-BF16.gguf")
 
 # Server profile for bandit live runs: enables prefill compression + pflash drafter.
+# Flags must all be recognised by dflash/src/server/server_main.cpp (unknown flags → exit 2).
 BANDIT_SERVER_PROFILE = ServerProfile(
     name="bandit_pflash",
     args=(
-        "--budget", "22",
-        "--verify-mode", "ddtree",
         "--max-ctx", "32768",
         "--fa-window", "2048",
         "--cache-type-k", "tq3_0",
         "--cache-type-v", "tq3_0",
-        "--prefix-cache-slots", "0",
-        "--prefill-cache-slots", "0",
         "--prefill-compression", "auto",
         "--prefill-threshold", "4096",
         "--prefill-keep-ratio", "0.10",

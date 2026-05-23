@@ -188,6 +188,62 @@ class TestAcceptRatePopulatedFromLog(unittest.TestCase):
             log_path.unlink(missing_ok=True)
 
 
+class TestRunBanditWiresAcceptRate(unittest.TestCase):
+    """Regression: run_bandit must populate accept_rate from server_log_path via metrics_parser.
+
+    Previous tests duplicated the wiring logic inline (line-for-line); they did not
+    exercise the actual code path inside run_bandit. This test stubs the adapter and
+    calls run_bandit directly so the wiring at client_test_runner.py:2569-2579 is
+    covered.
+    """
+
+    def test_run_bandit_populates_accept_rate_from_server_log(self):
+        from harness.client_test_runner import (
+            run_bandit, _ADAPTER_REGISTRY, AdapterResult,
+        )
+
+        log_content = (
+            "[pflash] 18517 -> 1809 -> 1821 tokens (9.8% kept)\n"
+            "[spec-decode] tokens=7 steps=16 accepted=3/16 (18.75%)\n"
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            f.write(log_content)
+            log_path = Path(f.name)
+
+        class _Stub:
+            client = "claude_code"
+            def preflight_check(self):
+                return AdapterResult(
+                    client="claude_code", preflight_ok=True, session_id_captured=False,
+                )
+            def live_run(self, *, session_id, **_kw):
+                return AdapterResult(
+                    client="claude_code", preflight_ok=True, session_id=session_id,
+                    session_id_captured=True, wall_s=10.0, exit_code=0,
+                )
+
+        original = _ADAPTER_REGISTRY.get("claude_code")
+        _ADAPTER_REGISTRY["claude_code"] = lambda: _Stub()
+        try:
+            buf = io.StringIO()
+            results = run_bandit(
+                clients=["claude_code"], condition="C_bandit",
+                output=buf, server_log_path=log_path,
+            )
+            self.assertEqual(len(results), 1)
+            self.assertIsNotNone(
+                results[0].accept_rate,
+                msg="run_bandit must wire accept_rate from server_log_path",
+            )
+            self.assertAlmostEqual(results[0].accept_rate, 3.0 / 16.0)
+            rows = list(csv.DictReader(io.StringIO(buf.getvalue())))
+            self.assertEqual(rows[0]["accept_rate"], str(3.0 / 16.0))
+        finally:
+            if original is not None:
+                _ADAPTER_REGISTRY["claude_code"] = original
+            log_path.unlink(missing_ok=True)
+
+
 class TestBanditServerProfileHasPflash(unittest.TestCase):
     """Blocker #8: BANDIT_SERVER_PROFILE must include --prefill-compression auto."""
 
@@ -210,6 +266,30 @@ class TestBanditServerProfileHasPflash(unittest.TestCase):
     def test_bandit_server_profile_needs_prefill_drafter(self):
         """BANDIT_SERVER_PROFILE.needs_prefill_drafter is True."""
         self.assertTrue(BANDIT_SERVER_PROFILE.needs_prefill_drafter)
+
+    def test_bandit_server_profile_only_cpp_recognised_flags(self):
+        """All BANDIT_SERVER_PROFILE flags must be recognised by dflash/src/server/server_main.cpp.
+
+        Stale Python-server flags (--budget, --verify-mode, --prefix-cache-slots,
+        --prefill-cache-slots) cause the C++ binary to exit 2 with 'unknown option'
+        before it ever opens a port — server.log ends up containing only usage text,
+        and accept_rate in the CSV stays empty.
+        """
+        forbidden = {
+            "--budget",
+            "--verify-mode",
+            "--prefix-cache-slots",
+            "--prefill-cache-slots",
+        }
+        args = list(BANDIT_SERVER_PROFILE.args)
+        present = forbidden.intersection(args)
+        self.assertFalse(
+            present,
+            msg=(
+                f"BANDIT_SERVER_PROFILE contains C++-server-unknown flags {present}; "
+                "they cause dflash_server to exit 2 before serving any request."
+            ),
+        )
 
     def test_start_server_argv_includes_prefill_compression_when_bandit_profile(self):
         """start_server with BANDIT_SERVER_PROFILE builds argv with --prefill-compression auto.
