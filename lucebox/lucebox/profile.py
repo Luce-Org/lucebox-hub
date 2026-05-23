@@ -328,6 +328,7 @@ def _runtime_tunables(cfg: Config) -> dict[str, Any]:
         "prefill_keep_ratio": d.prefill_keep_ratio,
         "prefill_threshold": d.prefill_threshold,
         "prefill_drafter": d.prefill_drafter,
+        "think_max": d.think_max,
     }
 
 
@@ -710,7 +711,7 @@ def registry() -> list[StepDefinition]:
     live_tunables = (
         "budget", "max_ctx", "lazy", "prefix_cache_slots", "prefill_cache_slots",
         "cache_type_k", "cache_type_v", "prefill_mode", "prefill_keep_ratio",
-        "prefill_threshold", "prefill_drafter",
+        "prefill_threshold", "prefill_drafter", "think_max",
     )
     return [
         StepDefinition(

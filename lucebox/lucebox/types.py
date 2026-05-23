@@ -54,6 +54,10 @@ class DflashRuntime:
     prefill_keep_ratio: float = 0.05
     prefill_threshold: int = 32000
     prefill_drafter: str = ""
+    # Phase-1 (thinking) cap when a request opts into thinking. Default mirrors
+    # antirez/ds4 ds4_eval.c: think_max_tokens = max_tokens - hard_limit_reply
+    # budget = 16000 - 512 = 15488. The server's own hardcoded default is 10000.
+    think_max: int = 15488
 
 
 @dataclass(frozen=True, slots=True)

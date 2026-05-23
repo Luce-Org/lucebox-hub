@@ -147,6 +147,7 @@ def _from_dict(raw: dict[str, Any]) -> Config:
         prefill_keep_ratio=float(df.get("prefill_keep_ratio", 0.05)),
         prefill_threshold=int(df.get("prefill_threshold", 32000)),
         prefill_drafter=str(df.get("prefill_drafter", "")),
+        think_max=int(df.get("think_max", 15488)),
     )
 
     host_raw = raw.get("host", {})

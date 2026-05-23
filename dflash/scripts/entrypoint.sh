@@ -120,6 +120,11 @@ fi
 : "${DFLASH_PREFILL_KEEP:=0.05}"
 : "${DFLASH_PREFILL_THRESHOLD:=32000}"
 : "${DFLASH_PREFILL_DRAFTER:=}"
+# Phase-1 (thinking) cap when a request opts into thinking. Default mirrors
+# antirez/ds4 ds4_eval.c: think_max_tokens = max_tokens(16000) - hard_limit
+# reply budget(512) = 15488. The server's own hardcoded default is 10000;
+# overriding here aligns ds4-eval and similar reasoning benches with upstream.
+: "${DFLASH_THINK_MAX:=15488}"
 
 # ── auto-detect target ─────────────────────────────────────────────────────
 # Largest .gguf wins (target ~16 GB vs ~1 GB drafter). Follow symlinks so a
@@ -209,7 +214,8 @@ CMD=("$DFLASH_SERVER_BIN" "$DFLASH_TARGET"
      --host "$DFLASH_HOST"
      --port "$DFLASH_PORT"
      --max-ctx "$DFLASH_MAX_CTX"
-     --prefix-cache-slots "$DFLASH_PREFIX_CACHE_SLOTS")
+     --prefix-cache-slots "$DFLASH_PREFIX_CACHE_SLOTS"
+     --think-max-tokens "$DFLASH_THINK_MAX")
 
 [ -n "$DRAFT_ARG" ]                && CMD+=(--draft "$DRAFT_ARG")
 [ -n "$DRAFT_ARG" ]                && CMD+=(--ddtree --ddtree-budget "$DFLASH_BUDGET")

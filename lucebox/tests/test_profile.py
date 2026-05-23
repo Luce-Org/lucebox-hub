@@ -183,7 +183,7 @@ def test_ds4_profile_step_uses_upstream_sized_score_only_run(tmp_path):
         assert "--area" in argv
         assert argv[argv.index("--area") + 1] == "ds4-eval"
         assert "--max-tokens" in argv
-        assert argv[argv.index("--max-tokens") + 1] == "4096"
+        assert argv[argv.index("--max-tokens") + 1] == "16000"
         assert "--think" in argv
         assert "--min-pass-rate" in argv
         assert argv[argv.index("--min-pass-rate") + 1] == "0.0"

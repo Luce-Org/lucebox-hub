@@ -95,6 +95,7 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
         ("DFLASH_MAX_CTX", str(cfg.dflash.max_ctx)),
         ("DFLASH_PREFIX_CACHE_SLOTS", str(cfg.dflash.prefix_cache_slots)),
         ("DFLASH_PREFILL_CACHE_SLOTS", str(cfg.dflash.prefill_cache_slots)),
+        ("DFLASH_THINK_MAX", str(cfg.dflash.think_max)),
         ("DFLASH_PORT", "8080"),
     ]
     if cfg.dflash.lazy:
@@ -137,6 +138,7 @@ def benchmark_run_spec(cfg: Config, args: tuple[str, ...] = ()) -> DockerRunSpec
         ("DFLASH_MAX_CTX", str(cfg.dflash.max_ctx)),
         ("DFLASH_PREFIX_CACHE_SLOTS", str(cfg.dflash.prefix_cache_slots)),
         ("DFLASH_PREFILL_CACHE_SLOTS", str(cfg.dflash.prefill_cache_slots)),
+        ("DFLASH_THINK_MAX", str(cfg.dflash.think_max)),
     ]
     if cfg.dflash.lazy:
         env.append(("DFLASH_LAZY", "1"))
