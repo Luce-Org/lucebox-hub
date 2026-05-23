@@ -916,6 +916,10 @@ void HttpServer::worker_loop() {
             result = backend_.generate(gen_req, io);
         }
 
+        // Log prefill timing (post-compression token count if pflash was active).
+        std::fprintf(stderr, "[prefill] tokens=%zu time=%.3f s\n",
+                     effective_prompt.size(), result.prefill_s);
+
         // Lazy-draft: park decode draft after generate to free VRAM.
         if (config_.lazy_draft) {
             backend_.park("draft");
