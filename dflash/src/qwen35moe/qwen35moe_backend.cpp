@@ -156,23 +156,11 @@ bool Qwen35MoeBackend::run_ar_decode_path(int committed, int n_gen,
     const int vocab  = target_weights().n_vocab;
     std::vector<float> logits_buf((size_t)vocab);
     std::vector<float> act_cur((size_t)hidden);
-    std::vector<float> act_next((size_t)hidden);
-    std::vector<float> residual((size_t)hidden);
-    std::vector<float> post((size_t)hidden);
-    std::vector<float> ffn_out((size_t)hidden);
-    std::string err;
     uint64_t hot_selected_total = 0;
     uint64_t cold_selected_total = 0;
     uint64_t decode_prefn_us = 0;
-    uint64_t decode_ffn_wall_us = 0;
-    uint64_t decode_ffn_partition_us = 0;
-    uint64_t decode_ffn_hot_us = 0;
-    uint64_t decode_ffn_cold_us = 0;
-    uint64_t decode_ffn_shared_us = 0;
-    uint64_t decode_ffn_combine_us = 0;
     uint64_t decode_logits_us = 0;
     uint64_t cold_layer_calls = 0;
-    uint64_t hot_only_layer_calls = 0;
     uint64_t layer_calls = 0;
     const auto decode_t0 = HybridClock::now();
 
@@ -233,9 +221,9 @@ bool Qwen35MoeBackend::run_ar_decode_path(int committed, int n_gen,
 
         for (int il = 0; il < target_weights().n_layer; ++il) {
             const auto prefn_t0 = HybridClock::now();
-            if (!build_layer_prefn_step(layer_sg, target_weights(), target_cache(), target_backend(),
-                                        il, committed, /*n_tokens=*/1,
-                                        /*with_mask=*/false, /*fa_window=*/0, cfg_.kq_stride_pad)) {
+            if (!build_hybrid_full_layer_step(layer_sg, target_weights(), target_cache(), target_backend(),
+                                              il, committed, /*n_tokens=*/1,
+                                              /*with_mask=*/false, /*fa_window=*/0, cfg_.kq_stride_pad)) {
                 step_graph_destroy(layer_sg);
                 return false;
             }
@@ -250,68 +238,45 @@ bool Qwen35MoeBackend::run_ar_decode_path(int committed, int n_gen,
                 return false;
             }
 
-            ggml_backend_tensor_get(layer_sg.ffn_residual, residual.data(), 0, sizeof(float) * (size_t)hidden);
-            ggml_backend_tensor_get(layer_sg.ffn_post, post.data(), 0, sizeof(float) * (size_t)hidden);
+            // Read layer output (pre-FFN + MoE FFN + shared + residual computed on GPU)
+            ggml_backend_tensor_get(layer_sg.hidden_input, act_cur.data(), 0, sizeof(float) * (size_t)hidden);
 
+            // Read moe_selected for routing stats
             const auto & storage = target_weights().moe_hybrid->layers[(size_t)il];
             std::vector<int32_t> selected((size_t)target_weights().n_expert_used);
-            std::vector<float> weights((size_t)target_weights().n_expert_used);
-            if (layer_sg.moe_selected.empty() || !layer_sg.moe_selected[(size_t)il] || !layer_sg.moe_weights) {
-                step_graph_destroy(layer_sg);
-                return false;
-            }
-            ggml_backend_tensor_get(layer_sg.moe_selected[(size_t)il], selected.data(), 0,
-                                    sizeof(int32_t) * selected.size());
-            ggml_backend_tensor_get(layer_sg.moe_weights, weights.data(), 0,
-                                    sizeof(float) * weights.size());
-            if (routing_stats_) {
-                routing_stats_->observe(il, selected.data(), (int)selected.size());
+            if (!layer_sg.moe_selected.empty() && layer_sg.moe_selected[(size_t)il]) {
+                ggml_backend_tensor_get(layer_sg.moe_selected[(size_t)il], selected.data(), 0,
+                                        sizeof(int32_t) * selected.size());
+                if (routing_stats_) {
+                    routing_stats_->observe(il, selected.data(), (int)selected.size());
+                }
             }
             const auto prefn_t1 = HybridClock::now();
             decode_prefn_us += elapsed_us(prefn_t0, prefn_t1);
 
-            Qwen35MoeHybridFfnTelemetry ffn_telemetry;
-            const auto ffn_t0 = HybridClock::now();
-            if (!eval_qwen35moe_hybrid_ffn_single(target_backend(), target_weights(),
-                                                  target_weights().layers[(size_t)il], storage,
-                                                  target_weights().moe_hybrid->cpu_backend,
-                                                  post.data(), selected.data(), weights.data(),
-                                                  (int)selected.size(), ffn_out,
-                                                  hybrid_telemetry_ ? &ffn_telemetry : nullptr,
-                                                  &err)) {
-                std::fprintf(stderr, "[qwen35moe] hybrid FFN eval failed layer=%d: %s\n",
-                             il, err.c_str());
-                step_graph_destroy(layer_sg);
-                return false;
-            }
-            const auto ffn_t1 = HybridClock::now();
-            decode_ffn_wall_us += elapsed_us(ffn_t0, ffn_t1);
             if (hybrid_telemetry_) {
-                decode_ffn_partition_us += ffn_telemetry.partition_us;
-                decode_ffn_hot_us += ffn_telemetry.hot_us;
-                decode_ffn_cold_us += ffn_telemetry.cold_us;
-                decode_ffn_shared_us += ffn_telemetry.shared_us;
-                decode_ffn_combine_us += ffn_telemetry.combine_us;
                 layer_calls++;
-                if (ffn_telemetry.cold_selected > 0) {
-                    cold_layer_calls++;
-                } else if (ffn_telemetry.hot_selected > 0) {
-                    hot_only_layer_calls++;
+                for (int32_t expert : selected) {
+                    if (expert >= 0 && expert < (int32_t)storage.hot_local_by_global.size()) {
+                        if (storage.hot_local_by_global[(size_t)expert] >= 0) {
+                            hot_selected_total++;
+                        } else {
+                            cold_selected_total++;
+                            cold_layer_calls++;
+                        }
+                    }
                 }
-            }
-            for (int i = 0; i < hidden; ++i) {
-                act_next[(size_t)i] = residual[(size_t)i] + ffn_out[(size_t)i];
-            }
-            for (int32_t expert : selected) {
-                if (expert >= 0 && expert < (int32_t)storage.hot_local_by_global.size()) {
-                    if (storage.hot_local_by_global[(size_t)expert] >= 0) {
-                        hot_selected_total++;
-                    } else {
-                        cold_selected_total++;
+            } else {
+                for (int32_t expert : selected) {
+                    if (expert >= 0 && expert < (int32_t)storage.hot_local_by_global.size()) {
+                        if (storage.hot_local_by_global[(size_t)expert] >= 0) {
+                            hot_selected_total++;
+                        } else {
+                            cold_selected_total++;
+                        }
                     }
                 }
             }
-            act_cur.swap(act_next);
         }
 
         const auto logits_t0 = HybridClock::now();
@@ -350,38 +315,13 @@ bool Qwen35MoeBackend::run_ar_decode_path(int committed, int n_gen,
                 (unsigned long long)last_cold_selected_);
     if (hybrid_telemetry_) {
         const uint64_t decode_us = elapsed_us(decode_t0, HybridClock::now());
-        const uint64_t accounted_ffn_us = decode_ffn_partition_us + decode_ffn_hot_us +
-                                          decode_ffn_cold_us + decode_ffn_shared_us +
-                                          decode_ffn_combine_us;
-        const uint64_t ffn_misc_us = decode_ffn_wall_us > accounted_ffn_us
-            ? (decode_ffn_wall_us - accounted_ffn_us) : 0;
-        const uint64_t cpu_skipped_layer_calls = layer_calls > cold_layer_calls
-            ? (layer_calls - cold_layer_calls) : 0;
-        const double cold_share_decode = decode_us > 0
-            ? (100.0 * (double)decode_ffn_cold_us / (double)decode_us) : 0.0;
-        const double cold_share_ffn = decode_ffn_wall_us > 0
-            ? (100.0 * (double)decode_ffn_cold_us / (double)decode_ffn_wall_us) : 0.0;
-        std::printf("[qwen35moe] hybrid telemetry: decode_ms=%.2f prefn_ms=%.2f logits_ms=%.2f "
-                    "ffn_wall_ms=%.2f hot_gpu_ms=%.2f cold_cpu_ms=%.2f shared_gpu_ms=%.2f "
-                    "partition_ms=%.2f combine_ms=%.2f ffn_misc_ms=%.2f "
-                    "cold_share_decode=%.1f%% cold_share_ffn=%.1f%% layer_calls=%llu "
-                    "cold_layer_calls=%llu hot_only_layer_calls=%llu cpu_skipped_layer_calls=%llu\n",
+        std::printf("[qwen35moe] hybrid telemetry: decode_ms=%.2f layer_ms=%.2f logits_ms=%.2f "
+                    "layer_calls=%llu cold_layer_calls=%llu\n",
                     decode_us / 1000.0,
                     decode_prefn_us / 1000.0,
                     decode_logits_us / 1000.0,
-                    decode_ffn_wall_us / 1000.0,
-                    decode_ffn_hot_us / 1000.0,
-                    decode_ffn_cold_us / 1000.0,
-                    decode_ffn_shared_us / 1000.0,
-                    decode_ffn_partition_us / 1000.0,
-                    decode_ffn_combine_us / 1000.0,
-                    ffn_misc_us / 1000.0,
-                    cold_share_decode,
-                    cold_share_ffn,
                     (unsigned long long)layer_calls,
-                    (unsigned long long)cold_layer_calls,
-                    (unsigned long long)hot_only_layer_calls,
-                    (unsigned long long)cpu_skipped_layer_calls);
+                    (unsigned long long)cold_layer_calls);
     }
     return true;
 }

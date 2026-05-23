@@ -148,6 +148,79 @@ bool build_layer_prefn_step(
     return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
 }
 
+// Full-layer graph for hybrid decode: pre-FFN (attention/DeltaNet + router) +
+// MoE FFN (all selected experts via ggml_mul_mat_id) + shared FFN + residual.
+// Outputs: sg.logits = layer_output, sg.moe_selected[layer_idx] = router picks.
+// This is 1 graph compute per layer instead of 2 (pre-FFN + fused hot+shared).
+bool build_hybrid_full_layer_step(
+    StepGraph & sg,
+    const TargetWeights & w,
+    TargetCache & cache,
+    ggml_backend_t backend,
+    int layer_idx,
+    int kv_start,
+    int n_tokens,
+    bool with_mask,
+    int fa_window,
+    int kq_stride_pad) {
+    step_graph_free(sg);
+
+    ggml_init_params ip{};
+    ip.mem_size   = 512 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    sg.ctx = ggml_init(ip);
+    if (!sg.ctx) return false;
+
+    const int hidden = w.n_embd;
+    sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
+    ggml_set_name(sg.inp_embed, "inp_embed");
+    ggml_set_input(sg.inp_embed);
+
+    const bool is_attn = (((layer_idx + 1) % w.full_attention_interval) == 0);
+    if (is_attn) {
+        sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
+        ggml_set_name(sg.positions, "positions");
+        ggml_set_input(sg.positions);
+        if (with_mask) {
+            const int max_win_len = cache.max_ctx + n_tokens;
+            const int kv_pad = align_up(max_win_len, kq_stride_pad);
+            const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
+            sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
+            ggml_set_name(sg.attn_mask, "attn_mask");
+            ggml_set_input(sg.attn_mask);
+        }
+    }
+
+    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+
+    ggml_tensor * moe_selected = nullptr;
+    ggml_tensor * layer_out = build_qwen35_layer(
+        sg.ctx, sg.gf, w, cache, layer_idx,
+        sg.inp_embed, sg.positions, sg.attn_mask,
+        kv_start, n_tokens, /*capture=*/false, fa_window,
+        /*q_tail_capture=*/nullptr, /*q_tail_start=*/0,
+        &moe_selected);
+    if (!layer_out) return false;
+
+    // Use hidden_input as the layer output tensor (repurpose field)
+    sg.hidden_input = layer_out;
+    ggml_set_output(layer_out);
+    ggml_build_forward_expand(sg.gf, layer_out);
+
+    if (moe_selected) {
+        sg.moe_selected.assign((size_t)w.n_layer, nullptr);
+        sg.moe_selected[(size_t)layer_idx] = moe_selected;
+        ggml_set_output(moe_selected);
+        ggml_build_forward_expand(sg.gf, moe_selected);
+    }
+
+    if (!sg.alloc) {
+        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
+}
+
 // ── build_target_step ───────────────────────────────────────────
 
 bool build_target_step(
