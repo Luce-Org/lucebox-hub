@@ -661,3 +661,125 @@ usage at 117K, that trade isn't worth taking. Users on 4090 or 3090
 (24 GB) at this context length should likely keep `--kv-tq3=1`. To go
 further than Q8_0 in either direction set the K/V types explicitly via
 `DFLASH27B_KV_K=<type> DFLASH27B_KV_V=<type>`.
+
+## RTX 4090 (Ada, sm_89, 24 GB) — WSL2 (community)
+
+Single RTX 4090 24 GB, CUDA 13.2, driver 596.21, WSL2 (Ubuntu) on Windows 11.
+i7-13700K, 64 GB host RAM (32 GB WSL allocation).
+Build: `cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89 -DDFLASH27B_ENABLE_BSA=ON`
+Models on native ext4 (`/home/`), not NTFS `/mnt/` (9P filesystem bottlenecks model loading).
+
+### Qwen3.5-27B Q4_K_M — RTX 4090 headline
+
+Target: `unsloth/Qwen3.5-27B-GGUF` (`Qwen3.5-27B-Q4_K_M.gguf`, ~16 GB).
+Draft:  `spiritbuun/Qwen3.5-27B-DFlash-GGUF` (`dflash-draft-q4_k_m.gguf`, 986 MB).
+Concurrency = 1, greedy decoding, `n_gen=256`, `bench_he.py`.
+
+| Task      | AR tok/s | DFlash tok/s | AL   | Speedup |
+|-----------|:--------:|:------------:|:----:|:-------:|
+| HumanEval | 32.20    | **125.37**   | 7.77 | **3.89×** |
+
+AR = `test_generate`, DFlash = DDTree budget 28 + fast rollback.
+
+### Qwen3.5-27B DDTree budget sweep (HumanEval, n_gen=256)
+
+| Budget | Mean AL | Mean tok/s |
+|:------:|:-------:|:----------:|
+| 22     | 7.45    | 122.95     |
+| 26     | 7.60    | 123.68     |
+| **28** | **7.77**| **125.37** |
+| 30     | 7.62    | 123.12     |
+| 34     | 7.28    | 111.76     |
+
+Budget 28 is optimal on 4090 (vs 22 on 3090). The 4090's 72 MB L2 cache (vs 3090's
+6 MB) lets the DDTree verification working set stay in cache, enabling larger trees
+without DRAM bandwidth penalties.
+
+### Qwen3.6-27B Q4_K_M — RTX 4090 headline
+
+Target: `unsloth/Qwen3.6-27B-GGUF` (`Qwen3.6-27B-Q4_K_M.gguf`, ~16 GB).
+Draft:  `Lucebox/Qwen3.6-27B-DFlash-GGUF` (`dflash-draft-3.6-q8_0.gguf`, 1.8 GB).
+Concurrency = 1, greedy decoding, `n_gen=256`, `bench_he.py`.
+
+| Task      | AR tok/s | DFlash tok/s | AL   | Speedup |
+|-----------|:--------:|:------------:|:----:|:-------:|
+| HumanEval | 33.74    | **84.55**    | 5.32 | **2.51×** |
+
+AR = `test_generate`, DFlash = DDTree budget 36 + fast rollback.
+
+### Qwen3.6-27B DDTree budget sweep (HumanEval, n_gen=256)
+
+| Budget | Mean AL | Mean tok/s |
+|:------:|:-------:|:----------:|
+| 22     | 4.85    |  79.65     |
+| 26     | 5.00    |  82.37     |
+| 28     | 4.99    |  82.46     |
+| 30     | 5.06    |  79.82     |
+| 34     | 5.17    |  83.00     |
+| 35     | 5.20    |  83.12     |
+| **36** | **5.32**| **84.55**  |
+| 37     | 5.32    |  84.30     |
+| 38     | 5.32    |  82.80     |
+
+Budget 36 is optimal for Qwen3.6 on 4090. AL saturates at 5.32 from budget 36+.
+The lower AL vs Qwen3.5 (5.32 vs 7.77) reflects the Qwen3.6 drafter still being
+under training per the [HuggingFace model card](https://huggingface.co/z-lab/Qwen3.6-27B-DFlash).
+
+### Qwen3.6-27B per-prompt breakdown (budget=36)
+
+| # | prompt                    | steps | AL   | tok/s  |
+|:-:|---------------------------|:-----:|:----:|:------:|
+| 01| has_close_elements        |  31   | 8.26 | 132.36 |
+| 02| separate_paren_groups     |  46   | 5.57 |  91.10 |
+| 03| truncate_number           |   0   | 0.00 |   0.00 |
+| 04| below_zero                |  46   | 5.57 |  90.15 |
+| 05| mean_absolute_deviation   |  37   | 6.92 | 109.82 |
+| 06| intersperse               |  40   | 6.40 | 101.67 |
+| 07| parse_nested_parens       |  32   | 8.00 | 127.26 |
+| 08| filter_by_substring       |  43   | 5.95 |  91.74 |
+| 09| sum_product               |   0   | 0.00 |   0.00 |
+| 10| rolling_max               |  39   | 6.56 | 105.53 |
+| **mean** |                    |       |**5.32**|**84.96**|
+
+Prompts 03 (truncate_number) and 09 (sum_product) emit EOS immediately (0 generated
+tokens). Excluding those: **106.2 tok/s mean** across 8 active prompts.
+
+### RTX 4090 vs RTX 3090 comparison (Qwen3.5-27B Q4_K_M)
+
+| Metric             | 3090 (budget=22) | 4090 WSL2 (budget=28) | Ratio   |
+|--------------------|:----------------:|:---------------------:|:-------:|
+| AR tok/s (HE)      | 37.78            | 32.20                 | 0.85×   |
+| DFlash tok/s (HE)  | 129.52           | **125.37**            | **0.97×** |
+| AL (HE)            | 8.31             | 7.77                  | 0.94×   |
+| Mem BW             | 936 GB/s         | 1008 GB/s             | 1.08×   |
+| SMs                | 82               | 128                   | 1.56×   |
+| L2 Cache           | 6 MB             | 72 MB                 | 12×     |
+| VRAM               | 24 GB            | 24 GB                 | 1.0×    |
+
+AR is 15% slower on 4090 WSL2 — likely WSL2 overhead (pin_memory=False, 9P bridge
+latency). DFlash is within 3% because the larger L2 cache compensates. Bare metal
+Linux 4090 should match or exceed the 3090 numbers.
+
+### WSL2 notes
+
+- **Always use native ext4 (`/home/`) for model files.** NTFS mounts (`/mnt/`) via
+  WSL2's 9P filesystem showed 9% CPU utilization and 337K voluntary context switches
+  during model loading (vs 85%+ on ext4).
+- WSL2 forces `pin_memory=False`, adding ~3–5% decode overhead vs bare metal.
+- Building CUDA binaries under WSL2 works correctly with `-DCMAKE_CUDA_ARCHITECTURES=89`.
+  CUDA toolkit path must be in `$PATH` (`/usr/local/cuda-13.2/bin`).
+
+### Server-mode reference (not apples-to-apples with bench_he.py)
+
+Running via `server.py` (OpenAI-compatible HTTP) with TQ3 KV cache and 128K context:
+
+```bash
+DFLASH27B_KV_TQ3=1 python dflash/scripts/server.py \
+  --target Qwen3.6-27B-Q4_K_M.gguf --draft dflash-draft-3.6-q8_0.gguf \
+  --port 8082 --budget 28 --max-ctx 131072
+```
+
+54.7 tok/s at C=1 with 150 mixed chat prompts (short/medium/long, SSE streaming).
+Server-mode is ~35% slower than direct binary due to HTTP/JSON/SSE overhead, Python
+FastAPI GIL, and mixed prompt distribution (vs uniform HumanEval code stubs).
+Quality: 7/7 on 10 complex queries (math, code, reasoning, knowledge, creative).

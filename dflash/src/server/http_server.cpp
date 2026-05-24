@@ -63,6 +63,22 @@ static std::string generate_id(const char * prefix) {
     return buf;
 }
 
+// Logging helpers shared by route_request() / worker_loop(). Kept static
+// (file-scope) so they don't leak into the public ABI; the chat lifecycle
+// logs that use them are part of #270's request-tracing instrumentation.
+static const char * api_format_name(ApiFormat format) {
+    switch (format) {
+    case ApiFormat::OPENAI_CHAT: return "chat";
+    case ApiFormat::ANTHROPIC:   return "anthropic";
+    case ApiFormat::RESPONSES:   return "responses";
+    default:                     return "unknown";
+    }
+}
+
+static size_t json_array_size(const json & value) {
+    return value.is_array() ? value.size() : 0;
+}
+
 // Build the /props response body. Matches dflash/scripts/server.py:1221-1312
 // key-for-key so cross-server diffs stay clean. The Python version is the
 // reference impl; if a key drifts here, update it there too (or document the
@@ -691,6 +707,9 @@ void HttpServer::handle_client(int fd) {
 bool HttpServer::route_request(int fd, const HttpRequest & hr) {
     if (hr.method != "POST") return false;
 
+    std::fprintf(stderr, "[server] request path=%s body_bytes=%zu\n",
+                 hr.path.c_str(), hr.body.size());
+
     ParsedRequest req;
     std::string err;
 
@@ -1009,6 +1028,21 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         return true;
     }
 
+    std::fprintf(stderr,
+        "[server] chat %s format=%s stream=%s msgs=%zu tools=%zu prompt_tokens=%zu "
+        "max_tokens=%d max_ctx=%d thinking=%s stops=%zu model=%s\n",
+        req.response_id.c_str(),
+        api_format_name(req.format),
+        req.stream ? "true" : "false",
+        json_array_size(req.messages),
+        json_array_size(req.tools),
+        req.prompt_tokens.size(),
+        req.max_output,
+        config_.max_ctx,
+        req.thinking_enabled ? "true" : "false",
+        req.stop_sequences.size(),
+        req.model.c_str());
+
     // Set socket non-blocking for send() stall detection during streaming.
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
@@ -1038,6 +1072,17 @@ void HttpServer::worker_loop() {
 
         int fd = job->fd;
         const auto & req = job->req;
+        auto started_at = std::chrono::steady_clock::now();
+
+        std::fprintf(stderr,
+            "[server] chat START %s format=%s stream=%s prompt_tokens=%zu "
+            "max_tokens=%d tools=%zu\n",
+            req.response_id.c_str(),
+            api_format_name(req.format),
+            req.stream ? "true" : "false",
+            req.prompt_tokens.size(),
+            req.max_output,
+            json_array_size(req.tools));
 
         // Send SSE headers.
         if (req.stream) {
@@ -1277,6 +1322,19 @@ void HttpServer::worker_loop() {
             gen_req.snap_slot = snap_slot;
             gen_req.snap_pos = snap_cut;
         }
+
+        std::fprintf(stderr,
+            "[server] chat CACHE %s restore=%s slot=%d prefix_len=%d "
+            "effective_prompt=%zu pflash=%s disk_hit=%s snap_slot=%d snap_pos=%d\n",
+            req.response_id.c_str(),
+            using_restore ? "true" : "false",
+            cache_slot,
+            prefix_len,
+            effective_prompt.size(),
+            pflash_compressed ? "true" : "false",
+            disk_hit ? "true" : "false",
+            snap_slot,
+            snap_cut);
 
         // Set up DaemonIO with on_token callback for streaming + disconnect.
         DaemonIO io;
@@ -1838,6 +1896,38 @@ void HttpServer::worker_loop() {
                          "(prompt=%zu out=%d)\n",
                          req.prompt_tokens.size(), completion_tokens);
         }
+
+        const auto done_at = std::chrono::steady_clock::now();
+        const double elapsed_s =
+            std::chrono::duration<double>(done_at - started_at).count();
+        const int result_tokens = (int)result.tokens.size();
+        const int out_tokens = std::max(completion_tokens, result_tokens);
+        const double tok_s = elapsed_s > 0.0 ? out_tokens / elapsed_s : 0.0;
+        const double decode_tok_s =
+            result.decode_s > 0.0 ? out_tokens / result.decode_s : 0.0;
+        const std::string finish = client_disconnected
+            ? "client_disconnect"
+            : (result.ok ? emitter.finish_reason() : "error");
+
+        std::fprintf(stderr,
+            "[server] chat DONE %s ok=%s in=%zu effective_in=%zu out=%d "
+            "%.1fs %.1f tok/s finish=%s restore=%s slot=%d prefix_len=%d "
+            "prefill=%.1fs decode=%.1fs(%.1ftok/s) error=%s\n",
+            req.response_id.c_str(),
+            result.ok ? "true" : "false",
+            req.prompt_tokens.size(),
+            effective_prompt.size(),
+            out_tokens,
+            elapsed_s,
+            tok_s,
+            finish.c_str(),
+            using_restore ? "true" : "false",
+            cache_slot,
+            prefix_len,
+            result.prefill_s,
+            result.decode_s,
+            decode_tok_s,
+            result.error.empty() ? "-" : result.error.c_str());
 
         // Signal client thread that we're done.
         {
