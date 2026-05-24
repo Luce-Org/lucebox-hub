@@ -548,7 +548,7 @@ if(DFLASH27B_TESTS)
         add_executable(test_drafter_early_exit_score_range
             test/test_drafter_early_exit_score_range.cpp)
         target_include_directories(test_drafter_early_exit_score_range PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3)
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
         add_test(NAME test_drafter_early_exit_score_range
             COMMAND test_drafter_early_exit_score_range)
     endif()
@@ -556,7 +556,7 @@ if(DFLASH27B_TESTS)
         add_executable(test_drafter_warm_path_regression
             test/test_drafter_warm_path_regression.cpp)
         target_include_directories(test_drafter_warm_path_regression PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3)
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
         add_test(NAME test_drafter_warm_path_regression
             COMMAND test_drafter_warm_path_regression)
     endif()

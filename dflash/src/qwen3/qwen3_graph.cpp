@@ -35,7 +35,7 @@
 #include "qwen3_drafter_model.h"
 #include "internal.h"
 #include "flashprefill.h"
-#include "score_range.h"
+#include "../common/score_range.h"
 
 #include "device_runtime.h"
 
