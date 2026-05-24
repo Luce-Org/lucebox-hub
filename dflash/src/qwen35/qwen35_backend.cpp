@@ -744,6 +744,15 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     //     normal sampling resumes (model writes visible answer).
     bool budget_close_started = false;
     int  close_inject_pos     = 0;
+    // Capture entry KV position so the budget check is in the
+    // "generated since entry" frame, not the absolute KV frame.
+    // n_gen is the gen-only count (or the remaining-budget remap done by
+    // spec-decode tail-off); subtracting committed_now (absolute KV =
+    // prompt_len + tokens generated this call) directly would treat
+    // prompt-length tokens as if they were generated output, firing
+    // force-close prompt_len tokens early on prompted requests and
+    // potentially going negative after spec-decode tail-off.
+    const int committed_at_entry = committed;
     auto maybe_force_close = [&](int32_t & tok, int committed_now) {
         if (budget_hook.close_token_ids.empty()) return;
 
@@ -766,7 +775,12 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         if (budget_close_started) return;
 
         // Check if budget has tightened to the force-close trigger.
-        int remaining = n_gen - committed_now;
+        // generated = tokens produced in THIS do_ar_decode call;
+        // remaining = budget headroom, measured against n_gen (the
+        // requested gen count or tail-off remap, never against the
+        // absolute KV position which would mis-count the prompt).
+        const int generated = committed_now - committed_at_entry;
+        int remaining = n_gen - generated;
         if (remaining <= budget_hook.hard_limit_remaining) {
             // Don't trigger if the model already sampled the first close
             // token naturally — avoids a redundant override.
