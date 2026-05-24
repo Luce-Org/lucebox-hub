@@ -1075,9 +1075,12 @@ def start_server(
             str(target),
             "--host", "127.0.0.1",
             "--port", str(port),
-            "--draft", str(draft),
-            *profile.args,
         ]
+        # Only include --draft (SD drafter) when the profile is not pflash-only.
+        # Passing --draft with a plain qwen3 model triggers an arch check failure.
+        if not profile.needs_prefill_drafter and draft:
+            args.extend(["--draft", str(draft)])
+        args.extend(profile.args)
     if profile.needs_prefill_drafter:
         if prefill_drafter is None:
             raise HarnessError(f"profile {profile.name} requires --prefill-drafter")
