@@ -3,6 +3,7 @@
 #include "qwen35_ops.h"
 
 #include "ggml-alloc.h"
+#include "ggml-backend.h"
 
 #include <chrono>
 #include <cmath>
@@ -599,53 +600,14 @@ bool eval_qwen35moe_hybrid_ffn_single(
 
     std::vector<float> hot_and_shared, cold;
 
-    // ── Cold path: use cached graph if n_cold matches ──
-    const auto cold_t0 = HybridClock::now();
-    if (!cold_ids.empty()) {
-        const int n_cold = (int)cold_ids.size();
-        // Lazily build cached cold graph on first use with this n_cold
-        if (!storage.cold_graph.valid() || storage.cold_graph.n_hot != n_cold) {
-            build_cached_cold_graph(storage.cold_graph, cpu_backend,
-                                    storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
-                                    L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
-                                    w.n_embd, w.n_ff_exp, n_cold);
-        }
-        if (storage.cold_graph.valid() && storage.cold_graph.n_hot == n_cold) {
-            // Use cached graph
-            ggml_backend_tensor_set(storage.cold_graph.inp, cur_host, 0, sizeof(float) * (size_t)w.n_embd);
-            ggml_backend_tensor_set(storage.cold_graph.ids, cold_ids.data(), 0, sizeof(int32_t) * (size_t)n_cold);
-            ggml_backend_tensor_set(storage.cold_graph.weights, cold_weights.data(), 0, sizeof(float) * (size_t)n_cold);
-            auto st = ggml_backend_graph_compute(cpu_backend, storage.cold_graph.gf);
-            if (st != GGML_STATUS_SUCCESS) {
-                if (err) *err = "cached cold graph compute failed";
-                return false;
-            }
-            cold.resize((size_t)w.n_embd);
-            ggml_backend_tensor_get(storage.cold_graph.output, cold.data(), 0, sizeof(float) * (size_t)w.n_embd);
-        } else {
-            // Fallback to dynamic
-            if (!run_routed_subset(cpu_backend,
-                                   storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
-                                   L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
-                                   w.n_embd, w.n_ff_exp,
-                                   cur_host, cold_ids.data(), cold_weights.data(), n_cold, cold, err)) {
-                return false;
-            }
-        }
-    } else {
-        cold.assign((size_t)w.n_embd, 0.0f);
-    }
-    const auto cold_t1 = HybridClock::now();
-    if (telemetry) {
-        telemetry->cold_us = cold_ids.empty() ? 0 : elapsed_us(cold_t0, cold_t1);
-    }
-
-    // ── Hot + Shared path: use cached graph if n_hot matches ──
-    const auto hot_t0 = HybridClock::now();
     const int n_hot = (int)hot_ids.size();
     const bool has_hot = (n_hot > 0);
     const bool has_shared = (L.ffn_up_shexp && L.ffn_gate_shexp && L.ffn_down_shexp);
+    const bool has_cold = !cold_ids.empty();
+    const int n_cold = (int)cold_ids.size();
 
+    // ── Hot + Shared path on GPU ──
+    const auto hot_t0 = HybridClock::now();
     if (!has_hot && !has_shared) {
         hot_and_shared.assign((size_t)w.n_embd, 0.0f);
     } else {
@@ -657,7 +619,6 @@ bool eval_qwen35moe_hybrid_ffn_single(
                                    L, w.n_embd, w.n_ff_exp, n_hot);
         }
         if (storage.hot_graph.valid() && storage.hot_graph.n_hot == n_hot) {
-            // Use cached graph
             ggml_backend_tensor_set(storage.hot_graph.inp, cur_host, 0, sizeof(float) * (size_t)w.n_embd);
             if (storage.hot_graph.ids && has_hot) {
                 ggml_backend_tensor_set(storage.hot_graph.ids, hot_ids.data(), 0, sizeof(int32_t) * (size_t)n_hot);
@@ -665,15 +626,10 @@ bool eval_qwen35moe_hybrid_ffn_single(
             if (storage.hot_graph.weights && has_hot) {
                 ggml_backend_tensor_set(storage.hot_graph.weights, hot_weights.data(), 0, sizeof(float) * (size_t)n_hot);
             }
-            auto st = ggml_backend_graph_compute(gpu_backend, storage.hot_graph.gf);
-            if (st != GGML_STATUS_SUCCESS) {
-                if (err) *err = "cached hot graph compute failed";
-                return false;
-            }
-            hot_and_shared.resize((size_t)w.n_embd);
-            ggml_backend_tensor_get(storage.hot_graph.output, hot_and_shared.data(), 0, sizeof(float) * (size_t)w.n_embd);
+            // Launch GPU async — kernel runs while we do cold on CPU
+            ggml_backend_graph_compute_async(gpu_backend, storage.hot_graph.gf);
         } else {
-            // Fallback to dynamic
+            // Fallback: sync compute (no overlap)
             if (!run_hot_and_shared_ffn_gpu(gpu_backend,
                                             storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
                                             L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
@@ -686,9 +642,52 @@ bool eval_qwen35moe_hybrid_ffn_single(
             }
         }
     }
+
+    // ── Cold path on CPU (overlaps with GPU kernels in flight) ──
+    const auto cold_t0 = HybridClock::now();
+    if (has_cold) {
+        if (!storage.cold_graph.valid() || storage.cold_graph.n_hot != n_cold) {
+            build_cached_cold_graph(storage.cold_graph, cpu_backend,
+                                    storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
+                                    L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
+                                    w.n_embd, w.n_ff_exp, n_cold);
+        }
+        if (storage.cold_graph.valid() && storage.cold_graph.n_hot == n_cold) {
+            ggml_backend_tensor_set(storage.cold_graph.inp, cur_host, 0, sizeof(float) * (size_t)w.n_embd);
+            ggml_backend_tensor_set(storage.cold_graph.ids, cold_ids.data(), 0, sizeof(int32_t) * (size_t)n_cold);
+            ggml_backend_tensor_set(storage.cold_graph.weights, cold_weights.data(), 0, sizeof(float) * (size_t)n_cold);
+            auto st = ggml_backend_graph_compute(cpu_backend, storage.cold_graph.gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                if (err) *err = "cached cold graph compute failed";
+                return false;
+            }
+            cold.resize((size_t)w.n_embd);
+            ggml_backend_tensor_get(storage.cold_graph.output, cold.data(), 0, sizeof(float) * (size_t)w.n_embd);
+        } else {
+            if (!run_routed_subset(cpu_backend,
+                                   storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
+                                   L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
+                                   w.n_embd, w.n_ff_exp,
+                                   cur_host, cold_ids.data(), cold_weights.data(), n_cold, cold, err)) {
+                return false;
+            }
+        }
+    } else {
+        cold.assign((size_t)w.n_embd, 0.0f);
+    }
+    const auto cold_t1 = HybridClock::now();
+
+    // ── Sync GPU and read result ──
+    if ((has_hot || has_shared) && storage.hot_graph.valid() && storage.hot_graph.n_hot == n_hot) {
+        ggml_backend_synchronize(gpu_backend);
+        hot_and_shared.resize((size_t)w.n_embd);
+        ggml_backend_tensor_get(storage.hot_graph.output, hot_and_shared.data(), 0, sizeof(float) * (size_t)w.n_embd);
+    }
     const auto hot_t1 = HybridClock::now();
+
     if (telemetry) {
         telemetry->hot_us = elapsed_us(hot_t0, hot_t1);
+        telemetry->cold_us = has_cold ? elapsed_us(cold_t0, cold_t1) : 0;
         telemetry->shared_us = 0;
     }
 
