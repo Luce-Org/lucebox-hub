@@ -15,6 +15,7 @@
 #include "tokenizer.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -120,9 +121,13 @@ public:
         int64_t lifetime_hits;
     };
 
-    // Lockless snapshot for /props. A mutation under daemon_lock can tear
-    // in_use vs lifetime_hits across the read pair; acceptable for an
-    // introspection report (matches the Python implementation's semantics).
+    // Lockless snapshot for /props. Hit counters and disk-bytes use
+    // std::atomic so the cross-thread read is well-defined under the
+    // C++ memory model. `entries_.size()` / `full_entries_.size()` are
+    // still read without a lock — that's a single relaxed integer load
+    // on every libstdc++/libc++ we target and matches the Python impl's
+    // tear-tolerant introspection semantics. Acceptable for an ops
+    // dashboard; not safe for control-flow decisions.
     InlineStats stats() const;
     FullStats full_stats() const;
 
@@ -155,9 +160,12 @@ private:
     std::vector<FullLruEntry> full_entries_;
     PrefixHash full_pending_evict_key_{};
     bool full_has_pending_evict_ = false;
-    int64_t lifetime_hits_ = 0;       // inline cache hits
-    int64_t full_lifetime_hits_ = 0;  // full-compress cache hits
-    int64_t full_disk_bytes_ = 0;     // best-effort snapshot of disk usage
+    // Atomic so /props can read them from a client thread without
+    // tearing across the daemon thread's increments. Relaxed ordering
+    // is sufficient — no synchronization with other state required.
+    std::atomic<int64_t> lifetime_hits_{0};       // inline cache hits
+    std::atomic<int64_t> full_lifetime_hits_{0};  // full-compress cache hits
+    std::atomic<int64_t> full_disk_bytes_{0};     // best-effort snapshot of disk usage
 
     // Helpers
     int find_entry(const PrefixHash & h) const;

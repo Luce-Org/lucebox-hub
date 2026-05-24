@@ -271,7 +271,7 @@ std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids)
     }
 
     if (best_slot >= 0) {
-        lifetime_hits_++;
+        lifetime_hits_.fetch_add(1, std::memory_order_relaxed);
         std::fprintf(stderr, "[pc] lookup hit slot=%d prefix_len=%d (of %zu total)\n",
                      best_slot, best_len, prompt_ids.size());
     }
@@ -379,7 +379,7 @@ std::pair<int, int> PrefixCache::lookup_full(const std::vector<int32_t> & prompt
     int slot = e.slot;
     int cur_ids_len = e.cur_ids_len;
     move_full_to_end(idx);
-    full_lifetime_hits_++;
+    full_lifetime_hits_.fetch_add(1, std::memory_order_relaxed);
 
     std::fprintf(stderr, "[pc] full-cache hit slot=%d cur_ids_len=%d\n",
                  slot, cur_ids_len);
@@ -439,13 +439,15 @@ void PrefixCache::abort_full_snap(int /*slot*/) {
 
 PrefixCache::InlineStats PrefixCache::stats() const {
     if (disabled_) return {0, 0, 0};
-    return {cap_, (int)entries_.size(), lifetime_hits_};
+    return {cap_, (int)entries_.size(),
+            lifetime_hits_.load(std::memory_order_relaxed)};
 }
 
 PrefixCache::FullStats PrefixCache::full_stats() const {
     if (full_disabled_) return {false, 0, 0, 0, 0};
     return {true, full_cap_, (int)full_entries_.size(),
-            full_disk_bytes_, full_lifetime_hits_};
+            full_disk_bytes_.load(std::memory_order_relaxed),
+            full_lifetime_hits_.load(std::memory_order_relaxed)};
 }
 
 }  // namespace dflash::common
