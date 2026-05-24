@@ -494,19 +494,21 @@ int main(int argc, char ** argv) {
     // expose the GGUF metadata key it was loaded from, so leave empty
     // and let /props report null. (Add a getter on Tokenizer later.)
 
-    // Resolve `</think>` close-tag sequence for Level 2 force-close. For
-    // Qwen3.6 this is a single special token (id 248069); for DeepSeek
-    // and laguna it tokenizes to multiple ordinary tokens (~3 for
-    // DeepSeek-V3: [1718, 37947, 32]). BudgetHook now supports both —
-    // the sampling loop injects the sequence across consecutive
-    // iterations. The encode() path picks up the special-token mapping
-    // the tokenizer built at load_from_gguf time.
+    // Resolve the close-tag sequence for Level 2 force-close. The text
+    // varies by arch:
+    //   - qwen35 / laguna: `</think>` (qwen35 = single special token id
+    //     248069; laguna/DeepSeek-V3 = multi-token e.g. [1718, 37947, 32])
+    //   - gemma4:           `<channel|>` (the architecture's own channel
+    //     boundary marker — Gemma4 doesn't emit `</think>`)
+    // BudgetHook supports both single- and multi-token close sequences;
+    // the sampling loop injects across consecutive iterations.
     if (sconfig.hard_limit_reply_budget > 0) {
-        auto close_ids = tokenizer.encode("</think>");
+        const char * close_tag = (arch == "gemma4") ? "<channel|>" : "</think>";
+        auto close_ids = tokenizer.encode(close_tag);
         if (!close_ids.empty()) {
             sconfig.think_close_token_ids = close_ids;
             std::fprintf(stderr,
-                "[server] level-2 force-close: </think> = ");
+                "[server] level-2 force-close: %s = ", close_tag);
             for (size_t i = 0; i < close_ids.size(); ++i) {
                 std::fprintf(stderr, "%s%d", i ? "," : "", close_ids[i]);
             }
@@ -516,9 +518,9 @@ int main(int argc, char ** argv) {
                 sconfig.hard_limit_reply_budget);
         } else {
             std::fprintf(stderr,
-                "[server] level-2 force-close DISABLED: </think> tokenizes "
+                "[server] level-2 force-close DISABLED: %s tokenizes "
                 "to empty (tokenizer reject?). Falling back to Level 1 "
-                "phase-2 reprompt only.\n");
+                "phase-2 reprompt only.\n", close_tag);
         }
     }
 
