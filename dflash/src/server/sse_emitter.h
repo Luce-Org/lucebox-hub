@@ -75,6 +75,28 @@ public:
     // transition are attributed to the mode they entered with.
     StreamMode mode() const { return mode_; }
 
+    // Zero-based index of the first emit_token() call that produced
+    // CONTENT-mode output (i.e., the first token after the model's
+    // natural `</think>`). Returns -1 if the model never closed
+    // `<think>` and the emitter stayed in REASONING for the whole
+    // stream.
+    //
+    // Callers use this to split a single phase-1 token vector into
+    // its reasoning prefix and content suffix when the model
+    // self-closed mid-stream: `finish_details.thinking_tokens` =
+    // first_content_token_index() (or the full size if -1), the
+    // remainder counts as content. Equivalent to the per-call
+    // bump_count(mode()) tracking but pushed into the emitter so
+    // both streaming and non-streaming response builders can read
+    // the same split. (Codex r1 P2 follow-up.)
+    int first_content_token_index() const { return first_content_token_index_; }
+
+    // Total number of emit_token() calls observed so far. Used in
+    // tandem with first_content_token_index() to compute the
+    // content-token count without depending on the caller's own
+    // counter; the difference is the natural-close content suffix.
+    int emit_token_count() const { return emit_token_count_; }
+
 private:
     // Format helpers
     std::string format_openai_delta(const json & delta, const char * finish = nullptr);
@@ -109,6 +131,15 @@ private:
 
     // Strip leading <think> tag from reasoning (ds4 pattern).
     bool         checked_think_prefix_ = false;
+
+    // Track the index (in emit_token calls) at which CONTENT mode
+    // first started, and the total emit_token call count. Used by
+    // http_server to derive thinking/content token counts from the
+    // emitter's REASONING → CONTENT transition rather than from
+    // phase-1/phase-2 invocation boundaries. See
+    // first_content_token_index() docs.
+    int          first_content_token_index_ = -1;
+    int          emit_token_count_ = 0;
 
     // Stop sequences support
     std::vector<std::string> stop_sequences_;

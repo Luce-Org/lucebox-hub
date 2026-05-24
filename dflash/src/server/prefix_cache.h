@@ -121,13 +121,13 @@ public:
         int64_t lifetime_hits;
     };
 
-    // Lockless snapshot for /props. Hit counters and disk-bytes use
-    // std::atomic so the cross-thread read is well-defined under the
-    // C++ memory model. `entries_.size()` / `full_entries_.size()` are
-    // still read without a lock — that's a single relaxed integer load
-    // on every libstdc++/libc++ we target and matches the Python impl's
-    // tear-tolerant introspection semantics. Acceptable for an ops
-    // dashboard; not safe for control-flow decisions.
+    // Lockless snapshot for /props. Every published field — hit
+    // counters, disk-bytes, AND the two in-use counts — is mirrored to
+    // an std::atomic that the daemon thread updates alongside the
+    // backing vector. /props reads those atomics with
+    // memory_order_relaxed, so the cross-thread read is well-defined
+    // under the C++ memory model. Used for an ops dashboard; not safe
+    // for control-flow decisions.
     InlineStats stats() const;
     FullStats full_stats() const;
 
@@ -166,6 +166,15 @@ private:
     std::atomic<int64_t> lifetime_hits_{0};       // inline cache hits
     std::atomic<int64_t> full_lifetime_hits_{0};  // full-compress cache hits
     std::atomic<int64_t> full_disk_bytes_{0};     // best-effort snapshot of disk usage
+    // Atomic mirrors of `entries_.size()` and `full_entries_.size()`.
+    // The vectors themselves are mutated only on the daemon thread
+    // under the daemon's serialised request loop, but `/props` reads
+    // happen from the client thread — calling `.size()` there is a
+    // data race per the C++ memory model. Bump these alongside every
+    // push_back / erase / clear so the public introspection counters
+    // stay well-defined. (Codex r1 P2 follow-up.)
+    std::atomic<int64_t> entries_size_count_{0};       // mirrors entries_.size()
+    std::atomic<int64_t> full_entries_size_count_{0};  // mirrors full_entries_.size()
 
     // Helpers
     int find_entry(const PrefixHash & h) const;

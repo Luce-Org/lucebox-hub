@@ -67,14 +67,20 @@ request will not delay a `/props` response.
   "pflash":                       { … },
   "prefix_cache":                 { … },
   "reasoning":                    { … },
+  "runtime":                      { … },
   "sampling":                     { "capabilities": { … } },
-  "speculative":                  { … }
+  "server":                       { "name": "<string>", "version": "<string>", "props_schema": <int> },
+  "speculative":                  { "enabled": <bool>, "ddtree_budget": <int|null> },
+  "speculative_mode":             "off" | "dflash" | "pflash",
+  "tool_replay":                  { … }
 }
 ```
 
-All top-level keys are required. Optional nested fields may be
-`null` when the corresponding feature is disabled (e.g.
-`pflash.threshold` when `pflash.enabled = false`).
+All top-level keys are required and always emitted by
+`build_props_body`. Optional nested fields may be `null` when the
+corresponding feature is disabled (e.g. `pflash.threshold` when
+`pflash.enabled = false`; `speculative.ddtree_budget` when
+`speculative.enabled = false`).
 
 ## 4. Per-section field semantics
 
@@ -162,8 +168,14 @@ Field names use llama.cpp conventions (`repeat_penalty`, not
 `repetition_penalty`) for compatibility with `/props` consumers
 written against llama-server.
 
-When the loaded model card carries a `sampling` object, those
-values replace the C++ defaults in this section.
+These values are the server's hard-coded sampler defaults
+(`temperature=0.0`, `top_p=1.0`, `top_k=0`, `min_p=0.0`,
+`repeat_penalty=1.0`) and **do not** reflect the loaded model
+card's `sampling` block. The model card's sampler defaults are
+applied at request-parse time when a request omits a sampler
+field; `/props` only carries the server-wide knobs. To see the
+card's sampler values, read the sidecar JSON or the startup
+banner.
 
 ### 4.6 `full_cache`
 

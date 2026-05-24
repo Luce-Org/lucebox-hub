@@ -150,6 +150,24 @@ static bool load_sidecar(const std::string & path, ModelCard & out, std::string 
         return false;
     }
 
+    // Schema sanity check — the four required fields per
+    // share/model_cards/_schema.json. We warn but DO NOT fail-start;
+    // operators may have a partial card (e.g. only max_tokens) and the
+    // family / hard fallback paths still want a chance to fill in the
+    // rest. The JSON Schema at share/model_cards/_schema.json catches
+    // typos earlier (CI / author-facing validation).
+    static const char * const kRequiredFields[] = {
+        "name", "source", "verified_at", "max_tokens"
+    };
+    for (const char * field : kRequiredFields) {
+        if (!j.contains(field)) {
+            std::fprintf(stderr,
+                "[model_card] %s: missing required field '%s' "
+                "(see share/model_cards/_schema.json)\n",
+                path.c_str(), field);
+        }
+    }
+
     if (j.contains("max_tokens") && j["max_tokens"].is_number_integer()) {
         out.max_tokens = j["max_tokens"].get<int>();
     }

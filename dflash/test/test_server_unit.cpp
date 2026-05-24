@@ -307,6 +307,76 @@ static void test_emitter_reasoning_split_openai() {
     TEST_ASSERT(em.accumulated_text().find("</think>") == std::string::npos);
 }
 
+// SseEmitter::first_content_token_index() / emit_token_count() — these
+// two accessors drive http_server's finish_details.thinking_tokens /
+// content_tokens split on the natural-close path (model self-closes
+// </think> mid-stream). Each test feeds tokens one-per-call so the
+// emit_token index is straightforward to reason about.
+static void test_emitter_first_content_index_natural_close() {
+    // Reasoning tokens, then </think> token, then content tokens.
+    // The token CARRYING </think> lands in REASONING; the NEXT token
+    // is the first CONTENT.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, true);
+    em.emit_start();
+    TEST_ASSERT(em.first_content_token_index() == -1);
+    TEST_ASSERT(em.emit_token_count() == 0);
+
+    em.emit_token("reasoning1");   // 0: REASONING
+    em.emit_token("reasoning2");   // 1: REASONING
+    em.emit_token("end</think>");  // 2: REASONING (carries close tag)
+    em.emit_token("content1");     // 3: CONTENT (first)
+    em.emit_token("content2");     // 4: CONTENT
+    em.emit_finish(5);
+
+    TEST_ASSERT(em.emit_token_count() == 5);
+    TEST_ASSERT(em.first_content_token_index() == 3);
+}
+
+static void test_emitter_first_content_index_never_closed() {
+    // Model emits reasoning only — never closes </think>. The index
+    // stays at -1 so the caller knows to count everything as thinking.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, true);
+    em.emit_start();
+
+    em.emit_token("reasoning never closes");
+    em.emit_token("still thinking");
+    em.emit_finish(2);
+
+    TEST_ASSERT(em.emit_token_count() == 2);
+    TEST_ASSERT(em.first_content_token_index() == -1);
+}
+
+static void test_emitter_first_content_index_content_only() {
+    // Non-thinking request: started_in_thinking=false. The very
+    // first emit_token starts in CONTENT mode, so the index is 0.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    em.emit_start();
+    em.emit_token("immediate content");
+    em.emit_finish(1);
+
+    TEST_ASSERT(em.first_content_token_index() == 0);
+    TEST_ASSERT(em.emit_token_count() == 1);
+}
+
+static void test_emitter_first_content_index_hard_close_inject() {
+    // Hard-close path: model never emits </think>, server injects
+    // a synthetic </think> before the phase-2 content tokens. The
+    // synthetic injection is one emit_token call (carries the close
+    // tag → REASONING); the next phase-2 token is the first CONTENT.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, true);
+    em.emit_start();
+
+    em.emit_token("phase1 reasoning a");  // 0: REASONING
+    em.emit_token("phase1 reasoning b");  // 1: REASONING
+    em.emit_token("</think>");            // 2: REASONING (synthetic close)
+    em.emit_token("phase2 answer a");     // 3: CONTENT (first)
+    em.emit_token("phase2 answer b");     // 4: CONTENT
+    em.emit_finish(5);
+
+    TEST_ASSERT(em.first_content_token_index() == 3);
+    TEST_ASSERT(em.emit_token_count() == 5);
+}
+
 static void test_emitter_reasoning_strips_leading_think_tag() {
     // When started_in_thinking=true, model may echo <think>.
     auto em = make_emitter(ApiFormat::OPENAI_CHAT, true);
@@ -1586,6 +1656,10 @@ int main() {
 
     std::fprintf(stderr, "\n── SSE Emitter ──\n");
     RUN_TEST(test_emitter_reasoning_split_openai);
+    RUN_TEST(test_emitter_first_content_index_natural_close);
+    RUN_TEST(test_emitter_first_content_index_never_closed);
+    RUN_TEST(test_emitter_first_content_index_content_only);
+    RUN_TEST(test_emitter_first_content_index_hard_close_inject);
     RUN_TEST(test_emitter_reasoning_strips_leading_think_tag);
     RUN_TEST(test_emitter_content_only_no_thinking);
     RUN_TEST(test_emitter_tool_buffer_detection);

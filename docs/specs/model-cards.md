@@ -45,8 +45,8 @@ share/model_cards/<name>.json
 The server resolves `<name>` from the loaded GGUF's `general.name`
 metadata, normalized per these rules:
 
-1. Lowercase.
-2. Replace spaces with `-`.
+1. Lowercase ASCII letters.
+2. Replace spaces, tabs, and underscores (`_`) with `-`.
 3. Strip any character not in `[a-z0-9.-]`.
 4. Append `.json`.
 
@@ -56,22 +56,31 @@ Examples:
 |---|---|
 | `Qwen3.6-27B` | `qwen3.6-27b.json` |
 | `Qwen3.6 27B` | `qwen3.6-27b.json` |
+| `Foo_Bar` | `foo-bar.json` |
 | `Laguna-XS.2` | `laguna-xs.2.json` |
 | `DeepSeek-V4-Flash` | `deepseek-v4-flash.json` |
 
 ### Cards directory search path
 
-The server probes (in order):
+The server probes (in order, matching
+`find_model_cards_dir` in `dflash/src/server/model_card.cpp`):
 
-1. `--model-cards-dir <path>` if the operator passed it.
-2. `$DFLASH_MODEL_CARDS_DIR` if set.
-3. `<binary_dir>/../share/model_cards/` (relative to the running
-   binary's parent dir, resolved via `/proc/self/exe`).
-4. `share/model_cards/` in the current working directory.
+1. `<repo_root_hint>/share/model_cards/` — an optional explicit
+   directory passed by the embedding application (e.g. tests). Not
+   exposed via a CLI flag today.
+2. `<binary_dir>/../share/model_cards/` (install layout — binary in
+   `bin/`, sidecars in `share/`, resolved via `/proc/self/exe`).
+3. `<binary_dir>/share/model_cards/` (build-tree layout — sidecars
+   shipped next to the binary).
+4. `share/model_cards/` in the current working directory (dev runs).
+5. `$DFLASH_MODEL_CARDS_DIR` if set (final override / escape hatch).
 
-The first directory containing a matching `<name>.json` wins. If
-none match, the server falls through to the per-family fallback
-table (see §4) and reports the chosen source in the startup banner.
+The first directory that **exists** wins (the implementation does
+*not* re-probe further candidates if the chosen directory lacks a
+matching `<name>.json`). If none exist, or if the chosen directory
+has no matching card, the server falls through to the per-family
+fallback table (see §4) and reports the chosen source in the
+startup banner.
 
 ## 3. JSON Schema
 
@@ -96,7 +105,7 @@ section is the human-readable summary.
 | `download_urls` | object | Map of variant → URL (e.g. `{"Q4_K_M": "https://...", "bf16": "https://..."}`). For operator convenience; the server does not download automatically. |
 | `complex_problem_max_tokens` | integer ≥ 1 | The card's recommendation for hard reasoning / benchmark workloads. Drives `x-high` and `max` effort tiers above the standard cap. Omit if the card has no separate complex-problem recommendation. |
 | `sampling` | object | Default sampler params. Used to fill values the request body did not specify. Allowed fields: `temperature` (float ≥ 0), `top_p` (float in 0..1), `top_k` (int ≥ 0), `min_p` (float in 0..1), `presence_penalty` (float), `repetition_penalty` (float). |
-| `reasoning_effort_tiers` | object | Explicit phase-1 budgets per `reasoning.effort` tier. Keys: `low`, `medium`, `high`, `x-high`, `max` (all optional integers ≥ 0). Missing keys fall through to the computed defaults in `docs/specs/thinking-budget.md` §3.3. |
+| `reasoning_effort_tiers` | object | Explicit phase-1 budgets per `reasoning.effort` tier. Keys: `low`, `medium`, `high`, `x-high`, `max` (all optional integers ≥ 1; the schema rejects `0`, and the resolver treats any value `≤ 0` as missing and substitutes the computed default per §5.4). Missing keys fall through to the computed defaults in `docs/specs/thinking-budget.md` §3.3. |
 | `notes` | string | Free-form provenance / caveats. Useful when the card omits values and the sidecar author has to pick defaults from related models or domain knowledge. |
 
 ### 3.3 Forbidden
@@ -115,12 +124,16 @@ first source supplying a value wins:
    `--default-max-tokens N`, `--reasoning-effort-high N`, etc.).
 2. **Model card sidecar** (this file).
 3. **Per-family fallback table**, built into the C++ server, keyed
-   on `general.architecture` (e.g. `qwen35`, `qwen36`, `gemma4`,
-   `laguna`). A coarse safety net for known families when no sidecar
-   matches.
+   on `general.architecture` (e.g. `qwen35`, `qwen36`, `qwen3`,
+   `gemma4`, `laguna`). A coarse safety net for known families when
+   no sidecar matches. Current family entries set `max_tokens` to
+   32768 (qwen*, laguna) or 16384 (gemma4), with
+   `complex_problem_max_tokens=0`.
 4. **Hard fallback**, matching `antirez/ds4 ds4_eval.c`'s reference
-   values: `default_max_tokens=16000`, `hard_limit_reply_budget=512`,
-   `think_max_tokens = default_max_tokens − hard_limit_reply_budget`.
+   values: `max_tokens=16000`, `hard_limit_reply_budget=512`,
+   `think_max_tokens = max_tokens − hard_limit_reply_budget = 15488`.
+   These also match the `ServerConfig` defaults in
+   `dflash/src/server/http_server.h`.
 
 The startup banner prints each tunable's value and which source
 supplied it, e.g.:
@@ -200,16 +213,23 @@ If the field is missing, the server computes defaults from
 
 | Tier | Default formula |
 |---|---|
-| `low` | `think_max × 0.125` |
-| `medium` | `think_max × 0.5` |
-| `high` | `think_max × 1.0` |
-| `x-high` | `(think_max + complex_think_max) / 2` |
+| `low` | `round(think_max × 0.125)` |
+| `medium` | `round(think_max × 0.5)` |
+| `high` | `think_max` |
+| `x-high` | `(think_max + complex_think_max) / 2` (integer division — truncates) |
 | `max` | `complex_think_max` |
 
 Where `think_max = max_tokens − hard_limit_reply_budget` and
 `complex_think_max = complex_problem_max_tokens − hard_limit_reply_budget`
 (falling back to `think_max` when the card has no complex
-recommendation).
+recommendation, in which case `x-high` and `max` collapse to
+`high`).
+
+Rounding note: `low` and `medium` use nearest-integer rounding
+(`int(x + 0.5)`); `x-high` uses C++ integer division (truncation
+toward zero). For odd or non-divisible `think_max` values this
+produces deterministic but distinct off-by-one outcomes; see
+`compute_default_tiers` in `dflash/src/server/model_card.cpp`.
 
 The `reasoning_effort_tiers` field exists because the ratio-based
 defaults don't fit every model. A smaller model that caps at 8192
@@ -226,24 +246,36 @@ At startup, after `resolve_model_card` selects a source:
 
 1. **JSON shape**: parsed with `nlohmann::json`. Malformed JSON → log
    error, fall through to family fallback, **do not** fail-start.
-2. **Schema check**: each required field present and type-correct.
-   Missing required field → log error per field, fall through to
-   family fallback.
-3. **Field bounds**: `max_tokens ≥ 1`,
-   `complex_problem_max_tokens ≥ max_tokens` (if present), tier
-   values non-decreasing in `low ≤ medium ≤ high ≤ x-high ≤ max`,
-   all values fit under `max_ctx − hard_limit_reply_budget`. Any
-   violation → log warning, clamp to satisfy invariants.
-4. **Banner**: print the resolved source label, max_tokens,
-   think_max_tokens, effort tiers, and sampling defaults.
+2. **Required-field check**: the loader logs a per-field error
+   message for each missing required field (`name`, `source`,
+   `verified_at`, `max_tokens`) but does **not** abandon the
+   sidecar — fields it could parse are kept; missing fields take
+   their `ModelCard` struct defaults (e.g. `max_tokens` defaults to
+   `16000`, matching the hard fallback). Authoritative
+   required/optional checking belongs in CI via
+   `share/model_cards/_schema.json`, not at server start. Operators
+   who want strict validation should run the schema validator in
+   their deployment pipeline.
+3. **Tier monotonicity**: tier values are clamped to be
+   non-decreasing in `low ≤ medium ≤ high ≤ x-high ≤ max`
+   (`enforce_tier_invariants`). Any violation is logged and clamped
+   up to the previous tier.
+4. **Absolute tier ceiling**: each effort tier is clamped to
+   `max_ctx − hard_limit_reply_budget` once `max_ctx` is resolved
+   from the backend / CLI (server_main.cpp, after
+   `resolve_model_card`). Any violation is logged and clamped down.
+5. **Banner**: print the resolved source label, max_tokens,
+   think_max_tokens, effort tiers, and per-tier provenance
+   (`from CLI` vs sidecar/family label).
 
 Validation never fails the server. The design priority is "operator
 can always start the server even with a missing/bad sidecar." The
 fallback chain (family table → hard fallback) guarantees the server
-has working defaults regardless of sidecar quality.
-
-A `validate.sh` script in `share/model_cards/` runs the schema
-check at CI time so bad sidecars don't land on `main`.
+has working defaults regardless of sidecar quality. Stricter
+checks (e.g. `complex_problem_max_tokens ≥ max_tokens`,
+`additionalProperties: false` on the root) live in
+`share/model_cards/_schema.json` and run at CI time so bad sidecars
+don't land on `main`.
 
 ## 7. Examples
 

@@ -177,6 +177,18 @@ std::vector<std::string> SseEmitter::emit_start() {
 std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
     if (stop_hit_) return {};  // already stopped
 
+    // Track the first emit_token call whose mode-on-entry is CONTENT —
+    // that's the first token attributed to the visible reply. Mode-on-
+    // entry matters because a token whose text *contains* `</think>`
+    // arrives while mode is still REASONING; the transition fires
+    // mid-emit. The token AFTER that transition is the first content
+    // token. Captured here so http_server can compute the natural-close
+    // split without a parallel bump_count loop.
+    if (first_content_token_index_ < 0 && mode_ == StreamMode::CONTENT) {
+        first_content_token_index_ = emit_token_count_;
+    }
+    emit_token_count_++;
+
     // Sanitize input to prevent json::dump() from throwing on invalid UTF-8.
     std::string piece = utf8_sanitize(raw_piece);
     std::vector<std::string> out;

@@ -1550,33 +1550,23 @@ void HttpServer::worker_loop() {
             // Non-streaming: build complete response using emitter state.
             // Feed all tokens through emitter (skip specials like streaming path).
             //
-            // While feeding, track per-mode token counts so the response's
-            // thinking_tokens / content_tokens split reflects the actual
-            // REASONING→CONTENT boundary the emitter detected (which can
-            // happen mid-phase-1 when the model self-closes </think>) — not
-            // the phase-1/phase-2 invocation boundary, which can over-count
-            // reasoning when phase-1 closed naturally and went on to write
-            // visible content.
-            int reasoning_tokens_emitted = 0;
-            int content_tokens_emitted = 0;
-            auto bump_count = [&](StreamMode m) {
-                // Attribute each token to the mode the emitter was in BEFORE
-                // the token was processed. A token that triggers the
-                // </think> transition lands in REASONING (it carries the
-                // close tag itself); the next token is the first CONTENT.
-                if (m == StreamMode::REASONING) reasoning_tokens_emitted++;
-                else if (m == StreamMode::CONTENT) content_tokens_emitted++;
-                // TOOL_BUFFER tokens are not counted toward either bucket —
-                // they're consumed by tool-call parsing.
-            };
+            // The emitter tracks first_content_token_index() — the
+            // emit_token index at which CONTENT mode first started.
+            // We use that to split the phase-1/phase-2 token totals at
+            // the actual REASONING→CONTENT boundary the emitter
+            // detected (which can happen mid-phase-1 when the model
+            // self-closes </think>). Without this, phase1_tokens.size()
+            // would over-count reasoning whenever the model naturally
+            // closed </think> and wrote a visible answer in phase 1.
+            // (Codex r1 P2 follow-up.)
             auto feed_tokens = [&](const std::vector<int32_t> & toks) -> bool {
                 for (int32_t tok : toks) {
                     const std::string & raw = tokenizer_.raw_token(tok);
                     if (tok == tokenizer_.eos_id()) continue;
                     if (tok == tokenizer_.eos_chat_id()) continue;
                     // Gemma4 channel → think mapping
-                    if (raw == "<|channel>") { bump_count(emitter.mode()); emitter.emit_token("<think>"); continue; }
-                    if (raw == "<channel|>") { bump_count(emitter.mode()); emitter.emit_token("</think>\n"); continue; }
+                    if (raw == "<|channel>") { emitter.emit_token("<think>"); continue; }
+                    if (raw == "<channel|>") { emitter.emit_token("</think>\n"); continue; }
                     // Qwen3.6 thinking tokens (id 248068 / 248069) — must
                     // forward as text so the emitter transitions
                     // reasoning→content. Without this the generic <...>
@@ -1584,15 +1574,14 @@ void HttpServer::worker_loop() {
                     // empty and the model's whole answer wedged in
                     // reasoning_content. Mirrors the streaming-path fix
                     // above.
-                    if (raw == "<think>") { bump_count(emitter.mode()); emitter.emit_token("<think>"); continue; }
-                    if (raw == "</think>") { bump_count(emitter.mode()); emitter.emit_token("</think>\n"); continue; }
+                    if (raw == "<think>") { emitter.emit_token("<think>"); continue; }
+                    if (raw == "</think>") { emitter.emit_token("</think>\n"); continue; }
                     if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|') continue;
                     if (raw.size() >= 2 && raw[0] == '<' && raw.back() == '>') {
                         if (!(raw.size() == 6 && raw[1] == '0' && raw[2] == 'x'))
                             continue;
                     }
                     std::string text = tokenizer_.token_text(tok);
-                    bump_count(emitter.mode());
                     emitter.emit_token(text);
                     if (emitter.stop_hit()) return false;
                 }
@@ -1616,6 +1605,27 @@ void HttpServer::worker_loop() {
             int total_completion_tokens =
                 (int)phase1_tokens.size() + (int)phase2_tokens.size();
             emitter.emit_finish(total_completion_tokens);
+
+            // Derive per-mode token counts from the emitter's REASONING
+            // → CONTENT transition. first_content_token_index() returns
+            // the emit_token index that first ran with mode == CONTENT;
+            // tokens before that index were emitted while the emitter
+            // was in REASONING (the `</think>`-carrying token itself
+            // lands in REASONING and the NEXT token is the first
+            // CONTENT). If the emitter never transitioned (model never
+            // closed <think>, then the synthetic </think> we injected
+            // before phase-2 tokens triggered the transition), the
+            // index reflects the synthetic close — exactly what we
+            // want for the hard-close path. EOS/special tokens are
+            // skipped by feed_tokens above, so emit_token_count() may
+            // be smaller than the sum of phase1+phase2 sizes; the
+            // remainder counts as unattributed (e.g., TOOL_BUFFER).
+            const int fci = emitter.first_content_token_index();
+            const int emitted = emitter.emit_token_count();
+            const int reasoning_tokens_emitted =
+                fci < 0 ? emitted : fci;
+            const int content_tokens_emitted =
+                fci < 0 ? 0 : emitted - fci;
 
             json resp;
             switch (req.format) {

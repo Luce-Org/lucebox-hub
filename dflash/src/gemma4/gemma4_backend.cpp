@@ -323,7 +323,22 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
     };
 
     for (int i = 0; i < n_gen; ++i) {
-        int32_t tok = out_tokens.back();
+        // Seed for this iteration's embed step:
+        //  - Normal case: previous iteration just pushed a sampled
+        //    token onto out_tokens; we re-embed it to advance KV +
+        //    produce next-token logits.
+        //  - Empty case (spec-decode tail-off at iter 0): no prior
+        //    iteration ran, so use cache_.last_tok — that's the
+        //    prefill argmax that spec-decode would have consumed as
+        //    its initial seed. Mirrors qwen35's initial_emitted=1
+        //    pattern; without this, out_tokens.back() on an empty
+        //    vector is UB. (Codex r2 P2 follow-up: the previous fix
+        //    pushed last_tok onto out_tokens here in the caller, but
+        //    that grew out_tokens by an uncounted extra token and the
+        //    caller's `result.tokens.size()` over-counted against the
+        //    budget. Reading from cache instead keeps the budget
+        //    honest.)
+        int32_t tok = out_tokens.empty() ? cache_.last_tok : out_tokens.back();
 
         // Embed single token
         w_.embedder.embed(&tok, 1, embed_buf.data());
@@ -405,8 +420,19 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
         // committed token is on out_tokens, but on a small-budget request
         // (budget_tokens <= reply_budget + q_len) tail-off can fire on
         // iter 0 before out_tokens has been seeded. Codex review flagged
-        // the resulting UB on out_tokens.back(). Seed last_tok explicitly
-        // when out_tokens is empty so do_decode always reads a valid id.
+        // the resulting UB on out_tokens.back(); we set cache_.last_tok
+        // and let do_decode pick it up when out_tokens is empty.
+        //
+        // Budget accounting (codex r2 P2): in the previous patch we
+        // also push_back'd last_tok before calling do_decode, which
+        // grew out_tokens by an extra token outside the budget — the
+        // caller (http_server) then saw `result.tokens.size() ==
+        // need_commit_budget + 1` and double-counted that seed against
+        // the budget. Mirror qwen35 instead: cache the seed via
+        // cache_.last_tok, leave out_tokens untouched, and have
+        // do_decode read the seed from cache when out_tokens is empty
+        // (initial_emitted=1 path below). That keeps the budget honest
+        // and matches the symmetry between qwen35 and gemma4 backends.
         if (budget_hook && !budget_hook->close_token_ids.empty()) {
             int hard = budget_hook->hard_limit_remaining;
             if (need_commit_budget <= hard + q_len) {
@@ -416,10 +442,7 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
                     "batch=%d) — switching to AR\n",
                     committed, n_gen, need_commit_budget, hard, q_len);
                 step_graph_destroy(draft_sg);
-                cache_.last_tok = last_tok;
-                if (out_tokens.empty()) {
-                    out_tokens.push_back(last_tok);
-                }
+                cache_.last_tok = last_tok;  // do_decode reads this when out_tokens empty
                 BudgetHook tail_hook = *budget_hook;
                 int ar_n_gen = need_commit_budget;
                 bool ok = do_decode(committed, ar_n_gen, out_tokens, io,
