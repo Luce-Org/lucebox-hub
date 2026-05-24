@@ -307,6 +307,76 @@ static void test_emitter_reasoning_split_openai() {
     TEST_ASSERT(em.accumulated_text().find("</think>") == std::string::npos);
 }
 
+// SseEmitter::first_content_token_index() / emit_token_count() — these
+// two accessors drive http_server's finish_details.thinking_tokens /
+// content_tokens split on the natural-close path (model self-closes
+// </think> mid-stream). Each test feeds tokens one-per-call so the
+// emit_token index is straightforward to reason about.
+static void test_emitter_first_content_index_natural_close() {
+    // Reasoning tokens, then </think> token, then content tokens.
+    // The token CARRYING </think> lands in REASONING; the NEXT token
+    // is the first CONTENT.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, true);
+    em.emit_start();
+    TEST_ASSERT(em.first_content_token_index() == -1);
+    TEST_ASSERT(em.emit_token_count() == 0);
+
+    em.emit_token("reasoning1");   // 0: REASONING
+    em.emit_token("reasoning2");   // 1: REASONING
+    em.emit_token("end</think>");  // 2: REASONING (carries close tag)
+    em.emit_token("content1");     // 3: CONTENT (first)
+    em.emit_token("content2");     // 4: CONTENT
+    em.emit_finish(5);
+
+    TEST_ASSERT(em.emit_token_count() == 5);
+    TEST_ASSERT(em.first_content_token_index() == 3);
+}
+
+static void test_emitter_first_content_index_never_closed() {
+    // Model emits reasoning only — never closes </think>. The index
+    // stays at -1 so the caller knows to count everything as thinking.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, true);
+    em.emit_start();
+
+    em.emit_token("reasoning never closes");
+    em.emit_token("still thinking");
+    em.emit_finish(2);
+
+    TEST_ASSERT(em.emit_token_count() == 2);
+    TEST_ASSERT(em.first_content_token_index() == -1);
+}
+
+static void test_emitter_first_content_index_content_only() {
+    // Non-thinking request: started_in_thinking=false. The very
+    // first emit_token starts in CONTENT mode, so the index is 0.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    em.emit_start();
+    em.emit_token("immediate content");
+    em.emit_finish(1);
+
+    TEST_ASSERT(em.first_content_token_index() == 0);
+    TEST_ASSERT(em.emit_token_count() == 1);
+}
+
+static void test_emitter_first_content_index_hard_close_inject() {
+    // Hard-close path: model never emits </think>, server injects
+    // a synthetic </think> before the phase-2 content tokens. The
+    // synthetic injection is one emit_token call (carries the close
+    // tag → REASONING); the next phase-2 token is the first CONTENT.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, true);
+    em.emit_start();
+
+    em.emit_token("phase1 reasoning a");  // 0: REASONING
+    em.emit_token("phase1 reasoning b");  // 1: REASONING
+    em.emit_token("</think>");            // 2: REASONING (synthetic close)
+    em.emit_token("phase2 answer a");     // 3: CONTENT (first)
+    em.emit_token("phase2 answer b");     // 4: CONTENT
+    em.emit_finish(5);
+
+    TEST_ASSERT(em.first_content_token_index() == 3);
+    TEST_ASSERT(em.emit_token_count() == 5);
+}
+
 static void test_emitter_reasoning_strips_leading_think_tag() {
     // When started_in_thinking=true, model may echo <think>.
     auto em = make_emitter(ApiFormat::OPENAI_CHAT, true);
@@ -1553,6 +1623,244 @@ static void test_sampler_needs_logit_processing() {
     TEST_ASSERT(!cfg.needs_logit_processing());
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// /props body shape tests (model-free)
+//
+// Verify build_props_body's new wholesale-sidecar `model_card` + new
+// `budget_envelope` section per docs/specs/props-endpoint.md §4.9 / §4.X.
+// ═══════════════════════════════════════════════════════════════════════
+
+static ServerConfig make_props_config_with_sidecar(const json & sidecar) {
+    ServerConfig cfg;
+    cfg.arch                    = "qwen35";
+    cfg.model_path              = "/tmp/fake/model.gguf";
+    cfg.model_card_source_label = "share/model_cards/qwen3.6-27b.json";
+    cfg.model_card_json         = sidecar;
+    cfg.default_max_tokens      = 32768;
+    cfg.hard_limit_reply_budget = 512;
+    cfg.think_max_tokens        = 32256;
+    cfg.effort_tiers.low    = 4032;
+    cfg.effort_tiers.medium = 16128;
+    cfg.effort_tiers.high   = 32256;
+    cfg.effort_tiers.x_high = 56832;
+    cfg.effort_tiers.max    = 81408;
+    return cfg;
+}
+
+static void test_props_model_card_wholesale_sidecar() {
+    // When a sidecar was loaded, /props.model_card should be the parsed
+    // sidecar JSON verbatim — *all* fields from the file, not just the
+    // five budget-derived ones from the pre-refactor shape.
+    json sidecar = {
+        {"name",         "Qwen3.6 27B"},
+        {"source",       "https://huggingface.co/Qwen/Qwen3.6-27B"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens",   32768},
+        {"complex_problem_max_tokens", 81920},
+        {"sampling", {
+            {"temperature", 1.0},
+            {"top_p",       0.95},
+            {"top_k",       20},
+        }},
+        {"reasoning_effort_tiers", {
+            {"low",    4032},
+            {"medium", 16128},
+            {"high",   32256},
+            {"x-high", 56832},
+            {"max",    81408},
+        }},
+        {"notes", "test card"},
+    };
+    ServerConfig cfg = make_props_config_with_sidecar(sidecar);
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body.contains("model_card"));
+    TEST_ASSERT(!body["model_card"].is_null());
+    // `source` is the upstream URL, NOT the filepath. The filepath label
+    // moved to budget_envelope.model_card_source post-refactor.
+    TEST_ASSERT(body["model_card"]["source"].get<std::string>() ==
+                "https://huggingface.co/Qwen/Qwen3.6-27B");
+    TEST_ASSERT(body["model_card"]["name"].get<std::string>() == "Qwen3.6 27B");
+    TEST_ASSERT(body["model_card"]["max_tokens"].get<int>() == 32768);
+    TEST_ASSERT(body["model_card"]["complex_problem_max_tokens"].get<int>() == 81920);
+    TEST_ASSERT(body["model_card"].contains("sampling"));
+    TEST_ASSERT(body["model_card"].contains("reasoning_effort_tiers"));
+    TEST_ASSERT(body["model_card"]["notes"].get<std::string>() == "test card");
+    // The pre-refactor `think_max_tokens` / `hard_limit_reply_budget`
+    // keys are NOT in the wholesale shape — they moved to budget_envelope.
+    TEST_ASSERT(!body["model_card"].contains("think_max_tokens"));
+    TEST_ASSERT(!body["model_card"].contains("hard_limit_reply_budget"));
+}
+
+static void test_props_model_card_null_on_family_fallback() {
+    // When family or hard fallback was used (no sidecar), /props.model_card
+    // is JSON null. The budget_envelope still carries the resolved values.
+    ServerConfig cfg;
+    cfg.arch                    = "qwen35";
+    cfg.model_card_source_label = "family:qwen35";
+    cfg.model_card_json         = nullptr;  // no sidecar parsed
+    cfg.default_max_tokens      = 32768;
+    cfg.hard_limit_reply_budget = 512;
+    cfg.think_max_tokens        = 32256;
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body.contains("model_card"));
+    TEST_ASSERT(body["model_card"].is_null());
+    // budget_envelope still present and carries the family-fallback label.
+    TEST_ASSERT(body.contains("budget_envelope"));
+    TEST_ASSERT(body["budget_envelope"]["model_card_source"].get<std::string>() ==
+                "family:qwen35");
+    TEST_ASSERT(body["budget_envelope"]["default_max_tokens"].get<int>() == 32768);
+}
+
+static void test_props_budget_envelope_shape() {
+    // budget_envelope is always present with all five fields and the
+    // expected effort_tiers vocabulary (low|medium|high|x-high|max).
+    // Values mirror ServerConfig regardless of what the sidecar carried.
+    json sidecar = {
+        {"name",        "Qwen3.6 27B"},
+        {"source",      "https://huggingface.co/Qwen/Qwen3.6-27B"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens",  32768},
+    };
+    ServerConfig cfg = make_props_config_with_sidecar(sidecar);
+    // Simulate CLI override: budget_envelope reflects the runtime value,
+    // which may diverge from the sidecar (here, 16000 != sidecar 32768).
+    cfg.default_max_tokens      = 16000;
+    cfg.hard_limit_reply_budget = 512;
+    cfg.think_max_tokens        = 15488;
+    cfg.effort_tiers.low    = 100;
+    cfg.effort_tiers.medium = 200;
+    cfg.effort_tiers.high   = 300;
+    cfg.effort_tiers.x_high = 400;
+    cfg.effort_tiers.max    = 500;
+
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body.contains("budget_envelope"));
+    const json & be = body["budget_envelope"];
+    TEST_ASSERT(be["model_card_source"].get<std::string>() ==
+                "share/model_cards/qwen3.6-27b.json");
+    TEST_ASSERT(be["default_max_tokens"].get<int>() == 16000);
+    TEST_ASSERT(be["hard_limit_reply_budget"].get<int>() == 512);
+    TEST_ASSERT(be["think_max_tokens"].get<int>() == 15488);
+    TEST_ASSERT(be["effort_tiers"]["low"].get<int>()    == 100);
+    TEST_ASSERT(be["effort_tiers"]["medium"].get<int>() == 200);
+    TEST_ASSERT(be["effort_tiers"]["high"].get<int>()   == 300);
+    TEST_ASSERT(be["effort_tiers"]["x-high"].get<int>() == 400);
+    TEST_ASSERT(be["effort_tiers"]["max"].get<int>()    == 500);
+
+    // Sanity: budget_envelope can diverge from model_card.max_tokens
+    // (CLI override case). Verifies the two sections aren't a tautology.
+    TEST_ASSERT(body["model_card"]["max_tokens"].get<int>() == 32768);
+    TEST_ASSERT(be["default_max_tokens"].get<int>() == 16000);
+
+    // Sanity: props_schema bumped to 2 (breaking change).
+    TEST_ASSERT(body["server"]["props_schema"].get<int>() == 2);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// usage.timings — per-request prefill / decode wall-clock breakdown
+// surfaced under usage.timings (spec §6.3). Tests cover all three
+// response shapes plus the zero-decode_s div-by-zero guard.
+// ═══════════════════════════════════════════════════════════════════════
+
+static void test_usage_timings_openai_chat_streaming() {
+    // OpenAI Chat streaming: the terminal usage chunk (just before
+    // data: [DONE]) carries `timings.{prefill_ms, decode_ms,
+    // decode_tokens_per_sec}` when timings are passed to emit_finish.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    em.emit_start();
+    em.emit_token("Hello world");
+
+    GenTimings t{0.2345, 2.4567};  // 234.5 ms / 2456.7 ms
+    auto finish = em.emit_finish(/*completion_tokens*/ 100, &t);
+    std::string finish_str = concat(finish);
+
+    TEST_ASSERT(finish_str.find("\"timings\"") != std::string::npos);
+    TEST_ASSERT(finish_str.find("\"prefill_ms\":234.5") != std::string::npos);
+    TEST_ASSERT(finish_str.find("\"decode_ms\":2456.7") != std::string::npos);
+    // 100 / 2.4567 = 40.7048... → rounds to 40.7
+    TEST_ASSERT(finish_str.find("\"decode_tokens_per_sec\":40.7") != std::string::npos);
+    TEST_ASSERT(finish_str.find("[DONE]") != std::string::npos);
+}
+
+static void test_usage_timings_anthropic_streaming() {
+    // Anthropic streaming: message_delta.usage gains a `timings`
+    // sibling alongside `output_tokens`.
+    auto em = make_emitter(ApiFormat::ANTHROPIC, false);
+    em.emit_start();
+    em.emit_token("ok");
+    GenTimings t{0.05, 0.5};  // 50.0 ms / 500.0 ms
+    auto finish = em.emit_finish(/*completion_tokens*/ 10, &t);
+    std::string finish_str = concat(finish);
+
+    TEST_ASSERT(finish_str.find("\"timings\"") != std::string::npos);
+    TEST_ASSERT(finish_str.find("\"prefill_ms\":50.0") != std::string::npos);
+    TEST_ASSERT(finish_str.find("\"decode_ms\":500.0") != std::string::npos);
+    // 10 / 0.5 = 20.0
+    TEST_ASSERT(finish_str.find("\"decode_tokens_per_sec\":20.0") != std::string::npos);
+}
+
+static void test_usage_timings_responses_streaming() {
+    // Responses streaming: response.completed.usage gains `timings`.
+    auto em = make_emitter(ApiFormat::RESPONSES, false);
+    em.emit_start();
+    em.emit_token("done");
+    GenTimings t{0.1, 1.0};
+    auto finish = em.emit_finish(/*completion_tokens*/ 25, &t);
+    std::string finish_str = concat(finish);
+
+    TEST_ASSERT(finish_str.find("\"timings\"") != std::string::npos);
+    TEST_ASSERT(finish_str.find("\"prefill_ms\":100.0") != std::string::npos);
+    TEST_ASSERT(finish_str.find("\"decode_ms\":1000.0") != std::string::npos);
+    // 25 / 1.0 = 25.0
+    TEST_ASSERT(finish_str.find("\"decode_tokens_per_sec\":25.0") != std::string::npos);
+}
+
+static void test_usage_timings_zero_decode_no_div_by_zero() {
+    // decode_s == 0 (prefill-only / no tokens generated path): emit
+    // decode_tokens_per_sec = 0.0 without div-by-zero.
+    GenTimings t{0.123, 0.0};
+    json j = build_timings_json(t, /*completion_tokens*/ 42);
+    TEST_ASSERT(j["prefill_ms"].get<double>() == 123.0);
+    TEST_ASSERT(j["decode_ms"].get<double>() == 0.0);
+    TEST_ASSERT(j["decode_tokens_per_sec"].get<double>() == 0.0);
+
+    // Also exercise via OpenAI streaming path — finite JSON output, no NaN/Inf.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    em.emit_start();
+    auto finish = em.emit_finish(/*completion_tokens*/ 0, &t);
+    std::string finish_str = concat(finish);
+    TEST_ASSERT(finish_str.find("\"decode_tokens_per_sec\":0.0") != std::string::npos);
+    // No NaN / Inf serialization leak.
+    TEST_ASSERT(finish_str.find("inf") == std::string::npos);
+    TEST_ASSERT(finish_str.find("nan") == std::string::npos);
+}
+
+static void test_usage_timings_omitted_when_null() {
+    // Backward compat: emit_finish(n) (no timings) emits the legacy
+    // usage block — no `timings` key. Guards the SDK-facing default
+    // for callers that don't yet wire timings through.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    em.emit_start();
+    em.emit_token("x");
+    auto finish = em.emit_finish(3);  // no timings arg
+    std::string finish_str = concat(finish);
+
+    TEST_ASSERT(finish_str.find("\"timings\"") == std::string::npos);
+    TEST_ASSERT(finish_str.find("[DONE]") != std::string::npos);
+}
+
 int main() {
     std::fprintf(stderr, "══════════════════════════════════════════\n");
     std::fprintf(stderr, " Server Unit Tests\n");
@@ -1586,6 +1894,10 @@ int main() {
 
     std::fprintf(stderr, "\n── SSE Emitter ──\n");
     RUN_TEST(test_emitter_reasoning_split_openai);
+    RUN_TEST(test_emitter_first_content_index_natural_close);
+    RUN_TEST(test_emitter_first_content_index_never_closed);
+    RUN_TEST(test_emitter_first_content_index_content_only);
+    RUN_TEST(test_emitter_first_content_index_hard_close_inject);
     RUN_TEST(test_emitter_reasoning_strips_leading_think_tag);
     RUN_TEST(test_emitter_content_only_no_thinking);
     RUN_TEST(test_emitter_tool_buffer_detection);
@@ -1668,6 +1980,18 @@ int main() {
     RUN_TEST(test_parse_sampler_token_no_samp);
     RUN_TEST(test_sampler_temp_zero_with_penalties_uses_argmax);
     RUN_TEST(test_sampler_needs_logit_processing);
+
+    std::fprintf(stderr, "\n── /props body shape ──\n");
+    RUN_TEST(test_props_model_card_wholesale_sidecar);
+    RUN_TEST(test_props_model_card_null_on_family_fallback);
+    RUN_TEST(test_props_budget_envelope_shape);
+
+    std::fprintf(stderr, "\n── usage.timings ──\n");
+    RUN_TEST(test_usage_timings_openai_chat_streaming);
+    RUN_TEST(test_usage_timings_anthropic_streaming);
+    RUN_TEST(test_usage_timings_responses_streaming);
+    RUN_TEST(test_usage_timings_zero_decode_no_div_by_zero);
+    RUN_TEST(test_usage_timings_omitted_when_null);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");
     std::fprintf(stderr, " Results: %d assertions, %d failures\n",

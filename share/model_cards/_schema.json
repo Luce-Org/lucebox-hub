@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/lucebox/lucebox-hub/blob/main/share/model_cards/_schema.json",
+  "title": "dflash model card sidecar",
+  "description": "Sidecar JSON carrying per-model defaults transcribed from the upstream model card. Read by dflash_server at startup to set --default-max-tokens, --think-max-tokens, sampler, and reasoning.effort tier values. See docs/specs/thinking-budget.md §3.3 for the full field reference.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "source", "verified_at", "max_tokens"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Display name. Informational; the filename is what matters for lookup."
+    },
+    "source": {
+      "type": "string",
+      "format": "uri",
+      "description": "URL of the upstream model card we transcribed."
+    },
+    "verified_at": {
+      "type": "string",
+      "format": "date",
+      "description": "ISO 8601 date (YYYY-MM-DD) the values were last checked against the source."
+    },
+    "max_tokens": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The card's standard recommended combined cap. Drives default_max_tokens."
+    },
+    "download_urls": {
+      "type": "object",
+      "description": "Optional. Map of variant tag (e.g. Q4_K_M, bf16) to GGUF download URL. Used by deployment tooling to resolve a sidecar to a concrete artifact.",
+      "additionalProperties": {
+        "type": "string",
+        "format": "uri"
+      }
+    },
+    "complex_problem_max_tokens": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Optional. Card's recommendation for hard reasoning / benchmark workloads. Drives x-high and max effort tiers."
+    },
+    "sampling": {
+      "type": "object",
+      "description": "Optional. Recommended sampler defaults; used when the request omits a field.",
+      "additionalProperties": false,
+      "properties": {
+        "temperature":        { "type": "number" },
+        "top_p":              { "type": "number" },
+        "top_k":              { "type": "integer" },
+        "min_p":              { "type": "number" },
+        "presence_penalty":   { "type": "number" },
+        "repetition_penalty": { "type": "number" }
+      }
+    },
+    "reasoning_effort_tiers": {
+      "type": "object",
+      "description": "Optional. Explicit per-tier phase-1 budgets. Overrides any computed default. Use when ratio-based defaults don't fit the model.",
+      "additionalProperties": false,
+      "properties": {
+        "low":    { "type": "integer", "minimum": 1 },
+        "medium": { "type": "integer", "minimum": 1 },
+        "high":   { "type": "integer", "minimum": 1 },
+        "x-high": { "type": "integer", "minimum": 1 },
+        "max":    { "type": "integer", "minimum": 1 }
+      }
+    },
+    "notes": {
+      "type": "string",
+      "description": "Optional. Free-form notes about provenance, caveats, or non-card-derived choices."
+    }
+  }
+}
