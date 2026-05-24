@@ -92,8 +92,17 @@ static json build_props_body(const ServerConfig & config,
     else if (config.speculative_enabled)   speculative_mode = "dflash";
     else                                   speculative_mode = "off";
 
+    // Spec §4.2: the five-tier vocabulary (low | medium | high | x-high | max)
+    // all activate the phase-1 envelope. Advertise the full set when the
+    // arch supports reasoning so clients can negotiate the higher tiers.
     json reasoning_efforts = json::array();
-    if (reasoning_supported) reasoning_efforts.push_back("medium");
+    if (reasoning_supported) {
+        reasoning_efforts.push_back("low");
+        reasoning_efforts.push_back("medium");
+        reasoning_efforts.push_back("high");
+        reasoning_efforts.push_back("x-high");
+        reasoning_efforts.push_back("max");
+    }
 
     json server = {
         {"name",         kServerName},
@@ -173,6 +182,22 @@ static json build_props_body(const ServerConfig & config,
             {"supported",         reasoning_supported},
             {"default",           nullptr},
             {"supported_efforts", reasoning_efforts},
+        }},
+        // Model-card-derived budgets surfaced for introspection. `source`
+        // tells operators which resolution branch fired (sidecar JSON,
+        // family fallback, or hard fallback) per spec §3.1.
+        {"model_card", {
+            {"source",                  config.model_card_source_label},
+            {"max_tokens",              config.default_max_tokens},
+            {"hard_limit_reply_budget", config.hard_limit_reply_budget},
+            {"think_max_tokens",        config.think_max_tokens},
+            {"effort_tiers", {
+                {"low",    config.effort_tiers.low},
+                {"medium", config.effort_tiers.medium},
+                {"high",   config.effort_tiers.high},
+                {"x-high", config.effort_tiers.x_high},
+                {"max",    config.effort_tiers.max},
+            }},
         }},
         {"speculative", {
             {"enabled",       config.speculative_enabled},
@@ -589,9 +614,31 @@ void HttpServer::handle_client(int fd) {
                      {"display_name", config_.model_name},
                      {"description", "Local DFlash speculative-decoding server"},
                      {"default_reasoning_level", "low"},
+                     // Spec §4.2: every tier activates the phase-1 envelope;
+                     // the difference is the budget cap selected from the
+                     // model card's effort_tiers. Descriptions surface the
+                     // resolved cap so clients can pick a tier purposefully.
                      {"supported_reasoning_levels", json::array({
-                         {{"effort", "low"}, {"description", "No thinking"}},
-                         {{"effort", "medium"}, {"description", "Thinking enabled"}},
+                         {{"effort", "low"},
+                          {"description", "Phase-1 budget at the model card's low tier ("
+                                          + std::to_string(config_.effort_tiers.low)
+                                          + " tokens)"}},
+                         {{"effort", "medium"},
+                          {"description", "Phase-1 budget at the model card's medium tier ("
+                                          + std::to_string(config_.effort_tiers.medium)
+                                          + " tokens)"}},
+                         {{"effort", "high"},
+                          {"description", "Phase-1 budget at the model card's standard recommendation ("
+                                          + std::to_string(config_.effort_tiers.high)
+                                          + " tokens)"}},
+                         {{"effort", "x-high"},
+                          {"description", "Phase-1 budget between high and the complex-problem ceiling ("
+                                          + std::to_string(config_.effort_tiers.x_high)
+                                          + " tokens)"}},
+                         {{"effort", "max"},
+                          {"description", "Phase-1 budget at the model card's complex-problem ceiling ("
+                                          + std::to_string(config_.effort_tiers.max)
+                                          + " tokens)"}},
                      })},
                      {"shell_type", "shell_command"},
                      {"visibility", "list"},
