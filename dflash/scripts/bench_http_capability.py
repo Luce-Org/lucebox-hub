@@ -458,6 +458,25 @@ def run_case(
     # in the per-case row lets the trace explain why a turn ended (model
     # closed </think> naturally vs server force-closed at the budget).
     finish_details = choice.get("finish_details") or {}
+    # OpenAI/Anthropic/OR convention: usage.completion_tokens_details has
+    # a reasoning_tokens field for thinking-mode models. Fall back to it
+    # when the server didn't emit finish_details (most non-dflash gateways).
+    or_ct_details = (usage.get("completion_tokens_details") or {})
+    or_reasoning_tokens = or_ct_details.get("reasoning_tokens")
+    # Derive content_tokens when usage gives us total + reasoning split.
+    or_content_tokens = None
+    if or_reasoning_tokens is not None and usage.get("completion_tokens") is not None:
+        or_content_tokens = int(usage["completion_tokens"]) - int(or_reasoning_tokens)
+    thinking_tokens_final = (
+        finish_details.get("thinking_tokens")
+        if finish_details.get("thinking_tokens") is not None
+        else or_reasoning_tokens
+    )
+    content_tokens_final = (
+        finish_details.get("content_tokens")
+        if finish_details.get("content_tokens") is not None
+        else or_content_tokens
+    )
     # usage.timings — per-request prefill/decode wall-clock breakdown
     # emitted by dflash_server (spec §6.3). Absent for backends that
     # don't surface timings (OpenRouter, older sindri binaries); the
@@ -486,8 +505,8 @@ def run_case(
         "http_status": http_status,
         "finish_reason": choice.get("finish_reason"),
         "close_kind": finish_details.get("close_kind"),
-        "thinking_tokens": finish_details.get("thinking_tokens"),
-        "content_tokens": finish_details.get("content_tokens"),
+        "thinking_tokens": thinking_tokens_final,
+        "content_tokens": content_tokens_final,
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
         "timings": timings,
