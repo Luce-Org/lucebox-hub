@@ -1241,6 +1241,8 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     int current_last = -1;
     std::vector<int> prefill_bases;
     std::vector<int> prefill_sizes;
+    int dflash_base = -1;
+    int dflash_last = -1;
     std::vector<int32_t> emitted_tokens;
     bool dflash_enabled = false;
     bool dflash_called = false;
@@ -1277,10 +1279,21 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
         return true;
     }
     bool can_dflash_decode() const override { return dflash_enabled; }
-    bool decode_dflash(const std::vector<int32_t> &, int, int, int,
-                       std::vector<int32_t> &, const DaemonIO &) override {
+    bool decode_dflash(const std::vector<int32_t> & prompt, int base_pos,
+                       int last_tok, int n_gen, std::vector<int32_t> & out_tokens,
+                       const DaemonIO & io) override {
+        (void)prompt;
         dflash_called = true;
-        return false;
+        dflash_base = base_pos;
+        dflash_last = last_tok;
+        for (int i = 0; i < n_gen; ++i) {
+            int32_t tok = last_tok + i + 10;
+            out_tokens.push_back(tok);
+            emitted_tokens.push_back(tok);
+            io.emit(tok);
+        }
+        io.emit(-1);
+        return true;
     }
     void free_drafter() override {}
     bool snapshot_save(int slot) override {
@@ -1350,12 +1363,14 @@ static void test_layer_split_backend_inline_snapshot_and_restore_delta() {
     GenerateResult restored = backend.restore_and_generate(2, restore_req, io);
 
     TEST_ASSERT(restored.ok);
-    TEST_ASSERT(!raw->dflash_called);
+    TEST_ASSERT(raw->dflash_called);
     TEST_ASSERT(raw->restored_slot == 2);
     TEST_ASSERT(!raw->reset_called);
     TEST_ASSERT(raw->prefill_bases.size() == 1);
     TEST_ASSERT(raw->prefill_bases[0] == 3);
     TEST_ASSERT(raw->prefill_sizes[0] == 1);
+    TEST_ASSERT(raw->dflash_base == 3);
+    TEST_ASSERT(raw->dflash_last == 99);
 }
 
 static void test_layer_split_compress_nopark_uses_default_drafter_path() {

@@ -86,6 +86,7 @@ bool Qwen35LayerSplitAdapter::init() {
     for (auto & slot : prefix_snapshots_) {
         slot.resize(shards_.size());
     }
+    draft_feature_snapshots_.resize(PREFIX_SLOTS);
 
     return true;
 }
@@ -208,6 +209,10 @@ bool Qwen35LayerSplitAdapter::snapshot_save(int slot) {
             return false;
         }
     }
+    if (!snapshot_draft_features(slot)) {
+        snapshot_free(slot);
+        return false;
+    }
     return true;
 }
 
@@ -216,6 +221,7 @@ void Qwen35LayerSplitAdapter::snapshot_free(int slot) {
     for (auto & snap : prefix_snapshots_[(size_t)slot]) {
         free_prefix_snapshot(snap);
     }
+    free_draft_feature_snapshot(slot);
 }
 
 bool Qwen35LayerSplitAdapter::snapshot_used(int slot) const {
@@ -224,6 +230,12 @@ bool Qwen35LayerSplitAdapter::snapshot_used(int slot) const {
     if (snaps.size() != shards_.size()) return false;
     for (const auto & snap : snaps) {
         if (!snap.ctx) return false;
+    }
+    if (cfg_.run_dflash && cfg_.draft_path) {
+        if (draft_feature_snapshots_.size() != (size_t)PREFIX_SLOTS) return false;
+        const auto & draft_snap = draft_feature_snapshots_[(size_t)slot];
+        if (draft_snap.cur_pos <= 0 || draft_snap.n_tokens <= 0 ||
+            draft_snap.data.empty()) return false;
     }
     return true;
 }
@@ -242,6 +254,109 @@ bool Qwen35LayerSplitAdapter::snapshot_restore(int slot) {
             !restore_target_cache(snaps[i], shards_[i].cache)) {
             return false;
         }
+    }
+    if (!restore_draft_features(slot)) return false;
+    return true;
+}
+
+bool Qwen35LayerSplitAdapter::snapshot_draft_features(int slot) {
+    if (!cfg_.run_dflash || !cfg_.draft_path) {
+        free_draft_feature_snapshot(slot);
+        return true;
+    }
+    if (!snapshot_slot_valid(slot) ||
+        draft_feature_snapshots_.size() != (size_t)PREFIX_SLOTS) {
+        return false;
+    }
+
+    const auto & snaps = prefix_snapshots_[(size_t)slot];
+    if (snaps.empty() || !snaps.front().ctx) return false;
+    const int cur_pos = snaps.front().cur_pos;
+    if (cur_pos <= 0) return false;
+    const int ring_cap = remote_draft_.active() ? remote_draft_.ring_cap() : feature_ring_.cap;
+    const int n_layers = remote_draft_.active() ? remote_draft_.n_target_layers()
+                                                : feature_ring_.n_target_layers;
+    const int hidden = remote_draft_.active() ? remote_draft_.hidden_size()
+                                              : feature_ring_.hidden_size;
+    if (ring_cap <= 0 || n_layers <= 0 || hidden <= 0) return false;
+    const int n_tokens = std::min(cur_pos, ring_cap);
+    const int start_pos = cur_pos - n_tokens;
+    if (n_tokens <= 0) return false;
+
+    auto & snap = draft_feature_snapshots_[(size_t)slot];
+    snap.cur_pos = cur_pos;
+    snap.start_pos = start_pos;
+    snap.n_tokens = n_tokens;
+    snap.cap = ring_cap;
+    snap.n_target_layers = n_layers;
+    snap.hidden_size = hidden;
+    snap.data.clear();
+    snap.data.resize((size_t)n_tokens * (size_t)n_layers * (size_t)hidden);
+
+    if (remote_draft_.active()) {
+        return remote_draft_.get_feature_range(start_pos, n_tokens, snap.data);
+    }
+
+    if (!feature_ring_.target_feat) return false;
+    const int fc_in = n_layers * hidden;
+    const size_t row_bytes = (size_t)fc_in * sizeof(float);
+    const size_t src_stride = feature_ring_.target_feat->nb[1];
+    for (int i = 0; i < n_tokens; ++i) {
+        const int ring_slot = (start_pos + i) % ring_cap;
+        ggml_backend_tensor_get(feature_ring_.target_feat,
+                                snap.data.data() + (size_t)i * (size_t)fc_in,
+                                (size_t)ring_slot * src_stride,
+                                row_bytes);
+    }
+    return true;
+}
+
+void Qwen35LayerSplitAdapter::free_draft_feature_snapshot(int slot) {
+    if (slot < 0 || draft_feature_snapshots_.size() != (size_t)PREFIX_SLOTS ||
+        slot >= (int)draft_feature_snapshots_.size()) {
+        return;
+    }
+    draft_feature_snapshots_[(size_t)slot] = DraftFeatureSnapshot{};
+}
+
+bool Qwen35LayerSplitAdapter::restore_draft_features(int slot) {
+    if (!cfg_.run_dflash || !cfg_.draft_path) return true;
+    if (slot < 0 || draft_feature_snapshots_.size() != (size_t)PREFIX_SLOTS ||
+        slot >= (int)draft_feature_snapshots_.size()) {
+        return false;
+    }
+
+    const auto & snap = draft_feature_snapshots_[(size_t)slot];
+    if (snap.cur_pos <= 0 || snap.start_pos < 0 || snap.n_tokens <= 0 ||
+        snap.cap <= 0 || snap.n_target_layers <= 0 || snap.hidden_size <= 0 ||
+        snap.data.empty()) {
+        return false;
+    }
+
+    if (remote_draft_.active()) {
+        if (snap.cap != remote_draft_.ring_cap() ||
+            snap.n_target_layers != remote_draft_.n_target_layers() ||
+            snap.hidden_size != remote_draft_.hidden_size()) {
+            return false;
+        }
+        return remote_draft_.set_feature_range(snap.start_pos, snap.n_tokens, snap.data);
+    }
+
+    if (!feature_ring_.target_feat ||
+        snap.cap != feature_ring_.cap ||
+        snap.n_target_layers != feature_ring_.n_target_layers ||
+        snap.hidden_size != feature_ring_.hidden_size) {
+        return false;
+    }
+    const int fc_in = snap.n_target_layers * snap.hidden_size;
+    const size_t row_bytes = (size_t)fc_in * sizeof(float);
+    const size_t dst_stride = feature_ring_.target_feat->nb[1];
+    for (int i = 0; i < snap.n_tokens; ++i) {
+        const int ring_slot = (snap.start_pos + i) % snap.cap;
+        ggml_backend_tensor_set(feature_ring_.target_feat,
+                                snap.data.data() + (size_t)i * (size_t)fc_in,
+                                (size_t)ring_slot * dst_stride,
+                                row_bytes);
     }
     return true;
 }
@@ -378,6 +493,7 @@ void Qwen35LayerSplitAdapter::shutdown() {
         for (auto & snap : slot) free_prefix_snapshot(snap);
     }
     prefix_snapshots_.clear();
+    draft_feature_snapshots_.clear();
     auto shard_metas = layer_split_shard_metas(shards_);
     free_layer_split_snapshot_backends(shard_metas, snapshot_backends_);
     if (draft_backend_owned_ && draft_backend_) {

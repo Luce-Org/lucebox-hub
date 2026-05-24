@@ -122,6 +122,64 @@ bool DFlashDraftIpcClient::propose(
 #endif
 }
 
+bool DFlashDraftIpcClient::get_feature_range(int start_pos, int n_tokens,
+                                             std::vector<float> & out) {
+#if defined(_WIN32)
+    (void)start_pos; (void)n_tokens; (void)out;
+    return false;
+#else
+    FILE * cmd = process_.command_stream();
+    const int stream_fd = process_.stream_fd();
+    if (!active_ || !cmd || stream_fd < 0 || ring_cap_ <= 0 ||
+        start_pos < 0 || n_tokens <= 0 || n_tokens > ring_cap_) return false;
+    const size_t count =
+        (size_t)n_tokens * (size_t)n_target_layers_ * (size_t)hidden_size_;
+    std::fprintf(cmd, "get_feature_range %d %d\n", start_pos, n_tokens);
+    std::fflush(cmd);
+    int32_t status = -1;
+    bool ok = read_exact_fd(stream_fd, &status, sizeof(status)) && status == 0;
+    if (ok) {
+        out.assign(count, 0.0f);
+        ok = read_exact_fd(stream_fd, out.data(), out.size() * sizeof(float));
+    }
+    if (!ok) {
+        std::fprintf(stderr, "draft-ipc get_feature_range failed status=%d\n", status);
+    }
+    return ok;
+#endif
+}
+
+bool DFlashDraftIpcClient::set_feature_range(int start_pos, int n_tokens,
+                                             const std::vector<float> & data) {
+#if defined(_WIN32)
+    (void)start_pos; (void)n_tokens; (void)data;
+    return false;
+#else
+    FILE * cmd = process_.command_stream();
+    const int stream_fd = process_.stream_fd();
+    if (!active_ || !cmd || stream_fd < 0 || ring_cap_ <= 0 ||
+        start_pos < 0 || n_tokens <= 0 || n_tokens > ring_cap_) return false;
+    const size_t expected =
+        (size_t)n_tokens * (size_t)n_target_layers_ * (size_t)hidden_size_;
+    if (data.size() != expected) return false;
+    const std::string path = process_.next_path("feature_range");
+    if (!write_binary_file(path, data.data(), data.size() * sizeof(float))) {
+        std::fprintf(stderr, "draft-ipc write feature range failed: %s\n", path.c_str());
+        return false;
+    }
+    std::fprintf(cmd, "set_feature_range %d %d %s\n",
+                 start_pos, n_tokens, path.c_str());
+    std::fflush(cmd);
+    int32_t status = -1;
+    const bool ok = read_exact_fd(stream_fd, &status, sizeof(status)) && status == 0;
+    std::remove(path.c_str());
+    if (!ok) {
+        std::fprintf(stderr, "draft-ipc set_feature_range failed status=%d\n", status);
+    }
+    return ok;
+#endif
+}
+
 void DFlashDraftIpcClient::close() {
     process_.close();
     active_ = false;

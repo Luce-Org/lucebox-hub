@@ -101,7 +101,7 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
             return result;
         }
         auto t_decode_start = std::chrono::steady_clock::now();
-        const bool ok = (base_pos == 0 && adapter_->can_dflash_decode())
+        const bool ok = adapter_->can_dflash_decode()
             ? adapter_->decode_dflash(req.prompt, base_pos, last_tok, req.n_gen,
                                       result.tokens, out_io)
             : adapter_->decode_ar(last_tok, base_pos + (int)req.prompt.size(), req.n_gen,

@@ -81,6 +81,9 @@ public:
 private:
     bool load_draft();
     bool snapshot_slot_valid(int slot) const;
+    bool snapshot_draft_features(int slot);
+    void free_draft_feature_snapshot(int slot);
+    bool restore_draft_features(int slot);
 
     Qwen35LayerSplitAdapterConfig cfg_;
     std::vector<Qwen35LayerSplitShard> shards_;
@@ -96,6 +99,16 @@ private:
     static constexpr int PREFIX_SLOTS = ModelBackend::kMaxSlots;
     std::vector<std::vector<PrefixSnapshot>> prefix_snapshots_;
     std::vector<ggml_backend_t> snapshot_backends_;
+    struct DraftFeatureSnapshot {
+        int cur_pos = 0;
+        int start_pos = 0;
+        int n_tokens = 0;
+        int cap = 0;
+        int n_target_layers = 0;
+        int hidden_size = 0;
+        std::vector<float> data;
+    };
+    std::vector<DraftFeatureSnapshot> draft_feature_snapshots_;
 
     SamplerCfg sampler_;
     std::mt19937_64 sampler_rng_{std::random_device{}()};
