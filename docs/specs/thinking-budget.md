@@ -83,7 +83,7 @@ dflash_server \
   --reasoning-effort-high 32256 \    # Phase-1 budget for effort=high
   --reasoning-effort-x-high 56832 \  # Phase-1 budget for effort=x-high
   --reasoning-effort-max 81408 \     # Phase-1 budget for effort=max
-                                     # (each capped at --think-max-tokens)
+                                     # (each capped at --max-ctx − --hard-limit-reply-budget)
 ```
 
 CLI flags always win. Omit any flag to take the value from the
@@ -122,7 +122,7 @@ Fields:
 | `source` | URL of the upstream card we transcribed. |
 | `verified_at` | ISO date the values were last checked against the source. |
 | `max_tokens` | The card's standard recommended combined cap. Drives `default_max_tokens`. |
-| `complex_problem_max_tokens` | Optional. The card's recommendation for hard reasoning / benchmark workloads. Drives the `x-high` and `max` effort tiers. If omitted, both collapse to the `high` tier value. |
+| `complex_problem_max_tokens` | Optional. The card's recommendation for hard reasoning / benchmark workloads. Drives the `x-high` and `max` effort tiers, which sit *above* `default_max_tokens` when this field is present — they are admissible as long as they fit under `max_ctx − hard_limit_reply_budget`. If omitted, both collapse to the `high` tier value. |
 | `sampling` | Recommended sampler params. Used as defaults when the request doesn't pin sampler values. |
 | `reasoning_effort_tiers` | Explicit phase-1 budgets per tier. Override any computed default. Whichever tiers are present win; missing tiers fall through to the computed defaults below. |
 
@@ -147,6 +147,18 @@ caps at 8192 tokens has a very different tier curve from Qwen3.6's
 32768/81920 envelope, and the model card author is in a better
 position to pick sensible numbers than a global formula.
 
+For the Qwen3.6 example above (`max_tokens=32768`,
+`complex_problem_max_tokens=81920`), the resolved tiers are
+`low=4032, medium=16128, high=32256, x-high=56832, max=81408`.
+The `x-high` and `max` values exceed `default_max_tokens`, but they
+are *phase-1 budgets* — clients that want to use them in full must
+also pass an explicit `max_tokens` ≥ `tier_value +
+hard_limit_reply_budget` on the request. With smaller `max_tokens`,
+the request parser narrows the effective phase-1 cap to fit (see
+§4.4). The tiers stay distinct rather than collapsing to `high`
+because the ceiling that bounds them is `max_ctx`, not
+`default_max_tokens`.
+
 ### 3.4 Hard fallback
 
 When no sidecar matches the loaded model and no family fallback
@@ -169,7 +181,17 @@ The server enforces these invariants at startup and clamps with a
 warning if violated:
 
 - `low ≤ medium ≤ high ≤ x-high ≤ max`
-- `max ≤ default_max_tokens − hard_limit_reply_budget`
+- `max ≤ max_ctx − hard_limit_reply_budget`
+
+The server's `--max-ctx` is the absolute ceiling for any single
+request — including its phase-1 portion. Effort tiers are *phase-1
+budgets*, not combined budgets; a tier value larger than
+`default_max_tokens` is well-defined. It just means a client that
+wants to use that tier's full budget needs to pass an explicit
+`max_tokens` ≥ `tier_value + hard_limit_reply_budget` on the
+request. With smaller `max_tokens`, the request parser narrows the
+effective phase-1 cap to `min(tier_value, request.max_tokens −
+hard_limit_reply_budget)` (see §4.4).
 
 A request that asks for an effort tier exceeding the model's
 ceiling (e.g. `effort: "max"` on a model whose card has no
@@ -256,6 +278,18 @@ fires, recording requested-vs-effective values for both fields. No
 error response — clamping is silent at the wire to preserve OpenAI/
 Anthropic protocol compatibility.
 
+When `reasoning.effort` is set, the request's effective phase-1
+cap is `min(effort_tier_value, request.max_tokens −
+hard_limit_reply_budget)`. The effort tier value is the server
+configuration looked up from the resolved model card (or CLI
+override); the per-request narrowing accommodates clients that
+choose a tier (e.g. `"max"`) without also passing an explicit
+`max_tokens`. If the client wants to use the full tier budget,
+they must also pass a large enough `max_tokens` — otherwise the
+effective cap silently narrows to what fits in `max_tokens` after
+reserving the reply budget. This narrowing is logged once at info
+level (not a warning — it is normal and expected behaviour).
+
 ### 4.5 Why client-side controls are bounded, not full overrides
 
 A previous design allowed clients to override the server budget
@@ -341,8 +375,9 @@ if remaining ≤ effective_reply_budget: force-close
 
 Where `effective_reply_budget` is the per-request `thinking.reply_budget`
 clamped to `--hard-limit-reply-budget` (see §4.4), and `n_gen` is the
-effective phase-1 cap derived from per-request `thinking.budget_tokens`
-or `reasoning.effort` clamped to `--think-max-tokens`.
+effective phase-1 cap: `thinking.budget_tokens` clamped to
+`--think-max-tokens` if set, otherwise the `reasoning.effort` tier value
+narrowed by `request.max_tokens − hard_limit_reply_budget` (see §4.4).
 
 The generated-since-entry frame matters because `committed_now`
 includes the prompt length and any tokens already committed before

@@ -108,9 +108,15 @@ static EffortTiers compute_default_tiers(int think_max, int complex_think_max) {
     return t;
 }
 
-// Apply spec §3.5 invariants. Clamps to monotone non-decreasing order
-// and warns if the sidecar (or computed tiers) violate the invariant.
-static void enforce_tier_invariants(EffortTiers & t, int hard_ceiling,
+// Apply spec §3.5 monotone-ordering invariant. Clamps to monotone
+// non-decreasing order and warns if the sidecar (or computed tiers)
+// violate the invariant.
+//
+// The absolute-ceiling invariant (max ≤ max_ctx − hard_limit_reply_budget)
+// is enforced separately in server_main.cpp once max_ctx has been
+// resolved from the backend / CLI — model_card resolution runs before
+// that, and the card itself doesn't know the operator's runtime ceiling.
+static void enforce_tier_invariants(EffortTiers & t,
                                     const std::string & source) {
     auto clamp_one = [&](int prev, int & v, const char * tier) {
         if (v < prev) {
@@ -124,18 +130,6 @@ static void enforce_tier_invariants(EffortTiers & t, int hard_ceiling,
     clamp_one(t.medium, t.high,   "high");
     clamp_one(t.high,   t.x_high, "x-high");
     clamp_one(t.x_high, t.max,    "max");
-
-    if (hard_ceiling > 0 && t.max > hard_ceiling) {
-        std::fprintf(stderr,
-            "[model_card] %s: effort_tiers.max=%d exceeds "
-            "default_max_tokens - hard_limit_reply_budget=%d; clamping\n",
-            source.c_str(), t.max, hard_ceiling);
-        t.max = hard_ceiling;
-        if (t.x_high > t.max) t.x_high = t.max;
-        if (t.high   > t.max) t.high   = t.max;
-        if (t.medium > t.max) t.medium = t.max;
-        if (t.low    > t.max) t.low    = t.max;
-    }
 }
 
 // ── Sidecar parsing ─────────────────────────────────────────────────────
@@ -313,8 +307,10 @@ ModelCard resolve_model_card(const std::string & gguf_path,
         if (card.effort_tiers.max    > card.effort_tiers.high) card.effort_tiers.max    = card.effort_tiers.high;
     }
 
-    // Enforce monotone non-decreasing tiers and `max <= think_max_tokens`.
-    enforce_tier_invariants(card.effort_tiers, card.think_max_tokens, card.source_label);
+    // Enforce monotone non-decreasing tiers. The absolute ceiling
+    // (max ≤ max_ctx − hard_limit_reply_budget) is applied later in
+    // server_main once max_ctx has been resolved.
+    enforce_tier_invariants(card.effort_tiers, card.source_label);
 
     return card;
 }

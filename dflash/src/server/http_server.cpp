@@ -890,8 +890,26 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             }
             req.per_req_phase1_cap = eff;
         } else if (effort_set) {
-            // effort tiers were already clamped at startup; defensive clamp here.
-            req.per_req_phase1_cap = std::min(effort_phase1_cap, config_.think_max_tokens);
+            // Spec §4.4: when reasoning.effort is set, the effective phase-1
+            // cap is min(effort_tier_value, request.max_tokens -
+            // hard_limit_reply_budget). The effort tier value can legitimately
+            // exceed default_max_tokens (e.g. Qwen3.6 max=81408 with
+            // default=32768) — clients that want that full budget must pass
+            // an explicit max_tokens. Otherwise we narrow silently to fit.
+            const int max_output_phase1_room = std::max(0,
+                req.max_output - config_.hard_limit_reply_budget);
+            int eff = std::min(effort_phase1_cap, max_output_phase1_room);
+            if (effort_phase1_cap > max_output_phase1_room) {
+                // Info-level: this is normal when clients use a tier name but
+                // don't pass an explicit max_tokens. Not a warning.
+                std::fprintf(stderr,
+                    "[server] reasoning.effort tier=%d narrowed to %d "
+                    "(max_tokens=%d - hard_limit_reply_budget=%d); "
+                    "pass a larger max_tokens to use the full tier budget\n",
+                    effort_phase1_cap, eff,
+                    req.max_output, config_.hard_limit_reply_budget);
+            }
+            req.per_req_phase1_cap = eff;
         }
         // Reply budget:
         if (request_reply_budget >= 0) {

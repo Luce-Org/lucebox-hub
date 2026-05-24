@@ -540,15 +540,30 @@ int main(int argc, char ** argv) {
 
     sconfig.model_card_source_label = card.source_label;
 
-    // Spec §3.5 invariant: each effort tier must clamp to think_max_tokens
-    // (the server-wide phase-1 ceiling). Clamp now so the request parser
-    // doesn't have to.
+    // Spec §3.5 invariant: each effort tier must fit under the server's
+    // absolute ceiling, which is `max_ctx - hard_limit_reply_budget` (the
+    // most tokens any single request — including its phase-1 portion —
+    // can occupy while still leaving the reply-reserve headroom).
+    //
+    // This is intentionally *not* clamped to think_max_tokens / default_
+    // max_tokens: effort tiers are phase-1 budgets, and the card's
+    // complex_problem_max_tokens can legitimately exceed default_max_tokens
+    // (Qwen3.6's card says max=81408 with default=32768). A request that
+    // wants to use such a tier must also pass an explicit max_tokens large
+    // enough to cover it (see spec §4.4); the request parser narrows the
+    // effective phase-1 cap when max_tokens is smaller.
+    const int tier_ceiling = std::max(0,
+        sconfig.max_ctx - sconfig.hard_limit_reply_budget);
+    std::fprintf(stderr,
+        "[server] effort-tier ceiling = max_ctx(%d) - hard_limit_reply_budget(%d) = %d\n",
+        sconfig.max_ctx, sconfig.hard_limit_reply_budget, tier_ceiling);
     auto clamp_tier = [&](const char * name, int & v) {
-        if (v > sconfig.think_max_tokens) {
+        if (tier_ceiling > 0 && v > tier_ceiling) {
             std::fprintf(stderr,
-                "[server] reasoning-effort %s=%d clamped to think_max_tokens=%d\n",
-                name, v, sconfig.think_max_tokens);
-            v = sconfig.think_max_tokens;
+                "[server] reasoning-effort %s=%d clamped to "
+                "max_ctx - hard_limit_reply_budget = %d\n",
+                name, v, tier_ceiling);
+            v = tier_ceiling;
         }
         if (v < 0) v = 0;
     };
