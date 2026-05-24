@@ -539,6 +539,10 @@ int main(int argc, char ** argv) {
     sconfig.sampler_defaults = card.sampling;
 
     sconfig.model_card_source_label = card.source_label;
+    // Stash the raw sidecar JSON (or null on family/hard fallback) so
+    // /props.model_card can re-emit it verbatim. See
+    // docs/specs/props-endpoint.md §4.9.
+    sconfig.model_card_json = card.raw_json;
 
     // Spec §3.5 invariant: each effort tier must fit under the server's
     // absolute ceiling, which is `max_ctx - hard_limit_reply_budget` (the

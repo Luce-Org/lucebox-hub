@@ -92,7 +92,16 @@ struct ServerConfig {
 
     // Operator-facing tag for the startup banner: e.g.
     // "share/model_cards/qwen3.6-27b.json", "family:qwen35", "hard-fallback".
+    // Surfaced at /props.budget_envelope.model_card_source per
+    // docs/specs/props-endpoint.md §4.2.
     std::string model_card_source_label;
+
+    // Cached on startup by server_main after resolve_model_card. Null
+    // (`.is_null()` returns true) when family or hard fallback was used.
+    // Exposed verbatim under /props.model_card; validates against
+    // share/model_cards/_schema.json. See docs/specs/props-endpoint.md
+    // §4.9 and docs/specs/model-cards.md.
+    nlohmann::json model_card_json = nullptr;
 
     // /props introspection inputs — captured at startup by server_main so
     // the /props handler doesn't need to crack open BackendArgs or env.
@@ -167,6 +176,13 @@ struct ParsedRequest {
     // Stop sequences (OpenAI "stop" + Anthropic "stop_sequences")
     std::vector<std::string>  stop_sequences;
 };
+
+// Build the /props response body. Exposed (non-static) so unit tests
+// can assert on its shape without spinning up a real socket. See
+// docs/specs/props-endpoint.md for the wire contract.
+json build_props_body(const ServerConfig & config,
+                      const PrefixCache & prefix_cache,
+                      const ToolMemory & tool_memory);
 
 // ─── HTTP server ────────────────────────────────────────────────────────
 class HttpServer {

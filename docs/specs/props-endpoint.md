@@ -55,6 +55,7 @@ request will not delay a `/props` response.
 ```json
 {
   "api":                          { "endpoints": [ … ] },
+  "budget_envelope":              { … },
   "build_info":                   "luce-dflash v<ver> props_schema=<n>",
   "capabilities":                 { … },
   "daemon":                       { "alive": true },
@@ -62,7 +63,7 @@ request will not delay a `/props` response.
   "full_cache":                   { … },
   "model":                        { … },
   "model_alias":                  "<string>",
-  "model_card":                   { … },
+  "model_card":                   { … } | null,
   "model_path":                   "<string>",
   "pflash":                       { … },
   "prefix_cache":                 { … },
@@ -80,7 +81,9 @@ All top-level keys are required and always emitted by
 `build_props_body`. Optional nested fields may be `null` when the
 corresponding feature is disabled (e.g. `pflash.threshold` when
 `pflash.enabled = false`; `speculative.ddtree_budget` when
-`speculative.enabled = false`).
+`speculative.enabled = false`). `model_card` itself is `null` when
+the server fell through to family or hard fallback (no sidecar
+matched).
 
 ## 4. Per-section field semantics
 
@@ -104,17 +107,65 @@ corresponding feature is disabled (e.g. `pflash.threshold` when
 server actually handles. Extension points (e.g. tool-call
 endpoints, embedding endpoints) appear here when implemented.
 
-### 4.2 `build_info`
+### 4.2 `budget_envelope`
+
+```json
+"budget_envelope": {
+  "model_card_source":       "share/model_cards/qwen3.6-27b.json",
+  "default_max_tokens":      32768,
+  "hard_limit_reply_budget": 512,
+  "think_max_tokens":        32256,
+  "effort_tiers": {
+    "low":    4032,
+    "medium": 16128,
+    "high":   32256,
+    "x-high": 56832,
+    "max":    81408
+  }
+}
+```
+
+The runtime-resolved budget knobs driving the thinking-budget
+envelope. These are always-present, even when no sidecar was loaded
+(see §4.10 `model_card`). They may differ from the authored card
+values because of CLI overrides (`--default-max-tokens`,
+`--think-max-tokens`, `--reasoning-effort-<tier>`) and the
+absolute-tier ceiling clamping (spec §3.5).
+
+- `model_card_source` — string, always present. The lookup hit that
+  produced these values: one of `share/model_cards/<file>.json`,
+  `family:<arch>`, or `hard-fallback`. Matches the startup banner.
+- `default_max_tokens` — effective combined cap (reasoning + reply)
+  applied when a request omits `max_tokens`. May diverge from
+  `model_card.max_tokens` if the operator passed `--max-tokens` or
+  `--default-max-tokens`.
+- `hard_limit_reply_budget` — effective reply-reserve ceiling in
+  tokens.
+- `think_max_tokens` — effective phase-1 (reasoning) ceiling.
+  Derived as `default_max_tokens − hard_limit_reply_budget` unless
+  `--think-max-tokens` overrides.
+- `effort_tiers` — phase-1 budgets per `reasoning.effort` tier.
+  Resolved from the card's `reasoning_effort_tiers` (if present),
+  then computed from `max_tokens` / `complex_problem_max_tokens` per
+  spec §3.3, then clamped to `max_ctx − hard_limit_reply_budget`
+  per §3.5. May differ from `model_card.reasoning_effort_tiers`
+  because of that clamp.
+
+`budget_envelope` is the source of truth for what the server will
+actually do with a request; `model_card` (§4.10) is the source of
+truth for what the authored card says.
+
+### 4.3 `build_info`
 
 ```
-"build_info": "luce-dflash v0.0.0+cpp props_schema=1"
+"build_info": "luce-dflash v0.0.0+cpp props_schema=2"
 ```
 
 A single string carrying: server name, build version, and the
 **`props_schema` version**. Schema version bumps when the response
 shape changes in a non-backward-compatible way (see §5).
 
-### 4.3 `capabilities`
+### 4.4 `capabilities`
 
 ```json
 "capabilities": {
@@ -136,7 +187,7 @@ client capability:
   fields and emits `tool_calls` blocks. If `false`, those fields
   are ignored.
 
-### 4.4 `daemon`
+### 4.5 `daemon`
 
 ```json
 "daemon": { "alive": true }
@@ -147,7 +198,7 @@ client capability:
 crashed or is restarting. Healthchecks should treat `false` as a
 failure even if HTTP returns 200.
 
-### 4.5 `default_generation_settings`
+### 4.6 `default_generation_settings`
 
 ```json
 "default_generation_settings": {
@@ -177,7 +228,7 @@ field; `/props` only carries the server-wide knobs. To see the
 card's sampler values, read the sidecar JSON or the startup
 banner.
 
-### 4.6 `full_cache`
+### 4.7 `full_cache`
 
 ```json
 "full_cache": {
@@ -199,7 +250,7 @@ internally consistent** — e.g. `in_use` and `lifetime_hits` may
 correspond to slightly different points in wall time. Acceptable
 for an introspection report; not safe for control-flow decisions.
 
-### 4.7 `model`
+### 4.8 `model`
 
 ```json
 "model": {
@@ -214,7 +265,7 @@ normalized. `draft_path` is the speculative-decode draft model
 path, or `null` when no draft is loaded. `tokenizer_id` is a
 best-effort tokenizer family hint from GGUF metadata.
 
-### 4.8 `model_alias` and `model_path`
+### 4.9 `model_alias` and `model_path`
 
 `model_alias` is the value clients should pass as the `model` field
 in chat/responses requests (defaults to `"dflash"`; override with
@@ -224,15 +275,24 @@ in chat/responses requests (defaults to `"dflash"`; override with
 GGUF. Useful for "which weights is this server actually serving"
 checks.
 
-### 4.9 `model_card`
+### 4.10 `model_card`
 
 ```json
 "model_card": {
-  "source":                  "share/model_cards/qwen3.6-27b.json",
-  "max_tokens":              32768,
-  "hard_limit_reply_budget": 512,
-  "think_max_tokens":        32256,
-  "effort_tiers": {
+  "name":                       "Qwen3.6 27B",
+  "source":                     "https://huggingface.co/Qwen/Qwen3.6-27B",
+  "verified_at":                "2026-05-23",
+  "max_tokens":                 32768,
+  "complex_problem_max_tokens": 81920,
+  "sampling": {
+    "temperature":        1.0,
+    "top_p":              0.95,
+    "top_k":              20,
+    "min_p":              0.0,
+    "presence_penalty":   0.0,
+    "repetition_penalty": 1.0
+  },
+  "reasoning_effort_tiers": {
     "low":    4032,
     "medium": 16128,
     "high":   32256,
@@ -242,25 +302,36 @@ checks.
 }
 ```
 
-The resolved model card values driving the thinking-budget envelope.
+The on-disk model-card sidecar that was loaded for this run,
+emitted **verbatim** (1:1 with the JSON in
+`share/model_cards/<name>.json`). The shape validates against
+[`share/model_cards/_schema.json`](../../share/model_cards/_schema.json) —
+all of `name`, `source`, `verified_at`, `max_tokens`,
+`complex_problem_max_tokens`, `sampling`, `reasoning_effort_tiers`,
+`download_urls`, and `notes` appear here exactly as the sidecar
+author wrote them.
 
-- `source` — the source label of the resolved card (sidecar path,
-  `family:<arch>`, or `hard-fallback`). Matches what the startup
-  banner printed.
-- `max_tokens` — effective `default_max_tokens`.
-- `hard_limit_reply_budget` — effective reply-reserve ceiling.
-- `think_max_tokens` — effective phase-1 ceiling.
-- `effort_tiers` — phase-1 budgets per `reasoning.effort` tier.
+`model_card` is `null` when the server fell through to a per-family
+fallback or the hard fallback (no `share/model_cards/<stem>.json`
+matched the loaded GGUF's `general.name`). In that case the resolved
+budget knobs still appear under `budget_envelope` (§4.2), tagged
+with `model_card_source` = `"family:<arch>"` or `"hard-fallback"`.
 
-When `--think-max-tokens` is overridden on the CLI, `think_max_tokens`
-here reflects the CLI value (not the card's recommendation). The
-banner is the place to see "from CLI" vs "from sidecar" provenance;
-`/props` only carries the final effective values.
+The `source` field inside `model_card` is the **upstream model-card
+URL** (e.g. the HuggingFace card the sidecar was transcribed from),
+NOT the filepath the server loaded. The filepath / lookup-hit label
+lives at `budget_envelope.model_card_source` (§4.2). This split
+keeps the on-disk sidecar contract pure (authored JSON, schema-validated)
+and the runtime-resolution metadata in its own section.
+
+For the runtime-resolved budget values (`default_max_tokens`,
+`think_max_tokens`, effort tiers post-clamp) the server will actually
+apply, see `budget_envelope` (§4.2).
 
 See [`docs/specs/model-cards.md`](model-cards.md) for the sidecar
 format and resolution order.
 
-### 4.10 `pflash`
+### 4.11 `pflash`
 
 ```json
 "pflash": {
@@ -288,7 +359,7 @@ enabled, fields carry the runtime configuration:
 - `bsa_enabled` / `bsa_alpha` / `lm_head_fix` — backend-specific
   PFlash tunables
 
-### 4.11 `prefix_cache`
+### 4.12 `prefix_cache`
 
 ```json
 "prefix_cache": {
@@ -299,10 +370,10 @@ enabled, fields carry the runtime configuration:
 ```
 
 The inline prefix cache (system-prompt KV reuse). Same atomic /
-non-strictly-consistent semantics as `full_cache` (§4.6).
+non-strictly-consistent semantics as `full_cache` (§4.7).
 `capacity = 0` means the cache is disabled.
 
-### 4.12 `reasoning`
+### 4.13 `reasoning`
 
 ```json
 "reasoning": {
@@ -329,7 +400,7 @@ Reasoning capability:
 See [`docs/specs/thinking-budget.md`](thinking-budget.md) §4 for
 the per-tier semantics.
 
-### 4.13 `sampling.capabilities`
+### 4.14 `sampling.capabilities`
 
 ```json
 "sampling": {
@@ -350,9 +421,9 @@ confusion when behavior doesn't match the request.
 
 The `sampling` object intentionally nests `capabilities` for
 future expansion (e.g. `sampling.defaults`, though that lives in
-§4.5 today).
+§4.6 today).
 
-### 4.14 `speculative`
+### 4.15 `speculative`
 
 ```json
 "speculative": {
@@ -372,7 +443,19 @@ Future fields: `accept_rate`, `lookahead_depth`, `draft_model_id`
 
 `build_info` includes `props_schema=<n>`. The integer `n` bumps
 when the response shape changes in a way that breaks existing
-clients.
+clients. The current schema is `2`.
+
+### 5.0 Changelog
+
+- **`2`** — `model_card` is now the wholesale on-disk sidecar JSON
+  (or `null` when family/hard fallback was used). Runtime-resolved
+  budget knobs that used to live under `model_card`
+  (`hard_limit_reply_budget`, `think_max_tokens`, `effort_tiers`,
+  effective `max_tokens`) moved to a new top-level `budget_envelope`
+  section. The `source` field inside `model_card` is now the
+  upstream URL from the sidecar; the lookup-hit filepath / label
+  lives at `budget_envelope.model_card_source`.
+- **`1`** — Initial schema.
 
 ### 5.1 Non-breaking changes (no version bump)
 
@@ -411,7 +494,20 @@ version increments.
       "POST /v1/responses"
     ]
   },
-  "build_info": "luce-dflash v0.0.0+cpp props_schema=1",
+  "budget_envelope": {
+    "model_card_source":       "share/model_cards/qwen3.6-27b.json",
+    "default_max_tokens":      32768,
+    "hard_limit_reply_budget": 512,
+    "think_max_tokens":        32256,
+    "effort_tiers": {
+      "low":    4032,
+      "medium": 16128,
+      "high":   32256,
+      "x-high": 56832,
+      "max":    81408
+    }
+  },
+  "build_info": "luce-dflash v0.0.0+cpp props_schema=2",
   "capabilities": {
     "reasoning_supported":   true,
     "speculative_supported": true,
@@ -440,11 +536,20 @@ version increments.
   },
   "model_alias": "dflash",
   "model_card": {
-    "source":                  "share/model_cards/qwen3.6-27b.json",
-    "max_tokens":              32768,
-    "hard_limit_reply_budget": 512,
-    "think_max_tokens":        32256,
-    "effort_tiers": {
+    "name":                       "Qwen3.6 27B",
+    "source":                     "https://huggingface.co/Qwen/Qwen3.6-27B",
+    "verified_at":                "2026-05-23",
+    "max_tokens":                 32768,
+    "complex_problem_max_tokens": 81920,
+    "sampling": {
+      "temperature":        1.0,
+      "top_p":              0.95,
+      "top_k":              20,
+      "min_p":              0.0,
+      "presence_penalty":   0.0,
+      "repetition_penalty": 1.0
+    },
+    "reasoning_effort_tiers": {
       "low":    4032,
       "medium": 16128,
       "high":   32256,

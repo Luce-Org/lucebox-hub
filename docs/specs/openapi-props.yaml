@@ -2,7 +2,7 @@ openapi: 3.1.0
 
 info:
   title: dflash_server /props endpoint
-  version: "1"
+  version: "2"
   summary: Capability and configuration introspection for dflash_server.
   description: |
     `GET /props` returns enough JSON for a dashboard, a deployment
@@ -13,7 +13,16 @@ info:
     The integer reported as `server.props_schema` (and as the
     trailing token of `build_info`) bumps when the response shape
     changes in a backward-incompatible way. The current schema is
-    `1`.
+    `2`.
+
+    Schema `2` (breaking change vs. `1`): `model_card` is now the
+    wholesale on-disk sidecar JSON (or `null` when family / hard
+    fallback was used), validating against
+    `share/model_cards/_schema.json`. The runtime-resolved budget
+    knobs (`default_max_tokens`, `hard_limit_reply_budget`,
+    `think_max_tokens`, `effort_tiers`) moved out of `model_card`
+    into a new top-level `budget_envelope` section, alongside a
+    `model_card_source` lookup-hit label.
   contact:
     name: lucebox-hub
     url: https://github.com/easel/lucebox-hub
@@ -21,7 +30,7 @@ info:
 # The numeric value matches `server.props_schema` and the
 # `props_schema=<n>` token in `build_info`. Bumps on breaking
 # response-shape changes; additive changes keep the same value.
-x-props-schema: 1
+x-props-schema: 2
 
 servers:
   - url: http://localhost:8080
@@ -62,7 +71,18 @@ paths:
                         - "POST /v1/messages"
                         - "POST /v1/messages/count_tokens"
                         - "POST /v1/responses"
-                    build_info: "luce-dflash v0.0.0+cpp props_schema=1"
+                    budget_envelope:
+                      model_card_source: "share/model_cards/qwen3.6-27b.json"
+                      default_max_tokens: 32768
+                      hard_limit_reply_budget: 512
+                      think_max_tokens: 32256
+                      effort_tiers:
+                        low: 4032
+                        medium: 16128
+                        high: 32256
+                        x-high: 56832
+                        max: 81408
+                    build_info: "luce-dflash v0.0.0+cpp props_schema=2"
                     capabilities:
                       reasoning_supported: true
                       speculative_supported: true
@@ -88,11 +108,19 @@ paths:
                       tokenizer_id: null
                     model_alias: "dflash"
                     model_card:
-                      source: "share/model_cards/qwen3.6-27b.json"
+                      name: "Qwen3.6 27B"
+                      source: "https://huggingface.co/Qwen/Qwen3.6-27B"
+                      verified_at: "2026-05-23"
                       max_tokens: 32768
-                      hard_limit_reply_budget: 512
-                      think_max_tokens: 32256
-                      effort_tiers:
+                      complex_problem_max_tokens: 81920
+                      sampling:
+                        temperature: 1.0
+                        top_p: 0.95
+                        top_k: 20
+                        min_p: 0.0
+                        presence_penalty: 0.0
+                        repetition_penalty: 1.0
+                      reasoning_effort_tiers:
                         low: 4032
                         medium: 16128
                         high: 32256
@@ -138,7 +166,7 @@ paths:
                         supports_top_p: true
                     server:
                       name: "luce-dflash"
-                      props_schema: 1
+                      props_schema: 2
                       version: "0.0.0+cpp"
                     speculative:
                       enabled: true
@@ -158,6 +186,7 @@ components:
       type: object
       required:
         - api
+        - budget_envelope
         - build_info
         - capabilities
         - daemon
@@ -180,13 +209,15 @@ components:
       properties:
         api:
           $ref: "#/components/schemas/Api"
+        budget_envelope:
+          $ref: "#/components/schemas/BudgetEnvelope"
         build_info:
           type: string
           description: |
             Single-string identity: `<server_name> v<version>
             props_schema=<n>`. Matches the structured `server`
             object. Bumps `props_schema` on breaking changes.
-          example: "luce-dflash v0.0.0+cpp props_schema=1"
+          example: "luce-dflash v0.0.0+cpp props_schema=2"
         capabilities:
           $ref: "#/components/schemas/Capabilities"
         daemon:
@@ -205,7 +236,15 @@ components:
             overridable with `--model-name`.
           example: "dflash"
         model_card:
-          $ref: "#/components/schemas/ModelCard"
+          oneOf:
+            - $ref: "#/components/schemas/ModelCard"
+            - type: "null"
+          description: |
+            Wholesale on-disk sidecar JSON when a sidecar matched
+            the loaded GGUF, or `null` when the server fell through
+            to a per-family or hard fallback (in which case the
+            resolved budget knobs still appear under
+            `budget_envelope`).
         model_path:
           type: string
           description: Absolute filesystem path of the loaded target GGUF.
@@ -419,31 +458,120 @@ components:
 
     ModelCard:
       description: |
-        Resolved model card values driving the thinking-budget
-        envelope. See docs/specs/model-cards.md for the sidecar
-        format and resolution order.
+        Wholesale on-disk model-card sidecar JSON. Validates 1:1
+        against `share/model_cards/_schema.json` — the same shape
+        the sidecar author wrote in `share/model_cards/<name>.json`.
+
+        Note: the `source` field here is the **upstream model-card
+        URL** (e.g. the HuggingFace card the sidecar was
+        transcribed from), NOT a filepath. The lookup-hit label
+        (which sidecar / family / hard-fallback the server matched
+        on) lives at `budget_envelope.model_card_source`.
+
+        See `docs/specs/model-cards.md` for the sidecar format and
+        resolution order, and `docs/specs/props-endpoint.md` §4.10
+        for how this section is wired up at /props.
       type: object
-      required:
-        - effort_tiers
-        - hard_limit_reply_budget
-        - max_tokens
-        - source
-        - think_max_tokens
+      additionalProperties: false
+      required: [name, source, verified_at, max_tokens]
       properties:
+        name:
+          type: string
+          description: Display name (informational).
+          example: "Qwen3.6 27B"
         source:
           type: string
-          description: |
-            Source label for the resolved card. One of:
-            `share/model_cards/<file>.json`, `family:<arch>`, or
-            `hard-fallback`. Matches the startup-banner value.
-          example: "share/model_cards/qwen3.6-27b.json"
+          format: uri
+          description: URL of the upstream model card the values were transcribed from.
+          example: "https://huggingface.co/Qwen/Qwen3.6-27B"
+        verified_at:
+          type: string
+          format: date
+          description: ISO 8601 date the values were last checked against the source.
+          example: "2026-05-23"
         max_tokens:
           type: integer
           minimum: 1
           description: |
-            Effective `default_max_tokens` (combined cap of
-            reasoning + reply) applied when a request omits
-            `max_tokens`.
+            Card's standard recommended combined cap. Drives
+            `budget_envelope.default_max_tokens` when no CLI
+            override is set.
+          example: 32768
+        complex_problem_max_tokens:
+          type: integer
+          minimum: 1
+          description: |
+            Card's recommendation for hard reasoning /
+            benchmark workloads. Drives `x-high` and `max`
+            effort tiers in `budget_envelope.effort_tiers`.
+          example: 81920
+        sampling:
+          type: object
+          additionalProperties: false
+          description: Recommended sampler defaults from the card.
+          properties:
+            temperature:        { type: number }
+            top_p:              { type: number }
+            top_k:              { type: integer }
+            min_p:              { type: number }
+            presence_penalty:   { type: number }
+            repetition_penalty: { type: number }
+        reasoning_effort_tiers:
+          type: object
+          additionalProperties: false
+          description: |
+            Card-authored phase-1 budgets per
+            `reasoning.effort` tier. May differ from
+            `budget_envelope.effort_tiers` because the latter is
+            clamped to `max_ctx - hard_limit_reply_budget` at
+            startup.
+          properties:
+            low:    { type: integer, minimum: 1 }
+            medium: { type: integer, minimum: 1 }
+            high:   { type: integer, minimum: 1 }
+            x-high: { type: integer, minimum: 1 }
+            max:    { type: integer, minimum: 1 }
+        download_urls:
+          type: object
+          description: Optional map of variant tag (e.g. `Q4_K_M`, `bf16`) to GGUF download URL.
+          additionalProperties:
+            type: string
+            format: uri
+        notes:
+          type: string
+          description: Free-form provenance / caveats.
+
+    BudgetEnvelope:
+      description: |
+        Runtime-resolved budget knobs driving the thinking-budget
+        envelope. Always present, regardless of whether a sidecar
+        loaded. May differ from the authored `model_card` values
+        because of CLI overrides and `max_ctx`-based tier clamping
+        (spec §3.5). See props-endpoint.md §4.2.
+      type: object
+      required:
+        - default_max_tokens
+        - effort_tiers
+        - hard_limit_reply_budget
+        - model_card_source
+        - think_max_tokens
+      properties:
+        model_card_source:
+          type: string
+          description: |
+            Lookup-hit label identifying where the resolved values
+            came from: one of `share/model_cards/<file>.json`,
+            `family:<arch>`, or `hard-fallback`. Always present;
+            matches the startup-banner value.
+          example: "share/model_cards/qwen3.6-27b.json"
+        default_max_tokens:
+          type: integer
+          minimum: 1
+          description: |
+            Effective combined cap (reasoning + reply) applied when
+            a request omits `max_tokens`. May diverge from
+            `model_card.max_tokens` if the operator passed
+            `--max-tokens` / `--default-max-tokens`.
           example: 32768
         hard_limit_reply_budget:
           type: integer
@@ -454,8 +582,8 @@ components:
           type: integer
           minimum: 0
           description: |
-            Effective phase-1 (reasoning) ceiling. Computed as
-            `max_tokens - hard_limit_reply_budget` unless
+            Effective phase-1 (reasoning) ceiling. Derived as
+            `default_max_tokens - hard_limit_reply_budget` unless
             `--think-max-tokens` overrides.
           example: 32256
         effort_tiers:
@@ -466,7 +594,8 @@ components:
         Per-`reasoning.effort` phase-1 budgets. Five fields
         (`low`, `medium`, `high`, `x-high`, `max`), monotone
         non-decreasing, each clamped to `max_ctx -
-        hard_limit_reply_budget` at startup.
+        hard_limit_reply_budget` at startup. Surfaced under
+        `budget_envelope.effort_tiers`.
       type: object
       required: [low, medium, high, x-high, max]
       properties:
@@ -708,8 +837,8 @@ components:
           description: |
             Integer schema version. Bumps when the response shape
             changes in a backward-incompatible way (see §5 of
-            props-endpoint.md).
-          example: 1
+            props-endpoint.md). Current value is `2`.
+          example: 2
         version:
           type: string
           description: Build version string (semver + build tag).

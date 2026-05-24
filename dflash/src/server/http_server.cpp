@@ -35,7 +35,7 @@ namespace dflash::common {
 // Do NOT bump for additive changes (new fields, new sections).
 //
 // Matches dflash/scripts/server.py:175 (PROPS_SCHEMA constant).
-static constexpr int  kPropsSchema  = 1;
+static constexpr int  kPropsSchema  = 2;
 static constexpr char kServerName[] = "luce-dflash";
 #ifndef DFLASH_SERVER_VERSION
 #define DFLASH_SERVER_VERSION "0.0.0+cpp"
@@ -67,9 +67,11 @@ static std::string generate_id(const char * prefix) {
 // key-for-key so cross-server diffs stay clean. The Python version is the
 // reference impl; if a key drifts here, update it there too (or document the
 // intentional difference in docs/specs/thinking-budget.md).
-static json build_props_body(const ServerConfig & config,
-                             const PrefixCache & prefix_cache,
-                             const ToolMemory & tool_memory) {
+//
+// Non-static so unit tests can call it directly (declared in http_server.h).
+json build_props_body(const ServerConfig & config,
+                      const PrefixCache & prefix_cache,
+                      const ToolMemory & tool_memory) {
     // arch-gated capabilities (mirrors Python _capabilities()).
     const bool is_qwen = (config.arch.rfind("qwen", 0) == 0);
     const bool reasoning_supported = is_qwen;
@@ -183,12 +185,22 @@ static json build_props_body(const ServerConfig & config,
             {"default",           nullptr},
             {"supported_efforts", reasoning_efforts},
         }},
-        // Model-card-derived budgets surfaced for introspection. `source`
-        // tells operators which resolution branch fired (sidecar JSON,
-        // family fallback, or hard fallback) per spec §3.1.
-        {"model_card", {
-            {"source",                  config.model_card_source_label},
-            {"max_tokens",              config.default_max_tokens},
+        // `model_card`: 1:1 with the on-disk sidecar JSON when one was
+        // loaded; null when family fallback or hard fallback was used.
+        // Validates against share/model_cards/_schema.json. The `source`
+        // field here is the upstream model-card URL (authored in the
+        // sidecar) — NOT a filepath. See spec §4.9.
+        {"model_card", config.model_card_json.is_null()
+                           ? json(nullptr)
+                           : config.model_card_json},
+        // `budget_envelope`: runtime-resolved values driving the
+        // thinking-budget envelope. May differ from the authored card
+        // values because of CLI overrides and max_ctx-based tier clamping
+        // (spec §3.5). Always emitted regardless of model_card source.
+        // See spec §4.2.
+        {"budget_envelope", {
+            {"model_card_source",       config.model_card_source_label},
+            {"default_max_tokens",      config.default_max_tokens},
             {"hard_limit_reply_budget", config.hard_limit_reply_budget},
             {"think_max_tokens",        config.think_max_tokens},
             {"effort_tiers", {

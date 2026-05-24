@@ -34,6 +34,17 @@ Sidecars are **source-controlled**, **reviewable**, and **bundled
 into the runtime image**. Adding a new model = adding a JSON file.
 No recompile required.
 
+### Server runtime exposure
+
+Loaded sidecars are exposed wholesale at `/props.model_card` (1:1
+with the on-disk JSON; `null` when family or hard fallback was
+used). The runtime-resolved budget knobs the server will actually
+apply — which may differ from the authored card values due to CLI
+overrides or `max_ctx`-based effort-tier clamping — appear at
+`/props.budget_envelope`. See
+[`docs/specs/props-endpoint.md`](props-endpoint.md) §4.2 and §4.10
+for the wire shape.
+
 ## 2. File location and lookup
 
 Sidecars live at:

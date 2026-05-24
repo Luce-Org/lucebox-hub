@@ -12,6 +12,8 @@
 
 #pragma once
 
+#include <nlohmann/json.hpp>
+
 #include <string>
 
 namespace dflash::common {
@@ -61,6 +63,12 @@ struct ModelCard {
     // Phase-1 ceiling derived from `max_tokens - hard_limit_reply_budget`.
     // Convenience: also the spec's `think_max` quantity (§3.3 formula).
     int think_max_tokens = 15488;
+
+    // Raw parsed sidecar JSON, populated on successful sidecar load.
+    // Null (`raw_json.is_null() == true`) when family fallback or hard
+    // fallback was used. Exposed verbatim under `/props.model_card`
+    // (see docs/specs/props-endpoint.md §4.9).
+    nlohmann::json raw_json = nullptr;
 };
 
 // Normalize a GGUF `general.name` value to a model-card filename stem.

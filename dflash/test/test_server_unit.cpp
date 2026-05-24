@@ -1623,6 +1623,151 @@ static void test_sampler_needs_logit_processing() {
     TEST_ASSERT(!cfg.needs_logit_processing());
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// /props body shape tests (model-free)
+//
+// Verify build_props_body's new wholesale-sidecar `model_card` + new
+// `budget_envelope` section per docs/specs/props-endpoint.md §4.9 / §4.X.
+// ═══════════════════════════════════════════════════════════════════════
+
+static ServerConfig make_props_config_with_sidecar(const json & sidecar) {
+    ServerConfig cfg;
+    cfg.arch                    = "qwen35";
+    cfg.model_path              = "/tmp/fake/model.gguf";
+    cfg.model_card_source_label = "share/model_cards/qwen3.6-27b.json";
+    cfg.model_card_json         = sidecar;
+    cfg.default_max_tokens      = 32768;
+    cfg.hard_limit_reply_budget = 512;
+    cfg.think_max_tokens        = 32256;
+    cfg.effort_tiers.low    = 4032;
+    cfg.effort_tiers.medium = 16128;
+    cfg.effort_tiers.high   = 32256;
+    cfg.effort_tiers.x_high = 56832;
+    cfg.effort_tiers.max    = 81408;
+    return cfg;
+}
+
+static void test_props_model_card_wholesale_sidecar() {
+    // When a sidecar was loaded, /props.model_card should be the parsed
+    // sidecar JSON verbatim — *all* fields from the file, not just the
+    // five budget-derived ones from the pre-refactor shape.
+    json sidecar = {
+        {"name",         "Qwen3.6 27B"},
+        {"source",       "https://huggingface.co/Qwen/Qwen3.6-27B"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens",   32768},
+        {"complex_problem_max_tokens", 81920},
+        {"sampling", {
+            {"temperature", 1.0},
+            {"top_p",       0.95},
+            {"top_k",       20},
+        }},
+        {"reasoning_effort_tiers", {
+            {"low",    4032},
+            {"medium", 16128},
+            {"high",   32256},
+            {"x-high", 56832},
+            {"max",    81408},
+        }},
+        {"notes", "test card"},
+    };
+    ServerConfig cfg = make_props_config_with_sidecar(sidecar);
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body.contains("model_card"));
+    TEST_ASSERT(!body["model_card"].is_null());
+    // `source` is the upstream URL, NOT the filepath. The filepath label
+    // moved to budget_envelope.model_card_source post-refactor.
+    TEST_ASSERT(body["model_card"]["source"].get<std::string>() ==
+                "https://huggingface.co/Qwen/Qwen3.6-27B");
+    TEST_ASSERT(body["model_card"]["name"].get<std::string>() == "Qwen3.6 27B");
+    TEST_ASSERT(body["model_card"]["max_tokens"].get<int>() == 32768);
+    TEST_ASSERT(body["model_card"]["complex_problem_max_tokens"].get<int>() == 81920);
+    TEST_ASSERT(body["model_card"].contains("sampling"));
+    TEST_ASSERT(body["model_card"].contains("reasoning_effort_tiers"));
+    TEST_ASSERT(body["model_card"]["notes"].get<std::string>() == "test card");
+    // The pre-refactor `think_max_tokens` / `hard_limit_reply_budget`
+    // keys are NOT in the wholesale shape — they moved to budget_envelope.
+    TEST_ASSERT(!body["model_card"].contains("think_max_tokens"));
+    TEST_ASSERT(!body["model_card"].contains("hard_limit_reply_budget"));
+}
+
+static void test_props_model_card_null_on_family_fallback() {
+    // When family or hard fallback was used (no sidecar), /props.model_card
+    // is JSON null. The budget_envelope still carries the resolved values.
+    ServerConfig cfg;
+    cfg.arch                    = "qwen35";
+    cfg.model_card_source_label = "family:qwen35";
+    cfg.model_card_json         = nullptr;  // no sidecar parsed
+    cfg.default_max_tokens      = 32768;
+    cfg.hard_limit_reply_budget = 512;
+    cfg.think_max_tokens        = 32256;
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body.contains("model_card"));
+    TEST_ASSERT(body["model_card"].is_null());
+    // budget_envelope still present and carries the family-fallback label.
+    TEST_ASSERT(body.contains("budget_envelope"));
+    TEST_ASSERT(body["budget_envelope"]["model_card_source"].get<std::string>() ==
+                "family:qwen35");
+    TEST_ASSERT(body["budget_envelope"]["default_max_tokens"].get<int>() == 32768);
+}
+
+static void test_props_budget_envelope_shape() {
+    // budget_envelope is always present with all five fields and the
+    // expected effort_tiers vocabulary (low|medium|high|x-high|max).
+    // Values mirror ServerConfig regardless of what the sidecar carried.
+    json sidecar = {
+        {"name",        "Qwen3.6 27B"},
+        {"source",      "https://huggingface.co/Qwen/Qwen3.6-27B"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens",  32768},
+    };
+    ServerConfig cfg = make_props_config_with_sidecar(sidecar);
+    // Simulate CLI override: budget_envelope reflects the runtime value,
+    // which may diverge from the sidecar (here, 16000 != sidecar 32768).
+    cfg.default_max_tokens      = 16000;
+    cfg.hard_limit_reply_budget = 512;
+    cfg.think_max_tokens        = 15488;
+    cfg.effort_tiers.low    = 100;
+    cfg.effort_tiers.medium = 200;
+    cfg.effort_tiers.high   = 300;
+    cfg.effort_tiers.x_high = 400;
+    cfg.effort_tiers.max    = 500;
+
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body.contains("budget_envelope"));
+    const json & be = body["budget_envelope"];
+    TEST_ASSERT(be["model_card_source"].get<std::string>() ==
+                "share/model_cards/qwen3.6-27b.json");
+    TEST_ASSERT(be["default_max_tokens"].get<int>() == 16000);
+    TEST_ASSERT(be["hard_limit_reply_budget"].get<int>() == 512);
+    TEST_ASSERT(be["think_max_tokens"].get<int>() == 15488);
+    TEST_ASSERT(be["effort_tiers"]["low"].get<int>()    == 100);
+    TEST_ASSERT(be["effort_tiers"]["medium"].get<int>() == 200);
+    TEST_ASSERT(be["effort_tiers"]["high"].get<int>()   == 300);
+    TEST_ASSERT(be["effort_tiers"]["x-high"].get<int>() == 400);
+    TEST_ASSERT(be["effort_tiers"]["max"].get<int>()    == 500);
+
+    // Sanity: budget_envelope can diverge from model_card.max_tokens
+    // (CLI override case). Verifies the two sections aren't a tautology.
+    TEST_ASSERT(body["model_card"]["max_tokens"].get<int>() == 32768);
+    TEST_ASSERT(be["default_max_tokens"].get<int>() == 16000);
+
+    // Sanity: props_schema bumped to 2 (breaking change).
+    TEST_ASSERT(body["server"]["props_schema"].get<int>() == 2);
+}
+
 int main() {
     std::fprintf(stderr, "══════════════════════════════════════════\n");
     std::fprintf(stderr, " Server Unit Tests\n");
@@ -1742,6 +1887,11 @@ int main() {
     RUN_TEST(test_parse_sampler_token_no_samp);
     RUN_TEST(test_sampler_temp_zero_with_penalties_uses_argmax);
     RUN_TEST(test_sampler_needs_logit_processing);
+
+    std::fprintf(stderr, "\n── /props body shape ──\n");
+    RUN_TEST(test_props_model_card_wholesale_sidecar);
+    RUN_TEST(test_props_model_card_null_on_family_fallback);
+    RUN_TEST(test_props_budget_envelope_shape);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");
     std::fprintf(stderr, " Results: %d assertions, %d failures\n",
