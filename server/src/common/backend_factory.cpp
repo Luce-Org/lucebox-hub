@@ -8,6 +8,7 @@
 #include "laguna_backend.h"
 #include "qwen3_backend.h"
 #include "gemma4_backend.h"
+#include "gemma4_layer_split_adapter.h"
 #include "layer_split_backend.h"
 #include "qwen35_layer_split_adapter.h"
 
@@ -151,6 +152,22 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
         return backend;
 
     } else if (arch == "gemma4") {
+        if (args.device.is_layer_split()) {
+            Gemma4LayerSplitAdapterConfig cfg;
+            cfg.target_path = args.model_path;
+            cfg.device      = args.device;
+            cfg.chunk       = args.chunk;
+            cfg.fa_window   = args.fa_window;
+
+            auto adapter = std::make_unique<Gemma4LayerSplitAdapter>(cfg);
+            auto backend = std::make_unique<LayerSplitBackend>(std::move(adapter));
+            if (!backend->init()) {
+                std::fprintf(stderr, "[backend_factory] LayerSplitBackend(gemma4) init failed\n");
+                return nullptr;
+            }
+            return backend;
+        }
+
         Gemma4BackendConfig gcfg;
         gcfg.model_path    = args.model_path;
         gcfg.draft_path    = args.draft_path;

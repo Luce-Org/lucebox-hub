@@ -387,6 +387,181 @@ static ggml_tensor * gemma4_view_2d_slice(ggml_context * ctx, ggml_tensor * x, i
                         (size_t)idx * x->ne[0] * x->ne[1] * ggml_element_size(x));
 }
 
+static ggml_tensor * build_gemma4_per_layer_input(
+    ggml_context * ctx,
+    const Gemma4Weights & w,
+    ggml_tensor * embed,
+    ggml_tensor * token_ids,
+    int n_tokens,
+    int layer_idx) {
+    if (!token_ids || !w.per_layer_tok_embd || !w.per_layer_model_proj ||
+        !w.per_layer_proj_norm || w.n_embd_per_layer <= 0) {
+        return nullptr;
+    }
+    const int D = w.n_embd_per_layer;
+    const size_t elt_tok = ggml_element_size(w.per_layer_tok_embd);
+    const size_t elt_norm = ggml_element_size(w.per_layer_proj_norm);
+
+    ggml_tensor * tok_embd_layer = ggml_view_2d(
+        ctx, w.per_layer_tok_embd, D, w.n_vocab,
+        w.per_layer_tok_embd->nb[1], (size_t)layer_idx * D * elt_tok);
+    ggml_tensor * inp_pl = ggml_get_rows(ctx, tok_embd_layer, token_ids);
+    inp_pl = ggml_scale(ctx, inp_pl, std::sqrt((float)D));
+
+    ggml_tensor * proj_w_layer = ggml_view_2d(
+        ctx, w.per_layer_model_proj, w.n_embd, D,
+        w.per_layer_model_proj->nb[1],
+        (size_t)layer_idx * D * w.per_layer_model_proj->nb[1]);
+    ggml_tensor * proj = ggml_mul_mat(ctx, proj_w_layer, embed);
+    proj = ggml_scale(ctx, proj, 1.0f / std::sqrt((float)w.n_embd));
+    proj = ggml_rms_norm(ctx, proj, w.norm_eps);
+    ggml_tensor * norm_w = ggml_view_1d(
+        ctx, w.per_layer_proj_norm, D, (size_t)layer_idx * D * elt_norm);
+    proj = ggml_mul(ctx, proj, norm_w);
+
+    ggml_tensor * per_layer = ggml_add(ctx, proj, inp_pl);
+    return ggml_scale(ctx, per_layer, 1.0f / std::sqrt(2.0f));
+}
+
+void gemma4_layer_step_graph_free(Gemma4LayerStepGraph & sg) {
+    if (sg.ctx) {
+        ggml_free(sg.ctx);
+        sg.ctx = nullptr;
+    }
+    sg.gf = nullptr;
+    sg.positions = nullptr;
+    sg.token_ids = nullptr;
+    sg.attn_mask_full = nullptr;
+    sg.attn_mask_swa = nullptr;
+}
+
+void gemma4_layer_step_graph_destroy(Gemma4LayerStepGraph & sg) {
+    if (sg.alloc) {
+        ggml_gallocr_free(sg.alloc);
+        sg.alloc = nullptr;
+    }
+    gemma4_layer_step_graph_free(sg);
+}
+
+bool build_gemma4_layer_step(
+    Gemma4LayerStepGraph & sg,
+    const Gemma4Weights &  w,
+    Gemma4Cache &          cache,
+    ggml_backend_t         backend,
+    int                    layer_idx,
+    ggml_tensor *          act_in,
+    ggml_tensor *          orig_embed,
+    ggml_tensor *          act_out,
+    int                    chunk_start,
+    int                    n_tokens,
+    int                    kv_start) {
+    gemma4_layer_step_graph_free(sg);
+    if (layer_idx < 0 || layer_idx >= w.n_layer) return false;
+
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() + 16 * 1024 * 1024;
+    ip.no_alloc = true;
+    sg.ctx = ggml_init(ip);
+    if (!sg.ctx) return false;
+    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+
+    ggml_tensor * inp = ggml_view_2d(
+        sg.ctx, act_in, w.n_embd, n_tokens,
+        act_in->nb[1], (size_t)chunk_start * act_in->nb[1]);
+    ggml_set_input(inp);
+
+    ggml_tensor * embed = ggml_view_2d(
+        sg.ctx, orig_embed, w.n_embd, n_tokens,
+        orig_embed->nb[1], (size_t)chunk_start * orig_embed->nb[1]);
+    ggml_set_input(embed);
+
+    sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(sg.positions);
+
+    sg.token_ids = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(sg.token_ids);
+
+    const int kv_len_raw = kv_start + n_tokens;
+    const int kv_len_padded = (kv_len_raw + 255) & ~255;
+    sg.attn_mask_full = ggml_new_tensor_4d(
+        sg.ctx, GGML_TYPE_F32, kv_len_padded, n_tokens, 1, 1);
+    ggml_set_input(sg.attn_mask_full);
+    ggml_tensor * mask_full_f16 = ggml_cast(sg.ctx, sg.attn_mask_full, GGML_TYPE_F16);
+
+    const int swa_size = cache.swa_size;
+    if (swa_size <= 0) return false;
+    const int swa_len_raw = std::min(kv_start + n_tokens, swa_size);
+    const int swa_len_padded = (swa_len_raw + 255) & ~255;
+    sg.attn_mask_swa = ggml_new_tensor_4d(
+        sg.ctx, GGML_TYPE_F32, swa_len_padded, n_tokens, 1, 1);
+    ggml_set_input(sg.attn_mask_swa);
+    ggml_tensor * mask_swa_f16 = ggml_cast(sg.ctx, sg.attn_mask_swa, GGML_TYPE_F16);
+
+    ggml_tensor * pl_input = build_gemma4_per_layer_input(
+        sg.ctx, w, embed, sg.token_ids, n_tokens, layer_idx);
+    ggml_tensor * layer_out = build_gemma4_layer(
+        sg.ctx, sg.gf, w, cache, layer_idx, inp, sg.positions,
+        mask_full_f16, mask_swa_f16, pl_input, kv_start, n_tokens);
+    if (!layer_out) return false;
+
+    ggml_tensor * out_view = ggml_view_2d(
+        sg.ctx, act_out, w.n_embd, n_tokens,
+        act_out->nb[1], (size_t)chunk_start * act_out->nb[1]);
+    ggml_build_forward_expand(sg.gf, ggml_cpy(sg.ctx, layer_out, out_view));
+
+    if (!sg.alloc) {
+        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
+}
+
+bool compute_gemma4_split_argmax(
+    ggml_backend_t          backend,
+    const Gemma4Weights &   w,
+    ggml_tensor *           act,
+    int                     token_offset,
+    int                     n_tokens,
+    std::vector<int32_t> &  out_argmax) {
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 64 + ggml_graph_overhead() + 1024 * 1024;
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return false;
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+
+    ggml_tensor * act_view = ggml_view_2d(
+        ctx, act, w.n_embd, n_tokens, act->nb[1],
+        (size_t)token_offset * act->nb[1]);
+    ggml_tensor * cur = gemma4_rms_norm_mul(ctx, act_view, w.out_norm, w.norm_eps);
+    cur = ggml_mul_mat(ctx, w.output, cur);
+    if (w.final_logit_softcap > 0.0f) {
+        cur = ggml_scale(ctx, cur, 1.0f / w.final_logit_softcap);
+        cur = ggml_tanh(ctx, cur);
+        cur = ggml_scale(ctx, cur, w.final_logit_softcap);
+    }
+    cur = ggml_argmax(ctx, cur);
+    ggml_set_output(cur);
+    ggml_build_forward_expand(gf, cur);
+
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!alloc || !ggml_gallocr_alloc_graph(alloc, gf)) {
+        if (alloc) ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        return false;
+    }
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        return false;
+    }
+    out_argmax.resize((size_t)n_tokens);
+    ggml_backend_tensor_get(cur, out_argmax.data(), 0,
+                            sizeof(int32_t) * (size_t)n_tokens);
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    return true;
+}
+
 bool gemma4_step(
     ggml_backend_t          backend,
     const Gemma4Weights &   w,

@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -89,11 +90,65 @@ ggml_tensor * find_tensor(ggml_context * ctx, const char * name) {
     return ggml_get_tensor(ctx, name);
 }
 
+static size_t align_up_size(size_t x, size_t a) {
+    if (a == 0) return x;
+    const size_t r = x % a;
+    return r == 0 ? x : x + (a - r);
+}
+
+static bool parse_block_tensor_name(const char * name, int & layer_id) {
+    const char prefix[] = "blk.";
+    const size_t prefix_len = sizeof(prefix) - 1;
+    if (std::strncmp(name, prefix, prefix_len) != 0) return false;
+    const char * p = name + prefix_len;
+    if (*p < '0' || *p > '9') return false;
+    char * end = nullptr;
+    const long v = std::strtol(p, &end, 10);
+    if (!end || *end != '.' || v < 0 || v > INT32_MAX) return false;
+    layer_id = (int)v;
+    return true;
+}
+
+static bool should_load_gemma4_tensor(const char * name,
+                                      const TargetLoadPlan & plan) {
+    if (std::strcmp(name, "token_embd.weight") == 0) return plan.load_output;
+    if (std::strcmp(name, "output_norm.weight") == 0 ||
+        std::strcmp(name, "output.weight") == 0) {
+        return plan.load_output;
+    }
+    if (std::strcmp(name, "rope_freqs.weight") == 0) return true;
+    if (std::strcmp(name, "per_layer_tok_embd.weight") == 0 ||
+        std::strcmp(name, "per_layer_model_proj.weight") == 0 ||
+        std::strcmp(name, "per_layer_proj_norm.weight") == 0) {
+        return true;
+    }
+    int layer_id = -1;
+    if (parse_block_tensor_name(name, layer_id)) {
+        return layer_id >= plan.layer_begin && layer_id < plan.layer_end;
+    }
+    return false;
+}
+
+struct Gemma4TensorAlloc {
+    ggml_tensor * tensor = nullptr;
+    size_t file_offset = 0;
+    size_t file_size = 0;
+    size_t buffer_offset = 0;
+};
+
 }  // namespace
 
 bool load_gemma4_gguf(const std::string & path,
                        ggml_backend_t backend,
                        Gemma4Weights & out) {
+    TargetLoadPlan plan;
+    return load_gemma4_gguf_partial(path, backend, plan, out);
+}
+
+bool load_gemma4_gguf_partial(const std::string & path,
+                               ggml_backend_t backend,
+                               const TargetLoadPlan & plan_in,
+                               Gemma4Weights & out) {
     ggml_context * meta_ctx = nullptr;
     gguf_init_params gip{};
     gip.no_alloc = true;
@@ -243,6 +298,19 @@ bool load_gemma4_gguf(const std::string & path,
                 out.kv_sharing_start, n_embd_pl, logit_softcap);
     std::fflush(stdout);
 
+    TargetLoadPlan plan = plan_in;
+    if (plan.layer_begin < 0) plan.layer_begin = 0;
+    if (plan.layer_end < 0) plan.layer_end = (int)n_layer;
+    if (plan.layer_begin > plan.layer_end ||
+        plan.layer_end > (int)n_layer) {
+        char e[160];
+        std::snprintf(e, sizeof(e),
+            "gemma4: invalid layer range [%d,%d) for n_layer=%u",
+            plan.layer_begin, plan.layer_end, n_layer);
+        set_last_error(e);
+        gguf_free(gctx); return false;
+    }
+
     // ── Map tensors ────────────────────────────────────────────────────
     // Mmap the GGUF; tok_embd stays on CPU (CpuEmbedder reads it directly).
     Gemma4Mmap mmap;
@@ -254,35 +322,65 @@ bool load_gemma4_gguf(const std::string & path,
         }
     }
 
-    // Allocate backend buffer for all tensors
-    out.buf = ggml_backend_alloc_ctx_tensors(meta_ctx, backend);
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    std::vector<Gemma4TensorAlloc> allocs;
+    size_t alloc_total = 0;
+    const size_t data_offset = gguf_get_data_offset(gctx);
+    const int n_tensors = gguf_get_n_tensors(gctx);
+    for (int i = 0; i < n_tensors; ++i) {
+        const char * name = gguf_get_tensor_name(gctx, i);
+        ggml_tensor * t = ggml_get_tensor(meta_ctx, name);
+        if (!t || !should_load_gemma4_tensor(name, plan)) continue;
+        alloc_total = align_up_size(alloc_total, alignment);
+        Gemma4TensorAlloc a;
+        a.tensor = t;
+        a.file_offset = data_offset + gguf_get_tensor_offset(gctx, i);
+        a.file_size = gguf_get_tensor_size(gctx, i);
+        a.buffer_offset = alloc_total;
+        alloc_total += ggml_backend_buft_get_alloc_size(buft, t);
+        allocs.push_back(a);
+    }
+    if (allocs.empty()) {
+        set_last_error("gemma4: load plan selected no tensors");
+        mmap.close_map();
+        gguf_free(gctx); return false;
+    }
+
+    out.buf = ggml_backend_alloc_buffer(backend, alloc_total);
     if (!out.buf) {
         set_last_error("gemma4: backend alloc failed");
         mmap.close_map();
         gguf_free(gctx); return false;
     }
+    ggml_backend_buffer_set_usage(out.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    char * base = (char *)ggml_backend_buffer_get_base(out.buf);
+    for (const Gemma4TensorAlloc & a : allocs) {
+        if (ggml_backend_tensor_alloc(out.buf, a.tensor,
+                                      base + a.buffer_offset) != GGML_STATUS_SUCCESS) {
+            set_last_error("gemma4: tensor alloc failed");
+            mmap.close_map();
+            gguf_free(gctx); return false;
+        }
+    }
 
     // Copy tensor data from mmap to backend; track tok_embd for CPU embedder
-    const size_t data_offset = gguf_get_data_offset(gctx);
-    const int n_tensors = gguf_get_n_tensors(gctx);
     size_t tok_embd_off = 0, tok_embd_sz = 0;
     ggml_type tok_embd_type = GGML_TYPE_COUNT;
     for (int i = 0; i < n_tensors; ++i) {
         const char * name = gguf_get_tensor_name(gctx, i);
         ggml_tensor * t = ggml_get_tensor(meta_ctx, name);
         if (!t) continue;
-        size_t offset = data_offset + gguf_get_tensor_offset(gctx, i);
-        size_t sz     = ggml_nbytes(t);
-        const void * src = (const char *)mmap.addr + offset;
-
+        const size_t offset = data_offset + gguf_get_tensor_offset(gctx, i);
+        const size_t sz = gguf_get_tensor_size(gctx, i);
         if (std::strcmp(name, "token_embd.weight") == 0) {
-            tok_embd_off  = offset;
-            tok_embd_sz   = sz;
-            tok_embd_type = t->type;
-            // Upload to GPU (needed for tied lm_head / output)
-            ggml_backend_tensor_set(t, src, 0, sz);
-        } else {
-            ggml_backend_tensor_set(t, src, 0, sz);
+            tok_embd_off = offset;
+            tok_embd_sz = sz;
+            tok_embd_type = gguf_get_tensor_type(gctx, i);
+        }
+        if (should_load_gemma4_tensor(name, plan)) {
+            ggml_backend_tensor_set(t, (const char *)mmap.addr + offset, 0, sz);
         }
     }
 
@@ -359,7 +457,9 @@ bool load_gemma4_gguf(const std::string & path,
         L.out_scale = get("layer_output_scale.weight");
     }
 
-    std::printf("[gemma4-loader] loaded %d tensors, vocab=%d\n", n_tensors, (int)n_vocab);
+    std::printf("[gemma4-loader] loaded %zu/%d tensors, vocab=%d layers=[%d,%d) output=%d\n",
+                allocs.size(), n_tensors, (int)n_vocab,
+                plan.layer_begin, plan.layer_end, plan.load_output ? 1 : 0);
     std::fflush(stdout);
 
     gguf_free(gctx);
@@ -376,6 +476,37 @@ void free_gemma4_weights(Gemma4Weights & w) {
 
 bool create_gemma4_cache(ggml_backend_t backend, const Gemma4Weights & w,
                           int max_ctx, Gemma4Cache & out) {
+    return create_gemma4_cache_partial(
+        backend, w, max_ctx, /*layer_begin=*/0, /*layer_end=*/w.n_layer, out);
+}
+
+bool create_gemma4_cache_partial(ggml_backend_t backend,
+                                  const Gemma4Weights & w,
+                                  int max_ctx,
+                                  int layer_begin,
+                                  int layer_end,
+                                  Gemma4Cache & out) {
+    if (layer_begin < 0) layer_begin = 0;
+    if (layer_end < 0) layer_end = w.n_layer;
+    if (layer_begin > layer_end || layer_end > w.n_layer) return false;
+
+    int last_kv_layer_check = -1;
+    for (int il = 0; il < w.n_layer; ++il) {
+        if (w.has_kv[il]) {
+            last_kv_layer_check = il;
+            continue;
+        }
+        if (il >= layer_begin && il < layer_end &&
+            (last_kv_layer_check < layer_begin || last_kv_layer_check >= layer_end)) {
+            char e[192];
+            std::snprintf(e, sizeof(e),
+                "gemma4 layer split crosses KV-sharing boundary: layer %d reuses layer %d outside shard [%d,%d)",
+                il, last_kv_layer_check, layer_begin, layer_end);
+            set_last_error(e);
+            return false;
+        }
+    }
+
     ggml_init_params ip{};
     ip.mem_size = ggml_tensor_overhead() * (size_t)(w.n_layer * 2 + 4) + 4096;
     ip.no_alloc = true;
@@ -394,12 +525,15 @@ bool create_gemma4_cache(ggml_backend_t backend, const Gemma4Weights & w,
     int last_kv_layer = -1;
     for (int il = 0; il < w.n_layer; ++il) {
         if (w.has_kv[il]) {
+            const bool owned_layer = il >= layer_begin && il < layer_end;
             const int D  = gemma4_head_dim(w, il);
             const int Hk = gemma4_n_head_kv(w, il);
             const bool is_swa = gemma4_is_swa_layer(w, il);
             const int cache_len = is_swa ? swa_size : max_ctx;
-            out.k[il] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F16, D, cache_len, Hk);
-            out.v[il] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F16, D, cache_len, Hk);
+            if (owned_layer) {
+                out.k[il] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F16, D, cache_len, Hk);
+                out.v[il] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F16, D, cache_len, Hk);
+            }
             out.kv_source[il] = il;
             last_kv_layer = il;
         } else {
