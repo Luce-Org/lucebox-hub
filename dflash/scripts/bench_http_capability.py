@@ -6,8 +6,15 @@ reliability. The `ds4-eval` area dispatches into the ported antirez/ds4
 corpus living in `bench_ds4_eval.py`; ds4-specific data, graders, and
 budget defaults stay colocated there so the upstream diff stays narrow.
 
-Standalone `ds4-eval`, `long`, and `all` runs are score-only unless
-`--min-pass-rate` is set explicitly.
+The `forge` area runs antoinezambelli/forge's tool-calling eval scenarios
+against our Anthropic-Messages-compatible ``/v1/messages`` endpoint. The
+runtime (forge.clients.AnthropicClient + forge.core.WorkflowRunner) comes
+from the ``forge-guardrails`` PyPI dep; the scenarios + ``run_eval``
+driver are vendored under ``scripts/fixtures/forge_eval/`` because forge's
+wheel does not ship its ``tests/eval`` tree.
+
+Standalone `ds4-eval`, `long`, `forge`, and `all` runs are score-only
+unless `--min-pass-rate` is set explicitly.
 """
 
 from __future__ import annotations
@@ -297,7 +304,13 @@ def default_max_tokens(area: str) -> int:
     # Combined cap (reasoning + reply). Thinking areas get the ds4_eval.c
     # default so the model has headroom; non-thinking areas (smoke, recall)
     # keep the short cap since a one-word answer doesn't need a buffer.
-    return DS4_EVAL_MAX_TOKENS if area in {"ds4-eval", "all"} else DEFAULT_MAX_TOKENS
+    # ``forge`` falls back to the long cap too — its scenarios are
+    # multi-step tool-calling chains and benefit from headroom.
+    return (
+        DS4_EVAL_MAX_TOKENS
+        if area in {"ds4-eval", "forge", "all"}
+        else DEFAULT_MAX_TOKENS
+    )
 
 
 def default_thinking_enabled(area: str) -> bool:
@@ -466,14 +479,197 @@ def write_trace(path: Path, rows: list[dict[str, Any]]) -> None:
                 )
 
 
+def run_forge_area(
+    url: str,
+    *,
+    model: str,
+    max_tokens: int,
+    timeout_s: int,
+    auth_header: str,
+    tags: list[str] | None,
+    names: list[str] | None,
+    questions: int | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run antoinezambelli/forge tool-calling scenarios via /v1/messages.
+
+    Lazy-imports forge + the vendored ``forge_eval`` package so that
+    other areas (smoke, ds4-eval, long) keep working when ``forge-
+    guardrails`` is not installed. Builds an ``AnthropicClient`` pointed
+    at ``url`` (the Anthropic SDK appends ``/v1/messages``), then runs
+    each scenario once via ``forge_eval.eval_runner.run_eval``.
+
+    Returns ``(rows, forge_block)`` where ``rows`` is the per-scenario
+    summary in the shape ``bench_http_capability`` already uses for its
+    table output and ``forge_block`` carries the raw forge-specific
+    detail (token counts, iteration counts, error type, …) for
+    ``--json-out`` consumers.
+    """
+    import asyncio
+    import os
+
+    # Vendored fixtures live next to this script. The path append is
+    # local to this function so other areas don't see the forge_eval
+    # namespace even if the import fails.
+    fixtures_dir = SCRIPT_DIR / "fixtures"
+    if str(fixtures_dir) not in sys.path:
+        sys.path.insert(0, str(fixtures_dir))
+
+    try:
+        from forge.clients.anthropic import AnthropicClient
+    except ImportError as exc:
+        raise SystemExit(
+            "[capability] --area forge requires forge-guardrails. "
+            "Install via: pip install -e 'dflash[eval]' "
+            f"(import failed: {exc})"
+        ) from exc
+
+    try:
+        from forge_eval.eval_runner import (  # type: ignore[import-not-found]
+            ALL_SCENARIOS,
+            EvalConfig,
+            RunResult,
+            run_eval,
+        )
+    except ImportError as exc:
+        raise SystemExit(
+            "[capability] --area forge requires the vendored "
+            "scripts/fixtures/forge_eval/ tree to be present "
+            f"(import failed: {exc})"
+        ) from exc
+
+    api_key = "dummy"
+    if auth_header:
+        # If the caller supplied --auth-env, forward the underlying token
+        # without the ``Bearer `` prefix — the Anthropic SDK sets the
+        # ``x-api-key`` header itself, so we just need a non-empty value.
+        api_key = auth_header.removeprefix("Bearer ").strip() or "dummy"
+
+    client = AnthropicClient(
+        model=model,
+        api_key=api_key,
+        base_url=url.rstrip("/"),
+        max_tokens=max_tokens,
+        timeout=float(timeout_s),
+        max_retries=0,  # let bench surface errors directly; no retry storms
+    )
+
+    scenarios = list(ALL_SCENARIOS)
+    if questions is not None and questions >= 0:
+        scenarios = scenarios[:questions]
+
+    config = EvalConfig(
+        runs_per_scenario=1,  # one shot per scenario, like ds4-eval
+        stream=False,
+        keep_message_history=False,  # we don't surface raw forge messages
+        verbose=False,
+        # No global budget override — let scenarios use their own defaults.
+        # Anthropic backends don't need a ServerManager-resolved budget.
+    )
+
+    print(
+        f"[capability] forge scenarios={len(scenarios)} "
+        f"tags={tags or 'all'} names={names or 'all'}",
+        flush=True,
+    )
+    raw_results: dict[str, list[RunResult]] = asyncio.run(
+        run_eval(
+            client,
+            scenarios,
+            config,
+            resolved_budget=None,
+            tags=tags,
+            names=names,
+            ablation=None,
+        )
+    )
+
+    rows: list[dict[str, Any]] = []
+    forge_scenarios: list[dict[str, Any]] = []
+    for idx, (scenario_name, run_list) in enumerate(raw_results.items(), start=1):
+        # runs_per_scenario=1, so pick the first (and only) RunResult.
+        result = run_list[0] if run_list else None
+        if result is None:
+            graded_pass = False
+            error_type = "no_runs"
+            row_status = "error"
+            elapsed = 0.0
+            iterations = 0
+            accuracy = None
+            completeness = False
+        else:
+            completeness = bool(result.completeness)
+            # forge grades pass = completed AND validator did not return
+            # False. ``accuracy=None`` means the scenario has no validator
+            # (treat as passed if completeness is True).
+            accuracy = result.accuracy
+            graded_pass = completeness and (accuracy is not False)
+            error_type = result.error_type
+            elapsed = result.elapsed_seconds
+            iterations = result.iterations_used
+            if not completeness:
+                row_status = "error"
+            elif accuracy is False:
+                row_status = "failed"
+            else:
+                row_status = "passed"
+
+        rows.append({
+            "area": "forge",
+            "source": "forge-guardrails",
+            "id": scenario_name,
+            "name": f"forge/{scenario_name}",
+            "kind": "tool-calling",
+            "status": row_status,
+            "ok": graded_pass,
+            "graded_pass": graded_pass,
+            "strict_pass": graded_pass,
+            "format_pass": completeness,
+            "semantic_hint": False,
+            "semantic_pass": False,
+            "given": "PASS" if graded_pass else (error_type or "FAIL"),
+            "correct": ["PASS"],
+            "wall_s": round(elapsed, 3),
+            "prompt": "",
+            "output": "",
+        })
+        forge_scenarios.append({
+            "name": scenario_name,
+            "completeness": completeness,
+            "accuracy": accuracy,
+            "graded_pass": graded_pass,
+            "iterations_used": iterations,
+            "error_type": error_type,
+            "error_message": getattr(result, "error_message", None) if result else None,
+            "elapsed_seconds": round(elapsed, 3),
+            "input_tokens": getattr(result, "input_tokens", 0) if result else 0,
+            "output_tokens": getattr(result, "output_tokens", 0) if result else 0,
+            "stream_retries": getattr(result, "stream_retries", 0) if result else 0,
+        })
+
+    forge_block = {
+        "scenarios": forge_scenarios,
+        "client": "forge.clients.AnthropicClient",
+        "endpoint": f"{url.rstrip('/')}/v1/messages",
+        "runs_per_scenario": 1,
+        "tags_filter": tags,
+        "names_filter": names,
+    }
+    return rows, forge_block
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run graded HTTP capability prompts.")
     ap.add_argument("--url", default="http://127.0.0.1:8000", help="Server base URL.")
     ap.add_argument(
         "--area",
-        choices=("smoke", "ds4-eval", "long", "all"),
+        choices=("smoke", "ds4-eval", "long", "forge", "all"),
         default="smoke",
-        help="Case area to run.",
+        help=(
+            "Case area to run. ``forge`` drives forge-guardrails' "
+            "tool-calling scenarios via /v1/messages (lazy-imports "
+            "forge_eval; the ``eval`` extra of dflash/pyproject.toml "
+            "must be installed)."
+        ),
     )
     ap.add_argument("--questions", type=int, default=None,
                     help="Run only the first N selected questions.")
@@ -529,6 +725,24 @@ def main() -> int:
             "and trace files."
         ),
     )
+    ap.add_argument(
+        "--forge-tags",
+        default="",
+        help=(
+            "Comma-separated forge scenario tag filter (e.g. "
+            "``plumbing,model_quality``). Maps to forge's run_eval(tags=).  "
+            "Only meaningful with --area forge."
+        ),
+    )
+    ap.add_argument(
+        "--forge-scenario",
+        default="",
+        help=(
+            "Comma-separated forge scenario name filter (e.g. "
+            "``basic_2step,sequential_3step``). Maps to run_eval(names=). "
+            "Only meaningful with --area forge."
+        ),
+    )
     ap.add_argument("--json-out", type=Path)
     ap.add_argument("--trace", type=Path)
     args = ap.parse_args()
@@ -556,16 +770,38 @@ def main() -> int:
             ap.error(f"--auth-env {args.auth_env}: env var is empty or unset")
         auth_header = f"Bearer {token}"
 
-    selected = select_cases(
-        args.area,
-        args.questions,
-        case_index=args.case_index,
-        case_id=args.case_id or None,
-    )
-    if (args.case_index is not None or args.case_id) and not selected:
-        ap.error("selected case was not found")
+    # ``forge`` is dispatched separately — it doesn't share the
+    # build_prompt/grade_case path. ``all`` runs the case-based areas
+    # first, then appends the forge results.
+    case_areas = {"smoke", "ds4-eval", "long", "all"}
+    forge_areas = {"forge", "all"}
+
+    if args.area in case_areas:
+        selected = select_cases(
+            args.area,
+            args.questions,
+            case_index=args.case_index,
+            case_id=args.case_id or None,
+        )
+        if (args.case_index is not None or args.case_id) and not selected:
+            ap.error("selected case was not found")
+    else:
+        selected = []
+        if args.case_index is not None or args.case_id:
+            ap.error(
+                "--case-index / --case-id are not meaningful for "
+                f"--area {args.area} (use --forge-scenario instead)"
+            )
+
     rows: list[dict[str, Any]] = []
-    print(f"[capability] url={args.url} area={args.area} questions={len(selected)}", flush=True)
+    forge_block: dict[str, Any] | None = None
+    total_for_log = (
+        len(selected) if args.area in case_areas else "forge"
+    )
+    print(
+        f"[capability] url={args.url} area={args.area} questions={total_for_log}",
+        flush=True,
+    )
     for idx, case in enumerate(selected, start=1):
         row = run_case(args.url, case, args.timeout, max_tokens, think,
                         model=args.model, auth_header=auth_header)
@@ -580,6 +816,38 @@ def main() -> int:
             flush=True,
         )
 
+    if args.area in forge_areas:
+        forge_tags = (
+            [t.strip() for t in args.forge_tags.split(",") if t.strip()]
+            or None
+        )
+        forge_names = (
+            [n.strip() for n in args.forge_scenario.split(",") if n.strip()]
+            or None
+        )
+        forge_rows, forge_block = run_forge_area(
+            args.url,
+            model=args.model,
+            max_tokens=max_tokens,
+            timeout_s=args.timeout,
+            auth_header=auth_header,
+            tags=forge_tags,
+            names=forge_names,
+            questions=args.questions if args.area == "forge" else None,
+        )
+        # Continue numbering across smoke/ds4 rows so ``--area all`` reads
+        # like a single sequence.
+        base = len(rows)
+        rows.extend(forge_rows)
+        for offset, row in enumerate(forge_rows, start=1):
+            status = "PASS" if row["ok"] else "FAIL"
+            print(
+                f"  {base + offset:2d} {status:4s} {row['source']:14s} "
+                f"{row['id']:30s} given={row.get('given', '?')} "
+                f"wall={row['wall_s']:.2f}s",
+                flush=True,
+            )
+
     passed = sum(1 for row in rows if row["ok"])
     strict_passed = sum(1 for row in rows if row.get("strict_pass"))
     format_passed = sum(1 for row in rows if row.get("format_pass"))
@@ -590,14 +858,16 @@ def main() -> int:
     format_pass_rate = format_passed / len(rows) if rows else 0.0
     semantic_hint_rate = semantic_hints / len(rows) if rows else 0.0
     semantic_pass_rate = semantic_passed / len(rows) if rows else 0.0
+    source = "lucebox-http-capability"
+    if args.area == "ds4-eval":
+        source = "antirez/ds4 ds4-eval HTTP port"
+    elif args.area == "forge":
+        source = "antoinezambelli/forge tool-calling eval"
+
     payload = {
         "suite": "capability",
         "area": args.area,
-        "source": (
-            "antirez/ds4 ds4-eval HTTP port"
-            if args.area == "ds4-eval"
-            else "lucebox-http-capability"
-        ),
+        "source": source,
         "max_tokens": max_tokens,
         "passed": passed,
         "graded_passed": passed,
@@ -617,6 +887,8 @@ def main() -> int:
         "rows": rows,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
+    if forge_block is not None:
+        payload["forge_results"] = forge_block
     print(f"[capability] pass_rate={pass_rate:.2%}", flush=True)
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
