@@ -99,17 +99,9 @@ bool load_qwen3_drafter_model(const std::string & path,
     // Detect weight quant type from blk.0.attn_q.weight; support BF16 and Q8_0.
     ggml_type wtype = GGML_TYPE_BF16;
     {
-        int tidx = gguf_find_tensor(gctx, "blk.0.attn_q.weight");
+        int64_t tidx = gguf_find_tensor(gctx, "blk.0.attn_q.weight");
         if (tidx >= 0) {
-            // gguf_context created with no_alloc=false builds a ggml_context
-            // internally; use gguf_get_tensor_type to read the stored type.
-            // Fallback: check the tensor size to distinguish Q8_0 from BF16.
-            // BF16 blk.0.attn_q is [1024, 2048] = 2097152 elements * 2 bytes = 4194304 B
-            // Q8_0 blk.0.attn_q is 2097152 * 1.0625 bytes = 2228224 B (32 bytes per 32 elems + 2 byte scale)
-            size_t tsz = gguf_get_tensor_size(gctx, tidx);
-            if (tsz == 2228224) {
-                wtype = GGML_TYPE_Q8_0;
-            }
+            wtype = gguf_get_tensor_type(gctx, tidx);
         }
     }
     std::fprintf(stderr, "[qwen3-0.6b] detected weight type: %s\n",
