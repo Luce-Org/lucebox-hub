@@ -15,9 +15,11 @@
 #include <vector>
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 
 #include "internal.h"  // CpuEmbedder
+#include "common/layer_split_utils.h"
 
 namespace dflash::common {
 
@@ -146,10 +148,14 @@ inline int gemma4_n_head_kv(const Gemma4Weights & w, int il) {
     return w.n_head_kv;
 }
 
-// GGUF loader
 bool load_gemma4_gguf(const std::string & path,
                        ggml_backend_t backend,
                        Gemma4Weights & out);
+
+bool load_gemma4_gguf_partial(const std::string & path,
+                               ggml_backend_t backend,
+                               const TargetLoadPlan & plan,
+                               Gemma4Weights & out);
 
 void free_gemma4_weights(Gemma4Weights & w);
 
@@ -184,6 +190,12 @@ struct Gemma4Cache {
 
 bool  create_gemma4_cache(ggml_backend_t backend, const Gemma4Weights & w,
                            int max_ctx, Gemma4Cache & out);
+bool  create_gemma4_cache_partial(ggml_backend_t backend,
+                                  const Gemma4Weights & w,
+                                  int max_ctx,
+                                  int layer_begin,
+                                  int layer_end,
+                                  Gemma4Cache & out);
 void  free_gemma4_cache(Gemma4Cache & c);
 
 // Allocate target_feat ring buffer (call after draft load determines n_capture_layers).
@@ -238,6 +250,41 @@ bool gemma4_project_hidden(
     const float *           hidden,
     int                     n_tokens,
     std::vector<int32_t> &  out_tokens);
+
+struct Gemma4LayerStepGraph {
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t alloc = nullptr;
+
+    ggml_tensor * positions = nullptr;
+    ggml_tensor * token_ids = nullptr;
+    ggml_tensor * attn_mask_full = nullptr;
+    ggml_tensor * attn_mask_swa = nullptr;
+};
+
+void gemma4_layer_step_graph_free(Gemma4LayerStepGraph & sg);
+void gemma4_layer_step_graph_destroy(Gemma4LayerStepGraph & sg);
+
+bool build_gemma4_layer_step(
+    Gemma4LayerStepGraph & sg,
+    const Gemma4Weights &  w,
+    Gemma4Cache &          cache,
+    ggml_backend_t         backend,
+    int                    layer_idx,
+    ggml_tensor *          act_in,
+    ggml_tensor *          orig_embed,
+    ggml_tensor *          act_out,
+    int                    chunk_start,
+    int                    n_tokens,
+    int                    kv_start);
+
+bool compute_gemma4_split_argmax(
+    ggml_backend_t          backend,
+    const Gemma4Weights &   w,
+    ggml_tensor *           act,
+    int                     token_offset,
+    int                     n_tokens,
+    std::vector<int32_t> &  out_argmax);
 
 // BSA sparse-FA prefill: process the full prompt at once using block-sparse
 // attention for SWA layers (flash_prefill_forward_bf16). Full-attention layers

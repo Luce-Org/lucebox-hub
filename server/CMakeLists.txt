@@ -227,6 +227,7 @@ add_library(dflash_common STATIC
     src/gemma4/gemma4_backend.cpp
     src/gemma4/gemma4_daemon.cpp
     src/gemma4/gemma4_dflash_target.cpp
+    src/gemma4/gemma4_layer_split_adapter.cpp
     src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
