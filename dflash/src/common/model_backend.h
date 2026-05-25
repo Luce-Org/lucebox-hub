@@ -116,6 +116,11 @@ struct GenerateResult {
     // stream and grepping for "</think>" cannot distinguish the two
     // (the injected close decodes identically).
     bool                       budget_forced_close = false;
+    // True iff the AR decode loop's post-close watchdog detected an n-gram
+    // repetition loop and broke out early. Caller surfaces this so clients
+    // can mark the answer as unreliable rather than treating the
+    // (truncated) content as a clean response.
+    bool                       degenerate_decode_close = false;
 };
 
 // ─── Backend interface ──────────────────────────────────────────────────

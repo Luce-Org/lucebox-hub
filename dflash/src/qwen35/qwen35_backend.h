@@ -183,7 +183,8 @@ private:
                         const DaemonIO & io,
                         const std::vector<int32_t> * hint_tokens = nullptr,
                         const BudgetHook * budget_hook = nullptr,
-                        bool * forced_close_out = nullptr);
+                        bool * forced_close_out = nullptr,
+                        bool * degenerate_close_out = nullptr);
 
     // AR decode fallback (no draft model or sampling mode).
     // budget_hook (when close_token_ids is non-empty) overrides the next
@@ -202,7 +203,8 @@ private:
                       std::vector<int32_t> & out_tokens,
                       const DaemonIO & io,
                       const BudgetHook & budget_hook = {},
-                      bool * forced_close_out = nullptr);
+                      bool * forced_close_out = nullptr,
+                      bool * degenerate_close_out = nullptr);
 
     // Chain-mode verify (single batch of q_len tokens).
     int verify_chain(int committed, const int32_t * draft_tok, int q_len);

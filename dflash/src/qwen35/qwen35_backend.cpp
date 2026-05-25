@@ -509,7 +509,8 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
         // model closes </think> naturally well before the budget edge.
         if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
                              req.hint_tokens, &req.budget_hook,
-                             &result.budget_forced_close)) {
+                             &result.budget_forced_close,
+                             &result.degenerate_decode_close)) {
             result.error = "decode";
             return result;
         }
@@ -578,7 +579,8 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
         // model closes </think> naturally well before the budget edge.
         if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
                              req.hint_tokens, &req.budget_hook,
-                             &result.budget_forced_close)) {
+                             &result.budget_forced_close,
+                             &result.degenerate_decode_close)) {
             result.error = "decode";
             return result;
         }
@@ -734,7 +736,8 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                   std::vector<int32_t> & out_tokens,
                                   const DaemonIO & io,
                                   const BudgetHook & budget_hook,
-                                  bool * forced_close_out) {
+                                  bool * forced_close_out,
+                                  bool * degenerate_close_out) {
     // Budget hook state.
     //   - budget_close_started: true once we've begun injecting the close
     //     sequence. Prevents re-triggering on continued forward generation.
@@ -904,6 +907,37 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         if (io.cancelled) break;
 
         if (IS_EOS_TOK(next_tok, w_)) break;
+
+        // Degenerate-decode watchdog. Once we're past the budget-hook's
+        // close sequence (model is now in post-`</think>` content phase),
+        // watch for n-gram repetition loops. The aime2025-02 case at
+        // think_max=4k produces output like "Let's use the result:
+        // Area($AFNBCEM$) = ... | Let's use the result: Area($AFNBCEM$)
+        // = ... | Let's use the result: Area(..." until max_tokens. Pure
+        // waste — the model is stuck and won't recover.
+        //
+        // Heuristic: 8-token suffix repeating 3× consecutively. Cheap
+        // (3 std::equal calls, no full sort), conservative enough that
+        // legitimate enumerations ("A. ...\nB. ...\nC. ...") don't trip
+        // it because each item differs. When tripped, break the loop —
+        // the caller sees a shorter completion. Server-log line tells
+        // the operator why.
+        if (budget_close_started && close_inject_pos >= (int)budget_hook.close_token_ids.size()
+            && (int)out_tokens.size() >= 24)
+        {
+            auto end = out_tokens.end();
+            const bool s1 = std::equal(end - 24, end - 16, end - 16);
+            const bool s2 = std::equal(end - 16, end -  8, end -  8);
+            if (s1 && s2) {
+                std::fprintf(stderr,
+                    "[degenerate-decode] post-close 8-gram repeating 3× — "
+                    "breaking AR loop at committed=%d, content_tokens=%zu\n",
+                    committed,
+                    out_tokens.size() - out_tokens_at_entry);
+                if (degenerate_close_out) *degenerate_close_out = true;
+                break;
+            }
+        }
     }
 
     auto t_dec1_ar = std::chrono::steady_clock::now();
@@ -922,7 +956,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     const DaemonIO & io,
                                     const std::vector<int32_t> * hint_tokens,
                                     const BudgetHook * budget_hook,
-                                    bool * forced_close_out) {
+                                    bool * forced_close_out,
+                                    bool * degenerate_close_out) {
     const int hidden = w_.n_embd;
 
     // First token: use the argmax that do_prefill already sampled and stored.
@@ -948,7 +983,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // still fires when spec-decode is unavailable.
         bool ok = do_ar_decode(committed, n_gen, out_tokens, io,
                                 budget_hook ? *budget_hook : BudgetHook{},
-                                forced_close_out);
+                                forced_close_out, degenerate_close_out);
         io.emit(-1);
         return ok;
     }
@@ -1014,7 +1049,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 BudgetHook tail_hook = *budget_hook;
                 int ar_n_gen = need_commit_budget;
                 bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
-                                        tail_hook, forced_close_out);
+                                        tail_hook, forced_close_out,
+                                        degenerate_close_out);
                 io.emit(-1);
                 return ok;
             }

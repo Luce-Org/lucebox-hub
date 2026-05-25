@@ -1796,6 +1796,17 @@ void HttpServer::worker_loop() {
                         {"content_tokens",  content_tokens_emitted},
                         {"total_tokens",    total_completion_tokens},
                     };
+                    // Honest signaling: when the post-close watchdog
+                    // detected an n-gram repetition loop and aborted
+                    // generation, surface a sibling flag so callers know
+                    // the answer is unreliable. finish_reason stays
+                    // "length" (SDK-safe per the truncation-signaling
+                    // convention: OpenAI/Anthropic/Gemini all collapse
+                    // budget-class events to one closed enum and put
+                    // richer signal in sidecar fields).
+                    if (result.degenerate_decode_close) {
+                        choice["finish_details"]["degenerate_decode"] = true;
+                    }
                 }
                 // usage.completion_tokens_details.reasoning_tokens — OpenAI
                 // o1/o3 standard location, also OR's normalized shape. Mirrors
