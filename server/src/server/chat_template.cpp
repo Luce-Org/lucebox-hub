@@ -419,13 +419,25 @@ std::string render_chat_template_jinja(
         // for tool use. Mirror the hard-coded behavior here when the rendered
         // prompt ends with a bare assistant generation prompt.
         if (!enable_thinking) {
-            static constexpr char kAssistantPrefix[] = "<|im_start|>assistant\n";
-            static constexpr char kNoThinkPrefill[] = "<think>\n\n</think>\n\n";
-            if (rendered.size() >= sizeof(kAssistantPrefix) - 1 &&
-                rendered.compare(rendered.size() - (sizeof(kAssistantPrefix) - 1),
-                                 sizeof(kAssistantPrefix) - 1,
-                                 kAssistantPrefix) == 0) {
-                rendered += kNoThinkPrefill;
+            // The hard-coded Qwen renderer follows <|im_start|>assistant with a
+            // closed <think> block to put the model in non-thinking decode mode.
+            // Tolerate template variants that emit extra trailing whitespace
+            // after the assistant marker (single \n, double \n\n, trailing
+            // space). Strategy: trim trailing whitespace, check for the BARE
+            // assistant marker (no newline), then re-emit marker + prefill.
+            static constexpr char kAssistantBare[]    = "<|im_start|>assistant";
+            static constexpr char kAssistantPrefill[] = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+            size_t trim_end = rendered.size();
+            while (trim_end > 0) {
+                char c = rendered[trim_end - 1];
+                if (c != ' ' && c != '\t' && c != '\n' && c != '\r') break;
+                --trim_end;
+            }
+            const size_t blen = sizeof(kAssistantBare) - 1;
+            if (trim_end >= blen &&
+                rendered.compare(trim_end - blen, blen, kAssistantBare) == 0) {
+                rendered.resize(trim_end - blen);
+                rendered += kAssistantPrefill;
             }
         }
 

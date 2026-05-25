@@ -561,6 +561,11 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
     }
 
     // Pattern 6: native claude-code XML tags (<bash>, <read>, <write>, <edit>, <ls>, <grep>, <glob>)
+    // Gate: only fire when the request actually provided tools. Otherwise
+    // legitimate prose like "please read the manual" or "grep for the pattern"
+    // gets eaten as a phantom tool call and the surrounding text is stripped
+    // via the removals span. Mirrors the streaming gate has_request_tools().
+    if (tools.is_array() && !tools.empty())
     {
         auto begin = std::sregex_iterator(text.begin(), text.end(), re_native_tag());
         auto end = std::sregex_iterator();
