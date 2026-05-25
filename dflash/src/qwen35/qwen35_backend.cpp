@@ -20,9 +20,21 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 
 namespace dflash::common {
+
+namespace {
+static float bf16_bits_to_f32(uint16_t bits) {
+    union {
+        uint32_t u;
+        float f;
+    } v;
+    v.u = (uint32_t)bits << 16;
+    return v.f;
+}
+}  // namespace
 
 #define IS_EOS_TOK(tok, w)                                         \
     ( ((w).eos_chat_id >= 0 && (tok) == (w).eos_chat_id)                  \
@@ -37,14 +49,15 @@ Qwen35Backend::~Qwen35Backend() { shutdown(); }
 // ── init() ──────────────────────────────────────────────────────────────
 
 bool Qwen35Backend::init() {
-    split_gpus_ = (cfg_.device.gpu != cfg_.draft_gpu);
+    const bool use_remote_draft = cfg_.remote_draft.enabled();
+    split_gpus_ = !use_remote_draft && (cfg_.device.gpu != cfg_.draft_gpu);
 
     target_backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
     if (!target_backend_) {
         std::fprintf(stderr, "target cuda init failed\n");
         return false;
     }
-    draft_backend_ = target_backend_;
+    draft_backend_ = use_remote_draft ? nullptr : target_backend_;
     if (split_gpus_) {
         draft_backend_ = ggml_backend_cuda_init(cfg_.draft_gpu);
         if (!draft_backend_) {
@@ -72,7 +85,22 @@ bool Qwen35Backend::init() {
     std::printf("[target] %s\n", dflash27b_last_error());
 
     // Load draft
-    if (cfg_.draft_path) {
+    if (cfg_.draft_path && use_remote_draft) {
+        const int cap = cfg_.remote_draft.ring_cap > 0
+            ? std::min(cfg_.remote_draft.ring_cap, cfg_.device.max_ctx)
+            : std::min(cfg_.device.max_ctx, cfg_.draft_ctx_max);
+        if (!remote_draft_.start(cfg_.remote_draft.ipc_bin, cfg_.draft_path,
+                                 cfg_.draft_gpu, cap,
+                                 cfg_.remote_draft.work_dir)) {
+            std::fprintf(stderr, "remote draft start failed\n");
+            return false;
+        }
+        dw_.n_embd = DFLASH27B_TARGET_HIDDEN;
+        dw_.block_size = DFLASH27B_DRAFT_BLOCK_SIZE;
+        dw_.n_target_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;
+        std::printf("[draft]  remote ipc ready gpu=%d cap=%d\n",
+                    cfg_.draft_gpu, cap);
+    } else if (cfg_.draft_path) {
         std::string dp(cfg_.draft_path);
         bool draft_ok = (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
             ? load_draft_gguf(cfg_.draft_path, draft_backend_, dw_, &w_)
@@ -104,7 +132,7 @@ bool Qwen35Backend::init() {
 
     // Init feature mirror when draft model is available (needed for spec decode).
     // On single-GPU, this is an F32 conversion buffer; on split-GPU, a cross-device mirror.
-    if (cfg_.draft_path) {
+    if (cfg_.draft_path && !use_remote_draft) {
         const int mirror_cap = std::min({cfg_.draft_ctx_max, cfg_.device.max_ctx,
                                          cache_.target_feat_cap > 0 ? cache_.target_feat_cap : cfg_.device.max_ctx});
         if (!draft_feature_mirror_init(feature_mirror_, draft_backend_,
@@ -130,10 +158,15 @@ void Qwen35Backend::print_ready_banner() const {
 bool Qwen35Backend::park(const std::string & what) {
     bool want_draft  = (what.empty() || what == "all" || what == "draft");
     bool want_target = (what.empty() || what == "all" || what == "target");
+    const bool use_remote_draft = cfg_.remote_draft.enabled();
 
     if (want_draft && !draft_parked_) {
-        step_graph_destroy(draft_sg_);
-        free_draft_weights(dw_);
+        if (use_remote_draft) {
+            remote_draft_.close();
+        } else {
+            step_graph_destroy(draft_sg_);
+            free_draft_weights(dw_);
+        }
         draft_parked_ = true;
         std::printf("[park] draft released\n"); std::fflush(stdout);
     }
@@ -149,6 +182,7 @@ bool Qwen35Backend::park(const std::string & what) {
 bool Qwen35Backend::unpark(const std::string & what) {
     bool want_target = (what.empty() || what == "all" || what == "target");
     bool want_draft  = (what.empty() || what == "all" || what == "draft");
+    const bool use_remote_draft = cfg_.remote_draft.enabled();
 
     if (want_target && target_parked_) {
         if (!load_target_gguf(cfg_.target_path, target_backend_, w_)) {
@@ -159,18 +193,30 @@ bool Qwen35Backend::unpark(const std::string & what) {
         std::printf("[unpark] target restored\n"); std::fflush(stdout);
     }
     if (want_draft && draft_parked_ && cfg_.draft_path) {
-        std::string dp(cfg_.draft_path);
-        bool draft_ok = (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
-            ? load_draft_gguf(cfg_.draft_path, draft_backend_, dw_, &w_)
-            : load_draft_safetensors(cfg_.draft_path, draft_backend_, dw_, &w_);
-        if (!draft_ok) {
-            std::fprintf(stderr, "[unpark] draft: %s\n", dflash27b_last_error());
-            return false;
-        }
-        if (cfg_.draft_swa_window > 0) {
-            dw_.swa_window = cfg_.draft_swa_window;
-            for (int il = 0; il < dw_.n_layer - 1; il++)
-                dw_.layers[il].is_swa = true;
+        if (use_remote_draft) {
+            const int cap = cfg_.remote_draft.ring_cap > 0
+                ? std::min(cfg_.remote_draft.ring_cap, cfg_.device.max_ctx)
+                : std::min(cfg_.device.max_ctx, cfg_.draft_ctx_max);
+            if (!remote_draft_.start(cfg_.remote_draft.ipc_bin, cfg_.draft_path,
+                                     cfg_.draft_gpu, cap,
+                                     cfg_.remote_draft.work_dir)) {
+                std::fprintf(stderr, "[unpark] remote draft failed\n");
+                return false;
+            }
+        } else {
+            std::string dp(cfg_.draft_path);
+            bool draft_ok = (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
+                ? load_draft_gguf(cfg_.draft_path, draft_backend_, dw_, &w_)
+                : load_draft_safetensors(cfg_.draft_path, draft_backend_, dw_, &w_);
+            if (!draft_ok) {
+                std::fprintf(stderr, "[unpark] draft: %s\n", dflash27b_last_error());
+                return false;
+            }
+            if (cfg_.draft_swa_window > 0) {
+                dw_.swa_window = cfg_.draft_swa_window;
+                for (int il = 0; il < dw_.n_layer - 1; il++)
+                    dw_.layers[il].is_swa = true;
+            }
         }
         draft_parked_ = false;
         std::printf("[unpark] draft restored\n"); std::fflush(stdout);
@@ -421,16 +467,18 @@ DFlashTarget * Qwen35Backend::dflash_target() {
 // ── Shutdown ────────────────────────────────────────────────────────────
 
 void Qwen35Backend::shutdown() {
+    const bool use_remote_draft = cfg_.remote_draft.enabled();
     free_drafter();
     step_graph_destroy(sg_);
     step_graph_destroy(draft_sg_);
     step_graph_destroy(proj_sg_);
+    remote_draft_.close();
     draft_feature_mirror_free(feature_mirror_);
     for (int i = 0; i < PREFIX_SLOTS; i++) {
         free_prefix_snapshot(prefix_snapshots_[i]);
     }
     if (!target_parked_) free_target_weights(w_);
-    if (!draft_parked_)  free_draft_weights(dw_);
+    if (!use_remote_draft && !draft_parked_) free_draft_weights(dw_);
     free_target_cache(cache_);
     if (split_gpus_ && draft_backend_) {
         ggml_backend_free(draft_backend_);
@@ -702,8 +750,10 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
             snap_slot = -1;
         }
 
-        // Sync feature mirror if active
-        if (feature_mirror_.target_feat && !draft_parked_) {
+        // Sync draft-side features if active.
+        if (remote_draft_.active() && !draft_parked_) {
+            if (!sync_remote_draft_features(kv_pos, n_tokens)) return -1;
+        } else if (feature_mirror_.target_feat && !draft_parked_) {
             draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
                                             feature_mirror_, kv_pos, n_tokens);
         }
@@ -793,6 +843,39 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     return true;
 }
 
+bool Qwen35Backend::sync_remote_draft_features(int start_pos, int n_tokens) {
+    if (!remote_draft_.active() || !cache_.target_feat || n_tokens <= 0) return true;
+    if (cache_.target_feat_cap <= 0) return false;
+
+    const int n_capture = w_.n_capture_layers;
+    const int feat_hidden = w_.n_embd;
+    const size_t src_stride = cache_.target_feat->nb[1];
+    std::vector<float> slice((size_t)n_tokens * (size_t)feat_hidden);
+    std::vector<uint16_t> bf16(feat_hidden);
+    ggml_backend_synchronize(target_backend_);
+    for (int cap_idx = 0; cap_idx < n_capture; ++cap_idx) {
+        for (int t = 0; t < n_tokens; ++t) {
+            const int slot = (start_pos + t) % cache_.target_feat_cap;
+            const size_t src_offset = (size_t)slot * src_stride +
+                (size_t)cap_idx * (size_t)feat_hidden * sizeof(uint16_t);
+            ggml_backend_tensor_get(cache_.target_feat, bf16.data(),
+                                    src_offset,
+                                    sizeof(uint16_t) * (size_t)feat_hidden);
+            float * dst = slice.data() + (size_t)t * feat_hidden;
+            for (int h = 0; h < feat_hidden; ++h) {
+                dst[h] = bf16_bits_to_f32(bf16[h]);
+            }
+        }
+        if (!remote_draft_.send_feature_slice(cap_idx, start_pos, n_tokens, slice)) {
+            std::fprintf(stderr,
+                "spec-decode: remote feature sync failed capture=%d\n",
+                cap_idx);
+            return false;
+        }
+    }
+    return true;
+}
+
 // ── DFlash speculative decode loop ─────────────────────────────────────
 
 bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
@@ -815,7 +898,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // - greedy decoding (no logit processing) — spec decode uses argmax verification
     const bool can_spec = cfg_.draft_path
         && !draft_parked_
-        && feature_mirror_.target_feat
+        && (cfg_.remote_draft.enabled()
+            ? remote_draft_.active()
+            : feature_mirror_.target_feat != nullptr)
         && !sampler_.needs_logit_processing();
 
     if (!can_spec) {
@@ -829,7 +914,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // ── DFlash spec-decode: draft → verify → accept → replay ──────────
 
     DFlashTarget * target = dflash_target();
-    const int q_len = dw_.block_size;
+    const bool use_remote_draft = cfg_.remote_draft.enabled() && remote_draft_.active();
+    const int q_len = dw_.block_size > 0 ? dw_.block_size : DFLASH27B_DRAFT_BLOCK_SIZE;
 
     StepGraph draft_sg;
 
@@ -864,50 +950,60 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
         // 2. Draft compute
         constexpr int DRAFT_CTX_MAX_DEFAULT = 2048;
-        const int ring_cap = feature_mirror_.cap;
+        const int ring_cap = use_remote_draft ? remote_draft_.ring_cap() : feature_mirror_.cap;
         const int draft_ctx = std::min(committed,
             std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)));
         const int draft_start = committed - draft_ctx;
         int mirror_slot0 = 0;
         const bool use_mirror_view =
+            !use_remote_draft &&
             draft_feature_mirror_can_view(feature_mirror_, committed, draft_ctx, mirror_slot0);
 
-        if (!build_draft_step(draft_sg, dw_, /*lm_head=*/nullptr, draft_backend_,
-                              draft_ctx, use_mirror_view ? &feature_mirror_ : nullptr,
-                              committed,
-                              /*ctx_len_max=*/std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)))) {
-            std::fprintf(stderr, "spec-decode: draft build failed\n");
-            step_graph_destroy(draft_sg);
-            return false;
-        }
-        if (!use_mirror_view &&
-            !copy_feature_ring_range_to_tensor(feature_mirror_, draft_sg.target_hidden_cat,
-                                               draft_start, draft_ctx)) {
-            std::fprintf(stderr, "spec-decode: feature copy failed\n");
-            step_graph_destroy(draft_sg);
-            return false;
-        }
-        ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
-                                sizeof(float) * noise_embed.size());
-        pos_k.resize((size_t)draft_ctx + q_len);
-        for (int i = 0; i < q_len; i++) pos_q[i] = draft_ctx + i;
-        for (int i = 0; i < draft_ctx + q_len; i++) pos_k[i] = i;
-        ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
-                                sizeof(int32_t) * pos_q.size());
-        ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
-                                sizeof(int32_t) * pos_k.size());
+        if (use_remote_draft) {
+            local_hidden.clear();
+            if (!remote_draft_.propose(committed, draft_ctx, noise_embed, local_hidden)) {
+                std::fprintf(stderr, "spec-decode: remote draft propose failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+        } else {
+            if (!build_draft_step(draft_sg, dw_, /*lm_head=*/nullptr, draft_backend_,
+                                  draft_ctx, use_mirror_view ? &feature_mirror_ : nullptr,
+                                  committed,
+                                  /*ctx_len_max=*/std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)))) {
+                std::fprintf(stderr, "spec-decode: draft build failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            if (!use_mirror_view &&
+                !copy_feature_ring_range_to_tensor(feature_mirror_, draft_sg.target_hidden_cat,
+                                                   draft_start, draft_ctx)) {
+                std::fprintf(stderr, "spec-decode: feature copy failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
+                                    sizeof(float) * noise_embed.size());
+            pos_k.resize((size_t)draft_ctx + q_len);
+            for (int i = 0; i < q_len; i++) pos_q[i] = draft_ctx + i;
+            for (int i = 0; i < draft_ctx + q_len; i++) pos_k[i] = i;
+            ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
+                                    sizeof(int32_t) * pos_q.size());
+            ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
+                                    sizeof(int32_t) * pos_k.size());
 
-        auto st = ggml_backend_graph_compute(draft_backend_, draft_sg.gf);
-        if (st != GGML_STATUS_SUCCESS) {
-            std::fprintf(stderr, "spec-decode: draft compute failed\n");
-            step_graph_destroy(draft_sg);
-            return false;
-        }
+            auto st = ggml_backend_graph_compute(draft_backend_, draft_sg.gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "spec-decode: draft compute failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
 
-        // Read draft hidden states to host for LM-head projection.
-        local_hidden.resize((size_t)hidden * q_len);
-        ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
-                                sizeof(float) * local_hidden.size());
+            // Read draft hidden states to host for LM-head projection.
+            local_hidden.resize((size_t)hidden * q_len);
+            ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
+                                    sizeof(float) * local_hidden.size());
+        }
 
         // 3. Project draft hidden → token IDs via target LM head
         if (!target->project_hidden_to_tokens(local_hidden.data(), q_len, draft_tok)) {
@@ -979,7 +1075,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         last_tok = replay_last_tok;
 
         // 7. Sync features for replayed range to mirror (needed for next draft step)
-        if (feature_mirror_.target_feat && cache_.target_feat) {
+        if (use_remote_draft && cache_.target_feat) {
+            if (!sync_remote_draft_features(committed, commit_n)) {
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+        } else if (feature_mirror_.target_feat && cache_.target_feat) {
             draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
                                             feature_mirror_, committed, commit_n);
         }

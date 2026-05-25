@@ -65,23 +65,41 @@ static bool validate_server_placement(const BackendArgs & bargs) {
             placement_backend_name(compiled));
         return false;
     }
-    if (!placement_backend_supported(bargs.draft_device.backend)) {
+    const PlacementBackend target = bargs.device.backend == PlacementBackend::Auto
+        ? compiled : bargs.device.backend;
+    const PlacementBackend draft = bargs.draft_device.backend == PlacementBackend::Auto
+        ? target : bargs.draft_device.backend;
+    if (!bargs.remote_draft.enabled() && bargs.remote_draft.has_aux_options()) {
+        std::fprintf(stderr,
+            "[server] --draft-ipc-work-dir and --draft-ipc-ring-cap require "
+            "--draft-ipc-bin\n");
+        return false;
+    }
+    if (target != draft) {
+        if (!bargs.remote_draft.enabled()) {
+            std::fprintf(stderr,
+                "[server] mixed target/draft backends require --draft-ipc-bin "
+                "(target=%s draft=%s)\n",
+                placement_backend_name(target), placement_backend_name(draft));
+            return false;
+        }
+        if (!bargs.draft_path) {
+            std::fprintf(stderr,
+                "[server] mixed target/draft backends require --draft <path>\n");
+            return false;
+        }
+    } else if (bargs.remote_draft.enabled()) {
+        std::fprintf(stderr,
+            "[server] --draft-ipc-bin is only needed for mixed target/draft "
+            "backends (target=%s draft=%s)\n",
+            placement_backend_name(target), placement_backend_name(draft));
+        return false;
+    } else if (!placement_backend_supported(bargs.draft_device.backend)) {
         std::fprintf(stderr,
             "[server] --draft-device=%s is unsupported in this binary "
             "(compiled backend: %s)\n",
             placement_device_name(bargs.draft_device).c_str(),
             placement_backend_name(compiled));
-        return false;
-    }
-    const PlacementBackend target = bargs.device.backend == PlacementBackend::Auto
-        ? compiled : bargs.device.backend;
-    const PlacementBackend draft = bargs.draft_device.backend == PlacementBackend::Auto
-        ? target : bargs.draft_device.backend;
-    if (target != draft) {
-        std::fprintf(stderr,
-            "[server] mixed target/draft backends are not implemented in the "
-            "native server yet (target=%s draft=%s)\n",
-            placement_backend_name(target), placement_backend_name(draft));
         return false;
     }
     if (!bargs.device.layer_split_gpus.empty()) {
@@ -111,6 +129,9 @@ static void print_usage(const char * prog) {
         "  --max-tokens <N>     Default max output tokens (default: 4096)\n"
         "  --target-device <backend:gpu>  Target device (default: auto:0)\n"
         "  --draft-device <backend:gpu>   Draft device (default: auto:0)\n"
+        "  --draft-ipc-bin <path>         Remote draft IPC daemon for mixed backends\n"
+        "  --draft-ipc-work-dir <path>    Remote draft IPC scratch directory\n"
+        "  --draft-ipc-ring-cap <N>       Remote draft feature ring capacity\n"
         "  --target-devices <list>        Reserved layer-split devices, e.g. cuda:0,cuda:1\n"
         "  --target-layer-split <weights>  Reserved layer-split weights\n"
         "  --peer-access        Enable peer access for multi-GPU placement\n"
@@ -195,6 +216,16 @@ int main(int argc, char ** argv) {
         } else if (std::strcmp(argv[i], "--draft-device") == 0 && i + 1 < argc) {
             if (!parse_placement_device(argv[++i], bargs.draft_device)) {
                 std::fprintf(stderr, "[server] bad --draft-device value (expected backend:gpu)\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--draft-ipc-bin") == 0 && i + 1 < argc) {
+            bargs.remote_draft.ipc_bin = argv[++i];
+        } else if (std::strcmp(argv[i], "--draft-ipc-work-dir") == 0 && i + 1 < argc) {
+            bargs.remote_draft.work_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--draft-ipc-ring-cap") == 0 && i + 1 < argc) {
+            bargs.remote_draft.ring_cap = std::atoi(argv[++i]);
+            if (bargs.remote_draft.ring_cap <= 0) {
+                std::fprintf(stderr, "[server] bad --draft-ipc-ring-cap value\n");
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--target-devices") == 0 && i + 1 < argc) {
@@ -301,6 +332,21 @@ int main(int argc, char ** argv) {
 
     if (!validate_server_placement(bargs)) return 2;
 
+    if (bargs.remote_draft.enabled()) {
+        const std::string arch = detect_arch(bargs.model_path);
+        if (arch.empty()) {
+            std::fprintf(stderr,
+                "[server] failed to detect model architecture for remote draft validation\n");
+            return 1;
+        }
+        if (!arch_supports_remote_draft(arch)) {
+            std::fprintf(stderr,
+                "[server] model architecture '%s' does not support remote draft execution\n",
+                arch.c_str());
+            return 2;
+        }
+    }
+
     // Sync max_ctx: if --max-ctx was not provided, use the backend's default.
     // This prevents the HTTP server from accepting prompts larger than the
     // KV cache the backend actually allocates.
@@ -376,6 +422,12 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "[server] backend creation failed\n");
         return 1;
     }
+    if (bargs.remote_draft.enabled() && !backend->supports_remote_draft()) {
+        std::fprintf(stderr,
+            "[server] detected model backend does not support remote draft execution\n");
+        backend->shutdown();
+        return 2;
+    }
 
     // Start HTTP server.
     std::fprintf(stderr, "\n");
@@ -399,6 +451,18 @@ int main(int argc, char ** argv) {
     }
     std::fprintf(stderr, "[server] │  draft_device    = %s\n",
                  placement_device_name(bargs.draft_device).c_str());
+    std::fprintf(stderr, "[server] │  draft_exec      = %s\n",
+                 bargs.remote_draft.enabled() ? "remote-ipc" : "local");
+    if (bargs.remote_draft.enabled()) {
+        std::fprintf(stderr, "[server] │  draft_ipc_bin  = %s\n",
+                     bargs.remote_draft.ipc_bin.c_str());
+        if (!bargs.remote_draft.work_dir.empty()) {
+            std::fprintf(stderr, "[server] │  draft_ipc_dir  = %s\n",
+                         bargs.remote_draft.work_dir.c_str());
+        }
+        std::fprintf(stderr, "[server] │  draft_ipc_cap  = %d\n",
+                     bargs.remote_draft.ring_cap);
+    }
     std::fprintf(stderr, "[server] │  peer_access     = %s\n",
                  bargs.device.peer_access ? "ON" : "off");
     std::fprintf(stderr, "[server] │  chunk           = %d\n", bargs.chunk);

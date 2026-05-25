@@ -183,6 +183,12 @@ struct ModelBackend {
     // growth over time. Default is a no-op.
     virtual void release_scratch() {}
 
+    // Return true when the backend can route draft execution through the
+    // common remote-draft IPC transport. Model families that do not implement
+    // the DFlash feature boundary keep the default false and are rejected by
+    // the server before startup.
+    virtual bool supports_remote_draft() const { return false; }
+
     // ── Cleanup ──────────────────────────────────────────────────────
     // Release all resources (weights, cache, snapshots, drafter).
     // Called by run_daemon() before returning.

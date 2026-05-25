@@ -17,6 +17,10 @@ std::string detect_arch(const char * model_path) {
     return info.arch;
 }
 
+bool arch_supports_remote_draft(const std::string & arch) {
+    return arch == "qwen35";
+}
+
 std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
     if (!args.model_path) {
         std::fprintf(stderr, "[backend_factory] model_path is null\n");
@@ -38,6 +42,7 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
         cfg.draft_path         = args.draft_path;
         cfg.device             = args.device;
         cfg.draft_gpu          = args.draft_device.gpu;
+        cfg.remote_draft       = args.remote_draft;
         cfg.stream_fd          = args.stream_fd;
         cfg.fa_window          = args.fa_window;
         cfg.kq_stride_pad      = args.kq_stride_pad;

@@ -13,7 +13,9 @@
 
 #include "common/model_backend.h"
 #include "common/dflash_target.h"
+#include "common/dflash_draft_ipc.h"
 #include "placement/placement_config.h"
+#include "placement/remote_draft_config.h"
 #include "step_graph.h"
 #include "ddtree.h"
 #include "dflash_feature_ring.h"
@@ -37,6 +39,7 @@ struct Qwen35Config {
     const char * draft_path  = nullptr;
     DevicePlacement device;                // target GPU placement
     int          draft_gpu   = 0;
+    RemoteDraftConfig remote_draft;
     int          stream_fd   = -1;
 
     // FA/KV
@@ -107,6 +110,7 @@ public:
 
     bool supports_dflash_spec_decode() const override { return true; }
     DFlashTarget * dflash_target() override;
+    bool supports_remote_draft() const override { return true; }
 
     void shutdown() override;
 
@@ -136,6 +140,7 @@ private:
 
     // ── Draft feature mirror (cross-GPU feature transfer) ────────────
     DraftFeatureMirror feature_mirror_;
+    DFlashDraftIpcClient remote_draft_;
 
     // ── Prefix cache (snapshots) ─────────────────────────────────────
     static constexpr int PREFIX_SLOTS = 64;
@@ -180,6 +185,8 @@ private:
     bool do_ar_decode(int committed, int n_gen,
                       std::vector<int32_t> & out_tokens,
                       const DaemonIO & io);
+
+    bool sync_remote_draft_features(int start_pos, int n_tokens);
 
     // Chain-mode verify (single batch of q_len tokens).
     int verify_chain(int committed, const int32_t * draft_tok, int q_len);
