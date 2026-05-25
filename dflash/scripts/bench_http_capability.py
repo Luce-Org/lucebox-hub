@@ -405,6 +405,9 @@ def run_case(
     think: bool,
     model: str = "luce-dflash",
     auth_header: str = "",
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
 ) -> dict[str, Any]:
     """Send one case to the server.
 
@@ -429,12 +432,14 @@ def run_case(
             {"role": "system", "content": case.get("system_prompt", SYSTEM_PROMPT)},
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0,
-        "top_p": 1.0,
+        "temperature": temperature,
+        "top_p": top_p,
         "max_tokens": request_max_tokens,
         "stream": False,
         "chat_template_kwargs": {"enable_thinking": think},
     }
+    if top_k > 0:
+        body_payload["top_k"] = top_k
     # Send the thinking control field for both modes. chat_template_kwargs
     # is only a Qwen-template hint and servers like antirez/ds4_server.c
     # don't read it, so --no-think previously left ds4-server defaulting to
@@ -1263,6 +1268,24 @@ def main() -> int:
     )
     ap.add_argument("--json-out", type=Path)
     ap.add_argument("--trace", type=Path)
+    # Sampling overrides. Default temp=0 / top_p=1.0 / top_k=0 (greedy)
+    # is the legacy reproducible-bench default, but for models whose card
+    # specifies a recommended sampling shape (Gemma 4: temp=1.0,
+    # top_p=0.95, top_k=64), greedy can trigger degenerate-decode
+    # collapse. Pass --sampling-from-card to read the server's /props
+    # default_generation_settings (which mirrors the loaded model card)
+    # and use those values. Explicit --temperature/--top-p/--top-k
+    # always win and disable the card lookup.
+    ap.add_argument("--temperature", type=float, default=None,
+                    help="Sampling temperature. Default 0 (greedy).")
+    ap.add_argument("--top-p", type=float, default=None,
+                    help="Top-p nucleus. Default 1.0.")
+    ap.add_argument("--top-k", type=int, default=None,
+                    help="Top-k cutoff. Default 0 (disabled).")
+    ap.add_argument("--sampling-from-card", action="store_true",
+                    help="GET /props and use default_generation_settings "
+                         "for any unspecified sampling field. Recommended "
+                         "for gemma4 (greedy triggers degenerate decode).")
     ap.add_argument(
         "--parallel",
         type=int,
@@ -1297,6 +1320,34 @@ def main() -> int:
         if not token:
             ap.error(f"--auth-env {args.auth_env}: env var is empty or unset")
         auth_header = f"Bearer {token}"
+
+    # Resolve sampling. Default (no flags) is greedy temp=0/top_p=1/top_k=0
+    # (legacy bench reproducibility). --sampling-from-card pulls the
+    # server's /props default_generation_settings (which reflects the
+    # loaded model card's sampling shape). Explicit per-field flags
+    # always win.
+    sampling_temperature = 0.0
+    sampling_top_p = 1.0
+    sampling_top_k = 0
+    if args.sampling_from_card:
+        try:
+            with urllib.request.urlopen(
+                args.url.rstrip("/") + "/props", timeout=5) as resp:
+                _props = json.loads(resp.read())
+            _dgs = _props.get("default_generation_settings", {}) or {}
+            sampling_temperature = float(_dgs.get("temperature", 0.0))
+            sampling_top_p = float(_dgs.get("top_p", 1.0))
+            sampling_top_k = int(_dgs.get("top_k", 0))
+            print(f"[sampling] from /props: temp={sampling_temperature} "
+                  f"top_p={sampling_top_p} top_k={sampling_top_k}", flush=True)
+        except Exception as e:
+            ap.error(f"--sampling-from-card: failed to GET {args.url}/props: {e}")
+    if args.temperature is not None:
+        sampling_temperature = float(args.temperature)
+    if args.top_p is not None:
+        sampling_top_p = float(args.top_p)
+    if args.top_k is not None:
+        sampling_top_k = int(args.top_k)
 
     # ``forge`` is dispatched separately — it doesn't share the
     # build_prompt/grade_case path. ``all`` runs the case-based areas
@@ -1423,7 +1474,10 @@ def main() -> int:
                 future_to_meta = {
                     pool.submit(run_case, args.url, case, args.timeout,
                                 max_tokens, think, model=args.model,
-                                auth_header=auth_header):
+                                auth_header=auth_header,
+                                temperature=sampling_temperature,
+                                top_p=sampling_top_p,
+                                top_k=sampling_top_k):
                         (idx, case)
                     for idx, case in enumerate(selected, start=1)
                 }
@@ -1440,7 +1494,10 @@ def main() -> int:
             for idx, case in enumerate(selected, start=1):
                 row = run_case(args.url, case, args.timeout, max_tokens,
                                think, model=args.model,
-                               auth_header=auth_header)
+                               auth_header=auth_header,
+                               temperature=sampling_temperature,
+                               top_p=sampling_top_p,
+                               top_k=sampling_top_k)
                 rows.append(row)
                 print(format_status(idx, case, row), flush=True)
 
