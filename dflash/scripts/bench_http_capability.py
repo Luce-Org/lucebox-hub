@@ -55,6 +55,12 @@ from bench_humaneval import HE_CASES, grade_completion  # noqa: E402
 # ``--area longctx`` dispatches into bench_longctx (frontier probe ported
 # from bench_http_frontiers).
 from bench_longctx import LONGCTX_CASES, grade_longctx  # noqa: E402
+# ``--area agent`` dispatches into bench_agent_cases (real codex system
+# prompts + coding-task user message, lightweight agent-shape grader).
+# Complement to forge — forge measures tool-call protocol reliability
+# with mocked scenarios; this measures "does the model engage as an
+# agent at all given a realistic agent context".
+from bench_agent_cases import AGENT_CASES, grade_agent  # noqa: E402
 
 __all__ = [
     "DS4_EVAL_CASES",
@@ -142,6 +148,13 @@ def build_prompt(case: dict[str, Any]) -> str:
     # ``prompt`` (haystack + instruction). Send verbatim.
     if case.get("kind") == "longctx-frontier":
         return case["prompt"]
+    # Agent-shape probes carry a separate ``system_prompt`` (loaded by
+    # the case-loader from fixtures/agent_prompts/) and a
+    # ``user_message`` here. build_prompt returns just the user message;
+    # the system_prompt flows through case.get("system_prompt") in
+    # run_case's request body assembly above.
+    if case.get("kind") == "agent-prompt":
+        return case["user_message"]
     parts = [case["question"]]
     choices = case.get("choices") or []
     if choices:
@@ -309,9 +322,11 @@ def select_cases(
         selected = list(HE_CASES)
     elif area == "longctx":
         selected = list(LONGCTX_CASES)
+    elif area == "agent":
+        selected = list(AGENT_CASES)
     elif area == "all":
         selected = (list(LOCAL_CASES) + list(DS4_EVAL_CASES) + list(HE_CASES)
-                    + list(LONGCTX_CASES))
+                    + list(LONGCTX_CASES) + list(AGENT_CASES))
     else:
         selected = [case for case in LOCAL_CASES if case["area"] == area]
     if case_index is not None:
@@ -343,6 +358,11 @@ def default_max_tokens(area: str) -> int:
         # The frontier prompts ask for one sentence; 256 leaves room
         # for the model to think briefly then comply.
         return 256
+    if area == "agent":
+        # Agent-shape responses are typically a small explanation + a
+        # tool call / code block. 1024 covers nearly all real agent
+        # turns without inviting verbose drift.
+        return 1024
     return DEFAULT_MAX_TOKENS
 
 
@@ -494,6 +514,12 @@ def run_case(
         got = (output or "").strip()[:60]
         expected = ["Risk: …"]
         grade = grade_longctx(case["prompt"], output)
+    elif case.get("kind") == "agent-prompt":
+        # Agent-shape: pass if the response contains a code block,
+        # JSON tool envelope, or apply_patch envelope.
+        got = (output or "").strip()[:60]
+        expected = ["agent-shape (```/JSON/apply_patch)"]
+        grade = grade_agent(case["user_message"], output)
     else:
         got = find_answer_with_fallback(case, output, reasoning)
         expected = expected_answers(case)
@@ -1142,7 +1168,7 @@ def main() -> int:
     ap.add_argument("--url", default="http://127.0.0.1:8000", help="Server base URL.")
     ap.add_argument(
         "--area",
-        choices=("smoke", "ds4-eval", "long", "code", "longctx", "forge", "all"),
+        choices=("smoke", "ds4-eval", "long", "code", "longctx", "agent", "forge", "all"),
         default="smoke",
         help=(
             "Case area to run. ``forge`` drives forge-guardrails' "
@@ -1275,7 +1301,7 @@ def main() -> int:
     # ``forge`` is dispatched separately — it doesn't share the
     # build_prompt/grade_case path. ``all`` runs the case-based areas
     # first, then appends the forge results.
-    case_areas = {"smoke", "ds4-eval", "long", "code", "longctx", "all"}
+    case_areas = {"smoke", "ds4-eval", "long", "code", "longctx", "agent", "all"}
     forge_areas = {"forge", "all"}
 
     if args.area in case_areas:
