@@ -52,6 +52,9 @@ from bench_ds4_eval import (  # noqa: E402
 # port). Same convention as ds4-eval: data + grader live in the sister
 # module, this file is the dispatcher.
 from bench_humaneval import HE_CASES, grade_completion  # noqa: E402
+# ``--area longctx`` dispatches into bench_longctx (frontier probe ported
+# from bench_http_frontiers).
+from bench_longctx import LONGCTX_CASES, grade_longctx  # noqa: E402
 
 __all__ = [
     "DS4_EVAL_CASES",
@@ -135,6 +138,10 @@ def build_prompt(case: dict[str, Any]) -> str:
             "body — no markdown, no explanation, no extra prose:\n\n"
             + case["prompt"]
         )
+    # Long-context frontier prompts are fully self-contained in
+    # ``prompt`` (haystack + instruction). Send verbatim.
+    if case.get("kind") == "longctx-frontier":
+        return case["prompt"]
     parts = [case["question"]]
     choices = case.get("choices") or []
     if choices:
@@ -300,8 +307,11 @@ def select_cases(
         selected = list(DS4_EVAL_CASES)
     elif area == "code":
         selected = list(HE_CASES)
+    elif area == "longctx":
+        selected = list(LONGCTX_CASES)
     elif area == "all":
-        selected = list(LOCAL_CASES) + list(DS4_EVAL_CASES) + list(HE_CASES)
+        selected = (list(LOCAL_CASES) + list(DS4_EVAL_CASES) + list(HE_CASES)
+                    + list(LONGCTX_CASES))
     else:
         selected = [case for case in LOCAL_CASES if case["area"] == area]
     if case_index is not None:
@@ -328,6 +338,10 @@ def default_max_tokens(area: str) -> int:
     if area in {"ds4-eval", "forge", "all"}:
         return DS4_EVAL_MAX_TOKENS
     if area == "code":
+        return 256
+    if area == "longctx":
+        # The frontier prompts ask for one sentence; 256 leaves room
+        # for the model to think briefly then comply.
         return 256
     return DEFAULT_MAX_TOKENS
 
@@ -474,6 +488,12 @@ def run_case(
         got = (output or "").strip()[:60]  # short preview for the log line
         expected = []                       # no reference solution
         grade = grade_completion(case["prompt"], output)
+    elif case.get("kind") == "longctx-frontier":
+        # Long-context frontier: pass if the response begins with the
+        # instructed "Risk:" prefix. Output is the model's reply.
+        got = (output or "").strip()[:60]
+        expected = ["Risk: …"]
+        grade = grade_longctx(case["prompt"], output)
     else:
         got = find_answer_with_fallback(case, output, reasoning)
         expected = expected_answers(case)
@@ -1122,7 +1142,7 @@ def main() -> int:
     ap.add_argument("--url", default="http://127.0.0.1:8000", help="Server base URL.")
     ap.add_argument(
         "--area",
-        choices=("smoke", "ds4-eval", "long", "code", "forge", "all"),
+        choices=("smoke", "ds4-eval", "long", "code", "longctx", "forge", "all"),
         default="smoke",
         help=(
             "Case area to run. ``forge`` drives forge-guardrails' "
@@ -1255,7 +1275,7 @@ def main() -> int:
     # ``forge`` is dispatched separately — it doesn't share the
     # build_prompt/grade_case path. ``all`` runs the case-based areas
     # first, then appends the forge results.
-    case_areas = {"smoke", "ds4-eval", "long", "code", "all"}
+    case_areas = {"smoke", "ds4-eval", "long", "code", "longctx", "all"}
     forge_areas = {"forge", "all"}
 
     if args.area in case_areas:
