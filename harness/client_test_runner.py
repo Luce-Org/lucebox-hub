@@ -168,7 +168,6 @@ SERVER_PROFILES: dict[str, ServerProfile] = {
             "--cache-type-v", "tq3_0",
             "--prefix-cache-slots", "0",
             "--prefill-cache-slots", "0",
-            "--lazy-draft",
         ),
         long_prompt=True,
     ),
@@ -186,7 +185,6 @@ SERVER_PROFILES: dict[str, ServerProfile] = {
             "--prefill-compression", "auto",
             "--prefill-threshold", "4096",
             "--prefill-keep-ratio", "0.10",
-            "--lazy-draft",
         ),
         needs_prefill_drafter=True,
         long_prompt=True,
@@ -508,6 +506,17 @@ def long_prompt() -> str:
         "optional PFlash compression without crashing the server.\n"
     )
     return unit * 180
+
+
+def claude_bandit_prompt() -> str:
+    return (
+        "Write an original short story of at least 700 words. "
+        "The story must be self-contained, vivid, and told in third person. "
+        "Center it on a lighthouse keeper repairing the lamp during a storm, "
+        "and give the story a clear beginning, middle, and ending. "
+        "Do not use bullet points or headings. "
+        "Keep going until the story is comfortably over 700 words."
+    )
 
 
 def unique_prompt(text: str, label: str) -> str:
@@ -1035,17 +1044,43 @@ def start_server(
     log_dir = work_dir / "server-logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{profile.name}-{int(time.time())}-{port}.log"
-    args = [
-        sys.executable,
-        "-u",
-        str(ROOT / "dflash" / "scripts" / "server.py"),
-        "--host", "127.0.0.1",
-        "--port", str(port),
-        "--target", str(target),
-        "--draft", str(draft),
-        "--bin", str(bin_path),
-        *profile.args,
-    ]
+    backend = os.environ.get("LUCEBOX_SERVER_BACKEND", "cpp")
+    if backend == "python":
+        server_py = ROOT / "dflash" / "scripts" / "server.py"
+        args = [
+            sys.executable,
+            "-u",
+            str(server_py),
+            "--host", "127.0.0.1",
+            "--port", str(port),
+            "--target", str(target),
+            "--draft", str(draft),
+            "--bin", str(bin_path),
+            *profile.args,
+        ]
+    else:
+        # cpp backend (default): use the native dflash_server binary
+        cpp_bin_env = os.environ.get("DFLASH_SERVER_BIN", "")
+        cpp_bin = Path(cpp_bin_env) if cpp_bin_env else (ROOT / "dflash" / "build" / "dflash_server")
+        if not cpp_bin.exists():
+            raise RuntimeError(
+                f"C++ server binary not found: {cpp_bin}\n"
+                "Build it with `cmake --build dflash/build` or set DFLASH_SERVER_BIN, "
+                "or set LUCEBOX_SERVER_BACKEND=python to use the Python fallback."
+            )
+        # dflash_server expects the target model as a positional argv[1];
+        # it has no --target flag and exits with usage if argv[1] starts with '-'.
+        args = [
+            str(cpp_bin),
+            str(target),
+            "--host", "127.0.0.1",
+            "--port", str(port),
+        ]
+        # Only include --draft (SD drafter) when the profile is not pflash-only.
+        # Passing --draft with a plain qwen3 model triggers an arch check failure.
+        if not profile.needs_prefill_drafter and draft:
+            args.extend(["--draft", str(draft)])
+        args.extend(profile.args)
     if profile.needs_prefill_drafter:
         if prefill_drafter is None:
             raise HarnessError(f"profile {profile.name} requires --prefill-drafter")
@@ -1918,6 +1953,1239 @@ def cmd_bench(args: argparse.Namespace) -> int:
     return 0 if payload["ok"] else 1
 
 
+# ── ClientAdapter protocol + bandit subcommand ──────────────────────────────
+
+import csv as _csv
+import shutil as _shutil
+from typing import IO, Protocol
+
+
+@dataclass
+class AdapterResult:
+    """Result of one adapter run (real or dry-run)."""
+
+    client: str
+    preflight_ok: bool
+    session_id_captured: bool = False
+    session_id: str | None = None
+    accept_rate: float | None = None
+    wall_s: float | None = None
+    exit_code: int | None = None
+    error: str | None = None
+    server_log_path: Path | None = None
+
+
+class ClientAdapter(Protocol):
+    """Protocol: every concrete adapter must implement these two methods."""
+
+    def preflight_check(self) -> AdapterResult: ...
+    def dry_run(self, *, session_id: str) -> AdapterResult: ...
+
+
+class _BaseAdapter:
+    """Shared logic for all adapters."""
+
+    client: str = ""
+    binary: str = ""
+
+    def __init__(self, binary: str | None = None) -> None:
+        if binary is not None:
+            self.binary = binary
+
+    def preflight_env(self) -> dict[str, str]:
+        """Return the environment that preflight_check should use.
+
+        Default: current process environment.
+        Override on adapters that mutate HOME in live_run so preflight
+        catches asdf shim breaks under the same HOME isolation.
+        """
+        return os.environ.copy()
+
+    def preflight_check(self) -> AdapterResult:
+        # shutil.which finds the path but asdf shims can be stale; probe with --version
+        env = self.preflight_env()
+        if not _shutil.which(self.binary, path=env.get("PATH")):
+            return AdapterResult(
+                client=self.client,
+                preflight_ok=False,
+                error=(
+                    f"PREFLIGHT FAIL: '{self.binary}' not found on PATH. "
+                    "Hint: run 'asdf reshim' or install it and ensure it is on PATH."
+                ),
+            )
+        try:
+            result = subprocess.run(
+                [self.binary, "--version"],
+                capture_output=True, text=True, timeout=5,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return AdapterResult(
+                client=self.client,
+                preflight_ok=False,
+                error=f"PREFLIGHT FAIL: '{self.binary} --version' timed out (5s) — binary may be broken.",
+            )
+        except Exception as exc:
+            return AdapterResult(
+                client=self.client,
+                preflight_ok=False,
+                error=f"PREFLIGHT FAIL: '{self.binary} --version' raised {exc!r}.",
+            )
+        combined = (result.stdout + result.stderr).lower()
+        asdf_broken = result.returncode != 0 and (
+            "unknown command" in combined or "reshim" in combined
+        )
+        if asdf_broken:
+            return AdapterResult(
+                client=self.client,
+                preflight_ok=False,
+                error=(
+                    f"PREFLIGHT FAIL: '{self.binary}' via asdf shim is stale — "
+                    f"try `asdf reshim node` then re-run. (stderr: {result.stderr.strip()!r})"
+                ),
+            )
+        if result.returncode != 0:
+            return AdapterResult(
+                client=self.client,
+                preflight_ok=False,
+                error=(
+                    f"PREFLIGHT FAIL: '{self.binary} --version' exited {result.returncode}. "
+                    f"stderr: {result.stderr.strip()!r}"
+                ),
+            )
+        return AdapterResult(client=self.client, preflight_ok=True)
+
+    def dry_run(self, *, session_id: str) -> AdapterResult:
+        return AdapterResult(
+            client=self.client,
+            preflight_ok=True,
+            session_id=session_id,
+            session_id_captured=True,
+        )
+
+    def live_run(
+        self,
+        *,
+        session_id: str,
+        run_script: Path,
+        prompt: str,
+        env_overrides: dict[str, str] | None = None,
+        timeout: int = 420,
+    ) -> AdapterResult:
+        """Run client via bash run script, capture metrics from log output."""
+        env = os.environ.copy()
+        env["LUCEBOX_SERVER_BACKEND"] = "cpp"
+        env["PFLASH_SESSION_ID"] = session_id
+        env.setdefault("PROMPT", prompt)
+        if env_overrides:
+            env.update(env_overrides)
+        t0 = time.perf_counter()
+        try:
+            proc = subprocess.run(
+                ["bash", str(run_script)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            wall = time.perf_counter() - t0
+            rc = proc.returncode
+            return AdapterResult(
+                client=self.client,
+                preflight_ok=True,
+                session_id=session_id,
+                session_id_captured=True,
+                wall_s=round(wall, 3),
+                exit_code=rc,
+            )
+        except subprocess.TimeoutExpired:
+            return AdapterResult(
+                client=self.client,
+                preflight_ok=True,
+                session_id=session_id,
+                exit_code=124,
+                error="timeout",
+            )
+        except Exception as exc:
+            return AdapterResult(
+                client=self.client,
+                preflight_ok=True,
+                session_id=session_id,
+                exit_code=1,
+                error=repr(exc),
+            )
+
+
+_CLIENTS_DIR = Path(__file__).resolve().parent / "clients"
+
+# Node version preference order — same heuristic as commit 2600108 in run_pi.sh / run_codex.sh.
+_NVM_NODE_VERSIONS = ["v24.13.0", "v22.17.0", "v20.18.0"]
+
+
+def _resolve_nvm_bin(binary: str) -> str:
+    """Return the direct nvm node-bin path for *binary*, bypassing asdf shims.
+
+    Tries each entry in _NVM_NODE_VERSIONS in order; returns the first that
+    contains an executable named *binary*. Falls back to *binary* unchanged so
+    the adapter can still run (shim may work for some setups).
+    """
+    nvm_root = Path.home() / ".nvm" / "versions" / "node"
+    for ver in _NVM_NODE_VERSIONS:
+        candidate = nvm_root / ver / "bin" / binary
+        if candidate.is_file() or candidate.is_symlink():
+            return str(candidate)
+    return binary  # fallback: hope it's on PATH directly
+
+
+def _start_session_inject_proxy(*, session_id: str, upstream: str) -> tuple[subprocess.Popen, str]:
+    host = os.environ.get("HOST", "127.0.0.1")
+    # Use PFLASH_PROXY_PORT if set, otherwise pick a free port to avoid collisions
+    proxy_port_env = os.environ.get("PFLASH_PROXY_PORT", "")
+    port = int(proxy_port_env) if proxy_port_env else free_port()
+    log_dir = Path(tempfile.mkdtemp(prefix="claude-proxy-"))
+    log_path = log_dir / "proxy.log"
+    proxy_cmd = [
+        sys.executable,
+        str(_CLIENTS_DIR / "session_inject_proxy.py"),
+        "--host", host,
+        "--port", str(port),
+        "--upstream", upstream,
+        "--session-id", session_id,
+    ]
+    log_f = open(log_path, "w")
+    proc = subprocess.Popen(
+        proxy_cmd,
+        stdout=log_f,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    proc._lucebox_log_f = log_f  # type: ignore[attr-defined]
+    client_base_url = f"http://{host}:{port}"
+    if not wait_http(client_base_url, proc=proc, timeout=10):
+        tail_text = tail(log_path, 4000)
+        stop_proc(proc)
+        close_server_log(proc)
+        raise RuntimeError(
+            f"session-inject proxy failed to start on {client_base_url}; log: {tail_text}"
+        )
+    return proc, client_base_url
+
+
+class ClaudeCodeAdapter(_BaseAdapter):
+    client = "claude_code"
+    binary = "claude"
+
+    def live_run(self, *, session_id: str, prompt: str = "", timeout: int = 420, **kwargs: Any) -> AdapterResult:
+        _prompt = prompt or claude_bandit_prompt()
+        base_url = os.environ.get("BASE_URL", "http://127.0.0.1:18080")
+        model_id = os.environ.get("MODEL_ID", "luce-dflash")
+        api_key = os.environ.get("API_KEY", "sk-lucebox")
+        claude_bin = os.environ.get("CLAUDE_BIN", self.binary)
+        claude_tools = os.environ.get("CLAUDE_TOOLS", "default")
+        # If a session-level proxy is already running (bandit-session sets PFLASH_SESSION_PROXY_URL),
+        # use it directly and skip spawning an additional proxy.
+        session_proxy_url = os.environ.get("PFLASH_SESSION_PROXY_URL", "")
+        client_base_url = session_proxy_url if session_proxy_url else base_url
+        proxy_proc: subprocess.Popen | None = None
+
+        try:
+            if session_id and not session_proxy_url:
+                proxy_proc, client_base_url = _start_session_inject_proxy(
+                    session_id=session_id,
+                    upstream=base_url,
+                )
+
+            with tempfile.TemporaryDirectory(prefix="claude-home-") as home_dir:
+                env = os.environ.copy()
+                env.update({
+                    "LUCEBOX_SERVER_BACKEND": "cpp",
+                    "HOME": home_dir,
+                    "ANTHROPIC_API_KEY": api_key,
+                    "ANTHROPIC_BASE_URL": client_base_url,
+                    "CLAUDE_CODE_API_BASE_URL": client_base_url,
+                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                    "CLAUDE_CODE_DISABLE_TELEMETRY": "1",
+                    "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": "1",
+                })
+                cmd = [
+                    claude_bin,
+                    "--print",
+                    "--output-format", "json",
+                    "--model", model_id,
+                    "--tools", claude_tools,
+                    "--permission-mode", "dontAsk",
+                    "--no-session-persistence",
+                    _prompt,
+                ]
+                t0 = time.perf_counter()
+                try:
+                    proc = subprocess.run(
+                        cmd,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                        stdin=subprocess.DEVNULL,
+                    )
+                    wall = time.perf_counter() - t0
+                    return AdapterResult(
+                        client=self.client,
+                        preflight_ok=True,
+                        session_id=session_id,
+                        session_id_captured=True,
+                        wall_s=round(wall, 3),
+                        exit_code=proc.returncode,
+                    )
+                except subprocess.TimeoutExpired:
+                    return AdapterResult(
+                        client=self.client,
+                        preflight_ok=True,
+                        session_id=session_id,
+                        exit_code=124,
+                        error="timeout",
+                    )
+                except Exception as exc:
+                    return AdapterResult(
+                        client=self.client,
+                        preflight_ok=True,
+                        session_id=session_id,
+                        exit_code=1,
+                        error=repr(exc),
+                    )
+        finally:
+            if proxy_proc is not None:
+                stop_proc(proxy_proc)
+                close_server_log(proxy_proc)
+
+
+class HermesAdapter(_BaseAdapter):
+    client = "hermes"
+    binary = "hermes"
+
+    def preflight_check(self) -> AdapterResult:
+        env = self.preflight_env()
+        if not _shutil.which(self.binary, path=env.get("PATH")):
+            return AdapterResult(
+                client=self.client,
+                preflight_ok=False,
+                error=(
+                    f"PREFLIGHT FAIL: '{self.binary}' not found on PATH. "
+                    "Install via the hermes install script."
+                ),
+            )
+        try:
+            result = subprocess.run(
+                [self.binary, "--version"],
+                capture_output=True, text=True, timeout=5,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error="PREFLIGHT FAIL: 'hermes --version' timed out (5s).",
+            )
+        except Exception as exc:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error=f"PREFLIGHT FAIL: 'hermes --version' raised {exc!r}.",
+            )
+        if result.returncode != 0:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error=(
+                    f"PREFLIGHT FAIL: 'hermes --version' exited {result.returncode}. "
+                    f"stderr: {result.stderr.strip()!r}"
+                ),
+            )
+        return AdapterResult(client=self.client, preflight_ok=True)
+
+    def live_run(self, *, session_id: str, prompt: str = "", timeout: int = 420, **kwargs: Any) -> AdapterResult:
+        import tempfile as _tmpfile
+        _prompt = prompt or "Reply with exactly: lucebox-bandit-ok"
+        base_url = os.environ.get("BASE_URL", "http://127.0.0.1:18080")
+        model_id = os.environ.get("MODEL_ID", "luce-dflash")
+        api_key = os.environ.get("API_KEY", "sk-lucebox")
+        hermes_bin = os.environ.get("HERMES_BIN", self.binary)
+        max_turns = os.environ.get("HERMES_MAX_TURNS", "40")
+
+        proxy_proc: subprocess.Popen | None = None
+        try:
+            # Inject session_id via proxy so [pflash-bandit] lines fire in server.log
+            if session_id:
+                proxy_proc, client_base_url = _start_session_inject_proxy(
+                    session_id=session_id,
+                    upstream=base_url,
+                )
+            else:
+                client_base_url = base_url
+
+            with _tmpfile.TemporaryDirectory(prefix="hermes-home-") as hermes_home_str:
+                hermes_home = Path(hermes_home_str)
+                # Write config pointing at proxy (or server directly)
+                config_text = (
+                    f"model:\n"
+                    f"  default: {model_id}\n"
+                    f"  provider: lucebox\n"
+                    f"  context_length: 65536\n"
+                    f"providers:\n"
+                    f"  lucebox:\n"
+                    f"    name: Lucebox\n"
+                    f"    base_url: {client_base_url}/v1\n"
+                    f"    api_key: {api_key}\n"
+                    f"    api_mode: chat_completions\n"
+                    f"    model: {model_id}\n"
+                    f"    max_tokens: 4096\n"
+                    f"auxiliary:\n"
+                    f"  compression:\n"
+                    f"    context_length: 65536\n"
+                    f"toolsets:\n"
+                    f"  - all\n"
+                    f"agent:\n"
+                    f"  max_turns: 40\n"
+                )
+                (hermes_home / "config.yaml").write_text(config_text)
+                env = os.environ.copy()
+                env.update({
+                    "LUCEBOX_SERVER_BACKEND": "cpp",
+                    "PFLASH_SESSION_ID": session_id,
+                    "OPENAI_API_KEY": api_key,
+                    "OPENAI_BASE_URL": f"{client_base_url}/v1",
+                    "HERMES_HOME": str(hermes_home),
+                    "HERMES_INFERENCE_PROVIDER": "lucebox",
+                    "HERMES_INFERENCE_MODEL": model_id,
+                    "HERMES_ACCEPT_HOOKS": "1",
+                    "HERMES_API_TIMEOUT": "600",
+                    "HERMES_API_CALL_STALE_TIMEOUT": "600",
+                    "NO_COLOR": "1",
+                })
+                cmd = [
+                    hermes_bin, "chat",
+                    "--quiet",
+                    "--provider", "lucebox",
+                    "--model", model_id,
+                    "--accept-hooks",
+                    "--yolo",
+                    "--max-turns", max_turns,
+                    "--source", "lucebox-harness",
+                    "--query", _prompt,
+                ]
+                t0 = time.perf_counter()
+                try:
+                    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
+                    wall = time.perf_counter() - t0
+                    return AdapterResult(
+                        client=self.client, preflight_ok=True, session_id=session_id,
+                        session_id_captured=True, wall_s=round(wall, 3), exit_code=proc.returncode,
+                    )
+                except subprocess.TimeoutExpired:
+                    return AdapterResult(client=self.client, preflight_ok=True, session_id=session_id,
+                                         exit_code=124, error="timeout")
+                except Exception as exc:
+                    return AdapterResult(client=self.client, preflight_ok=True, session_id=session_id,
+                                         exit_code=1, error=repr(exc))
+        finally:
+            if proxy_proc is not None:
+                stop_proc(proxy_proc)
+                close_server_log(proxy_proc)
+
+
+class CodexAdapter(_BaseAdapter):
+    client = "codex"
+    binary = "codex"
+
+    def preflight_env(self) -> dict[str, str]:
+        """Use real HOME for preflight — asdf shims need the real HOME to resolve node."""
+        return os.environ.copy()
+
+    def preflight_check(self) -> AdapterResult:
+        # codex does not support --version; use --help which exits 0 when the shim is healthy
+        env = self.preflight_env()
+        if not _shutil.which(self.binary, path=env.get("PATH")):
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error=f"PREFLIGHT FAIL: 'codex' not found on PATH. Try `asdf reshim node` then re-run.",
+            )
+        try:
+            result = subprocess.run(
+                [self.binary, "--help"],
+                capture_output=True, text=True, timeout=5,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error="PREFLIGHT FAIL: 'codex --help' timed out (5s) — asdf shim may be broken.",
+            )
+        except Exception as exc:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error=f"PREFLIGHT FAIL: 'codex --help' raised {exc!r}.",
+            )
+        combined = (result.stdout + result.stderr).lower()
+        if "unknown command" in combined or "reshim" in combined:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error=(
+                    f"PREFLIGHT FAIL: 'codex' via asdf shim is stale — "
+                    f"try `asdf reshim node` then re-run. (stderr: {result.stderr.strip()!r})"
+                ),
+            )
+        return AdapterResult(client=self.client, preflight_ok=True)
+
+    def live_run(self, *, session_id: str, prompt: str = "", timeout: int = 420, **kwargs: Any) -> AdapterResult:
+        _prompt = prompt or "Reply with exactly: lucebox-bandit-ok"
+        base_url = os.environ.get("BASE_URL", "http://127.0.0.1:18080")
+        model_id = os.environ.get("MODEL_ID", "luce-dflash")
+        api_key = os.environ.get("API_KEY", "sk-lucebox")
+        # Prefer CODEX_BIN override; fall back to direct nvm path — the default
+        # symlink via ~/.local/bin/codex breaks when HOME is overridden to a temp dir.
+        codex_bin = os.environ.get("CODEX_BIN") or _resolve_nvm_bin("codex")
+        sandbox = os.environ.get("CODEX_SANDBOX", "danger-full-access")
+        wire_api = os.environ.get("CODEX_WIRE_API", "responses")
+        # Write codex config to a temp dir so we don't pollute HOME
+        import tempfile, json as _json
+        with tempfile.TemporaryDirectory() as codex_home:
+            config_path = Path(codex_home) / "config.toml"
+            config_path.write_text(
+                f'model = "{model_id}"\n'
+                f'model_provider = "luce"\n'
+                f'approval_policy = "never"\n'
+                f'sandbox_mode = "{sandbox}"\n'
+                f'\n'
+                f'[model_providers.luce]\n'
+                f'name = "Lucebox"\n'
+                f'base_url = "{base_url}/v1"\n'
+                f'env_key = "OPENAI_API_KEY"\n'
+                f'wire_api = "{wire_api}"\n'
+            )
+            env = os.environ.copy()
+            # Prepend the nvm node bin dir so codex can find node when HOME is overridden.
+            nvm_bin_dir = str(Path(codex_bin).parent) if codex_bin != "codex" else ""
+            if nvm_bin_dir:
+                env["PATH"] = nvm_bin_dir + ":" + env.get("PATH", "")
+            env.update({
+                "LUCEBOX_SERVER_BACKEND": "cpp",
+                "PFLASH_SESSION_ID": session_id,
+                "OPENAI_API_KEY": api_key,
+                "HOME": codex_home,
+                "CODEX_HOME": codex_home,
+            })
+            cmd = [
+                codex_bin, "exec",
+                "--skip-git-repo-check",
+                "--sandbox", sandbox,
+                "--model", model_id,
+                "--json",
+                _prompt,
+            ]
+            t0 = time.perf_counter()
+            try:
+                proc = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                                      timeout=timeout, stdin=subprocess.DEVNULL)
+                wall = time.perf_counter() - t0
+                return AdapterResult(
+                    client=self.client, preflight_ok=True, session_id=session_id,
+                    session_id_captured=True, wall_s=round(wall, 3), exit_code=proc.returncode,
+                )
+            except subprocess.TimeoutExpired:
+                return AdapterResult(client=self.client, preflight_ok=True, session_id=session_id,
+                                     exit_code=124, error="timeout")
+            except Exception as exc:
+                return AdapterResult(client=self.client, preflight_ok=True, session_id=session_id,
+                                     exit_code=1, error=repr(exc))
+
+
+class PiAdapter(_BaseAdapter):
+    client = "pi"
+    binary = "pi"
+
+    def preflight_env(self) -> dict[str, str]:
+        """Use real HOME for preflight — asdf shims need the real HOME to resolve node."""
+        return os.environ.copy()
+
+    def preflight_check(self) -> AdapterResult:
+        # pi --version may fail if asdf shim is stale; probe with --help
+        env = self.preflight_env()
+        if not _shutil.which(self.binary, path=env.get("PATH")):
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error=f"PREFLIGHT FAIL: 'pi' not found on PATH. Try `asdf reshim node` then re-run.",
+            )
+        try:
+            result = subprocess.run(
+                [self.binary, "--help"],
+                capture_output=True, text=True, timeout=5,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error="PREFLIGHT FAIL: 'pi --help' timed out (5s) — asdf shim may be broken.",
+            )
+        except Exception as exc:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error=f"PREFLIGHT FAIL: 'pi --help' raised {exc!r}.",
+            )
+        combined = (result.stdout + result.stderr).lower()
+        if "unknown command" in combined or "reshim" in combined:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error=(
+                    f"PREFLIGHT FAIL: 'pi' via asdf shim is stale — "
+                    f"try `asdf reshim node` then re-run. (stderr: {result.stderr.strip()!r})"
+                ),
+            )
+        return AdapterResult(client=self.client, preflight_ok=True)
+
+    def live_run(self, *, session_id: str, prompt: str = "", timeout: int = 300, **kwargs: Any) -> AdapterResult:
+        _prompt = prompt or "Reply with exactly: lucebox-bandit-ok"
+        base_url = os.environ.get("BASE_URL", "http://127.0.0.1:18080")
+        model_id = os.environ.get("MODEL_ID", "luce-dflash")
+        api_key = os.environ.get("API_KEY", "sk-lucebox")
+        max_ctx = os.environ.get("MAX_CTX", "65536")
+        max_tokens = os.environ.get("MAX_TOKENS", "2048")
+        # Prefer PI_BIN override; fall back to direct nvm path — asdf shim for pi
+        # requires asdf runtime state which breaks under an isolated HOME.
+        pi_bin = os.environ.get("PI_BIN") or _resolve_nvm_bin("pi")
+        pi_tools = os.environ.get("PI_TOOLS", "read,grep,find,ls")
+        provider_api = os.environ.get("PROVIDER_API", "openai-responses")
+        import tempfile, json as _json
+        with tempfile.TemporaryDirectory() as home_dir:
+            agent_dir = Path(home_dir) / "agent"
+            sessions_dir = Path(home_dir) / "sessions"
+            agent_dir.mkdir()
+            sessions_dir.mkdir()
+            (agent_dir / "settings.json").write_text(
+                _json.dumps({"compaction": {"enabled": False}})
+            )
+            (agent_dir / "models.json").write_text(_json.dumps({
+                "providers": {
+                    "lucebox": {
+                        "baseUrl": f"{base_url}/v1",
+                        "api": provider_api,
+                        "apiKey": api_key,
+                        "compat": {
+                            "supportsDeveloperRole": False,
+                            "supportsReasoningEffort": False,
+                            "supportsUsageInStreaming": True,
+                            "maxTokensField": "max_tokens",
+                        },
+                        "models": [{
+                            "id": model_id,
+                            "name": "Lucebox DFlash",
+                            "api": provider_api,
+                            "reasoning": False,
+                            "input": ["text"],
+                            "contextWindow": int(max_ctx),
+                            "maxTokens": int(max_tokens),
+                            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                        }],
+                    }
+                }
+            }))
+            env = os.environ.copy()
+            # Prepend the nvm node bin dir so the pi Node.js binary resolves correctly
+            # even though HOME is overridden (which breaks asdf shim state).
+            nvm_bin_dir = str(Path(pi_bin).parent) if pi_bin != "pi" else ""
+            if nvm_bin_dir:
+                env["PATH"] = nvm_bin_dir + ":" + env.get("PATH", "")
+            env.update({
+                "LUCEBOX_SERVER_BACKEND": "cpp",
+                "PFLASH_SESSION_ID": session_id,
+                "HOME": home_dir,
+                "PI_CODING_AGENT_DIR": str(agent_dir),
+                "PI_CODING_AGENT_SESSION_DIR": str(sessions_dir),
+                "PI_OFFLINE": "1",
+            })
+            cmd = [
+                pi_bin,
+                "--provider", "lucebox",
+                "--model", model_id,
+                "--print",
+                "--mode", "json",
+                "--tools", pi_tools,
+                "--no-session",
+                "--offline",
+                _prompt,
+            ]
+            t0 = time.perf_counter()
+            try:
+                proc = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                                      timeout=timeout, stdin=subprocess.DEVNULL)
+                wall = time.perf_counter() - t0
+                return AdapterResult(
+                    client=self.client, preflight_ok=True, session_id=session_id,
+                    session_id_captured=True, wall_s=round(wall, 3), exit_code=proc.returncode,
+                )
+            except subprocess.TimeoutExpired:
+                return AdapterResult(client=self.client, preflight_ok=True, session_id=session_id,
+                                     exit_code=124, error="timeout")
+            except Exception as exc:
+                return AdapterResult(client=self.client, preflight_ok=True, session_id=session_id,
+                                     exit_code=1, error=repr(exc))
+
+
+class OpenCodeAdapter(_BaseAdapter):
+    client = "opencode"
+    binary = "opencode"
+
+    def preflight_env(self) -> dict[str, str]:
+        """Include the nvm node bin dir so opencode resolves without asdf."""
+        env = os.environ.copy()
+        nvm_bin = _resolve_nvm_bin("opencode")
+        if nvm_bin != "opencode":
+            env["PATH"] = str(Path(nvm_bin).parent) + ":" + env.get("PATH", "")
+        return env
+
+    def preflight_check(self) -> AdapterResult:
+        """Detect opencode via its direct nvm path; fall back to PATH scan."""
+        nvm_path = _resolve_nvm_bin("opencode")
+        candidate = Path(nvm_path)
+        if not (candidate.exists() or _shutil.which("opencode")):
+            return AdapterResult(
+                client=self.client,
+                preflight_ok=False,
+                error=(
+                    "PREFLIGHT FAIL: 'opencode' not found in nvm paths or on PATH. "
+                    "Install with: npm install -g opencode-ai"
+                ),
+            )
+        # Probe with --version to confirm the binary is healthy
+        bin_path = nvm_path if candidate.exists() else "opencode"
+        try:
+            result = subprocess.run(
+                [bin_path, "--version"],
+                capture_output=True, text=True, timeout=10,
+                env=self.preflight_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error="PREFLIGHT FAIL: 'opencode --version' timed out (10s).",
+            )
+        except Exception as exc:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error=f"PREFLIGHT FAIL: 'opencode --version' raised {exc!r}.",
+            )
+        if result.returncode != 0:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error=(
+                    f"PREFLIGHT FAIL: 'opencode --version' exited {result.returncode}. "
+                    f"stderr: {result.stderr.strip()!r}"
+                ),
+            )
+        return AdapterResult(client=self.client, preflight_ok=True)
+
+    def live_run(self, *, session_id: str, prompt: str = "", timeout: int = 300, **kwargs: Any) -> AdapterResult:
+        _prompt = prompt or "Reply with exactly: lucebox-bandit-ok"
+        base_url = os.environ.get("BASE_URL", "http://127.0.0.1:18080")
+        model_id = os.environ.get("MODEL_ID", "luce-dflash")
+        api_key = os.environ.get("API_KEY", "sk-lucebox")
+        max_ctx = os.environ.get("MAX_CTX", "86016")
+        max_tokens = os.environ.get("MAX_TOKENS", "2048")
+        # Prefer the OPENCODE_BIN env override; fall back to direct nvm path to avoid
+        # asdf shim resolution failures when HOME is overridden.
+        opencode_bin = os.environ.get("OPENCODE_BIN") or _resolve_nvm_bin("opencode")
+        import tempfile, json as _json
+        with tempfile.TemporaryDirectory() as home_dir:
+            config_dir = Path(home_dir) / ".config"
+            # opencode reads its global config from XDG_CONFIG_HOME/opencode/opencode.json
+            # NOT from the project dir opencode.json (which is only for project-level overrides).
+            opencode_config_dir = config_dir / "opencode"
+            data_dir = Path(home_dir) / ".local" / "share"
+            project_dir = Path(home_dir) / "project"
+            opencode_config_dir.mkdir(parents=True)
+            data_dir.mkdir(parents=True)
+            project_dir.mkdir()
+            opencode_cfg = {
+                "model": f"lucebox/{model_id}",
+                "small_model": f"lucebox/{model_id}",
+                "provider": {
+                    "lucebox": {
+                        "npm": "@ai-sdk/openai-compatible",
+                        "name": "Lucebox",
+                        "options": {
+                            "baseURL": f"{base_url}/v1",
+                            "apiKey": api_key,
+                            "timeout": 600000,
+                            "chunkTimeout": 60000,
+                        },
+                        "models": {
+                            model_id: {
+                                "name": "Lucebox DFlash",
+                                "limit": {"context": int(max_ctx), "output": int(max_tokens)},
+                            }
+                        },
+                    }
+                },
+                "tools": {"write": False, "bash": False},
+            }
+            (opencode_config_dir / "opencode.json").write_text(_json.dumps(opencode_cfg))
+            env = os.environ.copy()
+            # Prepend the nvm node bin dir so opencode.exe can find node even
+            # though HOME is overridden (which breaks ~/.local/bin and asdf shims).
+            nvm_bin_dir = str(Path(opencode_bin).parent) if opencode_bin != "opencode" else ""
+            if nvm_bin_dir:
+                env["PATH"] = nvm_bin_dir + ":" + env.get("PATH", "")
+            env.update({
+                "LUCEBOX_SERVER_BACKEND": "cpp",
+                "PFLASH_SESSION_ID": session_id,
+                "OPENAI_API_KEY": api_key,
+                "HOME": home_dir,
+                "XDG_CONFIG_HOME": str(config_dir),
+                "XDG_DATA_HOME": str(data_dir),
+            })
+            cmd = [
+                opencode_bin, "run",
+                "--pure",
+                "--model", f"lucebox/{model_id}",
+                "--format", "json",
+                _prompt,
+            ]
+            t0 = time.perf_counter()
+            try:
+                proc = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                                      timeout=timeout, stdin=subprocess.DEVNULL,
+                                      cwd=str(project_dir))
+                wall = time.perf_counter() - t0
+                return AdapterResult(
+                    client=self.client, preflight_ok=True, session_id=session_id,
+                    session_id_captured=True, wall_s=round(wall, 3), exit_code=proc.returncode,
+                )
+            except subprocess.TimeoutExpired:
+                return AdapterResult(client=self.client, preflight_ok=True, session_id=session_id,
+                                     exit_code=124, error="timeout")
+            except Exception as exc:
+                return AdapterResult(client=self.client, preflight_ok=True, session_id=session_id,
+                                     exit_code=1, error=repr(exc))
+
+
+_ADAPTER_REGISTRY: dict[str, type[_BaseAdapter]] = {
+    "claude_code": ClaudeCodeAdapter,
+    "hermes": HermesAdapter,
+    "codex": CodexAdapter,
+    "pi": PiAdapter,
+    "opencode": OpenCodeAdapter,
+}
+
+_CSV_COLUMNS = ["client", "preflight_ok", "session_id_captured", "accept_rate", "wall_s", "exit_code"]
+
+# Default pflash drafter path; override with --pflash-drafter or PFLASH_DRAFTER_PATH env var.
+_DEFAULT_PFLASH_DRAFTER = Path("/home/peppi/models/Qwen3-0.6B-BF16.gguf")
+
+# Server profile for bandit live runs: enables prefill compression + pflash drafter.
+# Flags must all be recognised by dflash/src/server/server_main.cpp (unknown flags → exit 2).
+BANDIT_SERVER_PROFILE = ServerProfile(
+    name="bandit_pflash",
+    args=(
+        "--max-ctx", "49152",
+        "--fa-window", "2048",
+        "--cache-type-k", "tq3_0",
+        "--cache-type-v", "tq3_0",
+        "--prefill-compression", "auto",
+        "--prefill-threshold", "4096",
+        "--prefill-keep-ratio", "0.05",
+        "--prefill-skip-park",
+    ),
+    needs_prefill_drafter=True,
+)
+
+
+def run_bandit(
+    clients: list[str],
+    condition: str,
+    *,
+    dry_run: bool = False,
+    output: IO[str] | None = None,
+    session_id: str | None = None,
+    server_log_path: Path | None = None,
+) -> list[AdapterResult]:
+    """Run the bandit condition against the requested clients.
+
+    In dry-run mode: performs preflight only, emits planned CSV to output.
+    In live mode: runs full client + records metrics (requires server running).
+
+    server_log_path: if provided, each AdapterResult gets this path so
+    metrics_parser can extract accept_rate after live_run completes.
+
+    Returns list of AdapterResult, one per client.
+    """
+    import sys as _sys
+    out = output if output is not None else _sys.stdout
+    results: list[AdapterResult] = []
+
+    for name in clients:
+        if name not in _ADAPTER_REGISTRY:
+            raise SystemExit(f"unknown client: {name}; choices: {', '.join(_ADAPTER_REGISTRY)}")
+        adapter = _ADAPTER_REGISTRY[name]()
+
+        if dry_run:
+            sid = session_id or f"dry-{name}-{condition}"
+            pre = adapter.preflight_check()
+            if pre.preflight_ok:
+                result = adapter.dry_run(session_id=sid)
+                result.exit_code = 0
+            else:
+                result = pre
+                result.session_id_captured = False
+                result.exit_code = 78
+            results.append(result)
+        else:
+            # Live mode: preflight first; if ok, run the actual client
+            pre = adapter.preflight_check()
+            if not pre.preflight_ok:
+                pre.exit_code = 78
+                results.append(pre)
+                if pre.error:
+                    print(pre.error, file=_sys.stderr)
+                continue
+            sid = session_id or f"{name}-{condition}"
+            result = adapter.live_run(session_id=sid)
+            # Attach server log path so accept_rate can be parsed below
+            if server_log_path is not None:
+                result.server_log_path = server_log_path
+            # Populate accept_rate from server log if not already set
+            if result.accept_rate is None and result.server_log_path is not None:
+                try:
+                    from harness.metrics_parser import extract_accept_rate_from_log
+                    log_text = result.server_log_path.read_text(errors="replace")
+                    result.accept_rate = extract_accept_rate_from_log(log_text)
+                except Exception:
+                    pass
+            results.append(result)
+
+    # Write CSV
+    writer = _csv.DictWriter(out, fieldnames=_CSV_COLUMNS, lineterminator="\n")
+    writer.writeheader()
+    for r in results:
+        writer.writerow({
+            "client": r.client,
+            "preflight_ok": r.preflight_ok,
+            "session_id_captured": r.session_id_captured,
+            "accept_rate": r.accept_rate,
+            "wall_s": r.wall_s,
+            "exit_code": r.exit_code,
+        })
+    return results
+
+
+def cmd_bandit(args: argparse.Namespace) -> int:
+    raw_clients = getattr(args, "clients", None) or getattr(args, "adapter", None)
+    if not raw_clients:
+        raise SystemExit("--clients or --adapter is required for the bandit subcommand")
+    if raw_clients == "all":
+        clients = list(_ADAPTER_REGISTRY)
+    else:
+        clients = [c.strip() for c in raw_clients.split(",") if c.strip()]
+
+    dry_run = args.dry_run
+    sid = getattr(args, "session_id", None)
+
+    # Live mode with --start-server: launch a pflash-enabled server, run clients, stop it.
+    start_server_flag = getattr(args, "start_server", False)
+    if start_server_flag and not dry_run:
+        target = getattr(args, "target", None)
+        draft = getattr(args, "draft", None)
+        bin_path = getattr(args, "bin", None)
+        drafter_arg = getattr(args, "pflash_drafter", None)
+        pflash_drafter = (
+            Path(drafter_arg).resolve() if drafter_arg
+            else Path(os.environ.get("PFLASH_DRAFTER_PATH", str(_DEFAULT_PFLASH_DRAFTER)))
+        )
+        if target is None or draft is None or bin_path is None:
+            raise SystemExit(
+                "--start-server requires --target, --draft, and --bin "
+                "(paths to target model, draft model, and server binary)"
+            )
+        work_dir = args.work_dir.resolve()
+        port = getattr(args, "port", None) or free_port()
+        os.environ["BASE_URL"] = f"http://127.0.0.1:{port}"
+        proc = None
+        log_path: Path | None = None
+        try:
+            proc, log_path, server_args, _env = start_server(
+                BANDIT_SERVER_PROFILE,
+                target=Path(target).resolve(),
+                draft=Path(draft).resolve(),
+                bin_path=Path(bin_path).resolve(),
+                prefill_drafter=pflash_drafter,
+                port=port,
+                work_dir=work_dir,
+            )
+            print(
+                f"[bandit] started server (pid={proc.pid} port={port} "
+                f"pflash=on drafter={pflash_drafter.name})"
+            )
+            print(f"[bandit] server args: {' '.join(server_args)}")
+            up = wait_http(f"http://127.0.0.1:{port}", proc=proc,
+                           timeout=getattr(args, "start_timeout", 240))
+            if not up:
+                print("[bandit] ERROR: server did not start in time", file=sys.stderr)
+                if log_path:
+                    print(tail(log_path, 2000), file=sys.stderr)
+                return 1
+            run_bandit(
+                clients=clients,
+                condition=args.condition,
+                dry_run=False,
+                session_id=sid,
+                server_log_path=log_path,
+            )
+        finally:
+            if proc is not None:
+                stop_proc(proc)
+                close_server_log(proc)
+        return 0
+
+    run_bandit(
+        clients=clients,
+        condition=args.condition,
+        dry_run=dry_run,
+        session_id=sid,
+    )
+    return 0
+
+
+_BANDIT_SESSION_PROMPTS_DIR = Path(__file__).resolve().parent / "clients" / "prompts"
+
+_BANDIT_SESSION_PROMPT_FILES = [
+    "decode_check.txt",
+    "logic_check.txt",
+    "math_check.txt",
+    "code_gen.txt",
+    "explain_algo.txt",
+]
+
+
+def _load_session_prompts(prompts_dir: Path, n: int) -> list[tuple[str, str]]:
+    """Return up to n (filename, content) pairs from the prompts directory."""
+    pairs: list[tuple[str, str]] = []
+    for fname in _BANDIT_SESSION_PROMPT_FILES:
+        path = prompts_dir / fname
+        if path.exists():
+            pairs.append((fname, path.read_text().strip()))
+        if len(pairs) >= n:
+            break
+    if not pairs:
+        raise HarnessError(
+            f"No prompt files found in {prompts_dir}. "
+            "Expected: " + ", ".join(_BANDIT_SESSION_PROMPT_FILES)
+        )
+    return pairs
+
+
+def cmd_bandit_session(args: argparse.Namespace) -> int:
+    """Multi-turn bandit session: start server once, run N turns, capture keep_ratio trajectory."""
+    dry_run: bool = getattr(args, "dry_run", False)
+    n_turns: int = getattr(args, "turns", 5)
+    client_name: str = getattr(args, "client", "claude_code")
+    # Stable session ID that spans all turns so the server's KV cache warms across turns.
+    sid: str = getattr(args, "session_id", None) or f"bandit-{client_name}-{int(time.time())}"
+    prompts_dir = Path(getattr(args, "prompts_dir", None) or _BANDIT_SESSION_PROMPTS_DIR)
+
+    if client_name not in _ADAPTER_REGISTRY:
+        raise SystemExit(f"unknown client: {client_name}; choices: {', '.join(_ADAPTER_REGISTRY)}")
+
+    prompts = _load_session_prompts(prompts_dir, n_turns)
+    while len(prompts) < n_turns:
+        prompts.append(prompts[len(prompts) % len(prompts)])
+
+    out_csv = Path(getattr(args, "output", None) or "/tmp/harness_adaptive_evidence.csv")
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    _CSV_TURN_COLUMNS = [
+        "client", "turn", "session_id", "prompt",
+        "keep_before", "accept_rate", "keep_after", "ema", "wall_s",
+    ]
+
+    if dry_run:
+        print(f"[bandit-session] DRY RUN: would run {n_turns} turns for {client_name} "
+              f"session={sid}", flush=True)
+        print(f"[bandit-session] prompts: {[p[0] for p in prompts[:n_turns]]}", flush=True)
+        with open(out_csv, "w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=_CSV_TURN_COLUMNS, lineterminator="\n")
+            w.writeheader()
+        print(f"[bandit-session] wrote empty CSV to {out_csv}", flush=True)
+        return 0
+
+    target = getattr(args, "target", None)
+    draft = getattr(args, "draft", None)
+    bin_path_arg = getattr(args, "bin", None)
+    if target is None or draft is None or bin_path_arg is None:
+        raise SystemExit(
+            "bandit-session requires --target, --draft, and --bin "
+            "unless --dry-run is set"
+        )
+
+    drafter_arg = getattr(args, "pflash_drafter", None)
+    pflash_drafter = (
+        Path(drafter_arg).resolve() if drafter_arg
+        else Path(os.environ.get("PFLASH_DRAFTER_PATH", str(_DEFAULT_PFLASH_DRAFTER)))
+    )
+    work_dir = args.work_dir.resolve()
+    port = getattr(args, "port", None) or free_port()
+    os.environ["BASE_URL"] = f"http://127.0.0.1:{port}"
+
+    adapter = _ADAPTER_REGISTRY[client_name]()
+    pre = adapter.preflight_check()
+    if not pre.preflight_ok:
+        print(f"[bandit-session] PREFLIGHT FAIL: {pre.error}", file=sys.stderr)
+        return 78
+
+    proc = None
+    log_path: Path | None = None
+    turn_rows: list[dict[str, Any]] = []
+    session_proxy_proc: subprocess.Popen | None = None
+
+    try:
+        proc, log_path, server_args, _env = start_server(
+            BANDIT_SERVER_PROFILE,
+            target=Path(target).resolve(),
+            draft=Path(draft).resolve(),
+            bin_path=Path(bin_path_arg).resolve(),
+            prefill_drafter=pflash_drafter,
+            port=port,
+            work_dir=work_dir,
+        )
+        print(
+            f"[bandit-session] server pid={proc.pid} port={port} pflash=on",
+            flush=True,
+        )
+        up = wait_http(
+            f"http://127.0.0.1:{port}", proc=proc,
+            timeout=getattr(args, "start_timeout", 240),
+        )
+        if not up:
+            print("[bandit-session] ERROR: server did not start in time", file=sys.stderr)
+            if log_path:
+                print(tail(log_path, 2000), file=sys.stderr)
+            return 1
+
+        # Start one session-inject proxy for the whole session so all turns share the
+        # same session_id. This lets the server's prefix cache warm across turns — turn 2+
+        # should show only delta-token prefill instead of the full context.
+        server_url = f"http://127.0.0.1:{port}"
+        session_proxy_proc, session_proxy_url = _start_session_inject_proxy(
+            session_id=sid, upstream=server_url
+        )
+        os.environ["PFLASH_SESSION_PROXY_URL"] = session_proxy_url
+        os.environ["BASE_URL"] = server_url  # adapters route through proxy via PFLASH_SESSION_PROXY_URL
+        print(
+            f"[bandit-session] session proxy pid={session_proxy_proc.pid} "
+            f"url={session_proxy_url} session_id={sid!r}",
+            flush=True,
+        )
+
+        from harness.metrics_parser import parse_bandit_session_from_log
+
+        for turn_num in range(1, n_turns + 1):
+            prompt_fname, prompt_text = prompts[turn_num - 1]
+            print(
+                f"[bandit-session] turn={turn_num}/{n_turns} prompt={prompt_fname}",
+                flush=True,
+            )
+
+            # Snapshot log length before this turn so we can slice out the new lines
+            log_size_before = log_path.stat().st_size if log_path.exists() else 0
+
+            result = adapter.live_run(session_id=sid, prompt=prompt_text)
+            wall_s = result.wall_s
+
+            # Read only the new log lines produced during this turn
+            turn_log_text = ""
+            if log_path and log_path.exists():
+                with open(log_path, "r", errors="replace") as lf:
+                    lf.seek(log_size_before)
+                    turn_log_text = lf.read()
+
+            turn_records = parse_bandit_session_from_log(turn_log_text, session_id=None)
+            if turn_records:
+                rec = turn_records[-1]
+                row = {
+                    "client": client_name,
+                    "turn": turn_num,
+                    "session_id": sid,
+                    "prompt": prompt_fname,
+                    "keep_before": round(rec.keep_before, 4),
+                    "accept_rate": round(rec.accept_rate, 4),
+                    "keep_after": round(rec.keep_after, 4),
+                    "ema": round(rec.ema, 4),
+                    "wall_s": wall_s,
+                }
+                print(
+                    f"[bandit-session]   keep={rec.keep_before:.4f}->{rec.keep_after:.4f} "
+                    f"accept={rec.accept_rate:.4f} ema={rec.ema:.4f} wall={wall_s}s",
+                    flush=True,
+                )
+            else:
+                # No bandit line found for this turn — record what we can
+                row = {
+                    "client": client_name,
+                    "turn": turn_num,
+                    "session_id": sid,
+                    "prompt": prompt_fname,
+                    "keep_before": None,
+                    "accept_rate": None,
+                    "keep_after": None,
+                    "ema": None,
+                    "wall_s": wall_s,
+                }
+                print(
+                    f"[bandit-session]   WARNING: no [pflash-bandit] line for turn {turn_num}",
+                    flush=True,
+                )
+            turn_rows.append(row)
+
+        # Sanity: check if keep_after moved
+        keep_afters = [r["keep_after"] for r in turn_rows if r["keep_after"] is not None]
+        if keep_afters and len(set(f"{k:.4f}" for k in keep_afters)) == 1:
+            print(
+                "[bandit-session] WARNING: keep_after is STUCK at "
+                f"{keep_afters[0]:.4f} for all turns — bandit may not be adapting!",
+                flush=True,
+            )
+        elif keep_afters:
+            print(
+                f"[bandit-session] keep_after trajectory: "
+                + " -> ".join(f"{k:.4f}" for k in keep_afters),
+                flush=True,
+            )
+
+    finally:
+        if session_proxy_proc is not None:
+            stop_proc(session_proxy_proc)
+            close_server_log(session_proxy_proc)
+        # Clear session proxy URL so it doesn't leak to subsequent runs
+        os.environ.pop("PFLASH_SESSION_PROXY_URL", None)
+        if proc is not None:
+            stop_proc(proc)
+            close_server_log(proc)
+
+        # Write CSV regardless of success/failure
+        with open(out_csv, "w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=_CSV_TURN_COLUMNS, lineterminator="\n")
+            w.writeheader()
+            for row in turn_rows:
+                w.writerow(row)
+        print(f"[bandit-session] wrote {len(turn_rows)}-row CSV to {out_csv}", flush=True)
+
+        # Also save server.log into results dir
+        if log_path and log_path.exists():
+            date_str = time.strftime("%Y-%m-%d")
+            results_dir = ROOT / "dflash" / "bench" / "results" / f"{date_str}_adaptive_evidence"
+            results_dir.mkdir(parents=True, exist_ok=True)
+            import shutil as _shutil2
+            _shutil2.copy2(log_path, results_dir / "server.log")
+            _shutil2.copy2(out_csv, results_dir / "adaptive_evidence.csv")
+            print(f"[bandit-session] results saved to {results_dir}", flush=True)
+
+    # Return non-zero if no rows captured
+    return 0 if turn_rows else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--work-dir", type=Path, default=DEFAULT_WORK_DIR)
@@ -1974,12 +3242,74 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument("--json-out", type=Path, default=None)
     p_bench.set_defaults(func=cmd_bench)
 
+    p_bandit = sub.add_parser("bandit", help="Run bandit condition against selected clients")
+    p_bandit.add_argument("--condition", default="C_bandit", help="Bandit condition name")
+    p_bandit.add_argument("--clients", default=None,
+                          help="Comma-separated client names or 'all'")
+    p_bandit.add_argument("--adapter", default=None,
+                          help="Single adapter name (alias for --clients with one entry)")
+    p_bandit.add_argument("--dry-run", action="store_true",
+                          help="Preflight only; emit planned CSV without running clients")
+    p_bandit.add_argument("--session-id", default=None)
+    # Server management: optional, launches a pflash-enabled server for the bandit run
+    p_bandit.add_argument("--start-server", action="store_true",
+                          help="Start a pflash-enabled dflash_server before running clients")
+    p_bandit.add_argument("--target", type=Path, default=None,
+                          help="Target model path (required with --start-server)")
+    p_bandit.add_argument("--draft", type=Path, default=None,
+                          help="Draft model path (required with --start-server)")
+    p_bandit.add_argument("--bin", type=Path, default=None,
+                          help="dflash_server binary path (required with --start-server)")
+    p_bandit.add_argument("--pflash-drafter", default=None,
+                          help=f"Pflash drafter model path (default: {_DEFAULT_PFLASH_DRAFTER})")
+    p_bandit.add_argument("--port", type=int, default=None,
+                          help="Server port (default: random free port)")
+    p_bandit.add_argument("--start-timeout", type=int, default=240,
+                          help="Seconds to wait for server to be healthy (default: 240)")
+    p_bandit.set_defaults(func=cmd_bandit)
+
+    p_bs = sub.add_parser(
+        "bandit-session",
+        help="Multi-turn adaptive session: start server once, run N turns, capture trajectory",
+    )
+    p_bs.add_argument("--client", default="claude_code",
+                      help="Adapter to use (default: claude_code)")
+    p_bs.add_argument("--turns", type=int, default=5,
+                      help="Number of turns to run (default: 5)")
+    p_bs.add_argument("--session-id", default=None,
+                      help="Session ID (default: auto-generated)")
+    p_bs.add_argument("--target", type=Path, default=None)
+    p_bs.add_argument("--draft", type=Path, default=None)
+    p_bs.add_argument("--bin", type=Path, default=None)
+    p_bs.add_argument("--pflash-drafter", default=None)
+    p_bs.add_argument("--port", type=int, default=None)
+    p_bs.add_argument("--start-timeout", type=int, default=240)
+    p_bs.add_argument("--prompts-dir", default=None,
+                      help="Override prompts directory")
+    p_bs.add_argument("--output", default="/tmp/harness_adaptive_evidence.csv",
+                      help="Output CSV path (default: /tmp/harness_adaptive_evidence.csv)")
+    p_bs.add_argument("--dry-run", action="store_true",
+                      help="Preflight only; no server started, no clients run")
+    p_bs.set_defaults(func=cmd_bandit_session)
+
     return ap
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Entry point. Supports subcommands and top-level --condition/--clients shorthand."""
+    import sys as _sys
+    raw = list(argv if argv is not None else _sys.argv[1:])
+
+    # Top-level shorthand: --condition + --clients without a subcommand
+    # e.g. python3 -m harness.client_test_runner --condition C_bandit --clients claude_code,hermes
+    if raw and raw[0].startswith("--") and "bandit" not in raw and not any(
+        c in raw for c in ["install", "probe", "sweep", "report", "bench", "list"]
+    ):
+        # Inject 'bandit' as subcommand so the standard parser handles it
+        raw = ["bandit"] + raw
+
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw)
     try:
         return int(args.func(args))
     except KeyboardInterrupt:

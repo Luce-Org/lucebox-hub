@@ -570,6 +570,18 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
 
         req.thinking_enabled = enable_thinking;
 
+        // Bandit: parse session_id from extra_body (opt-in adaptive keep_ratio)
+        if (body.contains("extra_body")) {
+            const auto & eb = body["extra_body"];
+            if (eb.is_object() && eb.contains("session_id")) {
+                req.session_id = eb["session_id"].get<std::string>();
+            }
+        }
+        // Also accept session_id at the top level for convenience.
+        if (req.session_id.empty() && body.contains("session_id")) {
+            req.session_id = body["session_id"].get<std::string>();
+        }
+
         // Serialize tools JSON for template injection.
         std::string tools_json;
         if (req.tools.is_array() && !req.tools.empty()) {
@@ -760,7 +772,10 @@ void HttpServer::worker_loop() {
                         // 3. Compress via typed API
                         ModelBackend::CompressRequest creq;
                         creq.input_ids = std::move(drafter_ids);
-                        creq.keep_ratio = config_.pflash_keep_ratio;
+                        // Bandit: use per-session keep_ratio if session_id provided.
+                        creq.keep_ratio = req.session_id.empty()
+                            ? config_.pflash_keep_ratio
+                            : sessions_.get_keep_ratio(req.session_id);
                         creq.drafter_path = config_.pflash_drafter_path;
                         creq.skip_park = config_.pflash_skip_park;
 
@@ -980,6 +995,21 @@ void HttpServer::worker_loop() {
         // doesn't grow monotonically across requests with different sizes.
         backend_.release_scratch();
 
+        // Bandit: update when spec decode actually ran — including 0-accept case,
+        // which signals the current keep_ratio is too low.
+        if (!req.session_id.empty() && result.spec_decode_ran) {
+            float old_keep = sessions_.get_keep_ratio(req.session_id);
+            int   old_turn = sessions_.turn_count(req.session_id);
+            sessions_.update(req.session_id, result.accept_rate);
+            float new_keep = sessions_.get_keep_ratio(req.session_id);
+            float ema      = sessions_.get_ema(req.session_id);
+            std::fprintf(stderr,
+                "[pflash-bandit] session=%s turn=%d keep=%.4f->%.4f ema=%.3f accept=%.3f\n",
+                req.session_id.c_str(), old_turn + 1,
+                old_keep, new_keep, ema, result.accept_rate);
+        }
+
+
         // Confirm or abort the inline snapshot.
         if (snap_prepared) {
             if (completion_tokens > 0 && !client_disconnected) {
@@ -1087,7 +1117,8 @@ void HttpServer::worker_loop() {
                     {"usage", {
                         {"prompt_tokens", (int)req.prompt_tokens.size()},
                         {"completion_tokens", (int)result.tokens.size()},
-                        {"total_tokens", (int)(req.prompt_tokens.size() + result.tokens.size())}
+                        {"total_tokens", (int)(req.prompt_tokens.size() + result.tokens.size())},
+                        {"accept_rate", result.accept_rate}
                     }}
                 };
                 break;
@@ -1135,7 +1166,8 @@ void HttpServer::worker_loop() {
                     {"stop_reason", emitter.finish_reason() == "stop" ? "end_turn" : "tool_use"},
                     {"usage", {
                         {"input_tokens", (int)req.prompt_tokens.size()},
-                        {"output_tokens", (int)result.tokens.size()}
+                        {"output_tokens", (int)result.tokens.size()},
+                        {"accept_rate", result.accept_rate}
                     }}
                 };
                 break;
@@ -1167,7 +1199,8 @@ void HttpServer::worker_loop() {
                     {"usage", {
                         {"input_tokens", (int)req.prompt_tokens.size()},
                         {"output_tokens", (int)result.tokens.size()},
-                        {"total_tokens", (int)(req.prompt_tokens.size() + result.tokens.size())}
+                        {"total_tokens", (int)(req.prompt_tokens.size() + result.tokens.size())},
+                        {"accept_rate", result.accept_rate}
                     }}
                 };
                 break;
