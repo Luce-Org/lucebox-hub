@@ -1840,6 +1840,126 @@ static void test_normalize_tools_preserves_real_fields() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Tool description truncation tests
+// ═══════════════════════════════════════════════════════════════════════
+
+// truncate_tool_description is exposed via normalize_tools_for_qwen: we
+// exercise it through the public normalize_tools_for_qwen() interface so the
+// tests stay independent of any helper signature changes.
+
+static json make_tool_with_desc(const std::string & desc) {
+    return json::array({{
+        {"name", "my_tool"},
+        {"description", desc},
+        {"input_schema", {
+            {"type", "object"},
+            {"properties", json::object()}
+        }}
+    }});
+}
+
+static json make_tool_with_param_desc(const std::string & param_desc) {
+    return json::array({{
+        {"name", "my_tool"},
+        {"description", "short top"},
+        {"input_schema", {
+            {"type", "object"},
+            {"properties", {
+                {"p1", {{"type", "string"}, {"description", param_desc}}}
+            }}
+        }}
+    }});
+}
+
+static void test_truncate_short_description_unchanged() {
+    // 100-char description must come through untouched.
+    std::string desc(100, 'A');
+    json out = dflash::common::normalize_tools_for_qwen(make_tool_with_desc(desc));
+    TEST_ASSERT(out.size() == 1);
+    TEST_ASSERT(out[0]["function"]["description"].get<std::string>() == desc);
+}
+
+static void test_truncate_at_paragraph_break() {
+    // Description has \n\n at position 200, total length 600.
+    // Expect cut at the paragraph break (pos 200) + "…".
+    std::string first(200, 'A');
+    std::string rest(400, 'B');
+    std::string desc = first + "\n\n" + rest;
+    TEST_ASSERT(desc.size() > 500);
+    json out = dflash::common::normalize_tools_for_qwen(make_tool_with_desc(desc));
+    TEST_ASSERT(out.size() == 1);
+    std::string result = out[0]["function"]["description"].get<std::string>();
+    // Must end with ellipsis and not contain any 'B' from the second paragraph.
+    TEST_ASSERT(result.back() == '\xE2' ||
+                result.size() >= 3 && result.substr(result.size()-3) == "\xE2\x80\xA6");
+    TEST_ASSERT(result.find('B') == std::string::npos);
+    TEST_ASSERT(result.find("…") != std::string::npos);
+}
+
+static void test_truncate_at_sentence_boundary() {
+    // Description with ". " at position 400, no \n\n before 500.
+    // Expect cut at end of sentence (pos 402: period + space consumed) + "…".
+    std::string first(400, 'C');
+    std::string desc = first + ". " + std::string(300, 'D');
+    TEST_ASSERT(desc.size() > 500);
+    // No \n\n in first 500 chars
+    TEST_ASSERT(desc.substr(0, 500).find("\n\n") == std::string::npos);
+    json out = dflash::common::normalize_tools_for_qwen(make_tool_with_desc(desc));
+    TEST_ASSERT(out.size() == 1);
+    std::string result = out[0]["function"]["description"].get<std::string>();
+    TEST_ASSERT(result.find("…") != std::string::npos);
+    TEST_ASSERT(result.find('D') == std::string::npos);
+    // The ". " boundary itself: result should contain the period.
+    TEST_ASSERT(result.find('.') != std::string::npos);
+}
+
+static void test_truncate_hard_cut() {
+    // 1000-char description with no \n\n and no ". " before char 500.
+    std::string desc(1000, 'X');
+    json out = dflash::common::normalize_tools_for_qwen(make_tool_with_desc(desc));
+    TEST_ASSERT(out.size() == 1);
+    std::string result = out[0]["function"]["description"].get<std::string>();
+    TEST_ASSERT(result.find("…") != std::string::npos);
+    // After stripping the 3-byte UTF-8 "…", the ASCII portion is 500 chars.
+    // Result total = 500 + 3 = 503 bytes.
+    TEST_ASSERT(result.size() == 503);
+}
+
+static void test_truncate_applies_to_parameter_descriptions() {
+    // Parameter description of 3000 chars must be truncated.
+    std::string long_param_desc(3000, 'P');
+    json out = dflash::common::normalize_tools_for_qwen(make_tool_with_param_desc(long_param_desc));
+    TEST_ASSERT(out.size() == 1);
+    const auto & props = out[0]["function"]["parameters"]["properties"];
+    TEST_ASSERT(props.contains("p1"));
+    std::string pdesc = props["p1"]["description"].get<std::string>();
+    TEST_ASSERT(pdesc.find("…") != std::string::npos);
+    // Must be shorter than the 3000-char input.
+    TEST_ASSERT(pdesc.size() < 600);
+}
+
+static void test_truncate_preserves_unicode() {
+    // Description: 499 ASCII chars followed by a 3-byte UTF-8 character (ん = E3 82 93),
+    // followed by more text. Hard cut at 500 would land mid-codepoint; we expect
+    // the cut to snap back to the safe boundary (499) and append "…".
+    std::string ascii499(499, 'Z');
+    // ん = 0xE3 0x82 0x93
+    std::string multibyte = "\xE3\x82\x93";
+    std::string desc = ascii499 + multibyte + std::string(100, 'W');
+    TEST_ASSERT(desc.size() > 500);
+    json out = dflash::common::normalize_tools_for_qwen(make_tool_with_desc(desc));
+    TEST_ASSERT(out.size() == 1);
+    std::string result = out[0]["function"]["description"].get<std::string>();
+    TEST_ASSERT(result.find("…") != std::string::npos);
+    // Must not contain 'W' (from beyond the cut).
+    TEST_ASSERT(result.find('W') == std::string::npos);
+    // Must not end with a partial multibyte sequence.
+    // The result (before …) should be exactly 499 'Z' chars.
+    TEST_ASSERT(result.find(multibyte) == std::string::npos ||
+                result.substr(result.size()-3-3, 3) != "\xE3\x82\x93");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Native claude-code XML tag tests (<bash>, <ls>, etc.)
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -2103,6 +2223,14 @@ int main() {
     RUN_TEST(test_normalize_tools_strips_schema_metadata);
     RUN_TEST(test_normalize_tools_strips_metadata_recursively);
     RUN_TEST(test_normalize_tools_preserves_real_fields);
+
+    std::fprintf(stderr, "\n── Tool description truncation ──\n");
+    RUN_TEST(test_truncate_short_description_unchanged);
+    RUN_TEST(test_truncate_at_paragraph_break);
+    RUN_TEST(test_truncate_at_sentence_boundary);
+    RUN_TEST(test_truncate_hard_cut);
+    RUN_TEST(test_truncate_applies_to_parameter_descriptions);
+    RUN_TEST(test_truncate_preserves_unicode);
 
     std::fprintf(stderr, "\n── Native claude-code XML tags (<bash> etc.) ──\n");
     RUN_TEST(test_parse_tool_call_bash_simple);

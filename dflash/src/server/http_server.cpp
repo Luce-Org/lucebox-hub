@@ -102,44 +102,104 @@ static json scrub_schema_metadata(json schema) {
     return schema;
 }
 
+// Maximum bytes kept from any tool or parameter description before truncation.
+static constexpr size_t kMaxToolDescriptionChars = 500;
+
+// Truncate a description string to kMaxToolDescriptionChars bytes.
+// Priority: paragraph break (\n\n) before the cap, then last ". " before the
+// cap, then hard cut (snapping back to avoid splitting a UTF-8 multibyte sequence).
+// Appends U+2026 (…, 3 UTF-8 bytes) at the cut point.
+static std::string truncate_description(const std::string & s) {
+    if (s.size() <= kMaxToolDescriptionChars) return s;
+
+    // 1. First \n\n before cap.
+    size_t nn = s.find("\n\n");
+    if (nn != std::string::npos && nn < kMaxToolDescriptionChars) {
+        return s.substr(0, nn) + "\xE2\x80\xA6";
+    }
+
+    // 2. Last ". " at or before cap.
+    std::string_view sv(s.data(), kMaxToolDescriptionChars);
+    size_t dot = sv.rfind(". ");
+    if (dot != std::string_view::npos) {
+        // Include the period; cut before the trailing space.
+        return s.substr(0, dot + 1) + "\xE2\x80\xA6";
+    }
+
+    // 3. Hard cut, snap back to UTF-8 boundary.
+    size_t cut = kMaxToolDescriptionChars;
+    // While cut > 0 and the byte at `cut` is a UTF-8 continuation byte
+    // (0x80–0xBF), move back one byte.
+    while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80) {
+        --cut;
+    }
+    return s.substr(0, cut) + "\xE2\x80\xA6";
+}
+
+// Apply truncate_description to every property's "description" inside a
+// parameters/properties object (mutates in place).
+static json truncate_parameter_descriptions(json params) {
+    if (!params.is_object()) return params;
+    if (!params.contains("properties") || !params["properties"].is_object()) {
+        return params;
+    }
+    for (auto & [prop_name, prop_schema] : params["properties"].items()) {
+        if (prop_schema.is_object() && prop_schema.contains("description") &&
+            prop_schema["description"].is_string()) {
+            prop_schema["description"] =
+                truncate_description(prop_schema["description"].get<std::string>());
+        }
+    }
+    return params;
+}
+
 // Normalize tools array to OpenAI/Qwen3 shape: {"type":"function","function":{...}}.
 // Anthropic shape uses "input_schema"; bare Qwen shape has "parameters" at top level.
 // Also scrubs JSON-Schema metadata keys that the Unsloth Jinja template would render
 // as garbage XML tags (causing the model to hallucinate function names like <function=cls>).
+// Truncates function and parameter descriptions to kMaxToolDescriptionChars to prevent
+// prescriptive recipes embedded in long descriptions from leaking into the prompt.
 json normalize_tools_for_qwen(const json & tools) {
     if (!tools.is_array()) return tools;
     json out = json::array();
     for (const auto & elem : tools) {
         if (!elem.is_object()) { out.push_back(elem); continue; }
-        // Already OpenAI shape: scrub metadata and pass through.
+        // Already OpenAI shape: scrub metadata, truncate descriptions, pass through.
         if (elem.contains("type") && elem["type"] == "function" && elem.contains("function")) {
             json e = elem;
+            if (e["function"].contains("description") && e["function"]["description"].is_string()) {
+                e["function"]["description"] =
+                    truncate_description(e["function"]["description"].get<std::string>());
+            }
             if (e["function"].contains("parameters")) {
-                e["function"]["parameters"] = scrub_schema_metadata(e["function"]["parameters"]);
+                e["function"]["parameters"] = truncate_parameter_descriptions(
+                    scrub_schema_metadata(e["function"]["parameters"]));
             }
             out.push_back(std::move(e));
             continue;
         }
-        // Anthropic shape: input_schema → parameters (scrubbed).
+        // Anthropic shape: input_schema → parameters (scrubbed + truncated).
         if (elem.contains("input_schema")) {
             out.push_back({
                 {"type", "function"},
                 {"function", {
                     {"name",        elem.value("name", "")},
-                    {"description", elem.value("description", "")},
-                    {"parameters",  scrub_schema_metadata(elem["input_schema"])}
+                    {"description", truncate_description(elem.value("description", ""))},
+                    {"parameters",  truncate_parameter_descriptions(
+                                        scrub_schema_metadata(elem["input_schema"]))}
                 }}
             });
             continue;
         }
-        // Bare Qwen shape: top-level name + parameters (scrubbed), no wrapper.
+        // Bare Qwen shape: top-level name + parameters (scrubbed + truncated), no wrapper.
         if (elem.contains("name") && elem.contains("parameters")) {
             out.push_back({
                 {"type", "function"},
                 {"function", {
                     {"name",        elem.value("name", "")},
-                    {"description", elem.value("description", "")},
-                    {"parameters",  scrub_schema_metadata(elem["parameters"])}
+                    {"description", truncate_description(elem.value("description", ""))},
+                    {"parameters",  truncate_parameter_descriptions(
+                                        scrub_schema_metadata(elem["parameters"]))}
                 }}
             });
             continue;
