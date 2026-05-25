@@ -99,6 +99,19 @@ static json scrub_schema_metadata(json schema) {
     if (schema.contains("items") && schema["items"].is_object()) {
         schema["items"] = scrub_schema_metadata(schema["items"]);
     }
+    // Recurse into JSON-Schema combinators. Claude tool defs frequently use
+    // these for polymorphic parameter types; without recursion the inner
+    // sub-schemas keep their $schema/additionalProperties noise.
+    for (const char * combinator : {"oneOf", "anyOf", "allOf"}) {
+        if (schema.contains(combinator) && schema[combinator].is_array()) {
+            for (auto & sub : schema[combinator]) {
+                sub = scrub_schema_metadata(sub);
+            }
+        }
+    }
+    if (schema.contains("not") && schema["not"].is_object()) {
+        schema["not"] = scrub_schema_metadata(schema["not"]);
+    }
     return schema;
 }
 
