@@ -138,6 +138,17 @@ static void print_usage(const char * prog) {
         "  --prefill-skip-park         Skip park/unpark (for >=32GB GPUs)\n"
         "  --lazy-draft                Park decode draft when idle to save VRAM\n"
         "\n"
+        "MTP speculative decoding (mutually exclusive with --draft):\n"
+        "  --mtp-source <none|native|external|auto>\n"
+        "                              MTP source (default: auto when --mtp-gamma given)\n"
+        "                                none     = disable MTP\n"
+        "                                native   = MTP heads in target GGUF (unsloth single-file)\n"
+        "                                external = separate GGUF via --mtp-gguf\n"
+        "                                auto     = probe target GGUF; native if found, else none\n"
+        "  --mtp-gguf <path>           MTP GGUF path (required only for --mtp-source external)\n"
+        "  --mtp-gamma <int>           Speculation chain depth (default: 0 = disabled)\n"
+        "  --mtp-draft-topk <int>      Top-k draft strategy (default: chain; >1 enables mtp_topk)\n"
+        "\n"
         "Disk KV cache:\n"
         "  --kv-cache-dir <path>       Directory for ondisk KV cache (enables feature)\n"
         "  --kv-cache-budget <MB>      Max disk usage in MB (default: 4096)\n"
@@ -278,6 +289,34 @@ int main(int argc, char ** argv) {
                 sconfig.chat_template_path = path;
                 std::fprintf(stderr, "[server] loaded chat template from %s (%ld bytes)\n", path, n);
             }
+        } else if (std::strcmp(argv[i], "--mtp-source") == 0 && i + 1 < argc) {
+            const char * src = argv[++i];
+            if (std::strcmp(src, "none") == 0)
+                bargs.mtp_source = MtpSource::None;
+            else if (std::strcmp(src, "native") == 0)
+                bargs.mtp_source = MtpSource::Native;
+            else if (std::strcmp(src, "external") == 0)
+                bargs.mtp_source = MtpSource::ExternalDrafter;
+            else if (std::strcmp(src, "auto") == 0)
+                bargs.mtp_source = MtpSource::Auto;
+            else {
+                std::fprintf(stderr, "[server] unknown --mtp-source: '%s' (expected: none|native|external|auto)\n", src);
+                print_usage(argv[0]);
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--mtp-gguf") == 0 && i + 1 < argc) {
+            bargs.mtp_gguf_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--mtp-gamma") == 0 && i + 1 < argc) {
+            bargs.mtp_gamma = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--mtp-draft-source") == 0 && i + 1 < argc) {
+            ++i;  // consume the argument
+            std::fprintf(stderr,
+                "[server] WARNING: --mtp-draft-source is deprecated. "
+                "Use --mtp-source [none|native|external|auto] and "
+                "--mtp-draft-topk <N> instead.\n");
+        } else if (std::strcmp(argv[i], "--mtp-draft-topk") == 0 && i + 1 < argc) {
+            bargs.mtp_draft_topk = std::atoi(argv[++i]);
+            if (bargs.mtp_draft_topk > 1) bargs.mtp_use_topk = true;
         } else if (std::strcmp(argv[i], "--kv-cache-dir") == 0 && i + 1 < argc) {
             sconfig.disk_cache_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--kv-cache-budget") == 0 && i + 1 < argc) {
@@ -308,6 +347,42 @@ int main(int argc, char ** argv) {
         sconfig.max_ctx = bargs.device.max_ctx;
     }
 
+    // Infer MtpSource from legacy flags when --mtp-source is absent.
+    //   --mtp-gguf without --mtp-source  → ExternalDrafter (backward compat)
+    //   --mtp-gamma without --mtp-source → Auto (probe the target GGUF)
+    // Only infer when Unset — explicit --mtp-source none must not be overridden.
+    if (bargs.mtp_source == MtpSource::Unset) {
+        if (bargs.mtp_gguf_path) {
+            bargs.mtp_source = MtpSource::ExternalDrafter;
+        } else if (bargs.mtp_gamma > 0) {
+            bargs.mtp_source = MtpSource::Auto;
+        } else {
+            bargs.mtp_source = MtpSource::None;
+        }
+    }
+
+    // Validate: ExternalDrafter requires --mtp-gguf.
+    if (bargs.mtp_source == MtpSource::ExternalDrafter && !bargs.mtp_gguf_path) {
+        std::fprintf(stderr,
+            "[server] ERROR: --mtp-source external requires --mtp-gguf <path>\n");
+        return 1;
+    }
+
+    // --draft and MTP are mutually exclusive; MTP wins if both are set.
+    // --draft suppression and env defaults gate on a concrete MTP source.
+    // Auto and Unset defer to backend resolution; this preserves --draft
+    // as a fallback when Auto resolves to None and avoids reserving MTP
+    // head_kv memory that may never be used.
+    const bool mtp_active =
+        (bargs.mtp_source == MtpSource::Native ||
+         bargs.mtp_source == MtpSource::ExternalDrafter);
+    if (bargs.draft_path && mtp_active) {
+        std::fprintf(stderr,
+            "[server] WARNING: --draft and MTP both set; ignoring --draft.\n"
+            "[server]          MTP speculation takes precedence over DFlash draft.\n");
+        bargs.draft_path = nullptr;
+    }
+
     // ── Apply environment defaults (mirrors server.py logic) ────────────
     // Explicit --cache-type-k/v override via env vars.
     if (!cache_type_k.empty()) {
@@ -325,6 +400,15 @@ int main(int argc, char ** argv) {
         setenv("DFLASH27B_KV_TQ3", "1", 0);  // don't overwrite user env
     }
 #endif
+
+    // Default MTP head_kv capacity to backbone max_ctx so prompts up to max_ctx
+    // never overflow the head_kv buffer (the old hardcoded 8192 caused a silent
+    // server crash when agentic prompts exceeded that length).
+    if (mtp_active && sconfig.max_ctx > 0) {
+        char ctx_str[32];
+        std::snprintf(ctx_str, sizeof(ctx_str), "%d", sconfig.max_ctx);
+        setenv("DFLASH27B_MTP_CTX", ctx_str, 0);  // don't overwrite user env
+    }
 
     // PFlash performance defaults: BSA kernel + sparse alpha + full attention window.
     bool pflash_enabled = (sconfig.pflash_mode != ServerConfig::PflashMode::OFF);
@@ -405,6 +489,18 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  fa_window       = %d\n", bargs.fa_window);
     std::fprintf(stderr, "[server] │  ddtree          = %s\n", bargs.ddtree_mode ? "ON" : "off");
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
+    if (mtp_active) {
+        const char * src_str =
+            bargs.mtp_source == MtpSource::Native        ? "native"   :
+            bargs.mtp_source == MtpSource::ExternalDrafter ? "external" :
+            bargs.mtp_source == MtpSource::Auto          ? "auto"     : "none";
+        std::fprintf(stderr, "[server] │  mtp_source      = %s\n", src_str);
+        if (bargs.mtp_gguf_path)
+            std::fprintf(stderr, "[server] │  mtp_gguf        = %s\n", bargs.mtp_gguf_path);
+        std::fprintf(stderr, "[server] │  mtp_gamma       = %d\n", bargs.mtp_gamma);
+        std::fprintf(stderr, "[server] │  mtp_draft_strat = %s\n",
+                     bargs.mtp_use_topk ? "mtp_topk" : "chain (default)");
+    }
     std::fprintf(stderr, "[server] │  cors            = %s\n", sconfig.enable_cors ? "ON" : "off");
     std::fprintf(stderr, "[server] │  cache_type_k    = %s\n",
 #ifdef GGML_USE_HIP

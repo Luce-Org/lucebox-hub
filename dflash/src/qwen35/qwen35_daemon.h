@@ -5,7 +5,8 @@
 
 #pragma once
 
-#include "placement/placement_config.h"
+#include "common/backend_factory.h"
+#include "device_placement.h"
 #include <string>
 
 namespace dflash::common {
@@ -34,6 +35,14 @@ struct Qwen35DaemonArgs {
     float        ddtree_temp       = 1.0f;
     bool         ddtree_chain_seed = true;
     bool         use_feature_mirror = false;
+
+    // MTP (Multi-Token Prediction) speculator — mutually exclusive with draft.
+    // The daemon uses BackendArgs directly; these fields mirror BackendArgs.
+    MtpSource    mtp_source       = MtpSource::None;
+    const char * mtp_gguf_path    = nullptr;   // required only for ExternalDrafter
+    int          mtp_gamma        = 0;         // max speculation depth
+    bool         mtp_use_topk     = false;     // false = chain, true = mtp_topk
+    int          mtp_draft_topk   = 1;         // top-k for mtp_topk mode
 };
 
 // Run the qwen35 daemon loop. Returns 0 on clean exit, 1 on init failure.
