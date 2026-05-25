@@ -1,6 +1,11 @@
 # Run request: bragi gemma4 + laguna config issues block local benchmarking
 
 **Date opened**: 2026-05-25
+**Owner**: gemma4 chat-template fixed in `f1d30f2` (PR #269 candidate).
+The remaining gemma4 `ggml_can_mul_mat` crash is being investigated by
+erik/Claude on `integration/props-uv-squared-clean` — will ship as an
+independent PR encapsulated outside the #269 thinking-budget series.
+Laguna OOM asks remain unowned (config / sidecar metadata, not engine).
 **Status**: Bragi has gemma-4-{26b,31b} + laguna-xs.2 models downloaded
 (~58 GB) and queued in the master sweep, but neither produces usable
 data at default config. Detail below.
@@ -122,11 +127,24 @@ I re-probed gemma4 and confirmed three distinct failure modes:
    `ggml_can_mul_mat(a, b)` failing on `mul_mat` means two tensors
    have incompatible shapes for matmul — likely in an attention head
    reshape, MoE expert dispatch, or the Gemma4-specific per-layer
-   embedding path. Needs sindri's eye on `gemma4_backend.cpp` /
-   `gemma4_decode.cu` to identify which mul is asserting.
+   embedding path.
+
+   **Investigation owner**: erik/Claude on
+   `integration/props-uv-squared-clean`. Bisection so far:
+   - Crash is **structure-specific**, not length-specific. Plain
+     repeated text at 466 prompt_tokens runs clean; the HumanEval
+     `has_close_elements` prompt at 169 prompt_tokens crashes
+     deterministically.
+   - Reproduces with a single user message — no system prompt needed.
+   - 24 `ggml_mul_mat` call sites in `dflash/src/gemma4/gemma4_graph.cpp`
+     (attention Q/K/V/O, FFN gate/up/down, MoE router + experts,
+     per-layer embedding gate/proj, output head, per-layer model proj).
+     Stripped binary, so stack trace addresses don't resolve to names
+     yet — next step is either a debug-symbol build or per-mul-mat
+     name-tagging via `ggml_set_name` to identify which call asserts.
 
    This is independent of the chat-template fix (commit `f1d30f2`)
-   and should ship as a separate PR (not part of #269 thinking-budget
+   and will ship as a separate PR (not part of #269 thinking-budget
    series).
 
 These three issues block the bragi gemma4 column in our local
