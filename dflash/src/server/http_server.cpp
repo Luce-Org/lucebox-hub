@@ -195,6 +195,15 @@ json build_props_body(const ServerConfig & config,
             {"kv_cache_v",      config.kv_cache_v},
             {"lazy_draft",      config.lazy_draft},
             {"target_sharding", config.target_sharding},
+            // Prefill chunk size (bargs.chunk). Surfaced so snapshot
+            // tooling captures the full config — bench consumers
+            // (dflash/scripts/bench_http_capability.py) read
+            // /props.runtime wholesale into result.json.server_info.
+            {"chunk",           config.chunk},
+            // Device placement strings (e.g. "auto:0", "cuda:0"). Empty
+            // string when no draft model is loaded.
+            {"target_device",   config.target_device},
+            {"draft_device",    config.draft_device.empty() ? json(nullptr) : json(config.draft_device)},
         }},
         {"reasoning", {
             {"supported",         reasoning_supported},

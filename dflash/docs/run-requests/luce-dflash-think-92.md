@@ -76,3 +76,13 @@ and will run both phases sequentially after the current ds4-eval and AIME
 sweeps complete (estimated ~Monday afternoon EDT). If RTX 5090 MaxQ can do
 them faster, that side wins — sindri will skip phases the snapshot already
 contains.
+
+## 2026-05-25 addendum: KV cache config divergence
+
+Same caveat as `sindri-rtx3090ti-qwen36-nothink-92.md` — the explicit
+`--cache-type-k q4_0 --cache-type-v q4_0` was an inherited
+not-actually-matching-bragi config. The current `--think 92 v2`
+orchestrator at `/tmp/luce-dflash-think-92-v2/run.sh` still uses it
+(no point switching mid-flight). The follow-on `--think 92 v3` (if we
+run one) should drop the flags + reference the q4_0 vs tq3_0 A/B
+snapshot.

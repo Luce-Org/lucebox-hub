@@ -1768,6 +1768,50 @@ static void test_props_budget_envelope_shape() {
     TEST_ASSERT(body["server"]["props_schema"].get<int>() == 2);
 }
 
+// ─── /props.runtime captures full config (§4.16) ──────────────────────
+// Snapshot/bench tooling reads /props.runtime wholesale into
+// result.json.server_info; this test pins the field set so additions
+// elsewhere don't accidentally drop a knob we depend on for forensics.
+static void test_props_runtime_shape() {
+    ServerConfig cfg = make_props_config_with_sidecar(json{
+        {"name", "Qwen3.6 27B"},
+        {"source", "https://huggingface.co/Qwen/Qwen3.6-27B"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens", 32768},
+    });
+    cfg.runtime_backend = "cuda";
+    cfg.fa_window       = 2048;
+    cfg.kv_cache_k      = "tq3_0";
+    cfg.kv_cache_v      = "tq3_0";
+    cfg.lazy_draft      = false;
+    cfg.target_sharding = false;
+    cfg.chunk           = 512;
+    cfg.target_device   = "auto:0";
+    cfg.draft_device    = "auto:0";
+
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body.contains("runtime"));
+    const json & rt = body["runtime"];
+    TEST_ASSERT(rt["backend"].get<std::string>()         == "cuda");
+    TEST_ASSERT(rt["fa_window"].get<int>()               == 2048);
+    TEST_ASSERT(rt["kv_cache_k"].get<std::string>()      == "tq3_0");
+    TEST_ASSERT(rt["kv_cache_v"].get<std::string>()      == "tq3_0");
+    TEST_ASSERT(rt["lazy_draft"].get<bool>()             == false);
+    TEST_ASSERT(rt["target_sharding"].get<bool>()        == false);
+    TEST_ASSERT(rt["chunk"].get<int>()                   == 512);
+    TEST_ASSERT(rt["target_device"].get<std::string>()   == "auto:0");
+    TEST_ASSERT(rt["draft_device"].get<std::string>()    == "auto:0");
+
+    // draft_device is null when no draft model is loaded.
+    cfg.draft_device.clear();
+    body = build_props_body(cfg, pc, tm);
+    TEST_ASSERT(body["runtime"]["draft_device"].is_null());
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // usage.timings — per-request prefill / decode wall-clock breakdown
 // surfaced under usage.timings (spec §6.3). Tests cover all three
@@ -1985,6 +2029,7 @@ int main() {
     RUN_TEST(test_props_model_card_wholesale_sidecar);
     RUN_TEST(test_props_model_card_null_on_family_fallback);
     RUN_TEST(test_props_budget_envelope_shape);
+    RUN_TEST(test_props_runtime_shape);
 
     std::fprintf(stderr, "\n── usage.timings ──\n");
     RUN_TEST(test_usage_timings_openai_chat_streaming);

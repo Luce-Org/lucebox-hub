@@ -76,3 +76,23 @@ The bragi sweep that produced 51/92 ran on that image, so its rows have
 `timings: None`. A bragi rebuild + re-run is on deck once the current
 `bragi_master.sh` sweep finishes; that snapshot will land at
 `dflash/docs/tuning-snapshots/bragi-rtx5090laptop-qwen36-2026-05-25-nothink-full92-with-timings/`.
+
+## 2026-05-25 addendum: KV cache config divergence
+
+The `--cache-type-k q4_0 --cache-type-v q4_0` flags in the command above
+were inherited from a 2-case A/B at
+`tuning-snapshots/sindri-rtx3090ti-qwen36-2026-05-23-postmerge-{A,B}*`
+(q4_0/q4_0 vs q8_0/q4_0). They were claimed to "match bragi" but
+bragi's run-requests never set these flags, and the binary's auto-default
+when `max_ctx > 6144` (on CUDA) is **`tq3_0`**, not `q4_0`. So this
+"canonical config" has been a sindri-only override of the binary default
+since 2026-05-23.
+
+Of 98 historical snapshots, only 1 has a populated `server_info` block
+(the post-`c35a8a4` bench script). So we have **no evidence** that bragi
+was ever on q4_0. New runs from 2026-05-25 forward should drop the
+explicit flags and let the binary auto-select tq3_0 — pending the A/B
+designed at `dflash/docs/experiments/kv-cache-q4-vs-tq3-2026-05-25.md`.
+
+The 53/92 = 57.6% snapshot remains valid as a measurement of "sindri at
+q4_0/q4_0" — just don't read into it as evidence about default config.

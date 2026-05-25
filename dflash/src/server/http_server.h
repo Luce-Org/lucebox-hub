@@ -117,6 +117,17 @@ struct ServerConfig {
     int         ddtree_budget       = 0;
     bool        speculative_enabled = false;
     bool        target_sharding     = false;
+    // Prefill chunk size (bargs.chunk). Exposed at /props.runtime.chunk so
+    // bench/snapshot tooling can capture the full server config — needed
+    // because pre-c35a8a4 snapshots had no /props capture and post-hoc
+    // forensics on which chunk was used are otherwise impossible. See
+    // dflash/docs/specs/props-endpoint.md §4.5.
+    int         chunk               = 0;
+    // Resolved device placement strings (e.g. "auto:0", "cuda:0"). Sourced
+    // from placement_device_name(bargs.device / bargs.draft_device) in
+    // server_main after CLI parse.
+    std::string target_device;
+    std::string draft_device;
 
     // PFlash (speculative prefill compression)
     enum class PflashMode { OFF, AUTO, ALWAYS };

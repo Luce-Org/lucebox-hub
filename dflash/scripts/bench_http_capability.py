@@ -1261,7 +1261,23 @@ def main() -> int:
                                             headers={"Accept": "application/json"})
         with urllib.request.urlopen(props_req, timeout=10) as pr:
             props = json.load(pr)
-        # Pull the fields actually useful for cross-run quant/perf analysis.
+        # Capture the full /props response wholesale under `server_info.props`
+        # so future field additions (e.g. runtime.chunk, runtime.target_device
+        # post-2026-05-25) are recorded automatically — no per-field
+        # bench-script edits needed. See docs/specs/props-endpoint.md §4.16.
+        # Strip volatile counters that change between calls (in_use,
+        # lifetime_hits, daemon.alive) so a config produces a stable
+        # server_info.props blob across reruns.
+        props_static = {k: v for k, v in props.items() if k != "daemon"}
+        for sub in ("prefix_cache", "full_cache"):
+            if isinstance(props_static.get(sub), dict):
+                props_static[sub] = {
+                    k: v for k, v in props_static[sub].items()
+                    if k not in ("in_use", "lifetime_hits")
+                }
+        server_info["props"] = props_static
+        # Keep the existing flat top-level keys so tools that already read
+        # `server_info.kv_cache_k` keep working without churn.
         server_info.update({
             "build_info":      props.get("build_info"),
             "model_alias":     props.get("model_alias"),
@@ -1272,6 +1288,9 @@ def main() -> int:
             "kv_cache_v":      (props.get("runtime") or {}).get("kv_cache_v"),
             "fa_window":       (props.get("runtime") or {}).get("fa_window"),
             "backend":         (props.get("runtime") or {}).get("backend"),
+            "chunk":           (props.get("runtime") or {}).get("chunk"),
+            "target_device":   (props.get("runtime") or {}).get("target_device"),
+            "draft_device":    (props.get("runtime") or {}).get("draft_device"),
             "think_max_tokens": (props.get("budget_envelope") or {}).get("think_max_tokens"),
             "hard_limit_reply_budget": (props.get("budget_envelope") or {}).get("hard_limit_reply_budget"),
             "model_card_name": (props.get("model_card") or {}).get("name"),

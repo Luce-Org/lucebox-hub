@@ -439,6 +439,45 @@ this section is omitted entirely.
 Future fields: `accept_rate`, `lookahead_depth`, `draft_model_id`
 — added as the speculative-decode surface grows.
 
+### 4.16 `runtime`
+
+```json
+"runtime": {
+  "backend":         "cuda",
+  "fa_window":       2048,
+  "kv_cache_k":      "q4_0",
+  "kv_cache_v":      "q4_0",
+  "lazy_draft":      false,
+  "target_sharding": false,
+  "chunk":           512,
+  "target_device":   "auto:0",
+  "draft_device":    "auto:0"
+}
+```
+
+Runtime knobs resolved at startup. These reflect the effective
+configuration the server is running with — CLI overrides, model-
+card-driven defaults, and binary fallback defaults are all
+collapsed into one snapshot. Bench/snapshot tooling reads this
+wholesale into `result.json.server_info` so post-hoc forensics on
+configuration drift between runs is possible.
+
+- `backend` — active compute backend: `"cuda" | "hip" | "cpu"`.
+- `fa_window` — sliding-window attention window in tokens.
+- `kv_cache_k` / `kv_cache_v` — effective KV cache dtypes (e.g.
+  `"q4_0"`, `"tq3_0"`, `"f16"`). Operator's CLI choice when set,
+  otherwise the binary's auto-default (`tq3_0` when
+  `max_ctx > 6144`, else `q4_0`, on CUDA).
+- `lazy_draft` — whether the decode draft is parked when idle.
+- `target_sharding` — true when the target model is layer-split
+  across multiple GPUs.
+- `chunk` — prefill chunk size in tokens. Determines how prompt
+  tokens are batched into the target model during prefill.
+- `target_device` — resolved target-model device placement string
+  (e.g. `"auto:0"`, `"cuda:0"`).
+- `draft_device` — resolved draft-model device placement, or
+  `null` when no draft model is loaded.
+
 ## 5. Schema versioning
 
 `build_info` includes `props_schema=<n>`. The integer `n` bumps
