@@ -70,16 +70,13 @@ struct DaemonIO {
 // decode) — the perf trade-off is acceptable since this only kicks in
 // for thinking-enabled requests. Spec-decode integration is a follow-up.
 struct BudgetHook {
-    std::vector<int32_t> close_token_ids;  // empty = disabled
-    int                  hard_limit_remaining = 0;  // force when (n_gen - committed) <= this
-    // Soft-limit negotiated close (spec §5.3). When `remaining` falls
-    // into the window `(hard_limit_remaining, soft_limit_remaining]`
-    // AND the close token is already in the top-K of the next-token
-    // logits, accept the close as natural. This gives the model a
-    // chance to self-close gracefully before the hard force-close
-    // override fires. 0 disables (hard-only path).
-    int                  soft_limit_remaining        = 0;
-    int                  soft_limit_close_rank       = 8;
+    // Multi-token close sequence injected when `(n_gen - committed)`
+    // drops to `hard_limit_remaining`. For Qwen3.x this is the
+    // canonical "Considering the limited time..." summarize-and-stop
+    // lead-in (tokenized at server startup); for non-qwen arches it's
+    // a single close-tag token. Empty = hook disabled.
+    std::vector<int32_t> close_token_ids;
+    int                  hard_limit_remaining = 0;
 };
 
 struct GenerateRequest {
@@ -119,11 +116,6 @@ struct GenerateResult {
     // stream and grepping for "</think>" cannot distinguish the two
     // (the injected close decodes identically).
     bool                       budget_forced_close = false;
-    // True iff the soft-limit top-K peek (spec §5.3) accepted the close
-    // (close_kind="soft"). Distinct from budget_forced_close which
-    // signals a unilateral hard override. When both are false and the
-    // model emitted `</think>` on its own, close_kind="natural".
-    bool                       budget_soft_close   = false;
 };
 
 // ─── Backend interface ──────────────────────────────────────────────────

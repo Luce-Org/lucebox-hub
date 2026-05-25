@@ -187,27 +187,14 @@ static bool load_sidecar(const std::string & path, ModelCard & out, std::string 
         // See docs/specs/thinking-budget.md §3.3.
         out.hard_limit_reply_budget = j["hard_limit_reply_budget"].get<int>();
     }
-    if (j.contains("soft_limit_reply_budget") &&
-        j["soft_limit_reply_budget"].is_number_integer()) {
-        // Soft-limit negotiated close window (spec §5.3). When set,
-        // ports ds4_eval.c:3030's two-tier strategy: in the window
-        // (hard_limit_reply_budget, soft_limit_reply_budget], the AR
-        // loop peeks the next-token logits — if `</think>` is in
-        // top-K, accept it as a natural close instead of unilateral
-        // override. Default 0 (disabled, hard-only path).
-        out.soft_limit_reply_budget = j["soft_limit_reply_budget"].get<int>();
+    if (j.contains("thinking_marker") &&
+        j["thinking_marker"].is_string()) {
+        out.thinking_marker = j["thinking_marker"].get<std::string>();
     }
-    if (j.contains("soft_limit_close_rank") &&
-        j["soft_limit_close_rank"].is_number_integer()) {
-        out.soft_limit_close_rank = j["soft_limit_close_rank"].get<int>();
-    }
-    if (j.contains("thinking_preamble") &&
-        j["thinking_preamble"].is_string()) {
-        out.thinking_preamble = j["thinking_preamble"].get<std::string>();
-    }
-    if (j.contains("thinking_preamble_format") &&
-        j["thinking_preamble_format"].is_string()) {
-        out.thinking_preamble_format = j["thinking_preamble_format"].get<std::string>();
+    if (j.contains("thinking_terminator_hint") &&
+        j["thinking_terminator_hint"].is_string()) {
+        out.thinking_terminator_hint =
+            j["thinking_terminator_hint"].get<std::string>();
     }
 
     if (j.contains("sampling") && j["sampling"].is_object()) {

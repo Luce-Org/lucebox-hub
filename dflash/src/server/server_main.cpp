@@ -510,13 +510,6 @@ int main(int argc, char ** argv) {
     if (!cli_set.hard_limit_reply_budget) {
         sconfig.hard_limit_reply_budget = card.hard_limit_reply_budget;
     }
-    // Soft-limit window: no CLI override yet (sidecar-only knob);
-    // copy through. 0 = disabled.
-    sconfig.soft_limit_reply_budget = card.soft_limit_reply_budget;
-    sconfig.soft_limit_close_rank   = card.soft_limit_close_rank;
-    // Thinking preamble (sidecar-only knob, no CLI override).
-    sconfig.thinking_preamble        = card.thinking_preamble;
-    sconfig.thinking_preamble_format = card.thinking_preamble_format;
     if (!cli_set.think_max_tokens) {
         // Recompute from possibly-updated combined cap + reply budget so
         // the invariant (think_max = default_max - hard_limit) holds when
@@ -708,42 +701,55 @@ int main(int argc, char ** argv) {
     // expose the GGUF metadata key it was loaded from, so leave empty
     // and let /props report null. (Add a getter on Tokenizer later.)
 
-    // Resolve the close-tag sequence for Level 2 force-close. The text
-    // varies by arch:
-    //   - qwen35 / laguna: `</think>` (qwen35 = single special token id
-    //     248069; laguna/DeepSeek-V3 = multi-token e.g. [1718, 37947, 32])
-    //   - gemma4:           `<channel|>\n\n` — the channel boundary plus
-    //     two newlines. Qwen3's chat template renders the no-think guard
-    //     as `<think>\n\n</think>\n\n` and the model is trained to treat
-    //     the `\n\n` after the close as the "now answer" transition cue.
-    //     With just `<channel|>` alone, gemma4 continues whatever
-    //     derivation it was mid-flight — see Q3a in
-    //     dflash/docs/experiments/gemma4-26b-thinking-control-2026-05-25.md:
-    //     reasoning ended at `(40 - 65` and content began
-    //     `cos \theta, -65 \sin \theta)` (zero-cue continuation). The
-    //     two newlines give the model the same training-time transition
-    //     cue qwen gets, without putting words in its mouth.
-    // BudgetHook supports both single- and multi-token close sequences;
-    // the sampling loop injects across consecutive iterations.
+    // Resolve the Level 2 force-close sequence. Two concepts, both sourced
+    // from the model card sidecar (see model_card.h for semantics):
+    //   - marker: bytes that signal end-of-thinking to *us* (parsers).
+    //     Arch default if sidecar doesn't override: `</think>` for qwen,
+    //     `<channel|>` for gemma4, `</think>` for everything else.
+    //   - hint: directive injected to tell the *model* to wrap up. Taken
+    //     verbatim — the operator decides whether to include the marker
+    //     at the end. Empty hint → inject just the marker (bare close).
+    //
+    // We do NOT auto-append the marker to the hint. Reasoning models have
+    // varied trained pathways; some respond to a directive followed by the
+    // marker (Qwen3.x: trained "Considering the limited time..." lead-in),
+    // others to just a transition cue after the marker (gemma4: `<channel|>\n\n`
+    // — see dflash/docs/experiments/gemma4-26b-thinking-control-2026-05-25.md
+    // for the empirical finding that the `\n\n` mirrors Qwen3's no-think
+    // template suffix and gives gemma4 the trained "now answer" cue, where
+    // a bare `<channel|>` left it mid-derivation). For each arch ship the
+    // right `thinking_terminator_hint` in its sidecar; for new arches the
+    // bare-marker fallback is safe but suboptimal. See spec §5.3.
     if (sconfig.hard_limit_reply_budget > 0) {
-        const char * close_tag = (arch == "gemma4") ? "<channel|>\n\n" : "</think>";
-        auto close_ids = tokenizer.encode(close_tag);
+        std::string marker = card.thinking_marker;
+        if (marker.empty()) {
+            marker = (arch == "gemma4") ? "<channel|>" : "</think>";
+        }
+        const std::string close_text = card.thinking_terminator_hint.empty()
+                                           ? marker
+                                           : card.thinking_terminator_hint;
+        auto close_ids = tokenizer.encode(close_text);
         if (!close_ids.empty()) {
             sconfig.think_close_token_ids = close_ids;
+            const char * src = card.thinking_terminator_hint.empty()
+                                   ? "marker-only" : "sidecar-hint";
             std::fprintf(stderr,
-                "[server] level-2 force-close: %s = ", close_tag);
-            for (size_t i = 0; i < close_ids.size(); ++i) {
+                "[server] level-2 force-close (%s, %zu chars → %zu tokens, "
+                "hard_limit_reply_budget = %d)\n",
+                src, close_text.size(), close_ids.size(),
+                sconfig.hard_limit_reply_budget);
+            std::fprintf(stderr,
+                "[server] level-2 force-close token ids: ");
+            for (size_t i = 0; i < std::min<size_t>(close_ids.size(), 16); ++i) {
                 std::fprintf(stderr, "%s%d", i ? "," : "", close_ids[i]);
             }
-            std::fprintf(stderr,
-                " (%zu token%s), hard_limit_reply_budget = %d\n",
-                close_ids.size(), close_ids.size() == 1 ? "" : "s",
-                sconfig.hard_limit_reply_budget);
+            if (close_ids.size() > 16) std::fprintf(stderr, ",...");
+            std::fprintf(stderr, "\n");
         } else {
             std::fprintf(stderr,
-                "[server] level-2 force-close DISABLED: %s tokenizes "
-                "to empty (tokenizer reject?). Falling back to Level 1 "
-                "phase-2 reprompt only.\n", close_tag);
+                "[server] level-2 force-close DISABLED: text %.40s... "
+                "tokenizes to empty. Falling back to Level 1 phase-2 "
+                "reprompt only.\n", close_text.c_str());
         }
     }
 

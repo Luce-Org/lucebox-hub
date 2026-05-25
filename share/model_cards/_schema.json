@@ -42,26 +42,15 @@
     "hard_limit_reply_budget": {
       "type": "integer",
       "minimum": 256,
-      "description": "Optional. Tokens reserved post-`</think>` for the visible answer phase. Default 4096 (raised from 512 on 2026-05-25 — the original was sized for DeepSeek-V4-flash's terse style but silently truncated almost every other model mid-answer). Terse models can override down to 512-1024; verbose math/code models keep 4096. When set, drives both `think_max_tokens = max_tokens - hard_limit_reply_budget` and the force-close trigger in do_ar_decode."
+      "description": "Optional. Tokens reserved post-`</think>` for the visible answer phase. When `(n_gen - generated) <= hard_limit_reply_budget` during decode, the engine injects `thinking_terminator_hint` (or the bare `thinking_marker` if no hint is set). Default 4096 (raised from 512 on 2026-05-25 — the original was sized for DeepSeek-V4-flash's terse style but silently truncated almost every other model mid-answer). Terse models can override down to 512-1024; verbose math/code models keep 4096. Drives both `think_max_tokens = max_tokens - hard_limit_reply_budget` and the force-close trigger in do_ar_decode."
     },
-    "soft_limit_reply_budget": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Optional. Soft-limit negotiated close window (spec §5.3). When `(n_gen - generated)` falls into the range (hard_limit_reply_budget, soft_limit_reply_budget], the AR decode loop peeks the next-token logits — if `</think>` is in the top-`soft_limit_close_rank` candidates, accept it as a natural close (close_kind=\"soft\"). Lets the model self-close gracefully before the hard override fires. 0 disables (hard-only behavior, default)."
-    },
-    "soft_limit_close_rank": {
-      "type": "integer",
-      "minimum": 1,
-      "description": "Optional. Top-K cutoff for the soft-limit close peek. Default 8 (per ds4_eval.c:3050). Tighter = stricter (close has to be more strongly favored); looser = more cases negotiate a soft close."
-    },
-    "thinking_preamble": {
+    "thinking_marker": {
       "type": "string",
-      "description": "Optional. Template string injected into the prompt right after the opening `<think>` tag when the request opted into thinking. Tells the model what its effective per-request `think_max` and `reply_max` budgets are so it can self-plan rather than being silently force-closed mid-thought. Supports `{think_max}` and `{reply_max}` substitution placeholders. Empty = no preamble (default). For Qwen3.6 the recommended template is an HTML-style comment so the directive is visible to the model but not parsed as content."
+      "description": "Optional. Bytes that signal end-of-thinking to PARSERS — bench grader, chat template, response formatter, started_in_thinking detect. If empty, the server uses arch defaults (`</think>` for qwen3-family, `<channel|>` for gemma4, `</think>` elsewhere). Sidecar override exists for arches we haven't enumerated yet; for current arches leave empty."
     },
-    "thinking_preamble_format": {
+    "thinking_terminator_hint": {
       "type": "string",
-      "enum": ["comment", "directive", "none"],
-      "description": "Optional. Rendering format hint for `thinking_preamble`. `comment` = HTML-style `<!-- ... -->` (default for Qwen3.6); `directive` = plain text directive; `none` = no preamble even if `thinking_preamble` is set. Reserved for future per-model rendering variants — current implementation emits `thinking_preamble` literally regardless of this hint."
+      "description": "Optional. Trained directive injected mid-stream when the budget hook fires. Tells the MODEL to wrap up. Tokenized at startup; the AR decode loop overrides sampled tokens with this sequence verbatim when `(n_gen - generated) <= hard_limit_reply_budget`. The server does NOT auto-append the marker — if the operator wants the close marker in the inject, they include it in the hint. This lets callers test whether a hint alone induces self-close (model emits marker itself) vs a full directive+marker (we force the close). For Qwen3.x the canonical hint per the Qwen3 technical report (arXiv 2505.09388) DOES include the marker: 'Considering the limited time by the user, I have to give the solution based on the thinking directly now.\\n</think>\\n\\n'. If empty, the server emits the bare `thinking_marker` only — safe but the model may continue derivation in content space."
     },
     "sampling": {
       "type": "object",

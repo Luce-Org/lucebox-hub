@@ -51,14 +51,12 @@ ChatFormat chat_format_for_arch(const std::string & arch) {
     return ChatFormat::QWEN3;
 }
 
-// (caller pre-substitutes {think_max}/{reply_max} in thinking_preamble.)
 std::string render_chat_template(
     const std::vector<ChatMessage> & messages,
     ChatFormat format,
     bool add_generation_prompt,
     bool enable_thinking,
-    const std::string & tools_json,
-    const std::string & thinking_preamble)
+    const std::string & tools_json)
 {
     std::string result;
     bool has_tools = !tools_json.empty() && tools_json != "[]" && tools_json != "null";
@@ -144,13 +142,6 @@ std::string render_chat_template(
                 // mechanism entirely (phase-2 reprompt never fires because
                 // started_in_thinking=false).
                 result += "<think>\n";
-                // Budget preamble (spec §3.3 / §5.4): inject *after* the
-                // opening tag so the model is already in reasoning mode
-                // when it sees the budget directive. Pre-substituted by
-                // the caller — emit literally. Empty = no-op.
-                if (!thinking_preamble.empty()) {
-                    result += thinking_preamble;
-                }
             }
         }
         break;
@@ -259,13 +250,6 @@ std::string render_chat_template(
                 // already sits in the prompt. Matches the GGUF
                 // template's "if not enable_thinking" branch.
                 result += "<|channel>thought\n<channel|>";
-            } else if (!thinking_preamble.empty()) {
-                // Optional budget preamble (spec §3.3 / §5.4) — drop
-                // inside the channel-thought block so the model sees
-                // its budget directive before producing tokens.
-                result += "<|channel>thought\n";
-                result += thinking_preamble;
-                result += "<channel|>";
             }
         }
         break;

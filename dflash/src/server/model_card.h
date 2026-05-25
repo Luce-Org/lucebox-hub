@@ -58,16 +58,33 @@ struct ModelCard {
     int               complex_problem_max_tokens = 0;      // 0 = not specified
     SamplingDefaults  sampling;
     EffortTiers       effort_tiers;
+    // Bumped from 512 to 4096 on 2026-05-25. The original ds4_eval.c
+    // value was sized for DeepSeek-V4-flash's terse style but silently
+    // truncated almost every other model mid-answer. Terse sidecars can
+    // override down to 512-1024; verbose math/code models keep 4096.
     int               hard_limit_reply_budget    = 4096;
-    // Soft-limit negotiated close window (spec §5.3). 0 = disabled
-    // (hard-only behavior). Operator can set per-model via sidecar.
-    int               soft_limit_reply_budget    = 0;
-    int               soft_limit_close_rank      = 8;
-    // Thinking-budget preamble (spec §3.3 / §5.4). Template string
-    // with `{think_max}` and `{reply_max}` placeholders. Empty =
-    // no preamble injected.
-    std::string       thinking_preamble;
-    std::string       thinking_preamble_format;
+
+    // Two distinct concepts for thinking-budget control:
+    //
+    // (a) `thinking_marker` — the parse-side terminator. Bytes that signal
+    //     end-of-thinking to *us* (bench parser, chat template, response
+    //     formatter, started_in_thinking detect). If empty, arch-default
+    //     applies: `</think>` for qwen3-family, `<channel|>` for gemma4,
+    //     `</think>` elsewhere.
+    // (b) `thinking_terminator_hint` — the inject-side directive. What we
+    //     tell the *model* when the budget hook fires. Free-form text;
+    //     the server tokenizes it and overrides sampled tokens with this
+    //     sequence at the budget boundary VERBATIM (no auto-append of
+    //     marker — operator includes it if they want guaranteed close).
+    //     Per Qwen3 tech report (arXiv 2505.09388) Qwen3.x's canonical
+    //     trained hint is the "Considering the limited time by the user…"
+    //     lead-in with `</think>` embedded. Gemma4's documented working
+    //     hint is the bare `<channel|>\n\n` transition cue (the trailing
+    //     newlines mirror Qwen3's no-think template suffix, giving gemma
+    //     the same trained transition cue — see
+    //     dflash/docs/experiments/gemma4-26b-thinking-control-2026-05-25.md).
+    std::string       thinking_marker;
+    std::string       thinking_terminator_hint;
 
     // Phase-1 ceiling derived from `max_tokens - hard_limit_reply_budget`.
     // Convenience: also the spec's `think_max` quantity (§3.3 formula).

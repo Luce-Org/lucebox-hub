@@ -235,8 +235,6 @@ json build_props_body(const ServerConfig & config,
             {"model_card_source",       config.model_card_source_label},
             {"default_max_tokens",      config.default_max_tokens},
             {"hard_limit_reply_budget", config.hard_limit_reply_budget},
-            {"soft_limit_reply_budget", config.soft_limit_reply_budget},
-            {"soft_limit_close_rank",   config.soft_limit_close_rank},
             {"think_max_tokens",        config.think_max_tokens},
             {"effort_tiers", {
                 {"low",    config.effort_tiers.low},
@@ -1012,33 +1010,9 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                 return true;
             }
         } else {
-            // Substitute the per-request effective budget values into the
-            // thinking_preamble template (spec §3.3 / §5.4). Only fires
-            // when thinking is opted-in AND the sidecar declared a
-            // preamble. Empty preamble → render path unchanged.
-            std::string preamble;
-            if (enable_thinking && !config_.thinking_preamble.empty()
-                && config_.thinking_preamble_format != "none")
-            {
-                const int eff_think = (req.per_req_phase1_cap >= 0)
-                    ? req.per_req_phase1_cap : config_.think_max_tokens;
-                const int eff_reply = (req.per_req_reply_budget >= 0)
-                    ? req.per_req_reply_budget : config_.hard_limit_reply_budget;
-                preamble = config_.thinking_preamble;
-                auto subst = [&](const std::string & needle, int val) {
-                    std::string rep = std::to_string(val);
-                    size_t p = 0;
-                    while ((p = preamble.find(needle, p)) != std::string::npos) {
-                        preamble.replace(p, needle.size(), rep);
-                        p += rep.size();
-                    }
-                };
-                subst("{think_max}", eff_think);
-                subst("{reply_max}", eff_reply);
-            }
             rendered = render_chat_template(chat_msgs, chat_format_,
                                             true, enable_thinking,
-                                            tools_json, preamble);
+                                            tools_json);
         }
         req.prompt_tokens = tokenizer_.encode(rendered);
         // Detect if prompt ends with <think> (model will start in reasoning mode).
@@ -1284,13 +1258,6 @@ void HttpServer::worker_loop() {
                 : config_.hard_limit_reply_budget;
             gen_req.budget_hook.close_token_ids = config_.think_close_token_ids;
             gen_req.budget_hook.hard_limit_remaining = eff_reply_budget;
-            // Soft-limit window (spec §5.3). Only meaningful when set
-            // strictly above hard_limit; clamp here so the AR loop's
-            // window-check `(hard < remaining <= soft)` is well-defined.
-            if (config_.soft_limit_reply_budget > eff_reply_budget) {
-                gen_req.budget_hook.soft_limit_remaining = config_.soft_limit_reply_budget;
-                gen_req.budget_hook.soft_limit_close_rank = config_.soft_limit_close_rank;
-            }
         }
 
         // Tool call hint generation: pre-tokenize predictable structural tokens
@@ -1554,17 +1521,13 @@ void HttpServer::worker_loop() {
         // phase-2 is a follow-up (needs SSE flush + re-open).
         std::vector<int32_t> phase1_tokens = result.tokens;  // copy
         std::vector<int32_t> phase2_tokens;
-        // Start as "natural" — the backend tells us via
-        // result.budget_{forced,soft}_close if a budget hook fired.
-        // Precedence: hard (forced override) > soft (negotiated close
-        // in top-K window) > natural (model self-closed). Level 1
-        // phase-2 reprompt below overrides to "hard" when it has to fire.
+        // Start as "natural" — the backend will tell us via
+        // result.budget_forced_close if Level 2 actually injected the
+        // close, and Level 1 below sets "hard" when it has to reprompt.
         std::string close_kind =
             (req.thinking_opt_in && result.budget_forced_close)
                 ? "hard"
-                : (req.thinking_opt_in && result.budget_soft_close)
-                    ? "soft"
-                    : "natural";
+                : "natural";
 
         // Phase-2 gate diagnostic — compile out by default. Enable with
         // -DDFLASH_DEBUG_PHASE2_GATE=1 to surface the gate-input dump
