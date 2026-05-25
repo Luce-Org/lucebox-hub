@@ -19,8 +19,8 @@
 
 #include "internal.h"
 
-namespace dflash27b {
+namespace dflash::common {
 
 // Placeholder; real impl lives with the spec_loop driver.
 
-} // namespace dflash27b
+} // namespace dflash::common

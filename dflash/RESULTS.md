@@ -150,3 +150,636 @@ Starting point: Chain DFlash at 112.8 tok/s mean on HumanEval, AL 7.67.
 - Published DFlash paper on Qwen3-4B/8B/30B-MoE (pure attention, BF16, B200) reports 4-5× over AR on HumanEval/Math500 at concurrency 1. Ours: 3.43× on 27B hybrid Q4_K_M on RTX 3090.
 - Memory ceiling: per-token SSM intermediate cache (hybrid-only cost) caps tree budget at ~26 on 24 GB. The paper uses budgets up to 1024 on pure-attention models with zero per-node memory tax.
 - Per-token verify cost drops from 25 ms at N=1 to 0.97 ms at N=128 (ggml-cuda Q4_K matmul amortises well with batch size).
+
+## RTX 2080 Ti (Turing, sm_75, 22 GB)
+
+Single RTX 2080 Ti 22 GB, CUDA 12.4.
+Same target/draft as above. BF16 draft weights auto-converted to FP16 at load time
+(cuBLAS BF16 GEMM has no tensor core acceleration on SM 7.5; FP16 conversion
+gives 3.9× faster draft compute via Turing tensor cores).
+
+Build: `cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=75`
+
+### RTX 2080 Ti headline
+
+| Task      | AR tok/s | DFlash tok/s | AL   | Speedup |
+|-----------|:--------:|:------------:|:----:|:-------:|
+| HumanEval | 19.88    | **53.42**    | 8.14 | **2.69×** |
+| Math500   | 19.67    | **49.01**    | 7.30 | **2.49×** |
+| GSM8K     | 19.49    | **43.55**    | 6.53 | **2.23×** |
+
+### RTX 2080 Ti per-prompt — HumanEval (10 samples)
+
+| # | n_tok | AR    | DFlash | AL    |
+|:-:|:-----:|:-----:|:------:|:-----:|
+| 01| 84    | 19.88 |  58.69 | 8.83  |
+| 02| 138   | 19.43 |  45.47 | 9.14  |
+| 03| 134   | 19.60 |  62.67 | 9.14  |
+| 04| 120   | 20.16 |  63.42 | 9.14  |
+| 05| 172   | 19.74 |  56.89 | 8.53  |
+| 06| 118   | 20.20 |  44.32 | 6.40  |
+| 07| 51    | 20.26 |  54.14 | 8.00  |
+| 08| 141   | 19.70 |  40.34 | 5.95  |
+| 09| 125   | 19.91 | **70.70** | **10.67** |
+| 10| 95    | 19.88 |  37.56 | 5.57  |
+| **mean** |   | **19.88** | **53.42** | **8.14** |
+
+Peak per-prompt: **70.70 tok/s at AL 10.67** (3.55× over AR on the same prompt).
+
+### RTX 2080 Ti per-prompt — GSM8K (10 samples)
+
+| # | n_tok | AR    | DFlash | AL   |
+|:-:|:-----:|:-----:|:------:|:----:|
+| 01| 45    | 19.24 |  39.54 | 5.82 |
+| 02| 111   | 19.70 |  39.49 | 5.82 |
+| 03| 49    | 19.33 |  57.01 | 8.53 |
+| 04| 70    | 19.70 |  38.35 | 5.69 |
+| 05| 102   | 19.67 |  36.77 | 5.45 |
+| 06| 118   | 19.39 |  40.45 | 5.95 |
+| 07| 113   | 19.55 |  54.02 | 8.46 |
+| 08| 50    | 18.92 |  42.16 | 6.51 |
+| 09| 43    | 19.68 |  48.07 | 7.11 |
+| 10| 96    | 19.72 |  39.63 | 5.95 |
+| **mean** |   | **19.49** | **43.55** | **6.53** |
+
+### RTX 2080 Ti per-prompt — Math500 (10 samples)
+
+| # | n_tok | AR    | DFlash | AL   |
+|:-:|:-----:|:-----:|:------:|:----:|
+| 01| 257   | 19.70 |  42.64 | 6.40 |
+| 02| 53    | 19.80 |  49.53 | 7.31 |
+| 03| 40    | 19.96 |  52.76 | 8.00 |
+| 04| 50    | 19.49 | **62.08** | **9.48** |
+| 05| 117   | 17.85 |  43.69 | 6.56 |
+| 06| 76    | 19.87 |  45.42 | 6.74 |
+| 07| 43    | 20.05 |  42.57 | 6.40 |
+| 08| 79    | 19.42 |  51.86 | 7.76 |
+| 09| 52    | 20.02 |  39.34 | 5.82 |
+| 10| 57    | 20.53 |  60.18 | 8.53 |
+| **mean** |   | **19.67** | **49.01** | **7.30** |
+
+### RTX 2080 Ti vs RTX 3090 comparison
+
+| Metric           | RTX 3090 | RTX 2080 Ti | Ratio |
+|------------------|:--------:|:-----------:|:-----:|
+| AR tok/s (HE)    | 37.78    | 19.88       | 0.53× |
+| DFlash tok/s (HE)| 129.52   | 53.42       | 0.41× |
+| Mem BW            | 936 GB/s | 616 GB/s   | 0.66× |
+| SMs               | 82       | 68          | 0.83× |
+| VRAM              | 24 GB    | 22 GB       | 0.92× |
+
+AR scaling (~0.53×) tracks bandwidth × SM count. DFlash scaling (~0.41×) is lower because the draft compute bottleneck is proportionally larger on a slower GPU, even after the BF16→FP16 fix. Acceptance length is identical (same draft model, same tokens), confirming the FP16 conversion is numerically faithful.
+
+## RTX 5090 (Blackwell, sm_120/sm_120a, 32 GB)
+
+Single RTX 5090 32 GB, CUDA 13.0.88, driver 595.58.03.
+Target: `unsloth/Qwen3.6-27B-GGUF` (`Qwen3.6-27B-UD-Q5_K_XL.gguf`, ~19 GB).
+Draft:  local Qwen3.6-27B DFlash safetensors (`model.safetensors`, ~3.3 GB).
+Concurrency = 1, greedy decoding, `n_gen=256`.
+
+Build: `cmake -B build-luce-sm120 -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 -DDFLASH27B_USER_CUDA_ARCHITECTURES=120 -DDFLASH27B_ENABLE_BSA=ON`
+Runtime: FP16/FP16 KV, FA window 4096, DDTree budget 22.
+
+These numbers use a newer Qwen3.6 Q5_K_XL target, so they are not an
+apples-to-apples hardware comparison with the RTX 3090 Qwen3.5 Q4_K_M run
+above.
+
+### RTX 5090 headline
+
+| Task      | AR tok/s | DFlash tok/s | AL   | Speedup |
+|-----------|:--------:|:------------:|:----:|:-------:|
+| HumanEval | 58.25    | **218.23**   | 7.12 | **3.75×** |
+| Math500   | 57.57    | **219.06**   | 7.31 | **3.80×** |
+| GSM8K     | 58.39    | **179.07**   | 5.88 | **3.07×** |
+
+### RTX 5090 per-prompt — HumanEval (10 samples)
+
+| # | n_tok | AR    | DFlash | AL    |
+|:-:|:-----:|:-----:|:------:|:-----:|
+| 01| 84    | 59.13 | 225.95 | 7.31  |
+| 02| 138   | 57.28 | 207.92 | 6.74  |
+| 03| 134   | 56.82 | 238.37 | 7.76  |
+| 04| 120   | 58.92 | **332.94** | **11.13** |
+| 05| 172   | 58.93 | 237.91 | 7.76  |
+| 06| 118   | 58.25 | 147.64 | 4.74  |
+| 07| 51    | 58.24 | 197.95 | 6.40  |
+| 08| 141   | 58.21 | 196.54 | 6.40  |
+| 09| 125   | 58.39 | 243.31 | 8.00  |
+| 10| 95    | 58.31 | 153.74 | 4.92  |
+| **mean** |   | **58.25** | **218.23** | **7.12** |
+
+Peak per-prompt: **332.94 tok/s at AL 11.13** (5.65× over AR on the same prompt).
+
+### RTX 5090 per-prompt — GSM8K (10 samples)
+
+| # | n_tok | AR    | DFlash | AL   |
+|:-:|:-----:|:-----:|:------:|:----:|
+| 01| 45    | 58.62 | 188.94 | 6.10 |
+| 02| 111   | 58.94 | 202.09 | 6.56 |
+| 03| 49    | 58.88 | 211.92 | 7.06 |
+| 04| 70    | 58.14 | 153.83 | 4.92 |
+| 05| 102   | 58.12 | 160.01 | 5.12 |
+| 06| 118   | 58.19 | 187.03 | 6.10 |
+| 07| 113   | 58.26 | 166.77 | 5.80 |
+| 08| 50    | 58.37 | **217.12** | **7.11** |
+| 09| 43    | 58.20 |  86.08 | 2.93 |
+| 10| 96    | 58.13 | 216.96 | 7.11 |
+| **mean** |   | **58.39** | **179.07** | **5.88** |
+
+### RTX 5090 per-prompt — Math500 (10 samples)
+
+| # | n_tok | AR    | DFlash | AL   |
+|:-:|:-----:|:-----:|:------:|:----:|
+| 01| 257   | 58.15 | 214.23 | 7.11 |
+| 02| 53    | 58.23 | 197.71 | 6.40 |
+| 03| 40    | 58.80 | 232.61 | 7.53 |
+| 04| 50    | 59.00 | 191.89 | 6.24 |
+| 05| 117   | 58.27 | **273.97** | **9.14** |
+| 06| 76    | 55.89 | 195.37 | 6.74 |
+| 07| 43    | 56.89 | 250.16 | 8.26 |
+| 08| 79    | 57.26 | 224.60 | 7.53 |
+| 09| 52    | 56.56 | 170.18 | 6.12 |
+| 10| 57    | 56.68 | 239.89 | 8.00 |
+| **mean** |   | **57.57** | **219.06** | **7.31** |
+
+### RTX 5090 DDTree budget sweep
+
+Fast HumanEval sweep, 10 prompts, `n_gen=128`, same target/draft, FP16/FP16 KV,
+FA window 4096.
+
+| Budget | Mean AL | Mean tok/s |
+|:------:|:-------:|:----------:|
+| 15     | 4.99    | 174.45     |
+| 16     | 5.76    | 176.98     |
+| 18     | 6.93    | 206.62     |
+| 20     | 6.94    | 204.03     |
+| **22** | **7.25**| **211.20** |
+| 24     | 7.19    | 203.08     |
+| 26     | 7.09    | 199.96     |
+| 30     | 7.44    | 206.19     |
+| 32     | 6.87    | 183.34     |
+| 40     | 6.97    | 174.52     |
+| 48     | 7.07    | 165.24     |
+| 64     | 7.14    | 148.12     |
+
+Budget 12 failed all prompts with a ggml shape assertion. Budget 22 remains the
+best short-context throughput default on this 5090 build. Budget 30 produced
+the highest mean AL but lower throughput, so it is a quality-biased experiment
+rather than the base setting.
+
+## RTX 5090 — Q4_K_M, DDTree budget 40, no-thinking (community)
+
+Single RTX 5090 32 GB GDDR7 (sm_120, 1792 GB/s), CUDA 12.8, Windows 11.
+Target: `unsloth/Qwen3.6-27B-GGUF` (`Qwen3.6-27B-Q4_K_M.gguf`, ~15.7 GB).
+Draft:  `z-lab/Qwen3.6-27B-DFlash` safetensors (~3.2 GB).
+Concurrency = 1, greedy decoding, `n_gen=256` (HumanEval/GSM8K), `n_gen=2048` (Math500).
+
+Build: MSVC 14.41, `cmake -DCMAKE_CUDA_ARCHITECTURES=120 -DBUILD_SHARED_LIBS=OFF`,
+BSA enabled.
+Runtime: default KV (auto), DDTree budget 40, `--no-thinking` (chat template
+with `enable_thinking=False`).
+
+Q4_K_M is a direct quant match with the RTX 3090 headline numbers above.
+Budget 40 was swept as optimal for the 5090's 170 SMs + 1792 GB/s bandwidth
+(vs budget 22 on the 3090's 82 SMs + 936 GB/s). Thinking is disabled because
+the DFlash drafter was trained on Qwen3.5 output with thinking disabled; `<think>` tokens
+tank acceptance rate.
+
+### RTX 5090 Q4_K_M headline
+
+| Task      | AR tok/s | DFlash tok/s | AL    | Speedup |
+|-----------|:--------:|:------------:|:-----:|:-------:|
+| HumanEval | 42.34    | **205.02**   | 12.93 | **4.84×** |
+| Math500   | 42.50    | **182.68**   | 9.70  | **4.30×** |
+| GSM8K     | 42.65    | **153.08**   | 8.20  | **3.59×** |
+
+Math500 score: 10/10 (using `\boxed{}` extraction).
+
+### RTX 5090 Q4_K_M per-prompt — HumanEval (10 samples)
+
+| # | n_tok | AR    | DFlash | AL    |
+|:-:|:-----:|:-----:|:------:|:-----:|
+| 01|  94   | 41.74 | 211.11 | 15.17 |
+| 02| 148   | 42.09 | 177.62 |  9.48 |
+| 03| 144   | 42.13 | 247.98 | 15.80 |
+| 04| 130   | 41.42 | 209.79 | 14.00 |
+| 05| 182   | 42.64 | 197.49 | 10.67 |
+| 06| 128   | 42.44 | 226.57 | 14.40 |
+| 07|  61   | 42.93 | 208.07 | 14.33 |
+| 08| 151   | 43.05 | 195.22 | 10.24 |
+| 09| 135   | 42.59 | 167.76 |  9.16 |
+| 10| 105   | 42.39 | 208.57 | 16.00 |
+| **mean** |   | **42.34** | **205.02** | **12.93** |
+
+Peak per-prompt: **247.98 tok/s at AL 15.80** (5.89× over AR).
+
+### RTX 5090 Q4_K_M per-prompt — GSM8K (10 samples)
+
+| # | n_tok | AR    | DFlash | AL    |
+|:-:|:-----:|:-----:|:------:|:-----:|
+| 01|  56   | 42.58 | 176.79 |  9.14 |
+| 02| 122   | 42.43 | 139.01 |  7.11 |
+| 03|  60   | 42.87 | 150.98 |  8.43 |
+| 04|  81   | 42.76 | 187.87 | 10.24 |
+| 05| 113   | 42.83 | 116.41 |  6.16 |
+| 06| 129   | 42.55 | 132.95 |  6.92 |
+| 07| 124   | 42.39 | 176.73 | 10.11 |
+| 08|  61   | 42.77 | 151.45 |  8.00 |
+| 09|  54   | 42.76 | 143.34 |  7.90 |
+| 10| 107   | 42.54 | 155.26 |  8.00 |
+| **mean** |   | **42.65** | **153.08** | **8.20** |
+
+### RTX 5090 Q4_K_M per-prompt — Math500 (10 samples)
+
+| # | n_tok | AR    | DFlash | AL    |
+|:-:|:-----:|:-----:|:------:|:-----:|
+| 01| 276   | 42.42 | 141.11 |  7.64 |
+| 02|  72   | 42.56 | 183.87 |  9.41 |
+| 03|  59   | 42.83 | 194.73 | 10.66 |
+| 04|  69   | 41.75 | 178.42 |  9.89 |
+| 05| 136   | 42.86 | 206.66 | 11.00 |
+| 06|  95   | 42.29 | 150.41 |  8.13 |
+| 07|  62   | 42.39 | 168.75 |  8.71 |
+| 08|  98   | 42.74 | 203.99 | 10.75 |
+| 09|  71   | 42.37 | 203.77 | 10.64 |
+| 10|  76   | 42.79 | 195.07 | 10.12 |
+| **mean** |   | **42.50** | **182.68** | **9.70** |
+
+### RTX 5090 Q4_K_M — 3090 vs 5090 comparison
+
+Both runs use Q4_K_M target, same `bench_llm.py` methodology (10 samples per
+task, seed=42 shuffle, greedy decoding). Budget tuned per-GPU.
+
+| Metric             | 3090 (budget=22) | 5090 (budget=40) | Ratio   |
+|--------------------|:----------------:|:----------------:|:-------:|
+| AR tok/s (HE)      | 37.78            | 42.34            | 1.12×   |
+| DFlash tok/s (HE)  | 129.52           | **205.02**       | **1.58×** |
+| AL (HE)            | 8.31             | 12.93            | 1.56×   |
+| AR tok/s (Math500)  | 37.71            | 42.50            | 1.13×   |
+| DFlash tok/s (Math500) | 110.51        | **182.68**       | **1.65×** |
+| AR tok/s (GSM8K)   | 37.65            | 42.65            | 1.13×   |
+| DFlash tok/s (GSM8K) | 96.15           | **153.08**       | **1.59×** |
+| Mem BW             | 936 GB/s         | 1792 GB/s        | 1.91×   |
+| SMs                | 82               | 170              | 2.07×   |
+| VRAM               | 24 GB            | 32 GB            | 1.33×   |
+
+AR scaling (~1.13×) is modest — the larger model already saturates bandwidth
+on the 3090. DFlash scaling (~1.6×) is super-linear relative to AR because
+higher bandwidth lets more speculative tokens survive per verify step.
+
+The AL difference (12.93 vs 8.31 on HumanEval) reflects two factors: budget 40
+vs 22 (wider tree captures more tokens per step), and `--no-thinking` on the
+5090 run (drafter predicts non-thinking output much better, since it was trained
+on Qwen3.5 output with thinking disabled). The 3090 run also used Qwen3.5 with
+thinking disabled (server default), so the comparison is fair: both runs generate non-thinking output.
+
+### RTX 5090 Q4_K_M DDTree budget sweep
+
+5 HumanEval prompts, `n_gen=256`, `--no-thinking`, same Q4_K_M target/draft as
+the headline numbers above.
+
+| Budget | Mean AL | Mean tok/s |
+|:------:|:-------:|:----------:|
+| 22     | 9.01    | 189.18     |
+| 28     | 9.20    | 186.87     |
+| 32     | 9.75    | 194.95     |
+| 36     | 9.75    | 193.70     |
+| **40** | **10.07** | **197.10** |
+| 48     | 10.07   | 183.99     |
+
+Budget 40 peaks at 197.10 tok/s. AL saturates at 10.07 between budget 40 and
+48, but 48 regresses on throughput (verify cost outpaces accept gain). Budget 28
+also regresses vs 22 — the useful jump is 22→32. The 32–36–40 plateau is within
+~2% (run-to-run noise); 40 is chosen because it has the highest mean and AL is
+at saturation.
+
+## Laguna-XS.2 target on RTX 3090 (Poolside MoE, Q4_K_M)
+
+Hand-rolled CUDA forward (Path A, ggml-only) for the 40-layer / 256-expert
+Laguna-XS.2 target. Loader pins 678 tensors at 18.77 GiB on GPU + 110 MiB
+tok_embd CPU-only, leaving room for KV cache and PFlash drafter activations
+in 24 GB. Drafter for compression: Qwen3-0.6B BF16 GGUF (Qwen tokenizer
+cross-mapped to Laguna BPE).
+
+### Dense TTFT (no PFlash compression, full chunked prefill)
+
+Measured with `bench_laguna_ttft`, `DFLASH_KV_TYPE=q4_0` for ctx > 32K, default
+chunk=4096 except where noted (smaller chunks needed at long ctx to keep the
+activation alloc inside 24 GB):
+
+| Context | KV   | chunk | TTFT (s) | tok/s   |
+|--------:|:----:|:-----:|---------:|--------:|
+|   4 096 | Q8_0 | 4096  |     1.04 |  3 932  |
+|  16 384 | Q8_0 | 4096  |     5.71 |  2 867  |
+|  32 768 | Q4_0 | 2048  |    19.26 |  1 701  |
+|  65 536 | Q4_0 | 1024  |    53.17 |  1 233  |
+|  65 536 | Q4_0 | 2048  |    51.33 |  1 277  |
+
+65K @ chunk=4096 OOMs on a 24 GB 3090 because the F32 mask alone needs ~1 GB;
+use chunk=1024 or 2048 for ctx > 32K. PFlash compression (below) bypasses the
+problem by feeding the target a much smaller compressed prompt.
+
+### NIAH single-needle retrieval with PFlash compression (depth=0.5)
+
+`scripts/laguna_pflash_niah.py` orchestrates haystack → drafter compress →
+cross-tokenizer round-trip with word-boundary recovery → Laguna prefill →
+decode → grep needle. The drafter scores Qwen3 token chunks; the
+word-boundary helper expands each kept run outward to whitespace before
+re-tokenizing as Laguna IDs, so multi-token needles like `BLUEHORIZON-7421`
+survive aggressive `keep` ratios.
+
+| Context | KV   | keep | drafter (s) | target prefill (s) | end-to-end TTFT | NIAH |
+|--------:|:----:|:----:|------------:|-------------------:|----------------:|:----:|
+|   4 096 | Q8_0 | 0.10 |        1.54 |               0.39 |          1.92 s |  ✅  |
+|  16 384 | Q8_0 | 0.10 |        1.27 |               0.51 |          1.78 s |  ✅  |
+|  16 384 | Q8_0 | 0.20 |        1.20 |               0.91 |          2.11 s |  ✅  |
+|  32 768 | Q4_0 | 0.10 |        2.08 |               0.91 |          2.99 s |  ✅  |
+|  32 768 | Q4_0 | 0.20 |        2.06 |               1.97 |          4.03 s |  ❌ (synthetic-NIAH variance; keep=0.10 PASS) |
+|  65 536 | Q4_0 | 0.10 |        ~5   |                ~6  |           ~11 s |  ✅  |
+|  65 536 | Q4_0 | 0.20 |        ~5   |                ~8  |           ~13 s |  ✅  |
+|  65 536 | Q4_0 | 0.30 |        ~5   |                ~10 |           ~15 s |  ✅  |
+|  65 536 | Q4_0 | 0.50 |        ~5   |                ~17 |           ~22 s |  ✅  |
+| 131 072 | Q4_0 | 0.10 |       11.11 |               4.79 |         15.91 s |  ✅  |
+| 131 072 | Q4_0 | 0.20 |       11.20 |              13.55 |         24.75 s |  ✅  |
+| 131 072 | Q4_0 | 0.30 |       11.41 |              26.43 |         37.84 s |  ✅  |
+
+Decode is autoregressive (~96 tok/s @ ctx=4K, ~27 tok/s @ ctx=131K) until a
+matched Laguna spec-decode draft model is published; the dflash daemon's
+draft-loaded path is reserved for that future drop-in.
+
+### Sampler smoke (test_laguna_daemon, prompt = "Tell me a one-line haiku about clouds.")
+
+| samp= tail                  | first 90 chars of decode |
+|-----------------------------|--------------------------|
+| (none, greedy)              | `Fluffy white giants / Sail through the sky on gentle / Wings of summer breeze` |
+| `2.0,1.0,0,1.0,42`          | `requires_blog_proxygps … setUser dirs feedbackUse thin covsyl Banks/mythtv MITMially beac` |
+| `2.0,1.0,0,1.0,43`          | `Phantom ships sail cre ways—.permissions['agrant\` paramount Then never Streaming Home>s` |
+| `1.0,0.5,0,1.0,99` (top_p)  | `Clouds drift like cotton dreams floating through the sky.` |
+
+Four distinct outputs from the same prompt confirms the rep_penalty → top_k
+→ softmax(temp) → top_p → draw chain is wired correctly end to end.
+
+### Speedup at 128K context (RTX 3090, Q4_K_M target, Q4_0 KV, FA on)
+
+| Path                                  |  Time @ 131072 | tok/s    | Notes |
+|---------------------------------------|---------------:|---------:|-------|
+| llama.cpp pp131072 (vendored fork)    |       86.60 s  |  1513.4  | `llama-bench -p 131072 -n 0 -ctk q4_0 -ctv q4_0 -fa 1 -t 8 -r 1 -ngl 99` |
+| dflash + PFlash keep=0.10 (end-to-end)|       15.91 s  |  8 240   | drafter compress 11.11s + target prefill 4.79s |
+| dflash target prefill only            |        4.79 s  | 27 364   | effective on the 131 072-token original prompt (target processes 13 120 compressed) |
+
+Headline: **dflash PFlash gives 5.4× faster TTFT than llama.cpp at 131K
+context** end-to-end on a 24 GB RTX 3090. The target prefill alone runs
+18.1× faster because PFlash compression has reduced the effective input
+length from 131 072 tokens to 13 120 (10× token-count drop). The drafter
+adds 11 s of fixed overhead which dominates at long context but folds
+below 1× of the target prefill cost as the haystack shrinks (4K @ keep=0.10
+spends 1.5 s drafter + 0.4 s target, net 1.92 s vs llama.cpp 1.7 s).
+
+**Reproducing the 11.11 s drafter number requires Block-Sparse Attention
+on the Qwen3-0.6B drafter forward.** The PflashDaemon Python wrapper sets
+these env vars by default; the dflash daemon honours them at runtime but
+does not force them, so any caller (including `scripts/server.py`) is free
+to opt out:
+
+```bash
+export DFLASH_FP_USE_BSA=1     # mit-han-lab BSA, FA-2 derived (sm_80+)
+export DFLASH_FP_ALPHA=0.85    # importance-score temperature
+```
+
+Without BSA the drafter falls back to dense attention and the 131 K
+drafter forward becomes multi-minute (O(N²) work). At ctx ≤ 8 K the
+fallback is fast enough that BSA is optional.
+
+### Parity vs HF reference (deferred)
+
+`scripts/parity_laguna.py` runs identical token IDs through the dflash
+daemon and a Hugging Face `LagunaForCausalLM` reference loaded from
+`poolside/Laguna-XS.2`, then reports last-position argmax agreement at
+4K—128K context. Cannot be run on a single 24 GB GPU because the BF16
+reference weighs ~37 GiB; pin to an A6000 / H100 (or use CPU offload) to
+produce the cos-sim numbers. The dflash forward itself was originally
+verified to match `llama.cpp build_laguna` for 30+ tokens during the
+scaffold-time bring-up (see `Lucebox/Laguna-XS.2-GGUF` README). The NIAH
+table above functions as the in-PR functional sanity check at 4K–131K.
+## RTX 5090 (Blackwell, sm_120/sm_120a, 32 GB) — long-context NIAH
+
+> **Companion to the short-context RTX 5090 section** (HumanEval / Math500 /
+> GSM8K, added in #86). That section validates speculative decoding on
+> short prompts where PFlash compression is not engaged; this one validates
+> the full PFlash drafter scoring + ~20× compression + DFlash decode
+> pipeline at 117K tokens.
+
+Single RTX 5090 32 GB, CUDA 13.2, driver 595.58.
+Target: `unsloth/Qwen3.6-27B-GGUF` (`Qwen3.6-27B-Q4_K_M.gguf`, ~16.8 GB).
+Q4_K_M (vs Q5_K_XL in the short-context section above) leaves more
+VRAM headroom for the FP16 KV cache at 117K context.
+Draft: local Qwen3.6-27B DFlash safetensors + Qwen3-0.6B-BF16 PFlash drafter.
+
+Build: `cmake -B build-luce-sm120 -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 -DDFLASH27B_USER_CUDA_ARCHITECTURES=120 -DDFLASH27B_ENABLE_BSA=ON`
+
+Final ("V4") runtime config — driven via the `pflash/tests/bench_niah_cpp.py`
+CLI flags added in #90 plus daemon env vars (each bullet leads with the
+exact interface):
+
+- `--keep-ratio=0.05` (PFlash compression target ratio)
+- `DFLASH_FP_USE_BSA=1` and `DFLASH_FP_ALPHA=0.70` (BSA enabled, block-selection threshold; both are daemon env vars)
+- `--ddtree-budget=22`
+- `--fa-window=4096` (also settable via `DFLASH27B_FA_WINDOW=4096`)
+- `--kv-tq3=0` (Q8_0 KV cache — the daemon default when TQ3_0 is disabled and no other KV type is set; 5090 has VRAM headroom so TQ3_0 isn't needed)
+- `--n-gen=1024`
+
+Test set: 10 NIAH prompts at 117K tokens (margin under Qwen3.6-27B's 131K
+native RoPE limit, generated with [`pflash/tests/niah_gen.py`](../pflash/tests/niah_gen.py)
+at calibrated `char_per_tok`).
+
+### RTX 5090 long-ctx headline
+
+| Metric                 | Value                              |
+|------------------------|------------------------------------|
+| NIAH accuracy          | **20/20** across 2 runs of n=10    |
+| Decode throughput      | 210.7 tok/s avg (range 179–230)    |
+| TTFT                   | 10.0 s                             |
+| Compression            | 20.2× (117064 → 5800 tokens)       |
+| Prefill (compressed)   | 3.9 s for ~5800 tokens             |
+| Drafter score+migrate  | ~5.8 s                             |
+
+These headline numbers are the **Phase 4 reliability run** at the V4 config
+above (n=20 across 2 independent runs of 10 prompts each). The three
+exploratory sweeps below — alpha, then budget, then keep — are what
+*selected* the V4 config; each table holds the non-swept parameters at the
+values discovered in the prior phase, so the swept-axis throughput numbers
+are not directly comparable to the headline (different keep ratios produce
+different per-step decode rates, see the keep-ratio table below).
+
+### Phase 1 — `DFLASH_FP_ALPHA` sweep (held: `--keep-ratio=0.08`, `--ddtree-budget=28`)
+
+| `DFLASH_FP_ALPHA` | NIAH    | Decode tok/s |
+|:-----------------:|:-------:|:------------:|
+| 0.60              | 10/10   | 213.7        |
+| **0.70**          | 10/10   | 210.6        |
+| 0.85              | **8/10**| 204.6        |
+
+The docs default of `DFLASH_FP_ALPHA=0.85` fails 2/10 prompts at this
+setup. This may be specific to long context, Qwen3.6, or Blackwell — I
+have not isolated which. Validating alpha per setup is recommended. I
+chose 0.70 over 0.60 for reliability margin: 0.60 wins decode by only
+1.5%, below the run-to-run variance, on an n=10 sample.
+
+### Phase 2 — budget sweep (held: `DFLASH_FP_ALPHA=0.70`, `--keep-ratio=0.08`)
+
+| `--ddtree-budget` | NIAH | Decode tok/s |
+|:-----------------:|:----:|:------------:|
+| **22**            | 10/10| **217.4**    |
+| 28                | 10/10| 210.7        |
+| 30                | 10/10| 211.1        |
+
+#86's short-context budget sweep above on the same 5090 build also lands
+on budget=22 as throughput-optimal (211.20 mean tok/s at AL 7.25). So
+**budget=22 is a stable default for Qwen3.6-27B on Blackwell across
+context regimes**, not a knob that needs per-context-length tuning. This
+is the most useful cross-reference between the two sections.
+
+### Phase 3 — keep-ratio sweep (held: `DFLASH_FP_ALPHA=0.70`, `--ddtree-budget=22`)
+
+| `--keep-ratio` | NIAH    | Decode tok/s | TTFT    | Compression |
+|:--------------:|:-------:|:------------:|:-------:|:-----------:|
+| **0.05**       | 10/10   | 210.4        | 10.0 s  | 20.2×       |
+| 0.06           | 10/10   | 212.1        | 10.5 s  | 16.8×       |
+| 0.08           | 10/10   | 216.5        | 13.0 s  | 12.6×       |
+
+`--keep-ratio=0.08` wins per-token throughput by ~3% but pays 30% more
+TTFT and gives up 38% of the compression. For the 117K NIAH workload I
+chose 0.05 to optimize end-to-end response latency; 0.08 is preferable
+when sustained throughput on already-compressed prompts dominates.
+
+### Note on `--kv-tq3`
+
+I set `--kv-tq3=0`, which leaves the daemon at its Q8_0 KV-cache default
+(no `DFLASH27B_KV_K`/`DFLASH27B_KV_V` overrides). The 3-bit TQ3_0 cache
+trades VRAM for memory bandwidth; on a 5090 with 32 GB and ~22 GB peak
+usage at 117K, that trade isn't worth taking. Users on 4090 or 3090
+(24 GB) at this context length should likely keep `--kv-tq3=1`. To go
+further than Q8_0 in either direction set the K/V types explicitly via
+`DFLASH27B_KV_K=<type> DFLASH27B_KV_V=<type>`.
+
+## RTX 4090 (Ada, sm_89, 24 GB) — WSL2 (community)
+
+Single RTX 4090 24 GB, CUDA 13.2, driver 596.21, WSL2 (Ubuntu) on Windows 11.
+i7-13700K, 64 GB host RAM (32 GB WSL allocation).
+Build: `cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89 -DDFLASH27B_ENABLE_BSA=ON`
+Models on native ext4 (`/home/`), not NTFS `/mnt/` (9P filesystem bottlenecks model loading).
+
+### Qwen3.5-27B Q4_K_M — RTX 4090 headline
+
+Target: `unsloth/Qwen3.5-27B-GGUF` (`Qwen3.5-27B-Q4_K_M.gguf`, ~16 GB).
+Draft:  `spiritbuun/Qwen3.5-27B-DFlash-GGUF` (`dflash-draft-q4_k_m.gguf`, 986 MB).
+Concurrency = 1, greedy decoding, `n_gen=256`, `bench_he.py`.
+
+| Task      | AR tok/s | DFlash tok/s | AL   | Speedup |
+|-----------|:--------:|:------------:|:----:|:-------:|
+| HumanEval | 32.20    | **125.37**   | 7.77 | **3.89×** |
+
+AR = `test_generate`, DFlash = DDTree budget 28 + fast rollback.
+
+### Qwen3.5-27B DDTree budget sweep (HumanEval, n_gen=256)
+
+| Budget | Mean AL | Mean tok/s |
+|:------:|:-------:|:----------:|
+| 22     | 7.45    | 122.95     |
+| 26     | 7.60    | 123.68     |
+| **28** | **7.77**| **125.37** |
+| 30     | 7.62    | 123.12     |
+| 34     | 7.28    | 111.76     |
+
+Budget 28 is optimal on 4090 (vs 22 on 3090). The 4090's 72 MB L2 cache (vs 3090's
+6 MB) lets the DDTree verification working set stay in cache, enabling larger trees
+without DRAM bandwidth penalties.
+
+### Qwen3.6-27B Q4_K_M — RTX 4090 headline
+
+Target: `unsloth/Qwen3.6-27B-GGUF` (`Qwen3.6-27B-Q4_K_M.gguf`, ~16 GB).
+Draft:  `Lucebox/Qwen3.6-27B-DFlash-GGUF` (`dflash-draft-3.6-q8_0.gguf`, 1.8 GB).
+Concurrency = 1, greedy decoding, `n_gen=256`, `bench_he.py`.
+
+| Task      | AR tok/s | DFlash tok/s | AL   | Speedup |
+|-----------|:--------:|:------------:|:----:|:-------:|
+| HumanEval | 33.74    | **84.55**    | 5.32 | **2.51×** |
+
+AR = `test_generate`, DFlash = DDTree budget 36 + fast rollback.
+
+### Qwen3.6-27B DDTree budget sweep (HumanEval, n_gen=256)
+
+| Budget | Mean AL | Mean tok/s |
+|:------:|:-------:|:----------:|
+| 22     | 4.85    |  79.65     |
+| 26     | 5.00    |  82.37     |
+| 28     | 4.99    |  82.46     |
+| 30     | 5.06    |  79.82     |
+| 34     | 5.17    |  83.00     |
+| 35     | 5.20    |  83.12     |
+| **36** | **5.32**| **84.55**  |
+| 37     | 5.32    |  84.30     |
+| 38     | 5.32    |  82.80     |
+
+Budget 36 is optimal for Qwen3.6 on 4090. AL saturates at 5.32 from budget 36+.
+The lower AL vs Qwen3.5 (5.32 vs 7.77) reflects the Qwen3.6 drafter still being
+under training per the [HuggingFace model card](https://huggingface.co/z-lab/Qwen3.6-27B-DFlash).
+
+### Qwen3.6-27B per-prompt breakdown (budget=36)
+
+| # | prompt                    | steps | AL   | tok/s  |
+|:-:|---------------------------|:-----:|:----:|:------:|
+| 01| has_close_elements        |  31   | 8.26 | 132.36 |
+| 02| separate_paren_groups     |  46   | 5.57 |  91.10 |
+| 03| truncate_number           |   0   | 0.00 |   0.00 |
+| 04| below_zero                |  46   | 5.57 |  90.15 |
+| 05| mean_absolute_deviation   |  37   | 6.92 | 109.82 |
+| 06| intersperse               |  40   | 6.40 | 101.67 |
+| 07| parse_nested_parens       |  32   | 8.00 | 127.26 |
+| 08| filter_by_substring       |  43   | 5.95 |  91.74 |
+| 09| sum_product               |   0   | 0.00 |   0.00 |
+| 10| rolling_max               |  39   | 6.56 | 105.53 |
+| **mean** |                    |       |**5.32**|**84.96**|
+
+Prompts 03 (truncate_number) and 09 (sum_product) emit EOS immediately (0 generated
+tokens). Excluding those: **106.2 tok/s mean** across 8 active prompts.
+
+### RTX 4090 vs RTX 3090 comparison (Qwen3.5-27B Q4_K_M)
+
+| Metric             | 3090 (budget=22) | 4090 WSL2 (budget=28) | Ratio   |
+|--------------------|:----------------:|:---------------------:|:-------:|
+| AR tok/s (HE)      | 37.78            | 32.20                 | 0.85×   |
+| DFlash tok/s (HE)  | 129.52           | **125.37**            | **0.97×** |
+| AL (HE)            | 8.31             | 7.77                  | 0.94×   |
+| Mem BW             | 936 GB/s         | 1008 GB/s             | 1.08×   |
+| SMs                | 82               | 128                   | 1.56×   |
+| L2 Cache           | 6 MB             | 72 MB                 | 12×     |
+| VRAM               | 24 GB            | 24 GB                 | 1.0×    |
+
+AR is 15% slower on 4090 WSL2 — likely WSL2 overhead (pin_memory=False, 9P bridge
+latency). DFlash is within 3% because the larger L2 cache compensates. Bare metal
+Linux 4090 should match or exceed the 3090 numbers.
+
+### WSL2 notes
+
+- **Always use native ext4 (`/home/`) for model files.** NTFS mounts (`/mnt/`) via
+  WSL2's 9P filesystem showed 9% CPU utilization and 337K voluntary context switches
+  during model loading (vs 85%+ on ext4).
+- WSL2 forces `pin_memory=False`, adding ~3–5% decode overhead vs bare metal.
+- Building CUDA binaries under WSL2 works correctly with `-DCMAKE_CUDA_ARCHITECTURES=89`.
+  CUDA toolkit path must be in `$PATH` (`/usr/local/cuda-13.2/bin`).
+
+### Server-mode reference (not apples-to-apples with bench_he.py)
+
+Running via `server.py` (OpenAI-compatible HTTP) with TQ3 KV cache and 128K context:
+
+```bash
+DFLASH27B_KV_TQ3=1 python dflash/scripts/server.py \
+  --target Qwen3.6-27B-Q4_K_M.gguf --draft dflash-draft-3.6-q8_0.gguf \
+  --port 8082 --budget 28 --max-ctx 131072
+```
+
+54.7 tok/s at C=1 with 150 mixed chat prompts (short/medium/long, SSE streaming).
+Server-mode is ~35% slower than direct binary due to HTTP/JSON/SSE overhead, Python
+FastAPI GIL, and mixed prompt distribution (vs uniform HumanEval code stubs).
+Quality: 7/7 on 10 complex queries (math, code, reasoning, knowledge, creative).

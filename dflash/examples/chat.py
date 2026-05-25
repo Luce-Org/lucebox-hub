@@ -15,7 +15,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-TARGET = ROOT / "models" / "Qwen3.5-27B-Q4_K_M.gguf"
+TARGET = Path(os.environ.get(
+    "DFLASH_TARGET",
+    str(ROOT / "models" / "Qwen3.6-27B-Q4_K_M.gguf"),
+))
 DRAFT_ROOT = ROOT / "models" / "draft"
 BIN = ROOT / "build" / ("test_dflash.exe" if sys.platform == "win32" else "test_dflash")
 
@@ -82,7 +85,7 @@ def stream_generate(tok, bin_path: Path, target: Path, draft: Path,
 def main():
     if not BIN.is_file():
         sys.exit(f"binary not found at {BIN}. Build: "
-                 "cmake -B build -S . -DCMAKE_CUDA_ARCHITECTURES=86 && "
+                 "cmake -B build -S . -DCMAKE_BUILD_TYPE=Release && "
                  "cmake --build build --target test_dflash -j")
     if not TARGET.is_file():
         sys.exit(f"target GGUF not found at {TARGET}")

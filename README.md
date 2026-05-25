@@ -9,22 +9,179 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-e8e8ed?style=for-the-badge&labelColor=090909" alt="MIT"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-e8e8ed?style=for-the-badge&labelColor=090909" alt="Apache 2.0"></a>
   <a href="https://developer.nvidia.com/cuda-toolkit"><img src="https://img.shields.io/badge/CUDA-12%2B-76b900?style=for-the-badge&logo=nvidia&logoColor=76b900&labelColor=090909" alt="CUDA 12+"></a>
+  <a href="https://rocm.docs.amd.com/projects/HIP/en/latest/"><img src="https://img.shields.io/badge/HIP-7%2B-ed1c24?style=for-the-badge&logo=amd&logoColor=ed1c24&labelColor=090909" alt="HIP 7+"></a>
   <a href="https://isocpp.org"><img src="https://img.shields.io/badge/C%2B%2B-17-e8e8ed?style=for-the-badge&logo=cplusplus&logoColor=e8e8ed&labelColor=090909" alt="C++17"></a>
 </p>
 
 <p align="center">
-  <strong>Open LLM inference, rewritten by hand for one specific chip at a time.</strong><br/>
-  Kernels, speculative decoding, and quantization, tailored per target.<br/>
-  We don't wait for better silicon. We rewrite the software.
+  <strong>Local LLM inference server built for speed. Custom kernels, speculative prefill & decoding, quantized GGUF paths.</strong><br/>
+  Each project is a new optimization to our engine for a specific model family and hardware target.
 </p>
 
 ---
 
-## Inside the box
+## Quick start
 
-Two projects today, more coming. Each one is a self-contained release with its own benchmarks and paper-style writeup.
+The prebuilt Docker image covers CUDA 12.8-compatible NVIDIA GPUs. The
+host wrapper `lucebox.sh` probes your driver + GPU, selects the `:cuda12`
+image, and either runs the server foreground or
+manages it as a user systemd service. All orchestration logic — config,
+autotune, benchmarks, smoke tests, model download — lives in a typed
+Python CLI inside the image.
+
+```bash
+# 1. Install the host wrapper. ~80 lines of bash, zero deps beyond docker +
+#    nvidia-smi. No uv or Python required on the host.
+curl -fsSL https://raw.githubusercontent.com/Luce-Org/lucebox-hub/main/lucebox.sh \
+     -o ~/.local/bin/lucebox.sh && chmod +x ~/.local/bin/lucebox.sh
+
+# 2. Sanity check: driver, docker, NVIDIA Container Toolkit, VRAM, systemd.
+lucebox.sh check
+
+# 3. Pick image + autotune defaults. Writes ~/.lucebox/config.toml.
+lucebox.sh configure
+
+# 4. Pull the image (~14 GB).
+lucebox.sh pull
+
+# 5. Fetch the default target + DFlash draft (~17 GB) via the container —
+#    no host-side huggingface-cli install needed.
+lucebox.sh download-models
+
+# 6. Run the server. Either foreground:
+lucebox.sh serve
+#    …or install + start as a user systemd service:
+lucebox.sh install        # writes ~/.config/systemd/user/lucebox.service
+lucebox.sh start          # systemctl --user start lucebox
+lucebox.sh status         # journalctl-style status
+lucebox.sh logs           # follow the journal
+
+# 7. Use it.
+curl http://localhost:8080/v1/models
+```
+
+Prefer raw docker? `lucebox.sh print-run` emits the exact `docker run`
+command without executing — copy, tweak, paste. Or skip the wrapper
+entirely:
+
+```bash
+docker run --rm --gpus all -p 8080:8080 \
+    -v "$PWD/models:/opt/lucebox-hub/dflash/models" \
+    ghcr.io/luce-org/lucebox-hub:cuda12
+```
+
+The container falls back to VRAM-tiered autotune when env vars aren't
+supplied — ~112K ctx with TQ3_0 KV on a 24 GB card, full 128K on 32+ GB.
+
+### Hardware coverage
+
+| GPU                              | sm   | cuda12 |
+|----------------------------------|------|:------:|
+| RTX 2080 Ti                      | 75   | ✓      |
+| A100                             | 80   | ✓      |
+| RTX 3090 / A40 / A10             | 86   | ✓      |
+| RTX 4090 / L40                   | 89   | ✓      |
+| H100                             | 90   | ✓      |
+| RTX 5090 / RTX 5090 Laptop       | 120  | ✓      |
+
+Pre-Turing GPUs (Pascal sm_60/61, Volta sm_70) aren't supported — dflash's
+kernels assume sm_75+ with no fallback below.
+
+### Configuration
+
+`lucebox.sh configure` writes `~/.lucebox/config.toml` with VRAM-tiered
+heuristics; edit it, then `lucebox.sh start` (or `serve`). For a tuned
+config, run `lucebox.sh benchmark` after `pull`. The optimizer is organized as
+a progression:
+
+- `--profile level1` (default): start from conservative VRAM heuristics, sweep
+  selected tunables at the configured context, then require smoke capability,
+  short HTTP frontiers, and agentic tool-call validation before persisting.
+- `--profile level2`: sweep `DFLASH_MAX_CTX × DFLASH_BUDGET` plus any
+  requested cache/pFlash/lazy tunables, then choose the highest reliable
+  context that stays within the configured speed floor and passes the standard
+  validation gates.
+- `--profile level3`: stress validation for new architectures or code changes:
+  context-first sweep, repeated agentic tool calls, a multi-turn agentic
+  session, and broader HTTP frontier coverage before accepting aggressive
+  settings.
+
+Winning `DFLASH_BUDGET`, `DFLASH_MAX_CTX`, lazy-draft, prefix-cache, KV-cache,
+and pFlash values are merged back into `config.toml`; reports are written
+under `models/.lucebox/`. Use `--lazy-values`, `--prefix-cache-slots-values`,
+`--kv-values`, `--prefill-modes`, `--prefill-keep-ratios`, and
+`--prefill-thresholds` to widen the sweep. Use
+`--extra-suites http-frontiers,capability,ds4-eval,capability-long,agentic-tools,agentic-session` to
+attach validation suites to any profile; failed hard-gated suites reject the
+current candidate and the optimizer tries the next ranked candidate before
+leaving the config unchanged.
+`http-frontiers` is a DS4-bench-inspired HTTP probe, not antirez/ds4's
+`ds4-eval`; the `ds4-eval` suite ports all 92 embedded `ds4-eval` questions
+with the same `source/id` names, final-answer grading, and trace pattern for
+lucebox's HTTP API. It is score-only and uses the upstream-sized 16k-token
+generation budget with thinking enabled. `capability` remains the short lucebox
+API smoke gate.
+`agentic-session` is inspired by club-3090's coding-session benchmark and uses
+the Anthropic Messages wire shape emitted by Claude Code: streamed `tool_use`
+blocks followed by deterministic `tool_result` history. It tracks wall-bound
+first-content, wall-time, decode, and context-growth behavior as tool results
+accumulate across turns. `lucebox.sh profile --export-snapshot` updates the
+local append-only profile store, selects the newest matching artifact for each
+registered step, and writes the normalized tuning and benchmark format described
+in `dflash/docs/BENCHMARK_SNAPSHOT_SPEC.md`. Use `--force-refresh` to regenerate
+matching artifacts instead of reusing fresh results. Or override per-run via
+`-e VAR=value` on `docker run`:
+
+On WSL2, 24 GB-class NVIDIA GPUs default to a safer `DFLASH_MAX_CTX=65536`
+and `DFLASH_BUDGET=16`. Stress testing on a 3090 Ti showed that `114688/22`
+can leave only a few hundred MiB of VRAM headroom under repeated tool traffic,
+which is not enough for CUDA/VMM scratch allocations. Use
+`benchmark --profile level3` to prove higher settings before keeping them.
+
+| Env var                       | Default         | What it does
+|-------------------------------|-----------------|--------------
+| `DFLASH_PORT`                 | `8080`          | HTTP port
+| `DFLASH_MAX_CTX`              | autotuned       | Force a specific context length
+| `DFLASH_BUDGET`               | `22`            | DDTree tree budget (8 on AMD RDNA3)
+| `DFLASH_PREFIX_CACHE_SLOTS`   | `1`             | System-prompt prefix cache snapshots
+| `DFLASH_CACHE_TYPE_K`         | auto            | Explicit K-cache type override
+| `DFLASH_CACHE_TYPE_V`         | auto            | Explicit V-cache type override
+| `DFLASH_PREFILL_MODE`         | `off`           | `auto` / `always` for pFlash long-prompt speedups
+| `DFLASH_PREFILL_DRAFTER`      | unset           | Qwen3-0.6B BF16 GGUF for pFlash
+| `DFLASH_TARGET`               | auto-detected   | Override the target `.gguf` path
+| `DFLASH_DRAFT`                | `models/draft/` | Override the DFlash draft dir/file
+| `LUCEBOX_IMAGE`               | `ghcr.io/luce-org/lucebox-hub` | Override the image repository
+| `LUCEBOX_VARIANT`             | `cuda12`        | Override the image tag for release-candidate builds
+
+CLI reference: [`lucebox.sh`](lucebox.sh) (host) and
+[`lucebox/`](lucebox/) (Python package inside the container).
+
+### Available tags
+
+| Tag                            | Notes
+|--------------------------------|-------
+| `:cuda12`                      | rolling latest CUDA 12.8 image
+| `:vX.Y.Z-cuda12`               | pinned to a specific release
+| `:X.Y-cuda12`                  | latest patch in a minor series
+| `:sha-<short>-cuda12`          | exact commit
+
+### Building from source
+
+Megakernel isn't in the Docker images yet (its CUDA extension links against
+a `torch.utils.cpp_extension` wheel at build time and has to be compiled in
+your venv). For megakernel benchmarks, dflash kernel development, or
+running dflash with a non-default arch list, see
+[`megakernel/README.md`](megakernel/README.md),
+[`dflash/README.md`](dflash/README.md), and
+[`pflash/README.md`](pflash/README.md).
+
+---
+
+## Projects
+
+Each directory is a self-contained project with setup instructions and benchmark notes.
 
 <p align="center">
   <a href="megakernel/"><img src="assets/svg/card-megakernel-dark.svg" alt="Megakernel" width="46%"></a>
@@ -32,62 +189,115 @@ Two projects today, more coming. Each one is a self-contained release with its o
   <a href="dflash/"><img src="assets/svg/card-dflash-dark.svg" alt="DFlash 27B" width="46%"></a>
 </p>
 
+<p align="center">
+  <a href="pflash/"><img src="assets/svg/card-pflash-dark.svg" alt="PFlash speculative prefill" width="46%"></a>
+</p>
+
 ---
+
+## Supported models
+
+All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant).
+
+| GPU | Model | TTFT speedup | Decode speedup |
+|-----|-------|:------------:|:--------------:|
+| RTX 3090 | Qwen 3.5-0.8B (Megakernel) | — | **~2×** vs F16 |
+| RTX 3090 | Qwen 3.5-27B Q4_K_M (DFlash + DDTree) | — | **3.43×** vs AR |
+| RTX 3090 | Qwen 3.6-27B Q4_K_M (DFlash + PFlash) | **10.4×** @ 128K | **~3×** vs AR |
+| RTX 3090 | Laguna-XS.2 33B-A3B Q4_K_M (DFlash + PFlash) | **5.4×** @ 128K | AR (draft pending) |
+| RTX 5090 | Qwen 3.6-27B Q4_K_M (DFlash + DDTree) | — | **4.84×** vs AR (205 tok/s) |
+| Ryzen AI MAX+ 395 (gfx1151) | Qwen 3.5-27B Q4_K_M (DFlash + PFlash, HIP) | **2.24×** @ 16K | **3.08×** vs llama.cpp HIP AR (37 tok/s) |
+
+## Client harnesses
+
+[`harness/`](harness/) contains RTX 3090 client launchers and regression tests
+for Lucebox server compatibility. Use it to run Lucebox inside Claude Code,
+Codex, OpenCode, Hermes, Pi, OpenClaw, or Open WebUI, or to check that a server
+change still works with those clients.
+
+```bash
+harness/clients/run_codex.sh
+harness/clients/run_claude_code.sh
+python3 harness/client_test_runner.py probe --url http://127.0.0.1:8000
+```
+
+The harness can also launch the native C++ HTTP server instead of the Python
+server wrapper:
+
+```bash
+LUCEBOX_SERVER_BACKEND=cpp \
+DFLASH_SERVER_BIN=dflash/build/dflash_server \
+MAX_CTX=32768 BUDGET=22 VERIFY_MODE=ddtree \
+harness/clients/run_codex.sh
+```
 
 ## 01 · Megakernel Qwen3.5 0.8B on RTX 3090
 
-**The first megakernel for hybrid DeltaNet/Attention LLMs.** All 24 layers of Qwen 3.5-0.8B in a single CUDA dispatch, 1.87 tok/J on a 2020 GPU, matching Apple's latest silicon at 2× the throughput.
+Single-kernel CUDA inference for Qwen 3.5-0.8B on RTX 3090. All 24 layers run in one persistent dispatch.
 
 ```bash
 # 1. clone + enter
-git clone https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/megakernel
+git clone https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub
 
-# 2. install (Python 3.10+, CUDA 12+, PyTorch 2.0+). Weights stream from HF on first run.
-pip install -e .
+# 2. install via the workspace (Python 3.12, CUDA 12+, PyTorch 2.0+).
+#    Weights stream from HF on first run.
+uv sync --extra megakernel          # builds the CUDA extension; torch is auto-installed first, then setup.py compiles
 
 # 3. run the benchmark (prefill pp520 + decode tg128 vs llama.cpp BF16 + PyTorch HF)
-python final_bench.py
+uv run --directory megakernel python final_bench.py
 ```
+
+> Don't have `uv`? Install with `curl -LsSf https://astral.sh/uv/install.sh | sh` or see [astral.sh/uv](https://astral.sh/uv/). The legacy `python -m venv` + `pip install -e . --no-build-isolation` flow still works from inside `megakernel/`.
 
 | Method | Prefill pp520 | Decode tg128 | tok/J |
 |--------|:-------------:|:------------:|:-----:|
-| **Megakernel** `@220W` | **37,800** | **413** | **1.87** |
+| **Megakernel** `@220W` | **21,347** | **413** | **1.87** |
 | llama.cpp BF16 `@350W` | 11,247 | 267 | 0.76 |
 | PyTorch HF | 7,578 | 108 | n/a |
 
-**What makes it work:** 82 blocks, 512 threads, one persistent kernel. No CPU round-trips between layers. Weights streamed straight from HuggingFace. Cooperative grid sync instead of ~100 kernel launches per token. Power ceiling hit before compute ceiling, so DVFS converts tight execution straight into saved watts.
+Implementation notes: 82 blocks, 512 threads, cooperative grid sync, no CPU round trips between layers, and weights streamed from Hugging Face on first run.
 
 [Full writeup →](megakernel/README.md) · [Benchmarks →](megakernel/RESULTS.md) · [Blog post →](https://lucebox.com/blog/megakernel)
 
+> **Blackwell (RTX 5090, DGX Spark / GB10):** auto-detected by setup; NVFP4 decode path lands ~194 tok/s tg128 on GB10. See [megakernel/README.md#blackwell-sm_120--sm_121a](megakernel/README.md).
+
 ---
 
-## 02 · DFlash DDtree Qwen3.5 27B GGUF on RTX 3090
+## 02 · DFlash DDtree Qwen3.5 & Qwen3.6 27B GGUF on RTX 3090
 
-**First GGUF port of DFlash speculative decoding.** Qwen3.5-27B on a single RTX 3090, Q4_K_M target + BF16 draft, DDTree budget=22.
+DFlash speculative decoding for Qwen3.5/Qwen3.6 27B GGUF targets on a single GPU. The default setup uses Qwen3.6-27B Q4_K_M plus a Q4_K_M GGUF DFlash draft.
 
 - **Up to 207 tok/s** in the demo (207.6 tok/s DFlash vs 38.0 tok/s AR, 5.46×)
 - **129.5 tok/s mean** on the HumanEval 10-prompt bench
 - **3.43× faster than autoregressive** (+15% over chain speculative decoding)
 - **2.8× faster than SGLang AWQ** on the same hardware
-- **128K context in 24 GB** (134.78 tok/s at ctx=131072)
+- **Up to 256K context in 24 GB** via TurboQuant TQ3_0 KV cache (128K Q4_0 bench: 134.78 tok/s at ctx=131072)
 
 ```bash
 # 1. clone with submodules (pulls the pinned Luce-Org/llama.cpp@luce-dflash fork)
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub
 
-# 2. build the C++/CUDA decoder (~3 min on sm_86, CUDA 12+, CMake 3.18+)
-cmake -B build -S . -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target test_dflash -j
+# 2. install Python deps via the workspace (creates one shared .venv at the
+#    repo root).
+uv sync
 
-# 3. fetch weights: ~16 GB Q4_K_M target + 3.46 GB bf16 draft
-huggingface-cli download unsloth/Qwen3.5-27B-GGUF Qwen3.5-27B-Q4_K_M.gguf --local-dir models/
-huggingface-cli download z-lab/Qwen3.5-27B-DFlash model.safetensors --local-dir models/draft/
+# 3. build the C++/CUDA decoder (CUDA 12+, CMake 3.18+)
+# Default compiles for Pascal/Volta/Turing/Ampere (60/61/62/70/75/86; +120 on CUDA 12.8+, +sm_121/DGX Spark on CUDA 12.9+, +sm_110/Thor on CUDA 13.0+) so the binary runs on every supported card.
+# 3090-only users can add -DCMAKE_CUDA_ARCHITECTURES=86 to skip the other archs and build faster (~3 min).
+cmake -B dflash/build -S dflash -DCMAKE_BUILD_TYPE=Release
+cmake --build dflash/build --target test_dflash -j
+cmake --build dflash/build --target test_generate -j
+cmake --build dflash/build --target dflash_server -j
 
-# 4a. one-shot streaming generate
-python3 scripts/run.py --prompt "def fibonacci(n):"
+# 4. fetch weights: ~16 GB Q4_K_M target + Q4_K_M GGUF DFlash draft
+uv run hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir dflash/models/
+uv run hf download spiritbuun/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf --local-dir dflash/models/draft/
 
-# 4b. or reproduce the paper-style bench (HumanEval + GSM8K + Math500, ~15 min)
-python3 scripts/bench_llm.py
+# 5a. one-shot streaming generate
+uv run --directory dflash python scripts/run.py --prompt "def fibonacci(n):"
+
+# 5b. or reproduce the paper-style bench (HumanEval + GSM8K + Math500, ~15 min)
+uv run --directory dflash python scripts/bench_llm.py
 ```
 
 | Benchmark | AR (tok/s) | DFlash+DDTree (tok/s) | Speedup |
@@ -96,21 +306,142 @@ python3 scripts/bench_llm.py
 | Math500 | 37.7 | 110.5 | 2.93× |
 | GSM8K | 37.7 | 96.2 | 2.55× |
 
-**The constraint that shaped the project.** AWQ INT4 of Qwen3.5-27B plus the BF16 draft doesn't leave room for the DDTree verify state on a 24 GB card. Q4_K_M GGUF (~16 GB target) is the largest format that fits target + 3.46 GB draft + budget=22 tree state + KV cache in 24 GB on the RTX 3090. Picking it forced a new port on top of ggml, since no public DFlash runtime supports a GGUF target.
+**Why GGUF/Q4_K_M:** on 24 GB GPUs, the target, draft, DDTree verify state, and KV cache need to fit together. The default Qwen3.6 setup uses a ~16 GB Q4_K_M target and a quantized GGUF draft.
 
-**What we built vs what we didn't.** The algorithms are not ours:
+Algorithms used:
 - [**DFlash**](https://arxiv.org/abs/2602.06036) (z-lab, 2026): block-diffusion draft conditioned on target hidden states.
 - [**DDTree**](https://arxiv.org/abs/2604.12989) (Ringel et al., 2026): tree-structured verify that beats chain verify at the same compute budget.
 
-What we ported and tuned:
+Implemented here:
 - C++/CUDA decode engine on top of ggml (no libllama, no Python runtime, Q4_K_M target path).
 - Three custom CUDA kernels for tree-aware SSM state rollback: `ggml_ssm_conv_tree`, `ggml_gated_delta_net_tree`, `ggml_gated_delta_net_tree_persist`.
 - DDTree budget swept for RTX 3090 + Q4_K_M target: **budget=22** is the sweet spot.
-- Q4_0 KV cache + sliding `target_feat` ring to fit 128K context in 24 GB with ~3% AL hit.
+- TQ3_0 KV cache (TurboQuant 3.5 bpv, default) + sliding `target_feat` ring to fit up to 256K context in 24 GB (Q4_0 available as legacy, tops out near 128K).
+
+### Running on other GPUs (4090, 5090, DGX Spark / GB10, Jetson AGX Thor)
+
+Supported out of the box; the build just needs the right CUDA toolkit. `dflash/CMakeLists.txt` already auto-adds Blackwell archs when your nvcc is new enough, so the main quickstart above works as-is on newer cards.
+
+| GPU | Arch | Min CUDA | Status |
+|-----|:----:|:--------:|--------|
+| Tesla P40 Pascal | `sm_61` | 12.0 | supported with scalar F16 fallback; needs 24 GB for the 27B stack |
+| Tesla V100 Volta | `sm_70` | 12.0 | supported with F16 WMMA kernels |
+| RTX 3090 Ampere | `sm_86` | 12.0 | **reference, all numbers above** |
+| RTX 2080 Ti Turing | `sm_75` | 12.0 | supported, 53 tok/s DFlash verified (FP16 draft) |
+| RTX 4090 Ada | `sm_89` | 12.0 | should work, unverified, pass `-DCMAKE_CUDA_ARCHITECTURES=89` |
+| RTX 5090 Blackwell consumer | `sm_120` | 12.8 | **205 tok/s DFlash, 4.84× vs AR** (Q4_K_M, budget=40) |
+| DGX Spark / GB10 | `sm_121` (compute capability 12.1) | 12.9 | supported, auto-added by CMake |
+| Jetson AGX Thor | `sm_110` | 13.0 | supported, auto-added by CMake |
+
+Verify your target:
+```bash
+python -c "import torch; p=torch.cuda.get_device_properties(0); print(p.name, 'sm_%d%d'%(p.major,p.minor), p.multi_processor_count,'SMs', round(p.total_memory/1e9,1),'GB')"
+nvcc --version
+```
+
+**DGX Spark / GB10 quick start:**
+```bash
+# CUDA 12.9+ required for sm_121
+nvcc --version  # must show >= 12.9
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release   # CMake auto-adds sm_121
+cmake --build build --target test_dflash -j
+```
+
+**Jetson AGX Thor quick start:**
+```bash
+# CUDA 13.0+ required for sm_110 / AGX Thor.
+nvcc --version
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release   # CMake auto-adds the Thor arch your nvcc supports
+cmake --build build --target test_dflash -j
+```
+
+**Retune per GPU:**
+- **DDTree `budget=22`** tuned for 3090 + Q4_K_M + 24 GB. On the RTX 5090, budget=40 is optimal (swept). On GB10 (128 GB unified), re-sweep — larger tree = more verify throughput until memory bandwidth saturates. `scripts/bench_llm.py --budget N` has the sweep hooks.
+- **TQ3_0 KV cache + sliding `target_feat` ring** was shaped by 24 GB (fits up to 256K context on a 3090). On GB10 (128 GB unified) / 5090 (32 GB) you can push context further or skip quantization entirely and keep F16 KV.
+- **Perf numbers** (207 tok/s demo, 129.5 HumanEval, 2.8× vs SGLang AWQ) are RTX 3090 @ stock. RTX 5090 numbers (205 tok/s HumanEval, 4.84×) are in [RESULTS.md](dflash/RESULTS.md). Ada/GB10/Thor not yet swept, PRs with `RESULTS.md` entries welcome.
 
 [Full writeup →](dflash/README.md) · [Benchmarks →](dflash/RESULTS.md) · [Blog post →](https://lucebox.com/blog/dflash27b)
 
-> **Qwen3.6-27B (experimental):** same `qwen35` architecture, so the 3.6 Q4_K_M GGUF loads as a drop-in target. With the 3.5-trained draft, throughput lands around ~74 tok/s on HumanEval (vs 129.5 on 3.5). Details in [dflash/README.md](dflash/README.md#qwen36-27b-target-experimental).
+---
+
+## 03 · PFlash speculative prefill on RTX 3090
+
+Speculative prefill for long prompts. A Qwen3-0.6B BF16 drafter scores token importance, then the 27B target prefills only the retained spans. Runtime is C++/CUDA through the dflash binaries; no PyTorch is required at serving time.
+
+- **~10.4× TTFT** on 128K context: **24.8 s** dflash daemon vs **~257 s** llama.cpp (FA on, Q4_0 KV).
+- **10.0× TTFT** on 64K context: **13.5 s** dflash vs **134.95 s** llama.cpp.
+- **NIAH single-needle retrieved** at every measured context (32K → 128K), `keep_ratio=0.05`, `DFLASH_FP_ALPHA=0.85`.
+
+```bash
+# 1. build dflash + BSA kernel (sm_80+ required for BSA, ~10 min cold compile)
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
+                    -DCMAKE_CUDA_ARCHITECTURES=86 \
+                    -DDFLASH27B_ENABLE_BSA=ON
+cmake --build build --target test_dflash test_flashprefill_kernels -j
+
+# 2. fetch weights: 27B Q4_K_M target + 0.6B BF16 drafter (GGUF) + DFlash spec-decode draft
+hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
+hf download unsloth/Qwen3-0.6B-GGUF Qwen3-0.6B-BF16.gguf --local-dir models/
+hf download spiritbuun/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf --local-dir models/draft/
+
+# 3. run the daemon: compress (drafter scoring) + generate (target spec decode)
+DFLASH_FP_USE_BSA=1 DFLASH_FP_ALPHA=0.85 \
+./build/test_dflash models/Qwen3.6-27B-Q4_K_M.gguf models/draft/dflash-draft-3.6-q4_k_m.gguf --daemon
+# stdin protocol: `compress <ids.bin> <keep_x1000> <drafter.gguf>` →
+#                 stream of compressed token ids, then `generate <…>` →
+#                 stream of generated tokens.
+```
+
+| Source S | dflash TTFT | llama.cpp baseline | Speedup | NIAH |
+|----------|:-----------:|:------------------:|:-------:|:----:|
+| **64K**  | **13.5 s** | 134.95 s (FA off, dense) | **10.0×** | ✅ |
+| **128K** | **24.8 s** | ~257 s (FA on, Q4_0 KV)  | **~10.4×** | ✅ |
+
+Daemon stdin commands: `compress` runs the drafter with FlashPrefill block-sparse attention and returns the compressed token-id stream; `generate` runs the target on that stream with normal speculative decode + DDTree. `park` / `unpark` / `free drafter` swap weights in and out of VRAM so target + drafter coexist on a 24 GB card.
+
+**Runtime tunables** (full list in [`dflash/src/flashprefill.h`](dflash/src/flashprefill.h)):
+```
+DFLASH_FP_USE_BSA=1     # dispatch sparse FA forward through BSA (sm_80+)
+DFLASH_FP_ALPHA=0.85    # block-selection threshold; higher = stricter = fewer K-blocks per Q-row
+DFLASH_FP_PROFILE=1     # log mean / score / select / forward stage timings
+```
+
+**What's ours, what isn't.** Algorithms are from [Cross-Family Speculative Prefill (Liu et al., ICLR 2026)](https://arxiv.org/abs/2603.02631) for the scoring + selection layer and [FlashPrefill (Fan et al., 2026)](https://arxiv.org/abs/2603.06199) for the drafter sparse-attention forward. What we built:
+- C++/CUDA daemon-resident speculative prefill in front of a quantized GGUF target — no PyTorch, no Triton, no per-request subprocess.
+- BSA wired without `libtorch` via a 3-header ATen/c10 stub set under `dflash/deps/bsa_stubs/`.
+- Custom Qwen3-0.6B forward (`qwen3_0p6b_*`) so the drafter runs through the same ggml allocator as the 27B target.
+- 4 CUDA kernels (`flashprefill_kernels.cu`) for the FlashPrefill `mean_K / score / select / sparse_fwd` algorithm.
+
+[Full writeup →](pflash/README.md) · [Daemon-side build / tunables →](dflash/docs/SPEC_PREFILL.md) · [Blog post →](https://lucebox.com/blog/pflash)
+
+---
+
+## AMD Strix Halo (HIP backend)
+
+**Same DFlash + PFlash stack on an AMD iGPU.** PR #119 ports the Phase 2 rocWMMA flashprefill kernels to HIP. End-to-end on a single Ryzen AI MAX+ 395 box (Radeon 8060S iGPU, gfx1151, 128 GiB LPDDR5X-8000 unified): **37.0 tok/s** DFlash decode on Qwen3.5-27B Q4_K_M, **27.6 s** TTFT at 16K context with NIAH retrieval intact. That is **3.08×** decode and **2.24×** prefill over llama.cpp HIP AR on the same iGPU. End-to-end wall clock at a realistic 16K prompt + 1K generation workload: **2.66×** faster than vanilla llama.cpp.
+
+```bash
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
+
+# Build for gfx1151 (Strix Halo). Swap the arch for gfx1100 / gfx1201.
+cmake -B build -S . \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DDFLASH27B_GPU_BACKEND=hip \
+  -DDFLASH27B_HIP_ARCHITECTURES=gfx1151 \
+  -DDFLASH27B_HIP_SM80_EQUIV=ON
+cmake --build build --target test_dflash -j
+```
+
+`DFLASH27B_HIP_SM80_EQUIV=ON` enables the rocWMMA Phase 2 flashprefill kernels (the path that delivers the prefill speedup). `OFF` falls back to ggml's `flash_attn_ext` (slower but no rocwmma headers needed).
+
+**Per-arch DDTree tuning**: gfx1151 (Strix Halo iGPU, bandwidth-bound on LPDDR5X) peaks at `--ddtree-budget=22`. gfx1100 (7900 XTX, GDDR6) prefers `budget=8` per the [PR #156 cross-arch perf plan](https://github.com/Luce-Org/lucebox-hub/pull/156). Run `scripts/bench_he.py --ddtree-budget N` to verify on your card.
+
+**Drafter recipe for max decode**: target = Qwen3.5-27B Q4_K_M, drafter = same gen quantized to Q8_0 via `dflash/scripts/quantize_draft_q8.py`. The matching Q8_0 GGUF on the unsloth Qwen3.6 target needs `DFLASH27B_DRAFT_SWA=2048` for sliding-window correctness.
+
+[Blog post →](https://lucebox.com/blog/amd) · [PR #119 →](https://github.com/Luce-Org/lucebox-hub/pull/119) · [PR #156 cross-arch perf plan →](https://github.com/Luce-Org/lucebox-hub/pull/156)
 
 ---
 
@@ -120,16 +451,26 @@ Local AI should be a default, not a privilege: private data, no per-token bill, 
 
 General-purpose frameworks dominated the last decade because hand-tuning kernels per chip was too expensive to justify. One stack, decent on everything, great on nothing. Most of the silicon's capability stays on the floor.
 
-AI-assisted development flips that calculus. Rewrites that took a quarter now fit in a release cycle. Lucebox is where we publish them, one chip and one model family at a time. MIT source, full writeup, reproducible benchmarks.
+AI-assisted development flips that calculus. Rewrites that took a quarter now fit in a release cycle. Lucebox is where we publish them, one chip and one model family at a time. Apache 2.0 source, full writeup, reproducible benchmarks.
 
 ---
 
 ## Requirements
 
-Built and benchmarked on NVIDIA RTX 3090 (2020); portable to other Ampere+ (sm_86+) NVIDIA GPUs with minor tuning. CUDA 12+, PyTorch 2.0+.
-dflash needs CMake 3.18+ and `--recurse-submodules` for the pinned `Luce-Org/llama.cpp@luce-dflash` fork (three tree-mode ggml ops).
+All experiments in this repo are built, tuned, and benchmarked on NVIDIA RTX 3090 (2020), the reference target. Supported GPU families:
 
-**Optional, find your GPU's sweet spot:** `sudo nvidia-smi -pl 220` (megakernel hits best tok/J at 220 W).
+- **Ampere** (sm_86, RTX 3090 / A-series): reference, CUDA 12+.
+- **Ada** (sm_89, RTX 40xx): should work, unverified, CUDA 12+.
+- **Blackwell consumer** (sm_120, RTX 50xx incl. 5090): supported, CUDA 12.8+.
+- **DGX Spark / GB10** (sm_121, compute capability 12.1): supported, CUDA 12.9+.
+- **Jetson AGX Thor** (sm_110): supported, CUDA 13+.
+- **Turing** (sm_75, RTX 2080): supported, CUDA 12+.
+
+PyTorch 2.0+. `dflash/` needs CMake 3.18+ and `--recurse-submodules` for the pinned `Luce-Org/llama.cpp@luce-dflash` fork (three tree-mode ggml ops); multi-arch build is automatic (see [Running on other GPUs](#running-on-other-gpus-4090-5090-dgx-spark--gb10-jetson-agx-thor)).
+
+**Megakernel porting note.** `megakernel/setup.py` auto-detects the GPU arch and SM count at build time via `torch.cuda.get_device_capability()`. The decode grid is persistent (one block per SM) and is clamped to the resident-block ceiling at runtime, so no manual tuning is needed. On SM < 80 (Turing), the kernel uses FP16 instead of BF16 via a compile-time `TARGET_SM` flag; on SM >= 80 (Ampere+), BF16 is used. From the workspace root, `uv sync --extra megakernel` builds the extension; the legacy `pip install -e . --no-build-isolation` flow still works from inside `megakernel/`.
+
+**Optional, find your GPU's sweet spot:** `sudo nvidia-smi -pl 220` (megakernel hits best tok/J at 220 W on 3090; re-sweep for other cards).
 
 ---
 
@@ -138,7 +479,8 @@ dflash needs CMake 3.18+ and `--recurse-submodules` for the pinned `Luce-Org/lla
 ```
 lucebox-hub/
 ├── megakernel/    · fused forward pass for Qwen 3.5-0.8B
-├── dflash/        · DFlash speculative decoding port for Qwen 3.5-27B on RTX 3090
+├── dflash/        · DFlash speculative decoding port for Qwen 3.5/3.6-27B on RTX 3090
+├── pflash/        · speculative-prefill harness in front of dflash (12.5× TTFT at 128K)
 └── assets/        · banners, cards, diagrams
 ```
 
@@ -174,7 +516,7 @@ Per-project citations live in each subproject's README.
 ## Inspired by
 
 - [Hazy Research](https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles): megakernel idea and the intelligence-per-watt methodology.
-- [z-lab/DFlash](https://arxiv.org/abs/2602.06036) (Wang et al., 2026): block-diffusion speculative decoding algorithm. We use their published Qwen3.5-27B-DFlash draft weights as-is.
+- [z-lab/DFlash](https://arxiv.org/abs/2602.06036) (Wang et al., 2026): block-diffusion speculative decoding algorithm. We use their published Qwen3.5/Qwen3.6-27B-DFlash draft weights as-is.
 - [DDTree](https://arxiv.org/abs/2604.12989) (Ringel & Romano, 2026): tree-structured verify that DFlash 27B uses for its 3.5× speedup over chain spec decoding. [liranringel/ddtree](https://github.com/liranringel/ddtree).
 - [AlpinDale/qwen_megakernel](https://github.com/AlpinDale/qwen_megakernel), [Infatoshi/MegaQwen](https://github.com/Infatoshi/MegaQwen): prior art on fused Qwen kernels.
 
@@ -190,5 +532,5 @@ Per-project citations live in each subproject's README.
 ---
 
 <p align="center">
-  <sub><a href="LICENSE">MIT</a> · <a href="https://lucebox.com">Lucebox.com</a></sub>
+  <sub><a href="LICENSE">Apache 2.0</a> · <a href="https://lucebox.com">Lucebox.com</a></sub>
 </p>

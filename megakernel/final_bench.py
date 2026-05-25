@@ -1,8 +1,27 @@
 """Final benchmark: pp520 tg128 — Our megakernel vs PyTorch naive.
-Both properly warmed. Saves completions for verification."""
+Both properly warmed. Saves completions for verification.
+
+Supports --backend {auto,bf16,nvfp4}. Default is auto: Blackwell (sm_12+)
+dispatches to final_bench_nvfp4.py; everything else runs the bf16 path
+below unchanged from upstream.
+"""
+import argparse as _argparse, os as _os, sys as _sys
+import torch as _torch
+
+_p = _argparse.ArgumentParser(add_help=False)
+_p.add_argument("--backend", default="auto", choices=("auto", "bf16", "nvfp4"))
+_a, _rest = _p.parse_known_args()
+_backend = _a.backend
+if _backend == "auto":
+    _backend = "nvfp4" if (_torch.cuda.is_available() and _torch.cuda.get_device_capability()[0] >= 12) else "bf16"
+if _backend == "nvfp4":
+    _here = _os.path.dirname(_os.path.abspath(__file__))
+    _os.execv(_sys.executable, [_sys.executable, _os.path.join(_here, "final_bench_nvfp4.py"), *_rest])
+
 import time, torch
+import _phase2_variant  # noqa: F401 — prints "[megakernel] DN phase2 variant = scalar|wmma"
 from model import Decoder, HIDDEN_SIZE, INTERMEDIATE_SIZE, FA_QPROJ_SIZE, FA_Q_SIZE, FA_KV_SIZE
-from model import DN_CONV_CHANNELS, DN_V_SIZE, DN_NUM_HEADS, MAX_SEQ_LEN
+from model import DN_CONV_CHANNELS, DN_V_SIZE, DN_NUM_HEADS, MAX_SEQ_LEN, _half_dtype
 import qwen35_megakernel_bf16_C
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -18,12 +37,15 @@ print(f"Prompt: {len(prompt_ids)} tokens")
 # ============================================================
 # 1. Our megakernel (prefill cuBLAS + decode megakernel)
 # ============================================================
-print("\n=== Our BF16 Megakernel ===")
+_dtype_label = "FP16" if _half_dtype() == torch.float16 else "BF16"
+_gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "Unknown GPU"
+
+print(f"\n=== Our {_dtype_label} Megakernel ===")
 dec = Decoder(verbose=False)
 _pf = torch.ops.qwen35_megakernel_bf16_C.prefill_bf16
 
 S = 520
-bf16 = dict(dtype=torch.bfloat16, device="cuda")
+bf16 = dict(dtype=_half_dtype(), device="cuda")
 f32 = dict(dtype=torch.float32, device="cuda")
 i32 = dict(dtype=torch.int32, device="cuda")
 mx = max(DN_CONV_CHANNELS, FA_QPROJ_SIZE, INTERMEDIATE_SIZE)
@@ -38,6 +60,7 @@ b = dict(
     final_normed=torch.empty(HIDDEN_SIZE, **bf16), hidden_bf16_out=torch.empty(HIDDEN_SIZE, **bf16),
     lm_bmv=torch.empty(1024, **f32), lm_bmi=torch.empty(1024, **i32),
 )
+b.update(dec.alloc_prefill_scratch(S))
 ids_t = torch.tensor(prompt_ids, dtype=torch.int32, device="cuda")
 
 def our_prefill():
@@ -48,7 +71,11 @@ def our_prefill():
         b['hidden'], b['residual'], b['normalized'],
         b['proj_buf'], b['proj_buf2'], b['attn_buf'], b['mlp_buf'],
         b['dn_out_buf'], b['beta_buf'], b['alpha_buf'],
-        b['final_normed'], b['hidden_bf16_out'], b['lm_bmv'], b['lm_bmi'])
+        b['dn_pre_qkv'],
+        b['dn_u_scratch'], b['dn_w_scratch'], b['dn_cs_scratch'],
+        dec._fused_fa_qkv, dec._fused_gate_up,
+        b['final_normed'], b['hidden_bf16_out'], b['lm_bmv'], b['lm_bmi'],
+        dec.max_seq_len)
     dec._hidden.copy_(b['hidden_bf16_out'])
     dec._position = len(prompt_ids)
     return dec._out_token.item()
@@ -87,7 +114,7 @@ torch.cuda.empty_cache()
 # 2. PyTorch naive (HuggingFace)
 # ============================================================
 print("\n=== PyTorch HuggingFace ===")
-model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-0.8B", dtype=torch.bfloat16, device_map="cuda")
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-0.8B", dtype=_half_dtype(), device_map="cuda")
 model.eval()
 input_ids = torch.tensor([prompt_ids], device="cuda")
 
@@ -129,13 +156,13 @@ print(f"Completion: {pt_text[:120]}")
 # Summary
 # ============================================================
 print(f"\n{'='*60}")
-print(f"FINAL RESULTS — Qwen3.5-0.8B BF16, RTX 3090")
+print(f"FINAL RESULTS — Qwen3.5-0.8B {_dtype_label}, {_gpu_name}")
 print(f"{'='*60}")
 print(f"{'Method':<25} {'pp'+str(len(prompt_ids)):>8} {'tg128':>10}")
 print(f"{'-'*45}")
 print(f"{'Our megakernel':<25} {our_pp_tps:>7.0f} t/s {our_tg_tps:>8.0f} t/s")
 print(f"{'PyTorch HF':<25} {pt_pp_tps:>7.0f} t/s {pt_tg_tps:>8.0f} t/s")
-print(f"{'llama.cpp BF16':<25} {'(run separately)':>19}")
+print(f"{'llama.cpp ' + _dtype_label:<25} {'(run separately)':>19}")
 print(f"")
 print(f"Megakernel vs PyTorch:  pp {our_pp_tps/pt_pp_tps:.1f}x  tg {our_tg_tps/pt_tg_tps:.1f}x")
 print(f"")

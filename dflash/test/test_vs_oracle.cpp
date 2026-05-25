@@ -9,7 +9,7 @@
 
 #include "dflash27b.h"
 #include "internal.h"
-#include "dflash_graph.h"
+#include "draft_graph.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-using namespace dflash27b;
+using namespace dflash::common;
 
 struct OracleMeta {
     int ctx_len = 0;

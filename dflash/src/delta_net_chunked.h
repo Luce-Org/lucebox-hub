@@ -4,7 +4,7 @@
 
 #include <ggml.h>
 
-namespace dflash27b {
+namespace dflash::common {
 
 struct DeltaNetChunkedResult {
     ggml_tensor * output;     // [S_v, H_v, n_tokens, n_seqs]
@@ -24,4 +24,4 @@ DeltaNetChunkedResult build_delta_net_chunked(
         ggml_tensor  * b,
         ggml_tensor  * s);
 
-} // namespace dflash27b
+} // namespace dflash::common

@@ -21,7 +21,7 @@ via a custom arch loader without colliding with any upstream tensor
 name.
 
 Usage:
-  PYTHONPATH=../../dflash27b_ggml/deps/llama.cpp/gguf-py python convert_dflash_to_gguf.py \
+  PYTHONPATH=../../dflash_ggml/deps/llama.cpp/gguf-py python convert_dflash_to_gguf.py \
     models/draft/model.safetensors \
     qwen3.5-27b-dflash-draft.gguf
 """

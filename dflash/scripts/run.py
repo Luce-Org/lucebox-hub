@@ -5,7 +5,12 @@ Streaming one-shot generation.
     echo "Write a haiku about GPUs" | python3 scripts/run.py
 
 Tokens print live as they are committed by the spec-decode loop.
-Auto-applies Qwen3.5 chat template unless --raw is passed.
+Auto-applies the Qwen3.5/3.6 chat template unless --raw is passed.
+
+Default target is Qwen3.6-27B-Q4_K_M.gguf. Override with `--target` or the
+`DFLASH_TARGET` env var (also honored by bench_he.py / bench_llm.py).
+The HF tokenizer repo defaults to `Qwen/Qwen3.6-27B` and can be overridden via
+the `DFLASH_TOKENIZER` env var.
 """
 import argparse
 import os
@@ -18,8 +23,9 @@ from pathlib import Path
 
 def default_paths():
     return {
-        "target": "models/Qwen3.5-27B-Q4_K_M.gguf",
-        "draft":  "models/draft",
+        "target": os.environ.get("DFLASH_TARGET",
+                                 "models/Qwen3.6-27B-Q4_K_M.gguf"),
+        "draft":  os.environ.get("DFLASH_DRAFT", "models/draft"),
         "bin":    "build/test_dflash" + (".exe" if sys.platform == "win32" else ""),
     }
 
@@ -35,11 +41,12 @@ def resolve_draft(draft_dir: str) -> str:
     if p.is_file():
         return str(p)
     if p.is_dir():
-        for st in p.rglob("model.safetensors"):
-            return str(st)
+        for pattern in ("dflash-draft-*.gguf", "*.gguf", "model.safetensors"):
+            for draft in sorted(p.rglob(pattern)):
+                return str(draft)
 
     raise FileNotFoundError(
-        f"no model.safetensors under {draft_dir}. Download it as documented in the README, or pass --draft explicitly."
+        f"no DFlash draft GGUF or model.safetensors under {draft_dir}. Download it as documented in the README, or pass --draft explicitly."
     )
 
 
@@ -64,6 +71,26 @@ def main():
     ap.add_argument("--system", type=str, default=None)
     ap.add_argument("--kv-q4", action="store_true",
                     help="Q4_0 KV cache (required for max_ctx=131072)")
+    ap.add_argument("--kv-tq3", action="store_true",
+                    help="TQ3_0 KV cache (3.5 bpv, near-lossless)")
+    ap.add_argument("--cache-type-k", "--ctk", dest="cache_type_k", default=None,
+                    choices=["f16","bf16","q4_0","q4_1","q5_0","q5_1","q8_0","tq3_0"],
+                    help="K cache element type (overrides --kv-q4/--kv-tq3/--kv-f16 for K). "
+                         "See kv_quant.cpp for supported (K,V) pairs.")
+    ap.add_argument("--cache-type-v", "--ctv", dest="cache_type_v", default=None,
+                    choices=["f16","bf16","q4_0","q4_1","q5_0","q5_1","q8_0","tq3_0"],
+                    help="V cache element type (overrides --kv-q4/--kv-tq3/--kv-f16 for V).")
+    ap.add_argument("--fa-window", type=int, default=None,
+                    help="Sliding window for FA layers (KV positions). 0 = full "
+                         "attention. Default 2048 (set in C++); only kicks in "
+                         "once kv_cache > window.")
+    ap.add_argument("--draft-swa", type=int, default=None,
+                    help="Draft SWA window (Qwen3.6 pattern: layers 0..n-2 use "
+                         "sliding window). 0 = disabled. Typical value: 2048.")
+    ap.add_argument("--draft-ctx-max", type=int, default=None,
+                    help="Draft context cap (default 2048). Raise to let the "
+                         "full-attention layer see more context. Requires "
+                         "--draft-swa < this value to activate SWA truncation.")
     ap.add_argument("--max-ctx", type=int, default=0,
                     help="Override max KV context (default: auto-fit "
                          "prompt+n_gen+block, aligned to 256). Passing a "
@@ -77,7 +104,8 @@ def main():
         sys.exit("no prompt")
 
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-27B",
+    tok_repo = os.environ.get("DFLASH_TOKENIZER", "Qwen/Qwen3.6-27B")
+    tokenizer = AutoTokenizer.from_pretrained(tok_repo,
                                               trust_remote_code=True)
 
     if args.raw:
@@ -100,8 +128,20 @@ def main():
     env = {**os.environ}
     if sys.platform == "win32":
         env["PATH"] = dll_dir + os.pathsep + bin_dir + os.pathsep + env.get("PATH", "")
+    if args.cache_type_k:
+        env["DFLASH27B_KV_K"] = args.cache_type_k
+    if args.cache_type_v:
+        env["DFLASH27B_KV_V"] = args.cache_type_v
     if args.kv_q4:
         env["DFLASH27B_KV_Q4"] = "1"
+    if args.kv_tq3:
+        env["DFLASH27B_KV_TQ3"] = "1"
+    if args.fa_window is not None:
+        env["DFLASH27B_FA_WINDOW"] = str(args.fa_window)
+    if args.draft_swa is not None:
+        env["DFLASH27B_DRAFT_SWA"] = str(args.draft_swa)
+    if args.draft_ctx_max is not None:
+        env["DFLASH27B_DRAFT_CTX_MAX"] = str(args.draft_ctx_max)
 
     with tempfile.TemporaryDirectory() as tmp:
         in_bin  = os.path.join(tmp, "prompt.bin")

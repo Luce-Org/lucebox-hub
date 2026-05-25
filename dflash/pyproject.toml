@@ -1,0 +1,40 @@
+[project]
+name = "lucebox-dflash"
+version = "0.1.0"
+description = "Driver scripts and OpenAI-compatible server for the dflash C++/CUDA speculative-decoding daemon."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Lucebox" }]
+
+# Runtime deps for scripts/server.py and the bench harness. The C++/CUDA
+# decoder is built separately via cmake (see README).
+dependencies = [
+    "fastapi>=0.115,<2.0",
+    "uvicorn>=0.30",
+    "transformers>=4.50",
+    "jinja2>=3.1",
+    "torch>=2.0",
+    "numpy>=1.26",
+    "gguf>=0.10",
+    "datasets>=2.20",
+    "huggingface-hub>=0.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+# Tool-calling eval harness (bench_http_capability.py --area forge).
+# The forge-guardrails runtime AND the eval harness are both vendored
+# under dflash/scripts/fixtures/forge_eval/ (eval driver alongside the
+# scenarios; runtime under ``_forge/``). Vendored from forge-guardrails
+# 0.7.1 — only the anthropic SDK is required at install time. See
+# scripts/fixtures/forge_eval/_forge/LICENSE for the upstream MIT.
+eval = [
+    "anthropic>=0.40",
+]
+
+# No installable Python package — scripts are invoked directly via
+# `.venv/bin/python scripts/server.py …`. Declared as a virtual project so
+# uv resolves deps but skips wheel building.
+[tool.uv]
+package = false

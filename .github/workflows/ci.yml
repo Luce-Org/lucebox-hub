@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  uv-workspace:
+    name: uv workspace (lock + sync + import smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.11.x"
+      - name: Verify uv lockfile and workspace sync
+        # Skips the torch wheel in this fast job; the CUDA build below runs a
+        # full sync and builds megakernel against torch.
+        run: bash scripts/check_uv_workspace.sh
+
+      - name: Lint Python surfaces touched by lucebox tooling
+        run: uv run --frozen --extra dev ruff check .
+
+      - name: Typecheck lucebox CLI
+        run: uv run --frozen --extra dev python -m mypy --package lucebox
+
+  build:
+    name: Build (cmake + uv sync --extra megakernel)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          # Keep the existing upstream CUDA toolkit version; the uv workspace
+          # only replaces Python environment setup.
+          # Building megakernel's CUDAExtension links against torch's libs,
+          # so CI uses the matching cu128 PyTorch wheel below.
+          cuda: '12.8.0'
+          method: network
+          sub-packages: '["nvcc", "cudart-dev", "thrust", "driver-dev"]'
+          non-cuda-sub-packages: '["libcublas-dev"]'
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.11.x"
+          # uv reads .python-version (3.12, matching the previous CI) and downloads the matching
+          # interpreter; no separate setup-python step needed.
+
+      - name: Build dflash (smoke + server)
+        run: |
+          cd dflash
+          cmake -B build \
+            -DCMAKE_CUDA_ARCHITECTURES="86" \
+            -DDFLASH27B_ENABLE_BSA=OFF \
+            -DDFLASH27B_FA_ALL_QUANTS=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target \
+            test_dflash test_generate test_flash_attn_sparse \
+            dflash_server test_server_unit \
+            -j$(nproc)
+
+      - name: Run C++ server unit tests
+        run: |
+          cd dflash/build
+          ctest --output-on-failure -R server_unit --no-tests=error
+
+      - name: Run Python server unit tests
+        run: |
+          pip install pytest fastapi httpx transformers
+          cd dflash/scripts
+          python3 -m pytest test_server.py -v
+
+      - name: Populate venv with cu128 torch + setuptools
+        # First pass: install the workspace's default deps. dflash declares
+        # torch (which uv pulls from the pytorch-cu128 index per
+        # [tool.uv.sources]) and pflash drags in setuptools. Megakernel is
+        # in the optional `megakernel` extra so its build does NOT run yet.
+        run: uv sync --frozen
+
+      - name: Build megakernel via uv sync (sm_75)
+        env:
+          CUDA_HOME: ${{ env.CUDA_PATH }}
+          MEGAKERNEL_CUDA_ARCH: sm_75
+        # Second pass: builds megakernel against the venv populated above.
+        # `no-build-isolation-package = ["qwen35-megakernel-bf16"]` (set in
+        # the root pyproject.toml) forces setup.py to import the main env's
+        # cu128 torch — same wheel that runtime will use, so the resulting
+        # .so links against an ABI we can actually load.
+        run: uv sync --frozen --extra megakernel
+
+      - name: Verify megakernel extension imports
+        run: |
+          uv run --frozen --no-sync python -c "
+          import torch
+          import qwen35_megakernel_bf16_C as M
+          print('megakernel sm_75 .so loads:', M.__file__)
+          "
+
+      - name: Rebuild megakernel via uv sync (sm_86)
+        env:
+          CUDA_HOME: ${{ env.CUDA_PATH }}
+          MEGAKERNEL_CUDA_ARCH: sm_86
+        # --reinstall-package forces uv to recompile the CUDAExtension
+        # with the new MEGAKERNEL_CUDA_ARCH env var; without it, uv
+        # would skip the already-installed package at the same version.
+        run: uv sync --frozen --extra megakernel --reinstall-package qwen35-megakernel-bf16
+
+      - name: Verify megakernel extension imports (sm_86)
+        run: |
+          uv run --frozen --no-sync python -c "
+          import torch
+          import qwen35_megakernel_bf16_C as M
+          print('megakernel sm_86 .so loads:', M.__file__)
+          "

@@ -7,7 +7,7 @@
 #include <mutex>
 #include <string>
 
-namespace dflash27b {
+namespace dflash::common {
 
 namespace {
 std::mutex g_err_mu;
@@ -19,9 +19,9 @@ void set_last_error(std::string msg) {
     g_last_error = std::move(msg);
 }
 
-} // namespace dflash27b
+} // namespace dflash::common
 
 extern "C" const char * dflash27b_last_error(void) {
-    std::lock_guard<std::mutex> lk(dflash27b::g_err_mu);
-    return dflash27b::g_last_error.c_str();
+    std::lock_guard<std::mutex> lk(dflash::common::g_err_mu);
+    return dflash::common::g_last_error.c_str();
 }

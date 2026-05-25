@@ -37,12 +37,14 @@ MANIFEST
 # virtualenvs
 venv/
 .venv/
+.conda/
 env/
 .env
 
-# IDE
+# IDE / tooling caches
 .vscode/
 .idea/
+.serena/
 *.swp
 *.swo
 *~
@@ -63,8 +65,20 @@ checkpoints/
 *.safetensors
 *.bin
 .cache/
+fix-plan.md
 
 # Secrets
 .env.local
 *.pem
 *.key
+
+# Sisyphus working dossier (preserve outside repo)
+.sisyphus/
+
+# Harness test artifacts
+.harness-work/
+health
+
+# lucebox host-side generated config + benchmark output
+.lucebox/
+models/.lucebox/

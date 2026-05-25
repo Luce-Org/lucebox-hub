@@ -14,11 +14,11 @@ Thanks for considering a contribution. Lucebox is a hub of self-contained optimi
 
 - Closed-source dependencies. Everything here has to be reproducible from public sources.
 
-## Luce DFash Setup
+## Luce DFlash Setup
 
 ### dflash
 
-**Hardware:** NVIDIA sm_86+ GPU (RTX 3090, A10, A40, 4090), 24 GB VRAM.
+**Hardware:** NVIDIA sm_86+ GPU (RTX 3090, A10, A40, 4090) or Jetson AGX Thor sm_110, 24 GB VRAM. Thor requires CUDA 13+.
 
 On Ubuntu 22.04 or 24.04, one script installs all system dependencies — `build-essential`, `cmake`, `git`, `git-lfs`, and the CUDA Toolkit from NVIDIA's repo:
 
@@ -36,12 +36,22 @@ The script is idempotent and configures `nvcc` on PATH for both bash and zsh. Fo
 | git-lfs | any |
 | CUDA Toolkit | 12.0+ |
 | huggingface-cli | any |
+| uv | 0.11+ (Python deps) |
 
 After setup:
 
 ```bash
 git submodule update --init --recursive
-cmake -B dflash/build -S dflash -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release
+
+# Python deps (workspace at the repo root; one .venv shared by dflash, pflash,
+# and optionally megakernel). `uv` is the canonical installer; the legacy
+# per-subproject `python -m venv .venv && pip install …` flow still works.
+uv sync                       # dflash + pflash deps
+uv sync --extra megakernel    # also compile the megakernel CUDA extension
+bash scripts/check_uv_workspace.sh  # lockfile + frozen-sync import smoke
+
+# C++/CUDA decoder
+cmake -B dflash/build -S dflash -DCMAKE_BUILD_TYPE=Release
 cmake --build dflash/build --target test_dflash -j
 ```
 
@@ -82,4 +92,4 @@ If you want to contribute benchmarks but don't have the hardware:
 
 ## Licensing
 
-By contributing you agree your work is MIT-licensed, same as the rest of the repo.
+By contributing you agree your work is licensed under the Apache License, Version 2.0, same as the rest of the repo (see `LICENSE`). Historical contributions before the relicense remain available under their original MIT terms in the git history.
