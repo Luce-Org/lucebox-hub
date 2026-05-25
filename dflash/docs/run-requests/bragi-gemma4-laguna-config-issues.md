@@ -62,6 +62,51 @@ should return content `'4'` (or short coherent answer) with NO
 `thought` substring. `usage.timings.decode_tokens_per_sec` should be
 nonzero.
 
+### Update 2026-05-25 — additional repro detail
+
+After landing the unified bench harness (`--area code|longctx|agent`)
+I re-probed gemma4 and confirmed three distinct failure modes:
+
+1. **`//thought\n\n` token leakage** (the original report). Probing
+   `"What is 2+2?"` returns
+   `'\n2 + 2 = 4//thought\n\n2 + 2 = 4//thought\n\n2 + 2 = 4//thought\n\n2 + 2 ='`
+   regardless of thinking mode. The literal substring `//thought\n\n`
+   is being rendered to visible content. This isn't `<|channel>` or
+   `<channel|>` (those have explicit SSE mappings in http_server.cpp
+   lines 1410-1421); it's some other special token whose text content
+   is `//thought\n\n`. Suggests the gemma4 vocab has additional
+   thought-channel markers we haven't enumerated. Need to dump the
+   gemma4 GGUF `added_tokens` list and add SSE mappings for any that
+   collide with thought-block control sequences.
+
+2. **`thinking: {type: enabled}` doesn't open a reasoning block** for
+   gemma4. With thinking enabled, reasoning_content stays empty and
+   the thought-leakage still happens in content. The
+   `ChatFormat::GEMMA4` render path in `chat_template.cpp:185-215`
+   doesn't reference thinking at all — no `<|channel>` opener emitted
+   in the prompt to put the model in thinking mode.
+
+3. **Crash on smoke-mc** (`What is 19 + 23?\nChoices: A. 41 ...`).
+   Bench reports the request errored client-side; container shows a
+   stack trace at `ggml_mul_mat`:
+
+   ```
+   /opt/lucebox-hub/dflash/build/deps/llama.cpp/ggml/src/libggml-base.so.0(ggml_mul_mat+0x59)
+   /opt/lucebox-hub/dflash/build/dflash_server(+0x1526d0)
+   /opt/lucebox-hub/dflash/build/dflash_server(+0x1112ec)
+   /opt/lucebox-hub/dflash/build/dflash_server(+0x1114f7)
+   ```
+
+   The container survives (other prompts continue to work) but the
+   specific request errors out. Likely a tensor-shape mismatch in
+   Gemma4Backend's decode path when the prompt has specific structure.
+   Need stack symbolication.
+
+These three issues block the bragi gemma4 column in our local
+benchmark matrix. Until fixed, the only gemma4 data we have is
+OpenRouter's hosted version (73-80% on ds4-eval — works fine
+upstream).
+
 ## 2. Laguna XS.2 — OOM at default max_ctx on 24 GB VRAM
 
 Laguna-xs.2-Q4_K_M loads 18.77 GiB of weights on RTX 5090 MaxQ
