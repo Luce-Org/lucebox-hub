@@ -48,17 +48,26 @@ def load_case(case_id: str) -> dict:
     raise SystemExit(f"case-id {case_id!r} not in ds4_eval_cases.json")
 
 
+SYSTEM_DEFAULT = (
+    "You are solving a hard benchmark question. Reason carefully. "
+    "The final answer must follow the requested format exactly."
+)
+
+# Stronger no-reasoning prompt: explicitly forbids step-by-step.
+SYSTEM_TERSE = (
+    "Answer with ONLY the final answer (a single integer for AIME, "
+    "or the requested format). Do not show any reasoning, work, "
+    "intermediate steps, or explanation. Output the answer alone."
+)
+
+
 def build_body(model: str, case: dict, mode: str, max_tokens: int,
                temperature: float, top_p: float, top_k: int) -> dict:
-    sys_default = (
-        "You are solving a hard benchmark question. Reason carefully. "
-        "The final answer must follow the requested format exactly."
-    )
     user = case["question"]
     body: dict = {
         "model": model,
         "messages": [
-            {"role": "system", "content": sys_default},
+            {"role": "system", "content": SYSTEM_DEFAULT},
             {"role": "user", "content": user},
         ],
         "temperature": temperature,
@@ -84,6 +93,35 @@ def build_body(model: str, case: dict, mode: str, max_tokens: int,
         body["thinking"] = {"type": "enabled"}
         body["chat_template_kwargs"] = {"enable_thinking": False}
         body["messages"][0]["content"] = ""
+    # ── Prompt-side anti-reasoning experiments ─────────────────────
+    # These test whether *behavioral* reasoning (model thinks in
+    # plain content even when the channel-thought block is suppressed)
+    # can be compelled away with stronger prompt-side controls. The
+    # nothink mode above shows that hiding the tags doesn't change
+    # what the model does — the question is whether anything in the
+    # prompt actually does.
+    elif mode == "nothink-terse":
+        body["thinking"] = {"type": "disabled"}
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+        body["messages"][0]["content"] = SYSTEM_TERSE
+    elif mode == "nothink-prefill-answer":
+        # Pre-seed an assistant turn so the model continues "The
+        # answer is " directly — forces a commit before reasoning.
+        # Many servers won't honor this without a special flag; this
+        # tests whether ours does.
+        body["thinking"] = {"type": "disabled"}
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+        body["messages"].append({"role": "assistant",
+                                 "content": "The answer is "})
+    elif mode == "nothink-stop-after-answer":
+        # Force a hard stop on tokens that signal "now let me explain".
+        # If the model commits to an answer at all, stop before it
+        # starts reasoning.
+        body["thinking"] = {"type": "disabled"}
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+        body["messages"][0]["content"] = SYSTEM_TERSE
+        body["stop"] = ["\nReason", "\nLet", "\nFirst", "\nWe ", "\nTo ",
+                        "Reasoning:", "Explanation:", "Step 1"]
     else:
         raise SystemExit(f"unknown mode: {mode}")
     return body

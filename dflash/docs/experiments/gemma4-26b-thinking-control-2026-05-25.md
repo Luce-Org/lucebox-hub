@@ -233,6 +233,96 @@ can't terminate.
 
 A follow-up run at the model card's recommended sampling is queued.
 
+## Addendum 1 — Retry at the model card's recommended sampling
+
+Re-ran three modes with temperature=1.0, top_p=0.95, top_k=64, seed=42
+(see `tuning-snapshots/...-mcsampling/`):
+
+| mode | comp | content | reasoning | finish | got 588? |
+|---|---|---|---|---|---|
+| `think-default` | 8192 | 1131 | 14867 | length | no — derails mid-derivation |
+| `nothink`       | 4241 | 8579 | 0     | **stop** | **yes** (final line: `QED ==> 588`) |
+| `think-medium`  | 4608 | 961  | 8046  | length | no |
+
+**The greedy-decode degeneration is gone at sampled decode.** All
+three runs are coherent throughout (no `- - - -` repeats).
+
+**Surprising headline**: at sampled decode, `nothink` is the only
+mode that produces a correct, terminated answer. The two thinking
+modes both hit `length` because the model gets lost in the dedicated
+`<|channel>thought` channel and never finalizes within an 8192-token
+budget. The model has a much stronger termination prior in `content`
+than in the reasoning channel.
+
+## Addendum 2 — Brevity-compulsion experiments
+
+User pushback: "if thinking == nothink in terms of content and length
+and the only difference is presence of `<thinking>` tags, that's an
+important observation. It has downstream implications."
+
+To test whether *any* prompt-side mechanism can compel Gemma 4 to
+actually produce a brief answer (rather than reasoning at length in
+either channel), ran three additional nothink variants at temp=1.0
+(see `tuning-snapshots/...-brevity/`):
+
+| mode | comp | content | finish | got 588? |
+|---|---|---|---|---|
+| `nothink` (baseline) | 4241 | 8579 | stop | yes |
+| `nothink-terse` (system="Answer with ONLY the final answer. Do not show any reasoning") | 4942 | 8750 | stop | yes — **prompt ignored** |
+| `nothink-prefill-answer` (assistant turn pre-seeded with `"The answer is "`) | 8192 | 15229 | length | partial — **prefill made it worse** |
+| `nothink-stop-after-answer` (terse system + stop=["\nReason","\nLet","\nFirst","\nWe ","\nTo ","Reasoning:","Explanation:","Step 1"]) | 4942 | **122** | stop | **NO** — answer truncated away |
+
+**No prompt-side mechanism compels brevity at the compute level.**
+The smoking gun is `nothink-stop-after-answer`: stop sequences cut
+visible content from 8579 → 122 chars, but the model still ran 4942
+tokens of compute (same as the other nothink variants), and the
+answer (588) was lost in the truncation. So even forced cutoffs
+don't save work — they just hide more output.
+
+### What's actually a compute lever on Gemma 4?
+
+Based on the data we have:
+
+1. **`max_tokens`** — hard truncation. Saves compute. Loses answer.
+2. **Server force-close at `budget_tokens`** — same: hard cut at
+   budget+512, post-close content is garbage. Saves compute, loses
+   answer.
+3. **Chat-template `enable_thinking=true/false`** — controls only
+   *which channel* the reasoning lands in (reasoning_content vs
+   content). Compute is the same. Channel choice can change
+   termination behavior (`enable_thinking=false` *helps* terminate,
+   per Addendum 1, because content has a stronger end-prior than
+   the reasoning channel).
+4. **Natural-language system prompts ("answer briefly", "don't
+   reason")** — **fully ignored** by the model. Matches the opcnew
+   research finding that reasoning is emergent from Gemma 4's
+   training, not instruction-gated.
+5. **Stop sequences** — work at the output level only; don't save
+   compute, lose the model's actual answer if it comes after the
+   stop trigger.
+6. **Prefill assistant turn** — tested with `"The answer is "`
+   prefix; model treats it as a setup and elaborates at length.
+   Made things worse.
+
+### Downstream implications
+
+- **"Thinking budget" isn't a knob for Gemma 4** the way it is for
+  Qwen3. For Qwen3 a budget triggers wrap-up behavior because the
+  model is trained to close `</think>` and answer. Gemma 4 just
+  gets truncated mid-derivation and emits garbage afterward.
+- **`reasoning_content` vs `content` is mostly cosmetic.** Clients
+  can't actually "opt out of reasoning compute" — only "opt out of
+  the reasoning channel". Pass-rate comparisons between
+  `--think`/`--no-think` on Gemma 4 are measuring channel routing,
+  not thinking behavior.
+- **For agentic use, `nothink` may be the right default for Gemma 4
+  on hard cases** because thinking-mode doesn't finalize within
+  reasonable budgets, while nothink does (and gets the same answer,
+  in `content`).
+- **Our bench harness should report `wall_s` and `comp_tokens`
+  alongside think/nothink labels** — the conventional "think saves
+  no-think loses" interpretation may invert here.
+
 ## Concrete follow-ups
 
 1. **Server: fix `reasoning_tokens` accounting in Gemma4Backend.**
