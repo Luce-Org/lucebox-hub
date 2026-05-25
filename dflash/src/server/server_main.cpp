@@ -692,6 +692,11 @@ int main(int argc, char ** argv) {
 #else
         "cuda";
 #endif
+    sconfig.chunk         = bargs.chunk;
+    sconfig.target_device = placement_device_name(bargs.device);
+    sconfig.draft_device  = bargs.draft_path
+                                ? placement_device_name(bargs.draft_device)
+                                : std::string();
     // Tokenizer ID: best-effort. The Tokenizer class doesn't currently
     // expose the GGUF metadata key it was loaded from, so leave empty
     // and let /props report null. (Add a getter on Tokenizer later.)

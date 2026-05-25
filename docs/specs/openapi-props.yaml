@@ -157,6 +157,9 @@ paths:
                       kv_cache_v: "q4_0"
                       lazy_draft: false
                       target_sharding: false
+                      chunk: 512
+                      target_device: "auto:0"
+                      draft_device: "auto:0"
                     sampling:
                       capabilities:
                         supports_frequency_penalty: true
@@ -741,8 +744,9 @@ components:
     Runtime:
       description: |
         Runtime knobs resolved at startup (compute backend, KV
-        cache dtypes, FA window, sharding). New fields appear
-        here without bumping props_schema.
+        cache dtypes, FA window, sharding, prefill chunk, device
+        placement). New fields appear here without bumping
+        props_schema.
       type: object
       required:
         - backend
@@ -751,6 +755,9 @@ components:
         - kv_cache_v
         - lazy_draft
         - target_sharding
+        - chunk
+        - target_device
+        - draft_device
       properties:
         backend:
           type: string
@@ -780,6 +787,29 @@ components:
           type: boolean
           description: True when the target model is sharded across multiple GPUs.
           example: false
+        chunk:
+          type: integer
+          minimum: 0
+          description: |
+            Prefill chunk size in tokens (`bargs.chunk`). Determines
+            how prompt tokens are batched into the target model
+            during prefill. Captured so bench/snapshot tooling has
+            a full record of the chunk size used.
+          example: 512
+        target_device:
+          type: string
+          description: |
+            Resolved target-model device placement (e.g. `"auto:0"`,
+            `"cuda:0"`). Empty string when no resolution was made.
+          example: "auto:0"
+        draft_device:
+          type:
+            - string
+            - "null"
+          description: |
+            Resolved draft-model device placement, or `null` when no
+            draft model is loaded.
+          example: "auto:0"
 
     Sampling:
       description: |
