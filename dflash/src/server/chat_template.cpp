@@ -139,8 +139,7 @@ std::string render_chat_template(
                 //   enable_thinking=false → suffix `assistant\n<think>\n\n</think>\n\n`
                 // Without this prefix, Qwen3.6 stays in non-thinking mode
                 // even when the client opts in, defeating the thinking-budget
-                // mechanism entirely (phase-2 reprompt never fires because
-                // started_in_thinking=false).
+                // mechanism entirely.
                 result += "<think>\n";
             }
         }

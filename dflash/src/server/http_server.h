@@ -64,8 +64,7 @@ struct ServerConfig {
     // Level 2 force-close (in-process, KV-continuous). When > 0 AND the
     // request opted into thinking, the backend's AR decode overrides
     // the next sampled token with `</think>` once (n_gen - committed)
-    // <= hard_limit_reply_budget. 0 disables the hook (falls back to
-    // Level 1 phase-2 reprompt only).
+    // <= hard_limit_reply_budget. 0 disables the hook.
     //
     // Default 4096. The original 512 came from ds4_eval.c, which sized
     // for DeepSeek-V4-flash's terse style. For most models that's far
@@ -180,7 +179,6 @@ struct ParsedRequest {
     std::string               response_id;
     // Thinking/reasoning state
     bool                      thinking_enabled = true;
-    bool                      started_in_thinking = false;
     // True when the request opted in to the thinking-budget envelope via
     // `thinking: {type: "enabled"}`. Distinct from thinking_enabled (which
     // can be set via the chat template kwarg alone). When true, the response

@@ -73,9 +73,9 @@ static const char * current_test = nullptr;
 
 // ─── Helper: create an SseEmitter with minimal config ──────────────────
 
-static SseEmitter make_emitter(ApiFormat fmt, bool thinking = false) {
+static SseEmitter make_emitter(ApiFormat fmt) {
     return SseEmitter(fmt, "test_id_001", "test-model", 10,
-                      json::array(), nullptr, thinking);
+                      json::array(), nullptr);
 }
 
 // Concatenate all SSE chunks into a single string.
@@ -289,10 +289,14 @@ static void test_parse_tool_allowed_filter() {
 
 static void test_emitter_reasoning_split_openai() {
     // Feed reasoning + content through emitter, verify split.
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, true);
+    // Model emits the opening <think> as its first token (Qwen3.6 path
+    // — the streaming on_token lambda maps the special <think> id to
+    // emit_token("<think>")).
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_start();
 
-    // Feed reasoning tokens
+    // Open reasoning, feed reasoning tokens
+    em.emit_token("<think>");
     em.emit_token("Let me think about this...");
     // Close thinking and start content
     em.emit_token("</think>");
@@ -307,49 +311,56 @@ static void test_emitter_reasoning_split_openai() {
     TEST_ASSERT(em.accumulated_text().find("</think>") == std::string::npos);
 }
 
-// SseEmitter::first_content_token_index() / emit_token_count() — these
-// two accessors drive http_server's finish_details.thinking_tokens /
-// content_tokens split on the natural-close path (model self-closes
-// </think> mid-stream). Each test feeds tokens one-per-call so the
-// emit_token index is straightforward to reason about.
+// SseEmitter::emit_token_count() / accumulated text accessors drive
+// http_server's finish_details accounting on the natural-close path
+// (model self-closes </think> mid-stream). Each test feeds tokens
+// one-per-call so the emit_token index is straightforward to reason
+// about.
 static void test_emitter_first_content_index_natural_close() {
-    // Reasoning tokens, then </think> token, then content tokens.
-    // The token CARRYING </think> lands in REASONING; the NEXT token
-    // is the first CONTENT.
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, true);
+    // Emit reasoning tokens (with explicit <think> open + </think>
+    // close), then content tokens. The emit_token_count() reflects
+    // all delivered tokens; the reasoning/content split is also
+    // recoverable from accumulated_text / reasoning_text.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_start();
-    TEST_ASSERT(em.first_content_token_index() == -1);
     TEST_ASSERT(em.emit_token_count() == 0);
 
-    em.emit_token("reasoning1");   // 0: REASONING
-    em.emit_token("reasoning2");   // 1: REASONING
-    em.emit_token("end</think>");  // 2: REASONING (carries close tag)
-    em.emit_token("content1");     // 3: CONTENT (first)
-    em.emit_token("content2");     // 4: CONTENT
-    em.emit_finish(5);
+    em.emit_token("<think>");
+    em.emit_token("reasoning1");
+    em.emit_token("reasoning2");
+    em.emit_token("end</think>");
+    em.emit_token("content1");
+    em.emit_token("content2");
+    em.emit_finish(6);
 
-    TEST_ASSERT(em.emit_token_count() == 5);
-    TEST_ASSERT(em.first_content_token_index() == 3);
+    TEST_ASSERT(em.emit_token_count() == 6);
+    // Reasoning + content text both populated.
+    TEST_ASSERT(!em.reasoning_text().empty());
+    TEST_ASSERT(em.accumulated_text().find("content1") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("content2") != std::string::npos);
 }
 
 static void test_emitter_first_content_index_never_closed() {
-    // Model emits reasoning only — never closes </think>. The index
-    // stays at -1 so the caller knows to count everything as thinking.
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, true);
+    // Model opens <think> then emits reasoning only — never closes
+    // </think>. All produced text lands in reasoning_text; visible
+    // accumulated_text stays empty.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_start();
 
+    em.emit_token("<think>");
     em.emit_token("reasoning never closes");
     em.emit_token("still thinking");
-    em.emit_finish(2);
+    em.emit_finish(3);
 
-    TEST_ASSERT(em.emit_token_count() == 2);
-    TEST_ASSERT(em.first_content_token_index() == -1);
+    TEST_ASSERT(em.emit_token_count() == 3);
+    TEST_ASSERT(em.reasoning_text().find("reasoning") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().empty());
 }
 
 static void test_emitter_first_content_index_content_only() {
-    // Non-thinking request: started_in_thinking=false. The very
-    // first emit_token starts in CONTENT mode, so the index is 0.
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    // Non-thinking request: emitter starts in CONTENT mode, so the
+    // very first emit_token lands at index 0.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_start();
     em.emit_token("immediate content");
     em.emit_finish(1);
@@ -358,31 +369,14 @@ static void test_emitter_first_content_index_content_only() {
     TEST_ASSERT(em.emit_token_count() == 1);
 }
 
-static void test_emitter_first_content_index_hard_close_inject() {
-    // Hard-close path: model never emits </think>, server injects
-    // a synthetic </think> before the phase-2 content tokens. The
-    // synthetic injection is one emit_token call (carries the close
-    // tag → REASONING); the next phase-2 token is the first CONTENT.
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, true);
-    em.emit_start();
-
-    em.emit_token("phase1 reasoning a");  // 0: REASONING
-    em.emit_token("phase1 reasoning b");  // 1: REASONING
-    em.emit_token("</think>");            // 2: REASONING (synthetic close)
-    em.emit_token("phase2 answer a");     // 3: CONTENT (first)
-    em.emit_token("phase2 answer b");     // 4: CONTENT
-    em.emit_finish(5);
-
-    TEST_ASSERT(em.first_content_token_index() == 3);
-    TEST_ASSERT(em.emit_token_count() == 5);
-}
-
 static void test_emitter_reasoning_strips_leading_think_tag() {
-    // When started_in_thinking=true, model may echo <think>.
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, true);
+    // Model emits leading whitespace + <think> as one token, then
+    // continues thinking. The leading-<think>-with-whitespace-prefix
+    // strip ensures the reasoning text doesn't contain the open tag.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_start();
 
-    // Model echoes \n<think>\n before actual reasoning
+    // Model emits \n<think>\n before actual reasoning
     em.emit_token("\n<think>\nActual reasoning here");
     em.emit_token("</think>");
     em.emit_token("Content");
@@ -395,7 +389,7 @@ static void test_emitter_reasoning_strips_leading_think_tag() {
 }
 
 static void test_emitter_content_only_no_thinking() {
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_start();
     em.emit_token("Hello, world!");
     em.emit_finish(5);
@@ -406,7 +400,7 @@ static void test_emitter_content_only_no_thinking() {
 
 static void test_emitter_tool_buffer_detection() {
     // When the emitter sees <tool_call>, it should buffer and parse tools.
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_start();
     em.emit_token("<tool_call>\n"
                   "<function=get_weather>\n"
@@ -438,7 +432,7 @@ static void test_emitter_anthropic_tool_use_blocks() {
                           {"properties", {{"city", {{"type", "string"}}}}}}}
     });
     SseEmitter em(ApiFormat::ANTHROPIC, "req_id", "test-model", 10,
-                  tools, nullptr, /*thinking=*/false);
+                  tools, nullptr);
     (void)em.emit_start();
     // Feed Qwen3 XML tool call in chunks so the holdback buffer flushes;
     // parser will detect <tool_call><function=NAME>...</tool_call>.
@@ -464,7 +458,7 @@ static void test_emitter_anthropic_tool_use_blocks() {
 
 static void test_emitter_anthropic_structure() {
     // Verify Anthropic format emits proper event sequence.
-    auto em = make_emitter(ApiFormat::ANTHROPIC, false);
+    auto em = make_emitter(ApiFormat::ANTHROPIC);
     auto start = em.emit_start();
     std::string start_str = concat(start);
 
@@ -488,7 +482,7 @@ static void test_emitter_anthropic_structure() {
 }
 
 static void test_emitter_responses_structure() {
-    auto em = make_emitter(ApiFormat::RESPONSES, false);
+    auto em = make_emitter(ApiFormat::RESPONSES);
     auto start = em.emit_start();
     std::string start_str = concat(start);
 
@@ -514,7 +508,7 @@ static void test_emitter_responses_bare_function_tool_call() {
         }}
     }});
     SseEmitter em(ApiFormat::RESPONSES, "resp_test_001", "test-model", 10,
-                  tools, nullptr, false);
+                  tools, nullptr);
     em.emit_start();
     em.emit_token("\n\n<function=exec_command>\n<parameter=cmd>\ngit pull\n");
     em.emit_token("</parameter>\n</function>\n");
@@ -532,7 +526,7 @@ static void test_emitter_responses_bare_function_tool_call() {
 }
 
 static void test_emitter_streaming_openai_has_done() {
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_start();
     em.emit_token("Hello");
     auto finish = em.emit_finish(3);
@@ -543,7 +537,7 @@ static void test_emitter_streaming_openai_has_done() {
 
 static void test_emitter_nonstreaming_accumulates() {
     // Non-streaming: tokens fed through emitter, accumulated_text() has all content.
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_token("Hello ");
     em.emit_token("world");
     em.emit_finish(5);
@@ -553,20 +547,20 @@ static void test_emitter_nonstreaming_accumulates() {
 }
 
 static void test_emitter_anthropic_thinking_blocks() {
-    auto em = make_emitter(ApiFormat::ANTHROPIC, true);
+    auto em = make_emitter(ApiFormat::ANTHROPIC);
     auto start = em.emit_start();
     std::string start_str = concat(start);
 
-    TEST_ASSERT(start_str.find("thinking") != std::string::npos);
-
-    // Feed reasoning
-    em.emit_token("Reasoning about the problem at length here...");
-    em.emit_token("</think>");
-    em.emit_token("The answer is clear now.");
+    // Model opens <think>, emits reasoning, closes, emits content.
+    auto t1 = em.emit_token("<think>");
+    auto t2 = em.emit_token("Reasoning about the problem at length here...");
+    auto t3 = em.emit_token("</think>");
+    auto t4 = em.emit_token("The answer is clear now.");
     auto finish = em.emit_finish(20);
-    std::string all = start_str + concat(finish);
+    std::string all = start_str + concat(t1) + concat(t2) + concat(t3) +
+                      concat(t4) + concat(finish);
 
-    // Should have both thinking and text blocks
+    // Should have both thinking and text blocks somewhere in the stream
     TEST_ASSERT(all.find("thinking") != std::string::npos);
     TEST_ASSERT(!em.reasoning_text().empty());
     TEST_ASSERT(!em.accumulated_text().empty());
@@ -576,15 +570,15 @@ static void test_emitter_anthropic_thinking_blocks() {
 // Stop sequences tests
 // ═══════════════════════════════════════════════════════════════════════
 
-static SseEmitter make_emitter_with_stops(ApiFormat fmt, bool thinking,
+static SseEmitter make_emitter_with_stops(ApiFormat fmt,
                                            const std::vector<std::string> & stops) {
     return SseEmitter(fmt, "test_id_001", "test-model", 10,
-                      json::array(), nullptr, thinking, stops);
+                      json::array(), nullptr, stops);
 }
 
 static void test_stop_sequence_basic() {
     // Stop sequence should truncate content at the match point.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, false, {"STOP"});
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{"STOP"});
     em.emit_token("Hello ");
     em.emit_token("world ");
     em.emit_token("STOP");
@@ -600,7 +594,7 @@ static void test_stop_sequence_basic() {
 
 static void test_stop_sequence_mid_token() {
     // Stop sequence may span multiple tokens due to holdback buffering.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, false, {"END"});
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{"END"});
     em.emit_token("Go ");
     em.emit_token("to the E");
     em.emit_token("ND now");
@@ -614,7 +608,7 @@ static void test_stop_sequence_mid_token() {
 
 static void test_stop_sequence_multiple() {
     // Multiple stop sequences — earliest match wins.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, false, {"AAA", "BB"});
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{"AAA", "BB"});
     em.emit_token("xBBy");
 
     TEST_ASSERT(em.stop_hit());
@@ -624,7 +618,7 @@ static void test_stop_sequence_multiple() {
 
 static void test_stop_sequence_no_match() {
     // No stop sequence hit — normal operation.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, false, {"NOMATCH"});
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{"NOMATCH"});
     em.emit_token("Hello world this is a long text");
     em.emit_finish(10);
 
@@ -634,7 +628,7 @@ static void test_stop_sequence_no_match() {
 
 static void test_stop_sequence_empty_list() {
     // Empty stop list — no effect.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, false, {});
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{});
     em.emit_token("Hello STOP world");
     em.emit_finish(5);
 
@@ -644,7 +638,7 @@ static void test_stop_sequence_empty_list() {
 
 static void test_stop_sequence_finish_reason() {
     // finish_reason should be "stop" when stop sequence hit.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, false, {"END"});
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{"END"});
     em.emit_token("content END more");
 
     TEST_ASSERT(em.stop_hit());
@@ -654,7 +648,7 @@ static void test_stop_sequence_finish_reason() {
 
 static void test_stop_sequence_streaming_output() {
     // Streaming: verify the [DONE] is still emitted after stop.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, false, {"HALT"});
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{"HALT"});
     auto start = em.emit_start();
     em.emit_token("some text HALT rest");
 
@@ -667,7 +661,7 @@ static void test_stop_sequence_streaming_output() {
 
 static void test_stop_sequence_anthropic_format() {
     // Anthropic format should emit end_turn stop_reason.
-    auto em = make_emitter_with_stops(ApiFormat::ANTHROPIC, false, {"DONE"});
+    auto em = make_emitter_with_stops(ApiFormat::ANTHROPIC, {"DONE"});
     em.emit_start();
     em.emit_token("This is content DONE rest");
 
@@ -679,8 +673,10 @@ static void test_stop_sequence_anthropic_format() {
 }
 
 static void test_stop_sequence_in_reasoning_mode() {
-    // Stop sequence in reasoning mode should still stop.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, true, {"CUTOFF"});
+    // Stop sequence in reasoning mode should still stop. Model opens
+    // <think> first to enter REASONING.
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, {"CUTOFF"});
+    em.emit_token("<think>");
     em.emit_token("Thinking deeply about this CUTOFF answer");
 
     TEST_ASSERT(em.stop_hit());
@@ -692,7 +688,7 @@ static void test_stop_sequence_in_reasoning_mode() {
 static void test_stop_sequence_holdback_extends() {
     // With a long stop sequence, holdback buffer should extend to prevent
     // emitting text that's part of a stop sequence.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, false,
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,
                                        {"LONGSTOPSEQUENCE"});
     // Feed text token by token — the holdback should prevent premature emission
     em.emit_token("prefix ");
@@ -1822,7 +1818,7 @@ static void test_usage_timings_openai_chat_streaming() {
     // OpenAI Chat streaming: the terminal usage chunk (just before
     // data: [DONE]) carries `timings.{prefill_ms, decode_ms,
     // decode_tokens_per_sec}` when timings are passed to emit_finish.
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_start();
     em.emit_token("Hello world");
 
@@ -1841,7 +1837,7 @@ static void test_usage_timings_openai_chat_streaming() {
 static void test_usage_timings_anthropic_streaming() {
     // Anthropic streaming: message_delta.usage gains a `timings`
     // sibling alongside `output_tokens`.
-    auto em = make_emitter(ApiFormat::ANTHROPIC, false);
+    auto em = make_emitter(ApiFormat::ANTHROPIC);
     em.emit_start();
     em.emit_token("ok");
     GenTimings t{0.05, 0.5};  // 50.0 ms / 500.0 ms
@@ -1857,7 +1853,7 @@ static void test_usage_timings_anthropic_streaming() {
 
 static void test_usage_timings_responses_streaming() {
     // Responses streaming: response.completed.usage gains `timings`.
-    auto em = make_emitter(ApiFormat::RESPONSES, false);
+    auto em = make_emitter(ApiFormat::RESPONSES);
     em.emit_start();
     em.emit_token("done");
     GenTimings t{0.1, 1.0};
@@ -1881,7 +1877,7 @@ static void test_usage_timings_zero_decode_no_div_by_zero() {
     TEST_ASSERT(j["decode_tokens_per_sec"].get<double>() == 0.0);
 
     // Also exercise via OpenAI streaming path — finite JSON output, no NaN/Inf.
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_start();
     auto finish = em.emit_finish(/*completion_tokens*/ 0, &t);
     std::string finish_str = concat(finish);
@@ -1895,7 +1891,7 @@ static void test_usage_timings_omitted_when_null() {
     // Backward compat: emit_finish(n) (no timings) emits the legacy
     // usage block — no `timings` key. Guards the SDK-facing default
     // for callers that don't yet wire timings through.
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_start();
     em.emit_token("x");
     auto finish = em.emit_finish(3);  // no timings arg
@@ -1941,7 +1937,6 @@ int main() {
     RUN_TEST(test_emitter_first_content_index_natural_close);
     RUN_TEST(test_emitter_first_content_index_never_closed);
     RUN_TEST(test_emitter_first_content_index_content_only);
-    RUN_TEST(test_emitter_first_content_index_hard_close_inject);
     RUN_TEST(test_emitter_reasoning_strips_leading_think_tag);
     RUN_TEST(test_emitter_content_only_no_thinking);
     RUN_TEST(test_emitter_tool_buffer_detection);

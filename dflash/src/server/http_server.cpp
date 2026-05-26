@@ -741,8 +741,8 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         // --default-max-tokens was previously a dead flag because the
         // parser read config_.max_tokens (legacy 4096) instead. The new
         // default protects thinking-budget requests that omit max_tokens
-        // from being capped at 4096 — phase-1 alone can consume that,
-        // leaving no headroom for phase-2.
+        // from being capped at 4096 — thinking alone can consume that,
+        // leaving no headroom for the visible reply.
         req.max_output = body.value("max_tokens",
                          body.value("max_output_tokens",
                          body.value("max_completion_tokens", config_.default_max_tokens)));
@@ -1015,16 +1015,6 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                                             tools_json);
         }
         req.prompt_tokens = tokenizer_.encode(rendered);
-        // Detect if prompt ends with <think> (model will start in reasoning mode).
-        if (enable_thinking) {
-            size_t end = rendered.size();
-            while (end > 0 && (rendered[end-1] == ' ' || rendered[end-1] == '\n' ||
-                   rendered[end-1] == '\r' || rendered[end-1] == '\t'))
-                end--;
-            if (end >= 7 && rendered.compare(end - 7, 7, "<think>") == 0) {
-                req.started_in_thinking = true;
-            }
-        }
 
         // count_tokens: short-circuit after tokenization. Skip generation
         // entirely — Anthropic's contract is just `{"input_tokens": N}`.
@@ -1115,7 +1105,7 @@ void HttpServer::worker_loop() {
         // Create SSE emitter for streaming state machine.
         SseEmitter emitter(req.format, req.response_id, req.model,
                            (int)req.prompt_tokens.size(), req.tools,
-                           &tool_memory_, req.started_in_thinking,
+                           &tool_memory_,
                            req.stop_sequences);
 
         // Emit initial SSE events.
@@ -1199,20 +1189,19 @@ void HttpServer::worker_loop() {
 
         // Build generate request.
         //
-        // Thinking-budget Level 1: when the caller opted in via
-        // `thinking: {type: "enabled"}` AND the request is non-streaming
-        // (the only path with phase-2 reprompt wired up), cap phase-1
-        // generation at --think-max-tokens. The remainder is reserved
-        // for a phase-2 reprompt that runs if the model failed to emit
-        // </think> within the phase-1 cap. Mirrors server.py:_phase1_gen_len
-        // at scripts/server.py:1708-1724. Streaming requests keep the
-        // legacy single-cap behaviour until streaming phase-2 lands.
-        const bool budget_active = req.thinking_opt_in && !req.stream;
-        // Effective phase-1 cap: per-request value (already clamped to
+        // Thinking-budget v2 (Level 2): when caller opts in via
+        // `thinking:{type:enabled}`, cap n_gen at think_max + reply_budget
+        // so the BudgetHook fires at the boundary, mid-stream, with KV
+        // state intact. Applies uniformly to streaming and non-streaming
+        // requests — the BudgetHook lives inside do_ar_decode /
+        // do_spec_decode and injects close tokens at the budget edge
+        // regardless of how the server is delivering the result.
+        const bool budget_active = req.thinking_opt_in;
+        // Effective think cap: per-request value (already clamped to
         // config_.think_max_tokens above) wins over the server-wide
         // think_max_tokens. Then both must fit inside the combined
         // max_output. Spec §4.4 + §5.3.
-        const int effective_phase1_ceiling = (req.per_req_phase1_cap >= 0)
+        const int effective_think_ceiling = (req.per_req_phase1_cap >= 0)
             ? req.per_req_phase1_cap
             : config_.think_max_tokens;
         // The effective per-request reply budget is the operator's choice
@@ -1220,19 +1209,19 @@ void HttpServer::worker_loop() {
         // when `n_gen - generated <= eff_reply`, which means n_gen must
         // include BOTH the think budget AND the reply reserve. Without the
         // `+ eff_reply` term, force-close fires immediately when
-        // `eff_reply == effective_phase1_ceiling` (e.g. think_max=4096,
+        // `eff_reply == effective_think_ceiling` (e.g. think_max=4096,
         // hard_limit=4096 → remaining starts at 4096, condition fires
         // before the model emits a single thinking token). Spec §4.4.
         const int eff_reply_for_n_gen = (req.per_req_reply_budget >= 0)
             ? req.per_req_reply_budget
             : config_.hard_limit_reply_budget;
-        const int phase1_cap = budget_active
-            ? std::min(effective_phase1_ceiling + eff_reply_for_n_gen, req.max_output)
+        const int n_gen_cap = budget_active
+            ? std::min(effective_think_ceiling + eff_reply_for_n_gen, req.max_output)
             : req.max_output;
 
         GenerateRequest gen_req;
         gen_req.prompt = effective_prompt;
-        gen_req.n_gen = phase1_cap;
+        gen_req.n_gen = n_gen_cap;
         gen_req.sampler = req.sampler;
         gen_req.do_sample = req.sampler.needs_logit_processing();
         gen_req.stream = false;  // we handle streaming via on_token callback
@@ -1241,11 +1230,8 @@ void HttpServer::worker_loop() {
         // configured with a hard-limit reply budget, and we resolved the
         // close-tag sequence at startup, wire the BudgetHook so the
         // backend's AR decode injects `</think>` at the budget boundary.
-        // This supersedes Level 1's phase-2 reprompt for most cases — the
-        // model gets to write the visible answer in-stream rather than
-        // having its KV state reset by the reprompt. Phase-2 still runs
-        // as a fallback if the model fails to close `</think>` (e.g.
-        // when force-close didn't fire because the budget never tightened).
+        // The model gets to write the visible answer in-stream rather than
+        // running unbounded.
         //
         // hard_limit_remaining is the per-request reply_budget when set
         // (already clamped to config_.hard_limit_reply_budget above), else
@@ -1511,129 +1497,15 @@ void HttpServer::worker_loop() {
             }
         }
 
-        // ── Phase-2 reprompt (thinking-budget Level 1) ─────────────────
-        // When the caller opted in via `thinking:{type:enabled}` and the
-        // model failed to emit `</think>` within --think-max-tokens, force
-        // close the reasoning by re-prompting with the phase-1 tokens
-        // followed by the literal "</think>\n\nFinal answer: " and let the
-        // model write a visible content body against the remaining budget.
-        // Mirrors server.py:2141-2196. Non-streaming only — streaming
-        // phase-2 is a follow-up (needs SSE flush + re-open).
-        std::vector<int32_t> phase1_tokens = result.tokens;  // copy
-        std::vector<int32_t> phase2_tokens;
-        // Start as "natural" — the backend will tell us via
-        // result.budget_forced_close if Level 2 actually injected the
-        // close, and Level 1 below sets "hard" when it has to reprompt.
+        // close_kind reflects the Level 2 BudgetHook outcome: "hard" when
+        // the backend's AR/spec decode injected the close-token sequence
+        // at the budget boundary, "natural" when the model self-closed
+        // (or the request never opted in). Emitted as part of
+        // finish_details for thinking-budget callers.
         std::string close_kind =
             (req.thinking_opt_in && result.budget_forced_close)
                 ? "hard"
                 : "natural";
-
-        // Phase-2 gate diagnostic — compile out by default. Enable with
-        // -DDFLASH_DEBUG_PHASE2_GATE=1 to surface the gate-input dump
-        // again (useful when Level 1 / Level 2 behavior drifts).
-#ifdef DFLASH_DEBUG_PHASE2_GATE
-        {
-            std::vector<int32_t> tail_ids(
-                effective_prompt.size() >= 10
-                    ? effective_prompt.end() - 10
-                    : effective_prompt.begin(),
-                effective_prompt.end());
-            std::string tail_text = tokenizer_.decode(tail_ids);
-            for (auto & ch : tail_text) {
-                if (ch == '\n' || ch == '\r') ch = '|';
-            }
-            std::string phase1_decoded;
-            if (!phase1_tokens.empty()) {
-                phase1_decoded = tokenizer_.decode(phase1_tokens);
-            }
-            bool dbg_close_found =
-                phase1_decoded.find("</think>") != std::string::npos;
-            int dbg_ph2_gen_len =
-                std::max(0, req.max_output - (int)phase1_tokens.size());
-            std::fprintf(stderr,
-                "[phase2-gate] thinking_opt_in=%d started_in_thinking=%d "
-                "stream=%d client_disconnected=%d phase1_tokens=%zu "
-                "result_ok=%d req.max_output=%d phase1_cap=%d "
-                "ph2_gen_len_est=%d close_in_phase1=%d "
-                "effective_prompt_tail=%s\n",
-                (int)req.thinking_opt_in, (int)req.started_in_thinking,
-                (int)req.stream, (int)client_disconnected,
-                phase1_tokens.size(), (int)result.ok,
-                req.max_output, phase1_cap, dbg_ph2_gen_len,
-                (int)dbg_close_found, tail_text.c_str());
-        }
-#endif
-
-        if (req.thinking_opt_in &&
-            req.started_in_thinking &&
-            !req.stream &&
-            !client_disconnected &&
-            !phase1_tokens.empty())
-        {
-            std::string phase1_text = tokenizer_.decode(phase1_tokens);
-            bool think_closed = phase1_text.find("</think>") != std::string::npos;
-            if (!think_closed) {
-                close_kind = "hard";
-                const std::string phase2_prefix = "</think>\n\nFinal answer: ";
-                auto closing_ids = tokenizer_.encode(phase2_prefix);
-
-                // New prompt = phase-1 effective prompt + phase-1 tokens +
-                // closing tag. We can't reuse the cached KV state because
-                // the prompt suffix changed; phase-2 always pays a fresh
-                // prefill (mirrors server.py — it spawns a new daemon
-                // command without RESTORE).
-                std::vector<int32_t> ph2_prompt = effective_prompt;
-                ph2_prompt.insert(ph2_prompt.end(),
-                                  phase1_tokens.begin(), phase1_tokens.end());
-                ph2_prompt.insert(ph2_prompt.end(),
-                                  closing_ids.begin(), closing_ids.end());
-
-                // Two bounds clamp phase-2 generation:
-                //   1. Remaining tokens after phase-1 (req.max_output budget)
-                //   2. Remaining context after the synthetic phase-2 prompt
-                //      grew by phase1_tokens + closing_ids. Without (2), a
-                //      request that passed the initial prompt+max_output <=
-                //      max_ctx check can still blow the window in phase-2.
-                //      Codex review feedback on the Level 1 port.
-                int ph2_gen_len = std::max(
-                    0, req.max_output - (int)phase1_tokens.size());
-                int ctx_remaining = config_.max_ctx - (int)ph2_prompt.size() - 20;
-                ph2_gen_len = std::min(ph2_gen_len, std::max(0, ctx_remaining));
-                if (ph2_gen_len > 0) {
-                    GenerateRequest ph2_req;
-                    ph2_req.prompt = std::move(ph2_prompt);
-                    ph2_req.n_gen = ph2_gen_len;
-                    ph2_req.sampler = req.sampler;
-                    ph2_req.do_sample = req.sampler.temp > 0.0f;
-                    ph2_req.stream = false;
-                    // No inline snapshot — phase-2's KV state isn't worth
-                    // caching (the prompt suffix is synthetic), and we
-                    // don't want phase-2 to step on the phase-1 inline
-                    // snapshot slot we just confirmed above.
-                    ph2_req.snap_slot = -1;
-                    ph2_req.snap_pos = -1;
-
-                    DaemonIO io_phase2{};
-                    io_phase2.stream_fd = -1;
-                    // No on_token callback — phase-2 is non-streaming.
-
-                    if (config_.lazy_draft) {
-                        backend_.unpark("draft");
-                    }
-                    GenerateResult ph2_result =
-                        backend_.generate(ph2_req, io_phase2);
-                    if (config_.lazy_draft) {
-                        backend_.park("draft");
-                    }
-                    backend_.release_scratch();
-
-                    if (ph2_result.ok) {
-                        phase2_tokens = std::move(ph2_result.tokens);
-                    }
-                }
-            }
-        }
 
         // Finalize.
         // Per-request wall-clock timings forwarded to the response's
@@ -1652,16 +1524,6 @@ void HttpServer::worker_loop() {
         } else if (!req.stream && !client_disconnected) {
             // Non-streaming: build complete response using emitter state.
             // Feed all tokens through emitter (skip specials like streaming path).
-            //
-            // The emitter tracks first_content_token_index() — the
-            // emit_token index at which CONTENT mode first started.
-            // We use that to split the phase-1/phase-2 token totals at
-            // the actual REASONING→CONTENT boundary the emitter
-            // detected (which can happen mid-phase-1 when the model
-            // self-closes </think>). Without this, phase1_tokens.size()
-            // would over-count reasoning whenever the model naturally
-            // closed </think> and wrote a visible answer in phase 1.
-            // (Codex r1 P2 follow-up.)
             auto feed_tokens = [&](const std::vector<int32_t> & toks) -> bool {
                 for (int32_t tok : toks) {
                     const std::string & raw = tokenizer_.raw_token(tok);
@@ -1691,22 +1553,8 @@ void HttpServer::worker_loop() {
                 return true;
             };
 
-            bool keep_going = feed_tokens(phase1_tokens);
-            // Phase-2 reprompt (Level 1): inject just the </think> close
-            // tag so the emitter transitions REASONING → CONTENT, then
-            // feed phase-2 tokens as content. The phase-2 daemon prompt
-            // includes "</think>\n\nFinal answer: " as scaffolding to
-            // anchor the model, but those bytes are server-injected and
-            // were neither generated by the model nor counted in usage —
-            // emitting them as visible content would prefix every
-            // hard-closed response with "Final answer: " text the user
-            // didn't write. Codex review caught this leak.
-            if (keep_going && close_kind == "hard" && !phase2_tokens.empty()) {
-                emitter.emit_token("</think>");
-                feed_tokens(phase2_tokens);
-            }
-            int total_completion_tokens =
-                (int)phase1_tokens.size() + (int)phase2_tokens.size();
+            feed_tokens(result.tokens);
+            const int total_completion_tokens = (int)result.tokens.size();
             emitter.emit_finish(total_completion_tokens);
 
             // Derive per-mode token counts from the emitter's REASONING
@@ -1715,14 +1563,10 @@ void HttpServer::worker_loop() {
             // tokens before that index were emitted while the emitter
             // was in REASONING (the `</think>`-carrying token itself
             // lands in REASONING and the NEXT token is the first
-            // CONTENT). If the emitter never transitioned (model never
-            // closed <think>, then the synthetic </think> we injected
-            // before phase-2 tokens triggered the transition), the
-            // index reflects the synthetic close — exactly what we
-            // want for the hard-close path. EOS/special tokens are
-            // skipped by feed_tokens above, so emit_token_count() may
-            // be smaller than the sum of phase1+phase2 sizes; the
-            // remainder counts as unattributed (e.g., TOOL_BUFFER).
+            // CONTENT). EOS/special tokens are skipped by feed_tokens
+            // above, so emit_token_count() may be smaller than
+            // result.tokens.size(); the remainder counts as
+            // unattributed (e.g., TOOL_BUFFER).
             const int fci = emitter.first_content_token_index();
             const int emitted = emitter.emit_token_count();
             const int reasoning_tokens_emitted =
@@ -1740,8 +1584,7 @@ void HttpServer::worker_loop() {
                     // multi-dialect aliasing".
                     //   reasoning_content : DeepSeek R1 / dflash primary
                     //   reasoning         : OpenRouter / Anthropic-gateway flat
-                    //   reasoning_details : typed-block list; single block today,
-                    //                       room for phase-1/phase-2 splits later.
+                    //   reasoning_details : typed-block list; single block.
                     const std::string & rt = emitter.reasoning_text();
                     msg["reasoning_content"] = rt;
                     msg["reasoning"]         = rt;
@@ -1761,17 +1604,13 @@ void HttpServer::worker_loop() {
                 // finish_reason: emitter only knows about "stop" / "tool_calls"
                 // (EOS / tool-call detection). It can't see that the daemon
                 // hit the n_gen cap. Compute "length" here from the
-                // committed-token counts vs the per-phase caps. Mirrors
-                // server.py:2245-2248. OpenAI/Anthropic clients (open-webui,
-                // Cline) gate retry logic on finish_reason="length".
+                // committed-token count vs the n_gen cap.
+                // OpenAI/Anthropic clients (open-webui, Cline) gate retry
+                // logic on finish_reason="length".
                 std::string effective_finish_reason = emitter.finish_reason();
                 if (effective_finish_reason == "stop") {
-                    bool phase1_at_cap = (int)phase1_tokens.size() >= phase1_cap;
-                    int  ph2_cap_est   = std::max(0,
-                        req.max_output - (int)phase1_tokens.size());
-                    bool phase2_at_cap = !phase2_tokens.empty() &&
-                        (int)phase2_tokens.size() >= ph2_cap_est;
-                    if (phase1_at_cap || phase2_at_cap) {
+                    bool at_cap = (int)result.tokens.size() >= n_gen_cap;
+                    if (at_cap) {
                         effective_finish_reason = "length";
                     }
                 }
@@ -1782,14 +1621,13 @@ void HttpServer::worker_loop() {
                 // finish_details — mirrors ds4_eval.c's eval_think_close_info.
                 // Emitted when the caller opted in to the thinking-budget
                 // envelope via `thinking:{type:enabled}`. close_kind reflects
-                // whether the model self-closed </think> ("natural") or the
-                // server force-closed it via phase-2 reprompt ("hard").
-                // See docs/specs/thinking-budget.md "v2 design".
+                // whether the model self-closed the thinking block ("natural")
+                // or the BudgetHook force-closed it at the budget boundary
+                // ("hard"). See docs/specs/thinking-budget.md "v2 design".
                 if (req.thinking_opt_in) {
-                    // Use the emitter-tracked split, not phase1/phase2 sizes.
-                    // The model can self-close </think> mid-phase-1 and write
-                    // visible content there; phase1_tokens.size() would
-                    // over-count thinking in that case (per codex review).
+                    // thinking_tokens / content_tokens come from the
+                    // emitter's REASONING→CONTENT transition tracking;
+                    // total_tokens is the raw committed-token count.
                     choice["finish_details"] = {
                         {"close_kind",      close_kind},
                         {"thinking_tokens", reasoning_tokens_emitted},
@@ -1819,8 +1657,8 @@ void HttpServer::worker_loop() {
                     {"completion_tokens", total_completion_tokens},
                     {"total_tokens", (int)req.prompt_tokens.size() + total_completion_tokens},
                     {"completion_tokens_details", {
-                        // Match finish_details.thinking_tokens (emitter-
-                        // tracked split, not phase1.size()).
+                        // Match finish_details.thinking_tokens
+                        // (emitter-tracked split).
                         {"reasoning_tokens", reasoning_tokens_emitted}
                     }},
                     {"timings", build_timings_json(gen_timings, total_completion_tokens)}
@@ -1878,14 +1716,10 @@ void HttpServer::worker_loop() {
                 std::string anthropic_stop_reason;
                 {
                     std::string er = emitter.finish_reason();
-                    bool phase1_at_cap = (int)phase1_tokens.size() >= phase1_cap;
-                    int  ph2_cap_est   = std::max(0,
-                        req.max_output - (int)phase1_tokens.size());
-                    bool phase2_at_cap = !phase2_tokens.empty() &&
-                        (int)phase2_tokens.size() >= ph2_cap_est;
-                    if (er == "tool_calls")            anthropic_stop_reason = "tool_use";
-                    else if (phase1_at_cap || phase2_at_cap) anthropic_stop_reason = "max_tokens";
-                    else                               anthropic_stop_reason = "end_turn";
+                    bool at_cap = (int)result.tokens.size() >= n_gen_cap;
+                    if (er == "tool_calls") anthropic_stop_reason = "tool_use";
+                    else if (at_cap)        anthropic_stop_reason = "max_tokens";
+                    else                    anthropic_stop_reason = "end_turn";
                 }
                 json anth_usage = {
                     {"input_tokens", (int)req.prompt_tokens.size()},

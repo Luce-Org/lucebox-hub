@@ -60,7 +60,6 @@ public:
                int prompt_tokens,
                const json & tools,
                ToolMemory * tool_memory,
-               bool started_in_thinking,
                const std::vector<std::string> & stop_sequences = {});
 
     // Emit the initial SSE events (role delta, message_start, etc.)
@@ -161,8 +160,7 @@ private:
     // Track the index (in emit_token calls) at which CONTENT mode
     // first started, and the total emit_token call count. Used by
     // http_server to derive thinking/content token counts from the
-    // emitter's REASONING → CONTENT transition rather than from
-    // phase-1/phase-2 invocation boundaries. See
+    // emitter's REASONING → CONTENT transition. See
     // first_content_token_index() docs.
     int          first_content_token_index_ = -1;
     int          emit_token_count_ = 0;

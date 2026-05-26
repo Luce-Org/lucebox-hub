@@ -748,8 +748,7 @@ int main(int argc, char ** argv) {
         } else {
             std::fprintf(stderr,
                 "[server] level-2 force-close DISABLED: text %.40s... "
-                "tokenizes to empty. Falling back to Level 1 phase-2 "
-                "reprompt only.\n", close_text.c_str());
+                "tokenizes to empty.\n", close_text.c_str());
         }
     }
 

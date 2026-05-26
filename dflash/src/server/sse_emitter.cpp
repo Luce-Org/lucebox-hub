@@ -59,7 +59,6 @@ SseEmitter::SseEmitter(ApiFormat format,
                        int prompt_tokens,
                        const json & tools,
                        ToolMemory * tool_memory,
-                       bool started_in_thinking,
                        const std::vector<std::string> & stop_sequences)
     : format_(format)
     , request_id_(request_id)
@@ -67,8 +66,8 @@ SseEmitter::SseEmitter(ApiFormat format,
     , prompt_tokens_(prompt_tokens)
     , tools_(tools)
     , tool_memory_(tool_memory)
-    , mode_(started_in_thinking ? StreamMode::REASONING : StreamMode::CONTENT)
-    , active_kind_(started_in_thinking ? "thinking" : "text")
+    , mode_(StreamMode::CONTENT)
+    , active_kind_("text")
     , stop_sequences_(stop_sequences)
     , created_at_(unix_timestamp())
     , msg_item_id_(gen_item_id())
@@ -262,7 +261,6 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
 
         if (mode_ == StreamMode::REASONING) {
             // Strip leading <think> tag from reasoning (ds4 pattern).
-            // When started_in_thinking=true, the model may echo <think> again.
             // The model may emit whitespace before <think>, so we skip leading
             // whitespace first, then check for the tag.
             if (!checked_think_prefix_) {
