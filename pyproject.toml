@@ -10,6 +10,7 @@ authors = [{ name = "Lucebox" }]
 dependencies = [
     "lucebox",
     "lucebox-dflash",
+    "luce-bench",
     "pflash",
 ]
 
@@ -24,16 +25,7 @@ line-length = 100
 # benchmark, autotune, and host-CLI stack. Untouched server-adjacent scripts and
 # vendored dependencies stay outside this gate until they are cleaned up.
 include = [
-    "dflash/scripts/bench_agent.py",
-    "dflash/scripts/bench_agentic_session.py",
-    "dflash/scripts/bench_agentic_tools.py",
-    "dflash/scripts/bench_he.py",
-    "dflash/scripts/bench_http_capability.py",
-    "dflash/scripts/bench_http_frontiers.py",
-    "dflash/scripts/bench_llm.py",
-    "dflash/scripts/lucebox_bench.py",
     "dflash/scripts/prefix_cache.py",
-    "dflash/scripts/test_lucebox_bench.py",
     "dflash/scripts/test_server.py",
     "dflash/scripts/tool_memory.py",
     "lucebox/**/*.py",
@@ -70,6 +62,10 @@ lucebox-dflash = { workspace = true }
 pflash = { workspace = true }
 qwen35-megakernel-bf16 = { workspace = true }
 torch = { index = "pytorch-cu128" }
+# luce-bench is the standalone PyPI benchmark package (formerly
+# `dflash/scripts/bench_*.py`). Pinned to a git tag until we land the
+# trusted-publishing flow on PyPI; switch to a plain version pin then.
+luce-bench = { git = "https://github.com/easel/luce-bench.git", tag = "v0.2.3" }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

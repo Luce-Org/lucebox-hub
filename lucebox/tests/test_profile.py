@@ -33,8 +33,7 @@ class StubProfileInfoProvider:
             "cpu_model": "Test CPU",
             "nproc": "8",
             "mem_total_kib": "123456",
-            "nvidia_smi_csv": self.nvidia_smi_csv
-            or "0, Test GPU, 24564, 1024, 999.1, 8.6",
+            "nvidia_smi_csv": self.nvidia_smi_csv or "0, Test GPU, 24564, 1024, 999.1, 8.6",
             "nvidia_smi_full": "GPU test dump",
         }
 
@@ -145,10 +144,7 @@ def test_profile_keeps_versioned_results_and_exports_audited_snapshot(tmp_path):
         assert "[profile.step.1]" in text
         assert "step_id=health.props" in text
         assert "status=fresh" in text
-        assert "step_id=quality.ds4_eval" in text
-        assert "status=missing" in text
         snapshot_json = json.loads((tmp_path / "snapshot.json").read_text())
-        assert snapshot_json["status"] == "incomplete"
         assert any(s["section"] == "profile.step.1" for s in snapshot_json["sections"])
     finally:
         srv.shutdown()
@@ -159,36 +155,14 @@ def test_profile_dry_run_reports_missing_without_running(tmp_path):
     rows = profile.run_profile(
         cfg,
         base_url="http://127.0.0.1:1",
-        step_filter="quality.ds4_eval",
+        step_filter="health.props",
         dry_run=True,
         provider=StubProfileInfoProvider(),
     )
 
-    assert rows[0]["step_id"] == "quality.ds4_eval"
+    assert rows[0]["step_id"] == "health.props"
     assert rows[0]["ran"] is False
     assert rows[0]["status"] == "skipped_unavailable"
-
-
-def test_ds4_profile_step_uses_upstream_sized_score_only_run(tmp_path):
-    srv, url = _server()
-    try:
-        cfg = _cfg(tmp_path)
-        ctx = profile.build_context(cfg, base_url=url, provider=StubProfileInfoProvider())
-        step = next(s for s in profile.registry() if s.id == "quality.ds4_eval")
-        assert step.argv is not None
-
-        argv = step.argv(ctx, tmp_path)
-
-        assert step.timeout_s == 86400
-        assert "--area" in argv
-        assert argv[argv.index("--area") + 1] == "ds4-eval"
-        assert "--max-tokens" in argv
-        assert argv[argv.index("--max-tokens") + 1] == "16000"
-        assert "--think" in argv
-        assert "--min-pass-rate" in argv
-        assert argv[argv.index("--min-pass-rate") + 1] == "0.0"
-    finally:
-        srv.shutdown()
 
 
 def test_profile_hash_ignores_volatile_machine_and_dirty_state(tmp_path):
@@ -201,8 +175,7 @@ def test_profile_hash_ignores_volatile_machine_and_dirty_state(tmp_path):
             provider=StubProfileInfoProvider(
                 dirty=False,
                 nvidia_smi_csv=(
-                    "0, Test GPU, 24564, 1024, 999.1, 8.6, 0000:01:00.0, "
-                    "70, 450, 3, 41, 1500, 9500"
+                    "0, Test GPU, 24564, 1024, 999.1, 8.6, 0000:01:00.0, 70, 450, 3, 41, 1500, 9500"
                 ),
             ),
         )
@@ -218,7 +191,7 @@ def test_profile_hash_ignores_volatile_machine_and_dirty_state(tmp_path):
             ),
         )
 
-        step = next(s for s in profile.registry() if s.id == "benchmark.http_frontiers")
+        step = next(s for s in profile.registry() if s.id == "benchmark.autotune_latest")
 
         assert profile.select_step(step, clean).hash == profile.select_step(step, busy).hash
         assert clean.git["repo_dirty"] is False

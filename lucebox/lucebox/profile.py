@@ -50,10 +50,6 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _scripts_dir() -> Path:
-    return _repo_root() / "dflash" / "scripts"
-
-
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -202,34 +198,46 @@ class LiveProfileInfoProvider:
             if line.startswith("PRETTY_NAME="):
                 pretty = line.split("=", 1)[1].strip().strip('"')
                 break
-        nvidia = _cmd([
-            "nvidia-smi",
-            "--query-gpu=index,name,memory.total,memory.used,driver_version,compute_cap,"
-            "pci.bus_id,power.draw,power.limit,utilization.gpu,temperature.gpu,"
-            "clocks.current.graphics,clocks.current.memory",
-            "--format=csv,noheader,nounits",
-        ])
+        nvidia = _cmd(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,memory.total,memory.used,driver_version,compute_cap,"
+                "pci.bus_id,power.draw,power.limit,utilization.gpu,temperature.gpu,"
+                "clocks.current.graphics,clocks.current.memory",
+                "--format=csv,noheader,nounits",
+            ]
+        )
         return {
             "hostname": _cmd(["hostname"]),
             "kernel": _cmd(["uname", "-a"]),
             "os_pretty_name": pretty,
-            "cpu_model": _cmd([
-                "sh",
-                "-lc",
-                "awk -F: '/model name|Hardware|Processor/ {print $2; exit}' /proc/cpuinfo",
-            ]).strip(),
+            "cpu_model": _cmd(
+                [
+                    "sh",
+                    "-lc",
+                    "awk -F: '/model name|Hardware|Processor/ {print $2; exit}' /proc/cpuinfo",
+                ]
+            ).strip(),
             "nproc": _cmd(["sh", "-lc", "nproc 2>/dev/null || true"]),
             "mem_total_kib": _cmd(["sh", "-lc", "awk '/MemTotal/ {print $2}' /proc/meminfo"]),
-            "pci_display_devices": _cmd([
-                "sh", "-lc", "lspci 2>/dev/null | grep -Ei 'vga|3d|display' || true",
-            ]),
+            "pci_display_devices": _cmd(
+                [
+                    "sh",
+                    "-lc",
+                    "lspci 2>/dev/null | grep -Ei 'vga|3d|display' || true",
+                ]
+            ),
             "nvidia_smi_csv": nvidia,
             "nvidia_smi_full": _redact_hardware_dump(
                 _cmd(["sh", "-lc", "nvidia-smi -q 2>/dev/null || true"])
             ),
-            "rocm_smi_summary": _cmd([
-                "sh", "-lc", "rocm-smi --showproductname --showmeminfo vram 2>/dev/null || true",
-            ]),
+            "rocm_smi_summary": _cmd(
+                [
+                    "sh",
+                    "-lc",
+                    "rocm-smi --showproductname --showmeminfo vram 2>/dev/null || true",
+                ]
+            ),
             "python": sys.version.replace("\n", " "),
         }
 
@@ -441,7 +449,10 @@ def _load_newest_result(root: Path, step_id: str, result_hash: str) -> dict[str,
 
 
 def _status_for_result(
-    step: StepDefinition, result: dict[str, Any] | None, available: bool, reason: str,
+    step: StepDefinition,
+    result: dict[str, Any] | None,
+    available: bool,
+    reason: str,
 ) -> tuple[StepStatus, str]:
     if not available:
         return "skipped_unavailable", reason
@@ -636,71 +647,14 @@ def _live_available(ctx: ProfileContext) -> tuple[bool, str]:
     return False, "live server did not return /health and /props"
 
 
-def _capability_argv(
-    area: str,
-    report: str,
-    trace: str,
-    *,
-    min_pass_rate: float = 1.0,
-    max_tokens: int | None = None,
-    timeout: int | None = None,
-    think: bool | None = None,
-) -> Callable[[ProfileContext, Path], list[str]]:
-    def build(ctx: ProfileContext, dest: Path) -> list[str]:
-        argv = [
-            sys.executable, str(_scripts_dir() / "bench_http_capability.py"),
-            "--url", ctx.base_url,
-            "--area", area,
-            "--min-pass-rate", str(min_pass_rate),
-            "--json-out", str(dest / report),
-            "--trace", str(dest / trace),
-        ]
-        if max_tokens is not None:
-            argv += ["--max-tokens", str(max_tokens)]
-        if timeout is not None:
-            argv += ["--timeout", str(timeout)]
-        if think is True:
-            argv += ["--think"]
-        elif think is False:
-            argv += ["--no-think"]
-        return argv
-    return build
-
-
-def _frontiers_argv(ctx: ProfileContext, dest: Path) -> list[str]:
+def _pytest_argv(_ctx: ProfileContext, _dest: Path) -> list[str]:
     return [
-        sys.executable, str(_scripts_dir() / "bench_http_frontiers.py"),
-        "--url", ctx.base_url,
-        "--frontiers", "2048,4096,8192,16384",
-        "--gen-tokens", "64",
-        "--repeat", "3",
-        "--json-out", str(dest / "bench-http-frontiers.json"),
-        "--csv-out", str(dest / "bench-http-frontiers.csv"),
-    ]
-
-
-def _agentic_tools_argv(ctx: ProfileContext, dest: Path) -> list[str]:
-    return [
-        sys.executable, str(_scripts_dir() / "bench_agentic_tools.py"),
-        "--url", ctx.base_url,
-        "--json-out", str(dest / "bench-agentic-tools.json"),
-    ]
-
-
-def _agentic_session_argv(ctx: ProfileContext, dest: Path) -> list[str]:
-    return [
-        sys.executable, str(_scripts_dir() / "bench_agentic_session.py"),
-        "--url", ctx.base_url,
-        "--turns", "4",
-        "--sessions", "1",
-        "--json-out", str(dest / "bench-agentic-session.json"),
-    ]
-
-
-def _pytest_argv(_ctx: ProfileContext, dest: Path) -> list[str]:
-    return [
-        "uv", "run", "--frozen", "--with", "pytest", "pytest",
-        "dflash/scripts/test_lucebox_bench.py",
+        "uv",
+        "run",
+        "--frozen",
+        "--with",
+        "pytest",
+        "pytest",
         "lucebox/tests",
         "-q",
     ]
@@ -708,9 +662,18 @@ def _pytest_argv(_ctx: ProfileContext, dest: Path) -> list[str]:
 
 def registry() -> list[StepDefinition]:
     live_tunables = (
-        "budget", "max_ctx", "lazy", "prefix_cache_slots", "prefill_cache_slots",
-        "cache_type_k", "cache_type_v", "prefill_mode", "prefill_keep_ratio",
-        "prefill_threshold", "prefill_drafter", "think_max",
+        "budget",
+        "max_ctx",
+        "lazy",
+        "prefix_cache_slots",
+        "prefill_cache_slots",
+        "cache_type_k",
+        "cache_type_v",
+        "prefill_mode",
+        "prefill_keep_ratio",
+        "prefill_threshold",
+        "prefill_drafter",
+        "think_max",
     )
     return [
         StepDefinition(
@@ -722,104 +685,6 @@ def registry() -> list[StepDefinition]:
             requires_live_server=True,
             collector=_health_collector,
             availability=_live_available,
-        ),
-        StepDefinition(
-            id="benchmark.http_frontiers",
-            version=1,
-            description="HTTP prompt frontier timing rows.",
-            timeout_s=1800,
-            max_age_hours=24,
-            requires_live_server=True,
-            argv=_frontiers_argv,
-            report_name="bench-http-frontiers.json",
-            csv_name="bench-http-frontiers.csv",
-            availability=_live_available,
-            tunable_keys=live_tunables,
-            script_paths=("dflash/scripts/bench_http_frontiers.py",),
-            row_section="benchmark.frontiers.row",
-        ),
-        StepDefinition(
-            id="quality.capability_smoke",
-            version=1,
-            description="Short deterministic API capability smoke prompts.",
-            timeout_s=300,
-            max_age_hours=24,
-            requires_live_server=True,
-            argv=_capability_argv("smoke", "bench-capability.json", "bench-capability-trace.txt"),
-            report_name="bench-capability.json",
-            trace_name="bench-capability-trace.txt",
-            availability=_live_available,
-            tunable_keys=live_tunables,
-            script_paths=("dflash/scripts/bench_http_capability.py",),
-        ),
-        StepDefinition(
-            id="quality.ds4_eval",
-            version=1,
-            description="Full 92-case antirez/ds4 ds4-eval HTTP port.",
-            timeout_s=86400,
-            max_age_hours=168,
-            requires_live_server=True,
-            argv=_capability_argv(
-                "ds4-eval",
-                "bench-ds4-eval.json",
-                "bench-ds4-eval-trace.txt",
-                min_pass_rate=0.0,
-                max_tokens=16000,
-                timeout=1800,
-                think=True,
-            ),
-            report_name="bench-ds4-eval.json",
-            trace_name="bench-ds4-eval-trace.txt",
-            availability=_live_available,
-            tunable_keys=live_tunables,
-            script_paths=(
-                "dflash/scripts/bench_http_capability.py",
-                "dflash/scripts/fixtures/ds4_eval_cases.json",
-            ),
-        ),
-        StepDefinition(
-            id="quality.capability_long",
-            version=1,
-            description="Long prompt recall capability check.",
-            timeout_s=600,
-            max_age_hours=24,
-            requires_live_server=True,
-            argv=_capability_argv(
-                "long",
-                "bench-capability-long.json",
-                "bench-capability-long-trace.txt",
-            ),
-            report_name="bench-capability-long.json",
-            trace_name="bench-capability-long-trace.txt",
-            availability=_live_available,
-            tunable_keys=live_tunables,
-            script_paths=("dflash/scripts/bench_http_capability.py",),
-        ),
-        StepDefinition(
-            id="quality.agentic_tools",
-            version=1,
-            description="Single-turn OpenAI tool-call reliability prompts.",
-            timeout_s=600,
-            max_age_hours=24,
-            requires_live_server=True,
-            argv=_agentic_tools_argv,
-            report_name="bench-agentic-tools.json",
-            availability=_live_available,
-            tunable_keys=live_tunables,
-            script_paths=("dflash/scripts/bench_agentic_tools.py",),
-        ),
-        StepDefinition(
-            id="benchmark.agentic_session",
-            version=2,
-            description="Four-turn multi-tool agentic session replay.",
-            timeout_s=1200,
-            max_age_hours=24,
-            requires_live_server=True,
-            argv=_agentic_session_argv,
-            report_name="bench-agentic-session.json",
-            availability=_live_available,
-            tunable_keys=live_tunables,
-            script_paths=("dflash/scripts/bench_agentic_session.py",),
         ),
         StepDefinition(
             id="benchmark.autotune_latest",
@@ -842,10 +707,7 @@ def registry() -> list[StepDefinition]:
             argv=_pytest_argv,
             report_name="pytest-report.json",
             availability=_always_available,
-            script_paths=(
-                "dflash/scripts/test_lucebox_bench.py",
-                "lucebox/tests/test_profile.py",
-            ),
+            script_paths=("lucebox/tests/test_profile.py",),
         ),
     ]
 
@@ -952,7 +814,10 @@ def run_profile(
 
 
 def _selection_row(
-    selection: StepSelection, *, ran: bool, result: dict[str, Any] | None = None,
+    selection: StepSelection,
+    *,
+    ran: bool,
+    result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     result = result or selection.newest or {}
     status = result.get("status") if ran and result else selection.status
@@ -1135,36 +1000,46 @@ def build_snapshot(
     skipped = [s for s in selections if s.status == "skipped_unavailable"]
     if bad:
         profile_status = "incomplete"
-    emit("snapshot", {
-        "schema": SNAPSHOT_SCHEMA,
-        "captured_at": _now(),
-        "profile_status": profile_status,
-        "missing_or_stale_or_failed": len(bad),
-        "skipped_unavailable": len(skipped),
-        "server_base_url": ctx.base_url,
-    } | ctx.git)
+    emit(
+        "snapshot",
+        {
+            "schema": SNAPSHOT_SCHEMA,
+            "captured_at": _now(),
+            "profile_status": profile_status,
+            "missing_or_stale_or_failed": len(bad),
+            "skipped_unavailable": len(skipped),
+            "server_base_url": ctx.base_url,
+        }
+        | ctx.git,
+    )
     emit("machine", ctx.machine)
     emit("docker", ctx.docker)
     emit("image", ctx.image)
-    emit("runtime.config", {
-        "port": cfg.port,
-        "container_name": cfg.container_name,
-        "models_dir": cfg.models_dir,
-        "autotune_source": cfg.autotune.source,
-        "autotune_timestamp": cfg.autotune.timestamp,
-    })
+    emit(
+        "runtime.config",
+        {
+            "port": cfg.port,
+            "container_name": cfg.container_name,
+            "models_dir": cfg.models_dir,
+            "autotune_source": cfg.autotune.source,
+            "autotune_timestamp": cfg.autotune.timestamp,
+        },
+    )
 
     for idx, selection in enumerate(selections, start=1):
         emit(f"profile.step.{idx}", _snapshot_step_status(selection))
 
     frontiers = _suite_report(selection_by_id, "benchmark.http_frontiers")
     if frontiers:
-        emit("benchmark.frontiers", {
-            "suite": frontiers.get("suite"),
-            "source": frontiers.get("source"),
-            "timestamp": frontiers.get("timestamp"),
-            "rows": len(frontiers.get("rows") or []),
-        })
+        emit(
+            "benchmark.frontiers",
+            {
+                "suite": frontiers.get("suite"),
+                "source": frontiers.get("source"),
+                "timestamp": frontiers.get("timestamp"),
+                "rows": len(frontiers.get("rows") or []),
+            },
+        )
         for idx, row in enumerate(frontiers.get("rows") or [], start=1):
             emit(f"benchmark.frontiers.row.{idx}", _frontier_summary(row))
 
@@ -1191,12 +1066,15 @@ def build_snapshot(
 
     autotune = _suite_report(selection_by_id, "benchmark.autotune_latest")
     if autotune:
-        emit("benchmark.autotune_latest", {
-            "profile": _canonical_autotune_profile(autotune.get("profile")),
-            "effective_profile": _canonical_autotune_profile(autotune.get("effective_profile")),
-            "target": autotune.get("target"),
-            "winner": autotune.get("winner"),
-        })
+        emit(
+            "benchmark.autotune_latest",
+            {
+                "profile": _canonical_autotune_profile(autotune.get("profile")),
+                "effective_profile": _canonical_autotune_profile(autotune.get("effective_profile")),
+                "target": autotune.get("target"),
+                "winner": autotune.get("winner"),
+            },
+        )
 
     payload = {
         "schema": SNAPSHOT_SCHEMA,

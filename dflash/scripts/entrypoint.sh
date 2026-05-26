@@ -21,7 +21,7 @@ die()   { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ── arg dispatch ───────────────────────────────────────────────────────────
 # `serve` (default) — start the OpenAI-compatible server.
-# `benchmark`        — run the in-container sweep (lucebox_bench.py).
+# `benchmark`        — run the in-container sweep (luce-bench --sweep).
 # `shell`            — drop into bash inside the container (debug).
 # `lucebox`          — dispatch to the Python CLI. Any subcommand
 #                      `lucebox.sh` doesn't handle on the host arrives here
@@ -39,9 +39,12 @@ case "$SUBCMD" in
         exec uv run --directory "$LUCEBOX_PKG" python -m lucebox "$@"
         ;;
     benchmark)
-        export DFLASH_DIR
-        cd "$DFLASH_DIR"
-        exec uv run --directory "$DFLASH_DIR" python scripts/lucebox_bench.py "$@"
+        # The in-container bench sweep is now luce-bench (separate PyPI
+        # package, installed via the host pyproject). The container's job
+        # is just to expose the HTTP server; luce-bench drives it from
+        # outside, but we still honor `docker run image benchmark …` as
+        # a convenience by execing the same CLI in-container.
+        exec uv run --directory "$LUCEBOX_PKG" python -m lucebench.cli "$@"
         ;;
     shell)
         exec /bin/bash "$@"

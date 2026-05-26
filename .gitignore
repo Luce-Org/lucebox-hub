@@ -82,3 +82,6 @@ health
 # lucebox host-side generated config + benchmark output
 .lucebox/
 models/.lucebox/
+
+# Claude Code session state (worktrees, agent scratchpads)
+.claude/
