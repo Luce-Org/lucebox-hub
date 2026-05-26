@@ -240,6 +240,7 @@ add_library(dflash_common STATIC
     src/common/dflash_capture.cpp
     src/common/dflash_draft_ipc.cpp
     src/common/dflash_draft_ipc_daemon.cpp
+    src/common/pflash_drafter_ipc.cpp
     src/common/dflash_draft_graph.cpp
     src/common/dflash_spec_decode.cpp
     src/qwen35/graph_builders.cpp
@@ -675,6 +676,7 @@ if(DFLASH27B_TESTS)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc/backend_ipc_main.cpp")
         add_executable(backend_ipc_daemon
             src/ipc/backend_ipc_main.cpp
+            src/common/pflash_drafter_ipc_daemon.cpp
         )
         target_include_directories(backend_ipc_daemon PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")

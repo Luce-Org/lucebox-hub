@@ -18,6 +18,7 @@ namespace dflash::common {
 
 enum class BackendIpcMode {
     DFlashDraft,
+    PFlashCompress,
 };
 
 const char * backend_ipc_mode_name(BackendIpcMode mode);

@@ -680,6 +680,25 @@ void HttpServer::worker_loop() {
         const auto & req = job->req;
         auto started_at = std::chrono::steady_clock::now();
 
+        auto finish_job = [&]() {
+            std::lock_guard<std::mutex> lk(job->mu);
+            job->done = true;
+            job->cv.notify_one();
+        };
+        auto fail_request = [&](int status, const std::string & message) {
+            std::fprintf(stderr, "[server] request failed: %s\n", message.c_str());
+            if (req.stream) {
+                json err = {{"error", {{"message", message}, {"type", "server_error"}}}};
+                const std::string chunk = "data: " + err.dump() + "\n\n";
+                send_all(fd, chunk.data(), chunk.size());
+                const char done[] = "data: [DONE]\n\n";
+                send_all(fd, done, sizeof(done) - 1);
+            } else {
+                send_error(fd, status, message);
+            }
+            finish_job();
+        };
+
         std::fprintf(stderr,
             "[server] chat START %s format=%s stream=%s prompt_tokens=%zu "
             "max_tokens=%d tools=%zu\n",
@@ -694,9 +713,7 @@ void HttpServer::worker_loop() {
         if (req.stream) {
             if (!send_sse_headers(fd)) {
                 // Client already disconnected before we started.
-                std::lock_guard<std::mutex> lk(job->mu);
-                job->done = true;
-                job->cv.notify_one();
+                finish_job();
                 continue;
             }
         }
@@ -717,9 +734,7 @@ void HttpServer::worker_loop() {
                 }
             }
             if (!start_ok) {
-                std::lock_guard<std::mutex> lk(job->mu);
-                job->done = true;
-                job->cv.notify_one();
+                finish_job();
                 continue;
             }
         }
@@ -750,21 +765,40 @@ void HttpServer::worker_loop() {
                     // effective_prompt stays as req.prompt_tokens — the cached KV
                     // state will be restored via cache_slot below.
                 } else {
+                    std::string compression_error;
                     // 1. Decode prompt to text using target tokenizer
                     std::string prompt_text = tokenizer_.decode(req.prompt_tokens);
 
                     // 2. Re-encode with drafter tokenizer
                     auto drafter_ids = drafter_tokenizer_->encode(prompt_text);
 
-                    if (!drafter_ids.empty()) {
+                    if (drafter_ids.empty()) {
+                        compression_error = "PFlash drafter tokenizer produced an empty prompt";
+                    } else {
                         // 3. Compress via typed API
                         ModelBackend::CompressRequest creq;
                         creq.input_ids = std::move(drafter_ids);
                         creq.keep_ratio = config_.pflash_keep_ratio;
                         creq.drafter_path = config_.pflash_drafter_path;
+                        creq.drafter_gpu = config_.pflash_drafter_gpu;
                         creq.skip_park = config_.pflash_skip_park;
 
-                        auto cresult = backend_.compress(creq);
+                        ModelBackend::CompressResult cresult;
+                        if (config_.pflash_remote_drafter) {
+                            if (!pflash_remote_.active() &&
+                                !pflash_remote_.start(config_.pflash_remote.ipc_bin,
+                                                       config_.pflash_drafter_path,
+                                                       config_.pflash_drafter_gpu,
+                                                       config_.pflash_remote.work_dir)) {
+                                compression_error = "remote PFlash drafter start failed";
+                            } else {
+                                cresult.ok = pflash_remote_.compress(
+                                    creq.input_ids, creq.keep_ratio,
+                                    cresult.compressed_ids);
+                            }
+                        } else {
+                            cresult = backend_.compress(creq);
+                        }
 
                         // 4. Decode compressed IDs with drafter tokenizer
                         if (cresult.ok && !cresult.compressed_ids.empty()) {
@@ -780,7 +814,15 @@ void HttpServer::worker_loop() {
                                 n_prompt, (int)cresult.compressed_ids.size(),
                                 (int)effective_prompt.size(),
                                 100.0 * effective_prompt.size() / n_prompt);
+                        } else if (compression_error.empty()) {
+                            compression_error = config_.pflash_remote_drafter
+                                ? "remote PFlash drafter compression failed"
+                                : "PFlash compression failed";
                         }
+                    }
+                    if (!pflash_compressed && !compression_error.empty()) {
+                        fail_request(500, compression_error);
+                        continue;
                     }
                 }
             }
@@ -1220,11 +1262,7 @@ void HttpServer::worker_loop() {
             result.error.empty() ? "-" : result.error.c_str());
 
         // Signal client thread that we're done.
-        {
-            std::lock_guard<std::mutex> lk(job->mu);
-            job->done = true;
-            job->cv.notify_one();
-        }
+        finish_job();
     }
 }
 

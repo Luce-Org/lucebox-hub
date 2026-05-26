@@ -65,5 +65,6 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args);
 std::string detect_arch(const char * model_path);
 
 bool arch_supports_remote_draft(const std::string & arch);
+bool arch_supports_pflash_compression(const std::string & arch);
 
 }  // namespace dflash::common

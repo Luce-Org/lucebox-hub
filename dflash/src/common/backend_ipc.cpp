@@ -22,6 +22,7 @@ namespace dflash::common {
 const char * backend_ipc_mode_name(BackendIpcMode mode) {
     switch (mode) {
         case BackendIpcMode::DFlashDraft: return "dflash-draft";
+        case BackendIpcMode::PFlashCompress: return "pflash-compress";
     }
     return "unknown";
 }
@@ -29,6 +30,10 @@ const char * backend_ipc_mode_name(BackendIpcMode mode) {
 bool parse_backend_ipc_mode(const std::string & value, BackendIpcMode & out) {
     if (value == "dflash-draft") {
         out = BackendIpcMode::DFlashDraft;
+        return true;
+    }
+    if (value == "pflash-compress") {
+        out = BackendIpcMode::PFlashCompress;
         return true;
     }
     return false;

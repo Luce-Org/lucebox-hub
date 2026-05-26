@@ -38,6 +38,7 @@ struct DrafterContext {
     Qwen3DrafterWeights   weights;             // BF16 weights on the backend
     DrafterArch           arch    = DrafterArch::Qwen3_0p6b;
     void *                arch_state = nullptr;
+    int                   gpu = -1;
     bool                  loaded  = false;
 };
 
@@ -50,7 +51,11 @@ struct DrafterContext {
 bool load_drafter(const std::string & gguf_path, int gpu_layers,
                   DrafterContext & out);
 bool load_drafter(const std::string & gguf_path, int gpu_layers,
+                  int gpu, DrafterContext & out);
+bool load_drafter(const std::string & gguf_path, int gpu_layers,
                   DrafterArch arch, DrafterContext & out);
+bool load_drafter(const std::string & gguf_path, int gpu_layers,
+                  DrafterArch arch, int gpu, DrafterContext & out);
 
 void free_drafter(DrafterContext & ctx);
 

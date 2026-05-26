@@ -143,7 +143,8 @@ struct ModelBackend {
         std::vector<int32_t> input_ids;      // drafter-tokenized prompt
         float                keep_ratio;      // fraction to keep (0.0–1.0)
         std::string          drafter_path;    // GGUF path (for lazy-load)
-        bool                 skip_park;       // true on ≥32GB GPUs
+        int                  drafter_gpu = 0;  // backend-local GPU for PFlash drafter
+        bool                 skip_park = false; // true on >=32GB GPUs
     };
 
     struct CompressResult {

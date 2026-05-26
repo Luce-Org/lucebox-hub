@@ -21,6 +21,10 @@ bool arch_supports_remote_draft(const std::string & arch) {
     return arch == "qwen35";
 }
 
+bool arch_supports_pflash_compression(const std::string & arch) {
+    return arch == "qwen35" || arch == "qwen3";
+}
+
 std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
     if (!args.model_path) {
         std::fprintf(stderr, "[backend_factory] model_path is null\n");

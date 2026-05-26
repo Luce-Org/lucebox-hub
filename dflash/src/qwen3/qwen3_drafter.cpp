@@ -121,33 +121,58 @@ const char * drafter_arch_name(DrafterArch arch) {
 
 bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
                   DrafterContext & out) {
-    return load_drafter(gguf_path, /*gpu_layers=*/999, DrafterArch::Qwen3_0p6b, out);
+    return load_drafter(gguf_path, /*gpu_layers=*/999, /*gpu=*/0, out);
+}
+
+bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
+                  int gpu, DrafterContext & out) {
+    return load_drafter(gguf_path, /*gpu_layers=*/999, DrafterArch::Qwen3_0p6b, gpu, out);
 }
 
 bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
                   DrafterArch arch, DrafterContext & out) {
+    return load_drafter(gguf_path, /*gpu_layers=*/999, arch, /*gpu=*/0, out);
+}
+
+bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
+                  DrafterArch arch, int gpu, DrafterContext & out) {
+    if (gpu < 0) {
+        set_last_error("load_drafter: negative GPU index");
+        return false;
+    }
     if (out.loaded) {
         set_last_error("drafter already loaded");
         return false;
     }
+    if (out.backend && out.gpu >= 0 && out.gpu != gpu) {
+        set_last_error("load_drafter: backend already bound to a different GPU");
+        return false;
+    }
 
-    // If caller didn't supply a backend, spin up our own CUDA one. Sharing
+    // If caller didn't supply a backend, spin up our own GPU backend. Sharing
     // would be ideal but we don't have a handle to the daemon's backend
-    // through this API. Same-process CUDA pools coexist fine — fragmentation
-    // is the only cost, and we free everything in free_drafter.
+    // through this API. Same-process GPU pools coexist fine; fragmentation is
+    // the only cost, and we free everything in free_drafter.
     if (!out.backend) {
         size_t n_dev = ggml_backend_dev_count();
+        int seen_gpu = 0;
         for (size_t i = 0; i < n_dev; ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                out.backend = ggml_backend_dev_init(dev, nullptr);
-                break;
+                if (seen_gpu == gpu) {
+                    out.backend = ggml_backend_dev_init(dev, nullptr);
+                    break;
+                }
+                seen_gpu++;
             }
         }
         if (!out.backend) {
-            set_last_error("load_drafter: no GPU backend available");
+            set_last_error("load_drafter: requested GPU backend unavailable");
             return false;
         }
+        out.gpu = gpu;
+    } else if (out.gpu < 0) {
+        out.gpu = gpu;
     }
 
     if (arch == DrafterArch::Qwen35_0p8b) {
@@ -161,11 +186,11 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
         out.arch = arch;
         std::fprintf(stderr,
             "[drafter] loaded %s qwen35: n_layer=%d n_head=%d n_head_kv=%d "
-            "n_embd=%d n_ff=%d head_dim=%d vocab=%d\n",
+            "n_embd=%d n_ff=%d head_dim=%d vocab=%d gpu=%d\n",
             drafter_arch_name(arch),
             st->weights.n_layer, st->weights.n_head, st->weights.n_head_kv,
             st->weights.n_embd, st->weights.n_ff, st->weights.n_embd_head_k,
-            st->weights.n_vocab);
+            st->weights.n_vocab, out.gpu);
         std::fflush(stderr);
         return true;
     }
@@ -179,11 +204,11 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
     out.arch = arch;
     std::fprintf(stderr,
         "[drafter] loaded %s BF16: n_layer=%d n_head=%d n_kv=%d "
-        "n_embd=%d n_ff=%d head_dim=%d vocab=%d\n",
+        "n_embd=%d n_ff=%d head_dim=%d vocab=%d gpu=%d\n",
         drafter_arch_name(arch),
         out.weights.n_layer, out.weights.n_head, out.weights.n_head_kv,
         out.weights.n_embd, out.weights.n_ff, out.weights.head_dim,
-        out.weights.n_vocab);
+        out.weights.n_vocab, out.gpu);
     std::fflush(stderr);
 
 #if defined(DFLASH27B_BACKEND_HIP)
@@ -202,6 +227,7 @@ void free_drafter(DrafterContext & ctx) {
         ggml_backend_free(ctx.backend);
         ctx.backend = nullptr;
     }
+    ctx.gpu = -1;
 }
 
 void free_drafter_weights(DrafterContext & ctx) {

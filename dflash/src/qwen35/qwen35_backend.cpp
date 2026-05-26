@@ -359,7 +359,8 @@ ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req
         // drafter_ctx_.backend == nullptr → load_drafter creates its own
         std::fprintf(stderr, "[compress] loading drafter from %s ...\n",
                      req.drafter_path.c_str());
-        if (!load_drafter(req.drafter_path, /*gpu_layers=*/999, drafter_ctx_)) {
+        if (!load_drafter(req.drafter_path, /*gpu_layers=*/999,
+                          req.drafter_gpu, drafter_ctx_)) {
             std::fprintf(stderr, "[compress] drafter init failed: %s\n",
                          dflash27b_last_error());
             if (!req.skip_park) {

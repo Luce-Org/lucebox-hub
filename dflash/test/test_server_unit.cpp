@@ -18,6 +18,7 @@
 #include "server/chat_template.h"
 #include "common/sampler.h"
 #include "common/backend_ipc.h"
+#include "placement/pflash_placement.h"
 #include <nlohmann/json.hpp>
 
 #include <cmath>
@@ -847,6 +848,91 @@ static void test_pflash_threshold_always_mode() {
     bool should = (cfg.pflash_mode == ServerConfig::PflashMode::ALWAYS) ||
                   (cfg.pflash_mode == ServerConfig::PflashMode::AUTO && n_prompt >= cfg.pflash_threshold);
     TEST_ASSERT(should);
+}
+
+static void test_pflash_placement_same_backend_local() {
+    DevicePlacement target;
+    target.backend = compiled_placement_backend();
+    target.gpu = 0;
+    DevicePlacement drafter;
+    drafter.backend = target.backend;
+    drafter.gpu = 2;
+    RemoteDraftConfig remote;
+    remote.ipc_bin = "/tmp/backend_ipc_daemon";
+
+    auto placement = resolve_pflash_drafter_placement(
+        target, drafter, remote, /*pflash_enabled=*/true);
+    TEST_ASSERT(placement.target_backend == target.backend);
+    TEST_ASSERT(placement.drafter_backend == target.backend);
+    TEST_ASSERT(placement.drafter_gpu == 2);
+    TEST_ASSERT(!placement.remote_drafter);
+    TEST_ASSERT(!placement.remote.enabled());
+}
+
+static void test_pflash_placement_mixed_backend_remote() {
+    DevicePlacement target;
+    target.backend = PlacementBackend::Cuda;
+    target.gpu = 0;
+    DevicePlacement drafter;
+    drafter.backend = PlacementBackend::Hip;
+    drafter.gpu = 1;
+    RemoteDraftConfig remote;
+    remote.ipc_bin = "/tmp/backend_ipc_daemon";
+    remote.work_dir = "/tmp/pflash-ipc";
+
+    auto placement = resolve_pflash_drafter_placement(
+        target, drafter, remote, /*pflash_enabled=*/true);
+    TEST_ASSERT(placement.target_backend == PlacementBackend::Cuda);
+    TEST_ASSERT(placement.drafter_backend == PlacementBackend::Hip);
+    TEST_ASSERT(placement.drafter_gpu == 1);
+    TEST_ASSERT(placement.remote_drafter);
+    TEST_ASSERT(placement.remote.enabled());
+    TEST_ASSERT(placement.remote.work_dir == "/tmp/pflash-ipc");
+}
+
+static void test_pflash_placement_auto_draft_follows_target() {
+    DevicePlacement target;
+    target.backend = PlacementBackend::Hip;
+    target.gpu = 0;
+    DevicePlacement drafter;
+    drafter.backend = PlacementBackend::Auto;
+    drafter.gpu = 3;
+    RemoteDraftConfig remote;
+    remote.ipc_bin = "/tmp/backend_ipc_daemon";
+
+    auto placement = resolve_pflash_drafter_placement(
+        target, drafter, remote, /*pflash_enabled=*/true);
+    TEST_ASSERT(placement.target_backend == PlacementBackend::Hip);
+    TEST_ASSERT(placement.drafter_backend == PlacementBackend::Hip);
+    TEST_ASSERT(placement.drafter_gpu == 3);
+    TEST_ASSERT(!placement.remote_drafter);
+}
+
+static void test_pflash_placement_disabled_never_remote() {
+    DevicePlacement target;
+    target.backend = PlacementBackend::Cuda;
+    DevicePlacement drafter;
+    drafter.backend = PlacementBackend::Hip;
+    RemoteDraftConfig remote;
+    remote.ipc_bin = "/tmp/backend_ipc_daemon";
+
+    auto placement = resolve_pflash_drafter_placement(
+        target, drafter, remote, /*pflash_enabled=*/false);
+    TEST_ASSERT(placement.target_backend == PlacementBackend::Cuda);
+    TEST_ASSERT(placement.drafter_backend == PlacementBackend::Hip);
+    TEST_ASSERT(!placement.remote_drafter);
+    TEST_ASSERT(!placement.remote.enabled());
+}
+
+static void test_pflash_placement_usage_gate() {
+    TEST_ASSERT(!pflash_drafter_placement_used(
+        /*pflash_enabled=*/false, /*has_decode_draft=*/false));
+    TEST_ASSERT(pflash_drafter_placement_used(
+        /*pflash_enabled=*/false, /*has_decode_draft=*/true));
+    TEST_ASSERT(pflash_drafter_placement_used(
+        /*pflash_enabled=*/true, /*has_decode_draft=*/false));
+    TEST_ASSERT(pflash_drafter_placement_used(
+        /*pflash_enabled=*/true, /*has_decode_draft=*/true));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1747,6 +1833,11 @@ int main() {
     RUN_TEST(test_pflash_compress_result_defaults);
     RUN_TEST(test_pflash_threshold_auto_mode);
     RUN_TEST(test_pflash_threshold_always_mode);
+    RUN_TEST(test_pflash_placement_same_backend_local);
+    RUN_TEST(test_pflash_placement_mixed_backend_remote);
+    RUN_TEST(test_pflash_placement_auto_draft_follows_target);
+    RUN_TEST(test_pflash_placement_disabled_never_remote);
+    RUN_TEST(test_pflash_placement_usage_gate);
 
     std::fprintf(stderr, "\n── Jinja chat template ──\n");
     RUN_TEST(test_jinja_render_basic);

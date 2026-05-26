@@ -2,6 +2,7 @@
 
 #include "backend_ipc.h"
 #include "dflash_draft_ipc.h"
+#include "pflash_drafter_ipc.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -34,7 +35,10 @@ int main(int argc, char ** argv) {
     } else {
         std::fprintf(stderr,
             "usage: %s --backend-ipc-mode=dflash-draft <draft.safetensors|draft.gguf> "
-            "--ring-cap=N --stream-fd=FD [--draft-gpu=N]\n",
+            "--ring-cap=N --stream-fd=FD [--draft-gpu=N]\n"
+            "   or: %s --backend-ipc-mode=pflash-compress <drafter.gguf> "
+            "--stream-fd=FD [--draft-gpu=N]\n",
+            argv[0],
             argv[0]);
         return 2;
     }
@@ -64,6 +68,8 @@ int main(int argc, char ** argv) {
     switch (mode) {
         case BackendIpcMode::DFlashDraft:
             return run_dflash_draft_ipc_daemon(payload_path, ring_cap, draft_gpu, stream_fd);
+        case BackendIpcMode::PFlashCompress:
+            return run_pflash_drafter_ipc_daemon(payload_path, draft_gpu, stream_fd);
     }
     std::fprintf(stderr, "[backend-ipc-daemon] unsupported mode\n");
     return 2;

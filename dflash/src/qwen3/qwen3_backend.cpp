@@ -955,7 +955,7 @@ ModelBackend::CompressResult Qwen3Backend::compress(const CompressRequest & req)
     if (!req.skip_park && !parked_) park("target");
 
     if (!drafter_loaded_) {
-        if (!load_drafter(req.drafter_path, 999, drafter_ctx_)) {
+        if (!load_drafter(req.drafter_path, 999, req.drafter_gpu, drafter_ctx_)) {
             std::fprintf(stderr, "[compress] load failed: %s\n", dflash27b_last_error());
             if (!req.skip_park && !was_parked) unpark("target");
             return result;
