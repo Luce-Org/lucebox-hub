@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <random>
 #include <regex>
@@ -114,6 +115,16 @@ static bool overlaps(const std::vector<Span> & spans, size_t pos) {
         if (s.start <= pos && pos < s.end) return true;
     }
     return false;
+}
+
+static size_t include_preceding_tool_call_open(const std::string & text, size_t pos) {
+    size_t wrapper = text.rfind("<tool_call>", pos);
+    if (wrapper == std::string::npos) return pos;
+    for (size_t i = wrapper + std::strlen("<tool_call>"); i < pos; i++) {
+        char c = text[i];
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') return pos;
+    }
+    return wrapper;
 }
 
 // ─── Pattern regexes ────────────────────────────────────────────────────
@@ -342,8 +353,9 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             if (overlaps(removals, pos)) continue;
             std::string fn_name = (*it)[1].str();
             std::string params = (*it)[2].str();
+            size_t removal_start = include_preceding_tool_call_open(text, pos);
             add_call(fn_name, parse_xml_params(params, fn_name, tools),
-                     pos, pos + it->length());
+                     removal_start, pos + it->length());
         }
     }
 

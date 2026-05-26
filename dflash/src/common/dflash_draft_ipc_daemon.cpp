@@ -36,7 +36,9 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
     return 2;
 #else
     if (!draft_path || ring_cap <= 0 || stream_fd < 0) {
-        std::fprintf(stderr, "usage: test_dflash --draft-ipc-daemon <draft> --ring-cap=N --stream-fd=FD [--draft-gpu=N]\n");
+        std::fprintf(stderr,
+                     "usage: backend_ipc_daemon --backend-ipc-mode=dflash-draft "
+                     "<draft> --ring-cap=N --stream-fd=FD [--draft-gpu=N]\n");
         return 2;
     }
 

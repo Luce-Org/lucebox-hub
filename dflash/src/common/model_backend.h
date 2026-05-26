@@ -191,7 +191,8 @@ struct ModelBackend {
         std::vector<int32_t> input_ids;      // drafter-tokenized prompt
         float                keep_ratio;      // fraction to keep (0.0–1.0)
         std::string          drafter_path;    // GGUF path (for lazy-load)
-        bool                 skip_park;       // true on ≥32GB GPUs
+        int                  drafter_gpu = 0;  // backend-local GPU for PFlash drafter
+        bool                 skip_park = false; // true on >=32GB GPUs
     };
 
     struct CompressResult {
@@ -230,6 +231,12 @@ struct ModelBackend {
     // Release oversized scratch buffers between requests to prevent VRAM
     // growth over time. Default is a no-op.
     virtual void release_scratch() {}
+
+    // Return true when the backend can route draft execution through the
+    // common remote-draft IPC transport. Model families that do not implement
+    // the DFlash feature boundary keep the default false and are rejected by
+    // the server before startup.
+    virtual bool supports_remote_draft() const { return false; }
 
     // ── Cleanup ──────────────────────────────────────────────────────
     // Release all resources (weights, cache, snapshots, drafter).

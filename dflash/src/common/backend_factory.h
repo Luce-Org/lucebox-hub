@@ -12,6 +12,7 @@
 
 #include "model_backend.h"
 #include "placement/placement_config.h"
+#include "placement/remote_draft_config.h"
 
 #include <memory>
 #include <string>
@@ -31,6 +32,7 @@ struct BackendArgs {
     // Device placement
     DevicePlacement device;
     DevicePlacement draft_device;
+    RemoteDraftConfig remote_draft;
 
     // I/O — only used when running under daemon_loop (legacy). The new
     // server passes -1 and uses on_token callbacks instead.
@@ -61,5 +63,8 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args);
 // Returns the detected architecture string without creating a backend.
 // Useful for early dispatch (e.g. printing which backend will be used).
 std::string detect_arch(const char * model_path);
+
+bool arch_supports_remote_draft(const std::string & arch);
+bool arch_supports_pflash_compression(const std::string & arch);
 
 }  // namespace dflash::common

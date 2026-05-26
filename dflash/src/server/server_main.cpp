@@ -1,7 +1,8 @@
 // dflash_server — native C++ HTTP server for dflash::common.
 //
-// Replaces the Python server.py for production use. Owns the ModelBackend
-// directly (no subprocess, no pipe protocol), enabling:
+// Replaces the Python server.py for production use. Owns the target
+// ModelBackend directly, while optional draft/PFlash IPC paths can be used
+// for mixed-backend placement. The direct target path enables:
 //   - Immediate client-disconnect cancellation (via send() failure)
 //   - Lower latency (no IPC overhead)
 //   - Single binary deployment
@@ -17,6 +18,9 @@
 #include "common/backend_factory.h"
 #include "common/gguf_inspect.h"
 #include "common/peer_access.h"
+#include "placement/pflash_placement.h"
+
+#include "gguf.h"
 
 #include "gguf.h"
 
@@ -24,7 +28,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <csignal>
 #include <memory>
 #include <string>
 #include <vector>
@@ -58,7 +61,8 @@ static bool parse_double_list(const char * value, std::vector<double> & out) {
     return !out.empty();
 }
 
-static bool validate_server_placement(const BackendArgs & bargs) {
+static bool validate_server_placement(const BackendArgs & bargs,
+                                      const ServerConfig & sconfig) {
     const PlacementBackend compiled = compiled_placement_backend();
     if (!placement_backend_supported(bargs.device.backend)) {
         std::fprintf(stderr,
@@ -68,23 +72,49 @@ static bool validate_server_placement(const BackendArgs & bargs) {
             placement_backend_name(compiled));
         return false;
     }
-    if (!placement_backend_supported(bargs.draft_device.backend)) {
+    const bool pflash_enabled =
+        sconfig.pflash_mode != ServerConfig::PflashMode::OFF;
+    const PFlashDrafterPlacement pflash_placement =
+        resolve_pflash_drafter_placement(
+            bargs.device, bargs.draft_device, bargs.remote_draft,
+            pflash_enabled);
+    const PlacementBackend target = pflash_placement.target_backend;
+    const PlacementBackend draft = pflash_placement.drafter_backend;
+    const bool draft_placement_used =
+        pflash_drafter_placement_used(pflash_enabled, bargs.draft_path != nullptr);
+    if (!bargs.remote_draft.enabled() && bargs.remote_draft.has_aux_options()) {
+        std::fprintf(stderr,
+            "[server] --draft-ipc-work-dir and --draft-ipc-ring-cap require "
+            "--draft-ipc-bin\n");
+        return false;
+    }
+    if (draft_placement_used && target != draft) {
+        if (!bargs.remote_draft.enabled()) {
+            std::fprintf(stderr,
+                "[server] mixed target/draft backends require --draft-ipc-bin "
+                "(target=%s draft=%s)\n",
+                placement_backend_name(target), placement_backend_name(draft));
+            return false;
+        }
+        if (!bargs.draft_path && !pflash_enabled) {
+            std::fprintf(stderr,
+                "[server] mixed target/draft backends require --draft <path> "
+                "or --prefill-compression with --prefill-drafter\n");
+            return false;
+        }
+    } else if (bargs.remote_draft.enabled()) {
+        std::fprintf(stderr,
+            "[server] --draft-ipc-bin is only needed for mixed target/draft "
+            "backends (target=%s draft=%s)\n",
+            placement_backend_name(target), placement_backend_name(draft));
+        return false;
+    } else if (draft_placement_used &&
+               !placement_backend_supported(bargs.draft_device.backend)) {
         std::fprintf(stderr,
             "[server] --draft-device=%s is unsupported in this binary "
             "(compiled backend: %s)\n",
             placement_device_name(bargs.draft_device).c_str(),
             placement_backend_name(compiled));
-        return false;
-    }
-    const PlacementBackend target = bargs.device.backend == PlacementBackend::Auto
-        ? compiled : bargs.device.backend;
-    const PlacementBackend draft = bargs.draft_device.backend == PlacementBackend::Auto
-        ? target : bargs.draft_device.backend;
-    if (target != draft) {
-        std::fprintf(stderr,
-            "[server] mixed target/draft backends are not implemented in the "
-            "native server yet (target=%s draft=%s)\n",
-            placement_backend_name(target), placement_backend_name(draft));
         return false;
     }
     if (!bargs.device.layer_split_gpus.empty()) {
@@ -116,6 +146,9 @@ static void print_usage(const char * prog) {
         "                       when both are passed)\n"
         "  --target-device <backend:gpu>  Target device (default: auto:0)\n"
         "  --draft-device <backend:gpu>   Draft device (default: auto:0)\n"
+        "  --draft-ipc-bin <path>         Remote backend IPC daemon for mixed backends\n"
+        "  --draft-ipc-work-dir <path>    Remote draft IPC scratch directory\n"
+        "  --draft-ipc-ring-cap <N>       Remote draft feature ring capacity\n"
         "  --target-devices <list>        Reserved layer-split devices, e.g. cuda:0,cuda:1\n"
         "  --target-layer-split <weights>  Reserved layer-split weights\n"
         "  --peer-access        Enable peer access for multi-GPU placement\n"
@@ -251,6 +284,16 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "[server] bad --draft-device value (expected backend:gpu)\n");
                 return 2;
             }
+        } else if (std::strcmp(argv[i], "--draft-ipc-bin") == 0 && i + 1 < argc) {
+            bargs.remote_draft.ipc_bin = argv[++i];
+        } else if (std::strcmp(argv[i], "--draft-ipc-work-dir") == 0 && i + 1 < argc) {
+            bargs.remote_draft.work_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--draft-ipc-ring-cap") == 0 && i + 1 < argc) {
+            bargs.remote_draft.ring_cap = std::atoi(argv[++i]);
+            if (bargs.remote_draft.ring_cap <= 0) {
+                std::fprintf(stderr, "[server] bad --draft-ipc-ring-cap value\n");
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--target-devices") == 0 && i + 1 < argc) {
             if (target_device_seen) {
                 std::fprintf(stderr, "[server] --target-devices conflicts with --target-device\n");
@@ -313,6 +356,8 @@ int main(int argc, char ** argv) {
                 sconfig.pflash_mode = ServerConfig::PflashMode::AUTO;
             else if (std::strcmp(mode, "always") == 0)
                 sconfig.pflash_mode = ServerConfig::PflashMode::ALWAYS;
+            else if (std::strcmp(mode, "off") == 0)
+                sconfig.pflash_mode = ServerConfig::PflashMode::OFF;
             else {
                 std::fprintf(stderr, "[server] unknown --prefill-compression mode: '%s' (expected: auto, always, off)\n", mode);
                 print_usage(argv[0]);
@@ -379,7 +424,22 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (!validate_server_placement(bargs)) return 2;
+    if (!validate_server_placement(bargs, sconfig)) return 2;
+
+    if (bargs.remote_draft.enabled() && bargs.draft_path) {
+        const std::string arch = detect_arch(bargs.model_path);
+        if (arch.empty()) {
+            std::fprintf(stderr,
+                "[server] failed to detect model architecture for remote draft validation\n");
+            return 1;
+        }
+        if (!arch_supports_remote_draft(arch)) {
+            std::fprintf(stderr,
+                "[server] model architecture '%s' does not support remote draft execution\n",
+                arch.c_str());
+            return 2;
+        }
+    }
 
     // Sync max_ctx: if --max-ctx was not provided, use the backend's default.
     // This prevents the HTTP server from accepting prompts larger than the
@@ -387,6 +447,13 @@ int main(int argc, char ** argv) {
     if (sconfig.max_ctx <= 0) {
         sconfig.max_ctx = bargs.device.max_ctx;
     }
+    const PFlashDrafterPlacement pflash_placement =
+        resolve_pflash_drafter_placement(
+            bargs.device, bargs.draft_device, bargs.remote_draft,
+            sconfig.pflash_mode != ServerConfig::PflashMode::OFF);
+    sconfig.pflash_drafter_gpu = pflash_placement.drafter_gpu;
+    sconfig.pflash_remote_drafter = pflash_placement.remote_drafter;
+    sconfig.pflash_remote = pflash_placement.remote;
 
     // ── Apply environment defaults (mirrors server.py logic) ────────────
     // Explicit --cache-type-k/v override via env vars.
@@ -441,9 +508,24 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "[server] drafter tokenizer load failed\n");
             return 1;
         }
-        std::fprintf(stderr, "[server] pflash: mode=%s threshold=%d keep=%.3f skip_park=%d\n",
+        if (sconfig.pflash_remote_drafter) {
+            if (!bargs.remote_draft.enabled()) {
+                std::fprintf(stderr,
+                    "[server] mixed-backend PFlash requires --draft-ipc-bin\n");
+                return 2;
+            }
+            const std::string arch = detect_arch(bargs.model_path);
+            if (!arch_supports_pflash_compression(arch)) {
+                std::fprintf(stderr,
+                    "[server] model architecture '%s' does not support PFlash compression\n",
+                    arch.c_str());
+                return 2;
+            }
+        }
+        std::fprintf(stderr, "[server] pflash: mode=%s threshold=%d keep=%.3f drafter_gpu=%d skip_park=%d\n",
                      sconfig.pflash_mode == ServerConfig::PflashMode::AUTO ? "auto" : "always",
                      sconfig.pflash_threshold, sconfig.pflash_keep_ratio,
+                     sconfig.pflash_drafter_gpu,
                      (int)sconfig.pflash_skip_park);
     }
 
@@ -456,6 +538,133 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "[server] backend creation failed\n");
         return 1;
     }
+    if (bargs.remote_draft.enabled() && bargs.draft_path &&
+        !backend->supports_remote_draft()) {
+        std::fprintf(stderr,
+            "[server] detected model backend does not support remote draft execution\n");
+        backend->shutdown();
+        return 2;
+    }
+
+    // ── Thinking-budget v2: resolve model card and apply to ServerConfig ──
+    // Read general.name + general.architecture directly from the GGUF.
+    // This is best-effort; if the file can't be opened (corruption, removed
+    // after backend init) we fall through to hard-fallback defaults via
+    // resolve_model_card(...).
+    std::string general_name;
+    std::string general_arch = arch;  // fall back to detect_arch() result
+    {
+        gguf_init_params gip{};
+        gip.no_alloc = true;
+        gip.ctx = nullptr;
+        gguf_context * gctx = gguf_init_from_file(bargs.model_path, gip);
+        if (gctx) {
+            int64_t name_id = gguf_find_key(gctx, "general.name");
+            if (name_id >= 0) {
+                const char * v = gguf_get_val_str(gctx, name_id);
+                if (v) general_name = v;
+            }
+            int64_t arch_id = gguf_find_key(gctx, "general.architecture");
+            if (arch_id >= 0) {
+                const char * v = gguf_get_val_str(gctx, arch_id);
+                if (v) general_arch = v;
+            }
+            gguf_free(gctx);
+        }
+        std::fprintf(stderr,
+            "[server] gguf meta: general.name='%s' general.architecture='%s'\n",
+            general_name.c_str(), general_arch.c_str());
+    }
+
+    ModelCard card = resolve_model_card(
+        bargs.model_path ? bargs.model_path : "",
+        general_name,
+        general_arch,
+        /*repo_root_hint=*/"");
+
+    // Apply each tunable to sconfig only if the operator did NOT set it
+    // via CLI. CLI always wins (spec §3.1 source #1).
+    //
+    // --max-tokens is a documented legacy alias for --default-max-tokens
+    // and beats the card; --default-max-tokens still wins over it when
+    // both are passed (the more specific flag).
+    if (!cli_set.default_max_tokens) {
+        if (legacy_max_tokens_set) {
+            sconfig.default_max_tokens = legacy_max_tokens_val;
+            cli_set.default_max_tokens = true;
+        } else {
+            sconfig.default_max_tokens = card.max_tokens;
+        }
+    }
+    if (!cli_set.hard_limit_reply_budget) {
+        sconfig.hard_limit_reply_budget = card.hard_limit_reply_budget;
+    }
+    if (!cli_set.think_max_tokens) {
+        // Recompute from possibly-updated combined cap + reply budget so
+        // the invariant (think_max = default_max - hard_limit) holds when
+        // the operator overrode one but not the other.
+        sconfig.think_max_tokens = std::max(0,
+            sconfig.default_max_tokens - sconfig.hard_limit_reply_budget);
+        // But if the card itself specified a smaller think_max_tokens
+        // (because complex tiers ride above default_max_tokens — see
+        // spec §3.3), respect that as a floor on the ceiling.
+        // Practically: card.think_max_tokens is just (max_tokens - reply),
+        // so this collapses to the same value when neither was overridden.
+        if (card.think_max_tokens > 0 &&
+            card.think_max_tokens < sconfig.think_max_tokens) {
+            sconfig.think_max_tokens = card.think_max_tokens;
+        }
+    }
+    // Effort tiers: per-tier CLI override. We pre-stored the CLI value
+    // into sconfig.effort_tiers above; for any tier the operator didn't
+    // set, take the card's value.
+    if (!cli_set.effort_low)    sconfig.effort_tiers.low    = card.effort_tiers.low;
+    if (!cli_set.effort_medium) sconfig.effort_tiers.medium = card.effort_tiers.medium;
+    if (!cli_set.effort_high)   sconfig.effort_tiers.high   = card.effort_tiers.high;
+    if (!cli_set.effort_x_high) sconfig.effort_tiers.x_high = card.effort_tiers.x_high;
+    if (!cli_set.effort_max)    sconfig.effort_tiers.max    = card.effort_tiers.max;
+
+    // Sampler defaults — currently no CLI surface; always take from card.
+    sconfig.sampler_defaults = card.sampling;
+
+    sconfig.model_card_source_label = card.source_label;
+    // Stash the raw sidecar JSON (or null on family/hard fallback) so
+    // /props.model_card can re-emit it verbatim. See
+    // docs/specs/props-endpoint.md §4.9.
+    sconfig.model_card_json = card.raw_json;
+
+    // Spec §3.5 invariant: each effort tier must fit under the server's
+    // absolute ceiling, which is `max_ctx - hard_limit_reply_budget` (the
+    // most tokens any single request — including its phase-1 portion —
+    // can occupy while still leaving the reply-reserve headroom).
+    //
+    // This is intentionally *not* clamped to think_max_tokens / default_
+    // max_tokens: effort tiers are phase-1 budgets, and the card's
+    // complex_problem_max_tokens can legitimately exceed default_max_tokens
+    // (Qwen3.6's card says max=81408 with default=32768). A request that
+    // wants to use such a tier must also pass an explicit max_tokens large
+    // enough to cover it (see spec §4.4); the request parser narrows the
+    // effective phase-1 cap when max_tokens is smaller.
+    const int tier_ceiling = std::max(0,
+        sconfig.max_ctx - sconfig.hard_limit_reply_budget);
+    std::fprintf(stderr,
+        "[server] effort-tier ceiling = max_ctx(%d) - hard_limit_reply_budget(%d) = %d\n",
+        sconfig.max_ctx, sconfig.hard_limit_reply_budget, tier_ceiling);
+    auto clamp_tier = [&](const char * name, int & v) {
+        if (tier_ceiling > 0 && v > tier_ceiling) {
+            std::fprintf(stderr,
+                "[server] reasoning-effort %s=%d clamped to "
+                "max_ctx - hard_limit_reply_budget = %d\n",
+                name, v, tier_ceiling);
+            v = tier_ceiling;
+        }
+        if (v < 0) v = 0;
+    };
+    clamp_tier("low",    sconfig.effort_tiers.low);
+    clamp_tier("medium", sconfig.effort_tiers.medium);
+    clamp_tier("high",   sconfig.effort_tiers.high);
+    clamp_tier("x-high", sconfig.effort_tiers.x_high);
+    clamp_tier("max",    sconfig.effort_tiers.max);
 
     // ── Thinking-budget v2: resolve model card and apply to ServerConfig ──
     // Read general.name + general.architecture directly from the GGUF.
@@ -624,6 +833,18 @@ int main(int argc, char ** argv) {
     }
     std::fprintf(stderr, "[server] │  draft_device    = %s\n",
                  placement_device_name(bargs.draft_device).c_str());
+    std::fprintf(stderr, "[server] │  draft_exec      = %s\n",
+                 bargs.remote_draft.enabled() && bargs.draft_path ? "remote-ipc" : "local");
+    if (bargs.remote_draft.enabled()) {
+        std::fprintf(stderr, "[server] │  draft_ipc_bin  = %s\n",
+                     bargs.remote_draft.ipc_bin.c_str());
+        if (!bargs.remote_draft.work_dir.empty()) {
+            std::fprintf(stderr, "[server] │  draft_ipc_dir  = %s\n",
+                         bargs.remote_draft.work_dir.c_str());
+        }
+        std::fprintf(stderr, "[server] │  draft_ipc_cap  = %d\n",
+                     bargs.remote_draft.ring_cap);
+    }
     std::fprintf(stderr, "[server] │  peer_access     = %s\n",
                  bargs.device.peer_access ? "ON" : "off");
     std::fprintf(stderr, "[server] │  chunk           = %d\n", bargs.chunk);
@@ -648,15 +869,18 @@ int main(int argc, char ** argv) {
         sconfig.pflash_mode == ServerConfig::PflashMode::AUTO ? "auto" :
         sconfig.pflash_mode == ServerConfig::PflashMode::ALWAYS ? "always" : "off");
     if (pflash_enabled) {
-    std::fprintf(stderr, "[server] │  pflash_threshold= %d\n", sconfig.pflash_threshold);
-    std::fprintf(stderr, "[server] │  pflash_keep     = %.3f\n", sconfig.pflash_keep_ratio);
-    std::fprintf(stderr, "[server] │  pflash_drafter  = %s\n", sconfig.pflash_drafter_path.c_str());
-    std::fprintf(stderr, "[server] │  pflash_skip_park= %s\n", sconfig.pflash_skip_park ? "ON" : "off");
-    std::fprintf(stderr, "[server] │  fp_use_bsa      = %s\n", getenv("DFLASH_FP_USE_BSA") ? "ON" : "off");
-    std::fprintf(stderr, "[server] │  fp_alpha        = %s\n", getenv("DFLASH_FP_ALPHA") ? getenv("DFLASH_FP_ALPHA") : "0.12 (default)");
+        std::fprintf(stderr, "[server] │  pflash_threshold= %d\n", sconfig.pflash_threshold);
+        std::fprintf(stderr, "[server] │  pflash_keep     = %.3f\n", sconfig.pflash_keep_ratio);
+        std::fprintf(stderr, "[server] │  pflash_drafter  = %s\n", sconfig.pflash_drafter_path.c_str());
+        std::fprintf(stderr, "[server] │  pflash_drafter_gpu= %d\n", sconfig.pflash_drafter_gpu);
+        std::fprintf(stderr, "[server] │  pflash_drafter_exec= %s\n",
+                     sconfig.pflash_remote_drafter ? "remote-ipc" : "local");
+        std::fprintf(stderr, "[server] │  pflash_skip_park= %s\n", sconfig.pflash_skip_park ? "ON" : "off");
+        std::fprintf(stderr, "[server] │  fp_use_bsa      = %s\n", getenv("DFLASH_FP_USE_BSA") ? "ON" : "off");
+        std::fprintf(stderr, "[server] │  fp_alpha        = %s\n", getenv("DFLASH_FP_ALPHA") ? getenv("DFLASH_FP_ALPHA") : "0.12 (default)");
     }
     if (bargs.draft_path) {
-    std::fprintf(stderr, "[server] │  lazy_draft      = %s\n", sconfig.lazy_draft ? "ON" : "off");
+        std::fprintf(stderr, "[server] │  lazy_draft      = %s\n", sconfig.lazy_draft ? "ON" : "off");
     }
     std::fprintf(stderr, "[server] ╰─────────────────────────────────────────────────────╯\n\n");
 

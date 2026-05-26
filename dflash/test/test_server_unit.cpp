@@ -17,6 +17,8 @@
 #include "server/http_server.h"
 #include "server/chat_template.h"
 #include "common/sampler.h"
+#include "common/backend_ipc.h"
+#include "placement/pflash_placement.h"
 #include <nlohmann/json.hpp>
 
 #include <cmath>
@@ -26,6 +28,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <unistd.h>
@@ -73,9 +76,35 @@ static const char * current_test = nullptr;
 
 // ─── Helper: create an SseEmitter with minimal config ──────────────────
 
-static SseEmitter make_emitter(ApiFormat fmt) {
+static json weather_tools() {
+    return json::array({
+        {{"type", "function"},
+         {"function", {
+             {"name", "get_weather"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"location", {{"type", "string"}}},
+                     {"command", {{"type", "string"}}}
+                 }}
+             }}
+         }}},
+        {{"type", "function"},
+         {"function", {
+             {"name", "terminal"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+}
+
+static SseEmitter make_emitter(ApiFormat fmt, json tools = json::array()) {
     return SseEmitter(fmt, "test_id_001", "test-model", 10,
-                      json::array(), nullptr);
+                      tools, nullptr);
 }
 
 // Concatenate all SSE chunks into a single string.
@@ -369,6 +398,40 @@ static void test_emitter_first_content_index_content_only() {
     TEST_ASSERT(em.emit_token_count() == 1);
 }
 
+static void test_emitter_first_content_index_qwen36_streaming_thinking() {
+    // Regression: when the chat template emits a leading `<think>` token
+    // (Qwen3.6 thinking-enabled path, or gemma4 `<|channel>` → `<think>`
+    // map) the emitter starts in CONTENT mode by default and naively
+    // captured first_content_token_index_=0 on the first emit_token
+    // call, before the state machine transitioned to REASONING. Result:
+    // finish_details.thinking_tokens misreported as 0 for any streamed-
+    // thinking response. Fix: detect the `<think>` opener up-front and
+    // defer the fci capture until a true CONTENT-mode token arrives.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
+    em.emit_start();
+
+    // Mirror http_server's on_token mapping: the special <think> id is
+    // forwarded as a standalone "<think>" piece, followed by reasoning
+    // text, the closing "</think>" piece, then the answer.
+    em.emit_token("<think>");
+    em.emit_token("reasoning step 1");
+    em.emit_token("reasoning step 2");
+    em.emit_token("</think>\n");
+    em.emit_token("answer text");
+    em.emit_finish(5);
+
+    // fci must point at the first true content token, NOT 0.
+    TEST_ASSERT(em.first_content_token_index() > 0);
+    // Reasoning text populated, leading <think> stripped.
+    TEST_ASSERT(!em.reasoning_text().empty());
+    TEST_ASSERT(em.reasoning_text().find("<think>") == std::string::npos);
+    // Content text populated.
+    TEST_ASSERT(em.accumulated_text().find("answer") != std::string::npos);
+    // emit_token_count - fci should be the content-suffix size
+    // (>0 means at least one content-mode token was attributed).
+    TEST_ASSERT(em.emit_token_count() - em.first_content_token_index() > 0);
+}
+
 static void test_emitter_reasoning_strips_leading_think_tag() {
     // Model emits leading whitespace + <think> as one token, then
     // continues thinking. The leading-<think>-with-whitespace-prefix
@@ -400,7 +463,7 @@ static void test_emitter_content_only_no_thinking() {
 
 static void test_emitter_tool_buffer_detection() {
     // When the emitter sees <tool_call>, it should buffer and parse tools.
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, weather_tools());
     em.emit_start();
     em.emit_token("<tool_call>\n"
                   "<function=get_weather>\n"
@@ -454,6 +517,75 @@ static void test_emitter_anthropic_tool_use_blocks() {
         n_stop++; pos++;
     }
     TEST_ASSERT(n_stop >= 2);
+}
+
+static void test_emitter_bare_function_tool_buffer_detection() {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, weather_tools());
+    em.emit_start();
+    em.emit_token("<function=terminal>\n"
+                  "<parameter=command>\n"
+                  "ls -la /tmp/lop/\n"
+                  "</parameter>\n"
+                  "</function>");
+    em.emit_finish(20);
+
+    TEST_ASSERT(!em.tool_calls().empty());
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "terminal");
+        auto args = json::parse(em.tool_calls()[0].arguments);
+        TEST_ASSERT(args["command"] == "ls -la /tmp/lop/");
+    }
+    TEST_ASSERT(em.accumulated_text().find("<function=terminal>") == std::string::npos);
+}
+
+static void test_emitter_does_not_leak_malformed_tool_xml() {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, weather_tools());
+    em.emit_start();
+    em.emit_token("Let me list files.\n\n");
+    em.emit_token("<tool_call>\n"
+                  "<function=terminal>\n"
+                  "<parameter=command>\n"
+                  "ls -la /tmp/lop/\n"
+                  "</parameter>");
+    em.emit_finish(20);
+
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.accumulated_text().find("Let me list files.") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("<tool_call>") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("<function=terminal>") == std::string::npos);
+}
+
+static void test_emitter_parses_tool_call_missing_outer_close() {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, weather_tools());
+    em.emit_start();
+    em.emit_token("<tool_call>\n"
+                  "<function=terminal>\n"
+                  "<parameter=command>\n"
+                  "ls -la /tmp/lop/\n"
+                  "</parameter>\n"
+                  "</function>");
+    em.emit_finish(20);
+
+    TEST_ASSERT(!em.tool_calls().empty());
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "terminal");
+        auto args = json::parse(em.tool_calls()[0].arguments);
+        TEST_ASSERT(args["command"] == "ls -la /tmp/lop/");
+    }
+    TEST_ASSERT(em.accumulated_text().find("<tool_call>") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("<function=terminal>") == std::string::npos);
+}
+
+static void test_emitter_no_tools_keeps_tool_like_text() {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
+    em.emit_start();
+    em.emit_token("<function=terminal>\n"
+                  "<parameter=command>ls</parameter>\n"
+                  "</function>");
+    em.emit_finish(20);
+
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.accumulated_text().find("<function=terminal>") != std::string::npos);
 }
 
 static void test_emitter_anthropic_structure() {
@@ -815,6 +947,91 @@ static void test_pflash_threshold_always_mode() {
     bool should = (cfg.pflash_mode == ServerConfig::PflashMode::ALWAYS) ||
                   (cfg.pflash_mode == ServerConfig::PflashMode::AUTO && n_prompt >= cfg.pflash_threshold);
     TEST_ASSERT(should);
+}
+
+static void test_pflash_placement_same_backend_local() {
+    DevicePlacement target;
+    target.backend = compiled_placement_backend();
+    target.gpu = 0;
+    DevicePlacement drafter;
+    drafter.backend = target.backend;
+    drafter.gpu = 2;
+    RemoteDraftConfig remote;
+    remote.ipc_bin = "/tmp/backend_ipc_daemon";
+
+    auto placement = resolve_pflash_drafter_placement(
+        target, drafter, remote, /*pflash_enabled=*/true);
+    TEST_ASSERT(placement.target_backend == target.backend);
+    TEST_ASSERT(placement.drafter_backend == target.backend);
+    TEST_ASSERT(placement.drafter_gpu == 2);
+    TEST_ASSERT(!placement.remote_drafter);
+    TEST_ASSERT(!placement.remote.enabled());
+}
+
+static void test_pflash_placement_mixed_backend_remote() {
+    DevicePlacement target;
+    target.backend = PlacementBackend::Cuda;
+    target.gpu = 0;
+    DevicePlacement drafter;
+    drafter.backend = PlacementBackend::Hip;
+    drafter.gpu = 1;
+    RemoteDraftConfig remote;
+    remote.ipc_bin = "/tmp/backend_ipc_daemon";
+    remote.work_dir = "/tmp/pflash-ipc";
+
+    auto placement = resolve_pflash_drafter_placement(
+        target, drafter, remote, /*pflash_enabled=*/true);
+    TEST_ASSERT(placement.target_backend == PlacementBackend::Cuda);
+    TEST_ASSERT(placement.drafter_backend == PlacementBackend::Hip);
+    TEST_ASSERT(placement.drafter_gpu == 1);
+    TEST_ASSERT(placement.remote_drafter);
+    TEST_ASSERT(placement.remote.enabled());
+    TEST_ASSERT(placement.remote.work_dir == "/tmp/pflash-ipc");
+}
+
+static void test_pflash_placement_auto_draft_follows_target() {
+    DevicePlacement target;
+    target.backend = PlacementBackend::Hip;
+    target.gpu = 0;
+    DevicePlacement drafter;
+    drafter.backend = PlacementBackend::Auto;
+    drafter.gpu = 3;
+    RemoteDraftConfig remote;
+    remote.ipc_bin = "/tmp/backend_ipc_daemon";
+
+    auto placement = resolve_pflash_drafter_placement(
+        target, drafter, remote, /*pflash_enabled=*/true);
+    TEST_ASSERT(placement.target_backend == PlacementBackend::Hip);
+    TEST_ASSERT(placement.drafter_backend == PlacementBackend::Hip);
+    TEST_ASSERT(placement.drafter_gpu == 3);
+    TEST_ASSERT(!placement.remote_drafter);
+}
+
+static void test_pflash_placement_disabled_never_remote() {
+    DevicePlacement target;
+    target.backend = PlacementBackend::Cuda;
+    DevicePlacement drafter;
+    drafter.backend = PlacementBackend::Hip;
+    RemoteDraftConfig remote;
+    remote.ipc_bin = "/tmp/backend_ipc_daemon";
+
+    auto placement = resolve_pflash_drafter_placement(
+        target, drafter, remote, /*pflash_enabled=*/false);
+    TEST_ASSERT(placement.target_backend == PlacementBackend::Cuda);
+    TEST_ASSERT(placement.drafter_backend == PlacementBackend::Hip);
+    TEST_ASSERT(!placement.remote_drafter);
+    TEST_ASSERT(!placement.remote.enabled());
+}
+
+static void test_pflash_placement_usage_gate() {
+    TEST_ASSERT(!pflash_drafter_placement_used(
+        /*pflash_enabled=*/false, /*has_decode_draft=*/false));
+    TEST_ASSERT(pflash_drafter_placement_used(
+        /*pflash_enabled=*/false, /*has_decode_draft=*/true));
+    TEST_ASSERT(pflash_drafter_placement_used(
+        /*pflash_enabled=*/true, /*has_decode_draft=*/false));
+    TEST_ASSERT(pflash_drafter_placement_used(
+        /*pflash_enabled=*/true, /*has_decode_draft=*/true));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1302,6 +1519,28 @@ static void test_disk_cache_save_below_min_tokens() {
     TEST_ASSERT(!cache.save(0, ids));
 
     rm_rf(dir);
+}
+
+static void test_backend_ipc_rejects_file_work_dir() {
+    const std::string file_path = "/tmp/dflash_test_backend_ipc_work_dir_file";
+    unlink(file_path.c_str());
+    int fd = open(file_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    TEST_ASSERT(fd >= 0);
+    if (fd >= 0) {
+        const char payload[] = "not a dir";
+        (void)write(fd, payload, sizeof(payload) - 1);
+        close(fd);
+    }
+
+    BackendIpcLaunchConfig cfg;
+    cfg.bin = "/bin/true";
+    cfg.payload_path = "/tmp/dflash_test_backend_ipc_payload";
+    cfg.work_dir = file_path;
+
+    BackendIpcProcess proc;
+    TEST_ASSERT(!proc.start(cfg));
+    TEST_ASSERT(!proc.active());
+    unlink(file_path.c_str());
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1937,10 +2176,15 @@ int main() {
     RUN_TEST(test_emitter_first_content_index_natural_close);
     RUN_TEST(test_emitter_first_content_index_never_closed);
     RUN_TEST(test_emitter_first_content_index_content_only);
+    RUN_TEST(test_emitter_first_content_index_qwen36_streaming_thinking);
     RUN_TEST(test_emitter_reasoning_strips_leading_think_tag);
     RUN_TEST(test_emitter_content_only_no_thinking);
     RUN_TEST(test_emitter_tool_buffer_detection);
     RUN_TEST(test_emitter_anthropic_tool_use_blocks);
+    RUN_TEST(test_emitter_bare_function_tool_buffer_detection);
+    RUN_TEST(test_emitter_does_not_leak_malformed_tool_xml);
+    RUN_TEST(test_emitter_parses_tool_call_missing_outer_close);
+    RUN_TEST(test_emitter_no_tools_keeps_tool_like_text);
     RUN_TEST(test_emitter_anthropic_structure);
     RUN_TEST(test_emitter_responses_structure);
     RUN_TEST(test_emitter_responses_bare_function_tool_call);
@@ -1974,6 +2218,11 @@ int main() {
     RUN_TEST(test_pflash_compress_result_defaults);
     RUN_TEST(test_pflash_threshold_auto_mode);
     RUN_TEST(test_pflash_threshold_always_mode);
+    RUN_TEST(test_pflash_placement_same_backend_local);
+    RUN_TEST(test_pflash_placement_mixed_backend_remote);
+    RUN_TEST(test_pflash_placement_auto_draft_follows_target);
+    RUN_TEST(test_pflash_placement_disabled_never_remote);
+    RUN_TEST(test_pflash_placement_usage_gate);
 
     std::fprintf(stderr, "\n── Jinja chat template ──\n");
     RUN_TEST(test_jinja_render_basic);
@@ -1999,6 +2248,7 @@ int main() {
     RUN_TEST(test_disk_cache_budget_enforcement_scoring);
     RUN_TEST(test_disk_cache_lookup_miss_no_layout);
     RUN_TEST(test_disk_cache_save_below_min_tokens);
+    RUN_TEST(test_backend_ipc_rejects_file_work_dir);
 
     std::fprintf(stderr, "\n── Sampler ──\n");
     RUN_TEST(test_sampler_cfg_defaults);

@@ -13,7 +13,9 @@
 
 #include "common/model_backend.h"
 #include "common/dflash_target.h"
+#include "common/dflash_draft_ipc.h"
 #include "placement/placement_config.h"
+#include "placement/remote_draft_config.h"
 #include "step_graph.h"
 #include "ddtree.h"
 #include "dflash_feature_ring.h"
@@ -37,6 +39,7 @@ struct Qwen35Config {
     const char * draft_path  = nullptr;
     DevicePlacement device;                // target GPU placement
     int          draft_gpu   = 0;
+    RemoteDraftConfig remote_draft;
     int          stream_fd   = -1;
 
     // FA/KV
@@ -46,6 +49,12 @@ struct Qwen35Config {
     // Draft
     int          draft_swa_window = 0;
     int          draft_ctx_max    = 4096;
+
+    // Draft YaRN rope scaling (set by caller for models that need it).
+    float        draft_yarn_factor    = 0.0f;  // 0 = no YaRN; >1 = enable
+    float        draft_yarn_beta_fast = 32.0f;
+    float        draft_yarn_beta_slow = 1.0f;
+    int          draft_yarn_orig_ctx  = 4096;
 
     // Speculative decode strategy
     bool         fast_rollback   = false;
@@ -107,6 +116,7 @@ public:
 
     bool supports_dflash_spec_decode() const override { return true; }
     DFlashTarget * dflash_target() override;
+    bool supports_remote_draft() const override { return true; }
 
     void shutdown() override;
 
@@ -114,10 +124,40 @@ public:
     // to prevent VRAM growth over time.
     void release_scratch() override;
 
-private:
+protected:
+    virtual bool load_target_model(ggml_backend_t backend, TargetWeights & out);
+    virtual bool run_ar_decode_path(int committed, int n_gen,
+                                    std::vector<int32_t> & out_tokens,
+                                    const DaemonIO & io);
+    virtual bool should_capture_moe_router() const { return false; }
+    virtual void after_target_compute(StepGraph &,
+                                      int /*kv_start*/,
+                                      int /*n_tokens*/) {}
+
+    TargetWeights & target_weights() { return w_; }
+    const TargetWeights & target_weights() const { return w_; }
+    TargetCache & target_cache() { return cache_; }
+    const TargetCache & target_cache() const { return cache_; }
+    ggml_backend_t target_backend() const { return target_backend_; }
+    StepGraph & target_step_graph() { return sg_; }
+    const StepGraph & target_step_graph() const { return sg_; }
+    SamplerCfg & sampler_config() { return sampler_; }
+    std::mt19937_64 & sampler_rng_engine() { return sampler_rng_; }
+    bool prefill_logits_valid() const { return prefill_last_logits_valid_; }
+    std::size_t prefill_logits_offset() const { return prefill_last_logits_offset_; }
+
+    // Accessors for draft/spec-decode state (needed by hybrid spec-decode in subclass)
+    DraftWeights & draft_weights() { return dw_; }
+    const DraftWeights & draft_weights() const { return dw_; }
+    ggml_backend_t draft_backend() const { return draft_backend_; }
+    DraftFeatureMirror & feature_mirror() { return feature_mirror_; }
+    const DraftFeatureMirror & feature_mirror() const { return feature_mirror_; }
+    bool is_draft_parked() const { return draft_parked_; }
+
     // ── Configuration ────────────────────────────────────────────────
     Qwen35Config cfg_;
 
+private:
     // ── GPU backends ─────────────────────────────────────────────────
     ggml_backend_t target_backend_ = nullptr;
     ggml_backend_t draft_backend_  = nullptr;
@@ -136,6 +176,7 @@ private:
 
     // ── Draft feature mirror (cross-GPU feature transfer) ────────────
     DraftFeatureMirror feature_mirror_;
+    DFlashDraftIpcClient remote_draft_;
 
     // ── Prefix cache (snapshots) ─────────────────────────────────────
     static constexpr int PREFIX_SLOTS = 64;
@@ -205,6 +246,8 @@ private:
                       const BudgetHook & budget_hook = {},
                       bool * forced_close_out = nullptr,
                       bool * degenerate_close_out = nullptr);
+
+    bool sync_remote_draft_features(int start_pos, int n_tokens);
 
     // Chain-mode verify (single batch of q_len tokens).
     int verify_chain(int committed, const int32_t * draft_tok, int q_len);

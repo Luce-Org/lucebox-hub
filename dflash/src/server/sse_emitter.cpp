@@ -18,7 +18,24 @@ static const char FUNCTION_OPEN[] = "<function=";
 static const char TOOL_CODE_OPEN[] = "<tool_code>";
 static constexpr size_t THINK_OPEN_LEN  = 7;
 static constexpr size_t THINK_CLOSE_LEN = 8;
-static constexpr size_t TOOL_OPEN_LEN   = 11;
+
+static bool has_request_tools(const json & tools) {
+    return tools.is_array() && !tools.empty();
+}
+
+static bool find_tool_start(const std::string & text, size_t & pos) {
+    size_t idx = text.find('<');
+    while (idx != std::string::npos) {
+        if (text.compare(idx, sizeof(TOOL_OPEN) - 1, TOOL_OPEN) == 0 ||
+            text.compare(idx, sizeof(FUNCTION_OPEN) - 1, FUNCTION_OPEN) == 0 ||
+            text.compare(idx, sizeof(TOOL_CODE_OPEN) - 1, TOOL_CODE_OPEN) == 0) {
+            pos = idx;
+            return true;
+        }
+        idx = text.find('<', idx + 1);
+    }
+    return false;
+}
 
 static std::string gen_item_id() {
     static std::atomic<uint64_t> ctr{0};
@@ -203,7 +220,21 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
     // mid-emit. The token AFTER that transition is the first content
     // token. Captured here so http_server can compute the natural-close
     // split without a parallel bump_count loop.
-    if (first_content_token_index_ < 0 && mode_ == StreamMode::CONTENT) {
+    //
+    // Exception: a leading `<think>` opener (Qwen3.6's thinking-enabled
+    // first token, or the synthesized `<|channel>` → `<think>` map for
+    // gemma4) arrives while mode is still CONTENT — the emitter's
+    // default — but the piece immediately transitions to REASONING.
+    // Capturing fci=0 in that case would misreport thinking_tokens as 0
+    // for any streamed-thinking response. Detect the `<think>` opener
+    // here (lookahead in the unsanitized piece, before the state
+    // machine runs) and skip the capture so it can fire on a later
+    // CONTENT-mode token after the natural </think> close.
+    const bool entry_is_think_opener =
+        mode_ == StreamMode::CONTENT &&
+        raw_piece.find(THINK_OPEN) != std::string::npos;
+    if (first_content_token_index_ < 0 && mode_ == StreamMode::CONTENT &&
+        !entry_is_think_opener) {
         first_content_token_index_ = emit_token_count_;
     }
     emit_token_count_++;
@@ -346,20 +377,18 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
         }
 
         // mode_ == StreamMode::CONTENT
-        // Look for <think>, </think>, or any supported tool-call opener.
+        // Look for <think>, </think>, or supported tool-call starts.
         size_t think_idx = window_.find(THINK_OPEN);
         size_t think_close_idx = window_.find(THINK_CLOSE);
-        size_t tool_idx = window_.find(TOOL_OPEN);
-        size_t function_idx = window_.find(FUNCTION_OPEN);
-        size_t tool_code_idx = window_.find(TOOL_CODE_OPEN);
+        size_t tool_idx = std::string::npos;
+        bool tool_hit = has_request_tools(tools_) &&
+                        find_tool_start(window_, tool_idx);
 
         struct Hit { size_t pos; int type; };  // type: 0=think, 1=think_close, 2=tool-ish
         std::vector<Hit> hits;
         if (think_idx != std::string::npos)       hits.push_back({think_idx, 0});
         if (think_close_idx != std::string::npos) hits.push_back({think_close_idx, 1});
-        if (tool_idx != std::string::npos)        hits.push_back({tool_idx, 2});
-        if (function_idx != std::string::npos)    hits.push_back({function_idx, 2});
-        if (tool_code_idx != std::string::npos)   hits.push_back({tool_code_idx, 2});
+        if (tool_hit)                             hits.push_back({tool_idx, 2});
 
         if (!hits.empty()) {
             std::sort(hits.begin(), hits.end(),
@@ -379,8 +408,8 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
                 // </think> in content — just skip it
                 window_ = window_.substr(h.pos + THINK_CLOSE_LEN);
             } else {
-                // Tool-call shapes can start with <tool_call>, bare
-                // <function=...>, or <tool_code> JSON wrappers.
+                // Tool-call syntax. Keep the full tag/function text buffered
+                // until finish so the parser can validate it.
                 tool_buffer_ = window_.substr(h.pos);
                 window_.clear();
                 mode_ = StreamMode::TOOL_BUFFER;
@@ -572,9 +601,12 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             default: break;
             }
         } else {
-            // No tool calls found — emit the buffer as content
-            accumulated_content_ += tool_buffer_;
-            emit_content_delta(out, tool_buffer_);
+            // Tool syntax was detected but no valid call parsed. Do not leak
+            // malformed/incomplete XML back to the user as assistant text.
+            std::fprintf(stderr,
+                "[server] tool_call parse failed; suppressing buffered tool text "
+                "request_id=%s format=%d bytes=%zu\n",
+                request_id_.c_str(), (int)format_, tool_buffer_.size());
         }
     }
 

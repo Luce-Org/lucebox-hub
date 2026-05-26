@@ -16,12 +16,12 @@ kept at host-data or process boundaries:
 ```bash
 cmake -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release \
   -DDFLASH27B_GPU_BACKEND=cuda
-cmake --build build-cuda --target pflash_daemon test_dflash -j
+cmake --build build-cuda --target pflash_daemon test_dflash backend_ipc_daemon -j
 
 cmake -S . -B build-hip -DCMAKE_BUILD_TYPE=Release \
   -DDFLASH27B_GPU_BACKEND=hip \
   -DDFLASH27B_HIP_ARCHITECTURES=<your-gfx-arch>
-cmake --build build-hip --target pflash_daemon test_dflash -j
+cmake --build build-hip --target pflash_daemon test_dflash backend_ipc_daemon -j
 ```
 
 ## PFlash phase split
@@ -69,13 +69,14 @@ python scripts/phase_split_dual_gpu.py run-prompt \
 
 ## DFlash draft split
 
-For DFlash, the target process can launch a separate draft IPC daemon from a
+For DFlash, the target process can launch a separate backend IPC daemon from a
 different backend build. The target process keeps target execution and any
 target layer split inside its own backend binary.
 
 Use these `test_dflash` options for the target process:
 
-- `--draft-ipc-bin <path>` points to the other backend's `test_dflash` binary.
+- `--draft-ipc-bin <path>` points to the other backend's `backend_ipc_daemon`
+  binary.
 - `--draft-ipc-gpu <id>` selects the draft daemon device in that backend's
   visible-device namespace.
 - `--draft-ipc-work-dir <path>` selects where temporary IPC payload files are

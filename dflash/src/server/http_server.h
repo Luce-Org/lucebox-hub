@@ -18,6 +18,8 @@
 #include "prefix_cache.h"
 #include "disk_prefix_cache.h"
 #include "api_types.h"
+#include "placement/remote_draft_config.h"
+#include "common/pflash_drafter_ipc.h"
 #include "model_card.h"
 #include <nlohmann/json.hpp>
 
@@ -143,7 +145,10 @@ struct ServerConfig {
     int         pflash_threshold = 32000;   // token count threshold for AUTO mode
     float       pflash_keep_ratio = 0.05f;  // fraction of tokens to keep
     std::string pflash_drafter_path;        // path to drafter GGUF (Qwen3-0.6B)
-    bool        pflash_skip_park = false;   // skip park/unpark for ≥32GB GPUs
+    int         pflash_drafter_gpu = 0;     // backend-local GPU for PFlash drafter
+    bool        pflash_remote_drafter = false; // use IPC drafter for mixed backends
+    RemoteDraftConfig pflash_remote;        // IPC binary/work-dir for remote PFlash drafter
+    bool        pflash_skip_park = false;   // skip park/unpark for >=32GB GPUs
     bool        lazy_draft      = false;   // park decode draft when idle to save VRAM
 
     // Disk prefix cache
@@ -272,6 +277,7 @@ private:
     Tokenizer *      drafter_tokenizer_ = nullptr;  // pflash drafter (optional)
     ServerConfig     config_;
     ChatFormat       chat_format_;
+    PFlashDrafterIpcClient pflash_remote_;
     ToolMemory       tool_memory_;
     PrefixCache      prefix_cache_;
     DiskPrefixCache  disk_cache_;

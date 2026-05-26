@@ -203,6 +203,7 @@ set(DFLASH27B_SRC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/common
     ${CMAKE_CURRENT_SOURCE_DIR}/src/draft
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35moe
     ${CMAKE_CURRENT_SOURCE_DIR}/src/laguna
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
@@ -235,13 +236,23 @@ add_library(dflash_common STATIC
     src/laguna/laguna_target_graph.cpp
     src/laguna/laguna_daemon.cpp
     src/laguna/laguna_backend.cpp
+    src/common/backend_ipc.cpp
     src/common/dflash_feature_ring.cpp
     src/common/dflash_capture.cpp
     src/common/dflash_draft_ipc.cpp
     src/common/dflash_draft_ipc_daemon.cpp
+    src/common/pflash_drafter_ipc.cpp
     src/common/dflash_draft_graph.cpp
     src/common/dflash_spec_decode.cpp
     src/qwen35/graph_builders.cpp
+    src/qwen35moe/qwen35moe_ffn.cpp
+    src/qwen35moe/qwen35moe_backend.cpp
+    src/qwen35moe/qwen35moe_daemon.cpp
+    src/qwen35moe/qwen35moe_routing_stats.cpp
+    src/qwen35moe/qwen35moe_expert_placement.cpp
+    src/qwen35moe/qwen35moe_hybrid_storage.cpp
+    src/qwen35moe/qwen35moe_hybrid_ffn_eval.cpp
+    src/qwen35moe/qwen35moe_swap_manager.cpp
     src/qwen35/layer_split_forward.cpp
     src/qwen35/layer_split_daemon.cpp
     src/qwen35/qwen35_backend.cpp
@@ -548,6 +559,30 @@ if(DFLASH27B_TESTS)
         add_executable(test_draft_vs_reference test/test_draft_vs_reference.cpp)
         target_link_libraries(test_draft_vs_reference PRIVATE dflash_common)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_qwen35moe_routing_stats.cpp")
+        add_executable(test_qwen35moe_routing_stats test/test_qwen35moe_routing_stats.cpp)
+        target_include_directories(test_qwen35moe_routing_stats PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_include_directories(test_qwen35moe_routing_stats PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+        endif()
+        target_link_libraries(test_qwen35moe_routing_stats PRIVATE dflash_common)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_qwen35moe_expert_placement.cpp")
+        add_executable(test_qwen35moe_expert_placement test/test_qwen35moe_expert_placement.cpp)
+        target_include_directories(test_qwen35moe_expert_placement PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_include_directories(test_qwen35moe_expert_placement PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+        endif()
+        target_link_libraries(test_qwen35moe_expert_placement PRIVATE dflash_common)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_qwen35moe_swap_manager.cpp")
+        add_executable(test_qwen35moe_swap_manager test/test_qwen35moe_swap_manager.cpp)
+        target_include_directories(test_qwen35moe_swap_manager PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_include_directories(test_qwen35moe_swap_manager PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+        endif()
+        target_link_libraries(test_qwen35moe_swap_manager PRIVATE dflash_common)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_draft.cpp")
         add_executable(smoke_load_draft test/smoke_load_draft.cpp)
         target_include_directories(smoke_load_draft PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
@@ -669,6 +704,28 @@ if(DFLASH27B_TESTS)
             target_link_libraries(dflash_server PRIVATE CUDA::cudart)
         else()
             target_link_libraries(dflash_server PRIVATE hip::host)
+        endif()
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc/backend_ipc_main.cpp")
+        add_executable(backend_ipc_daemon
+            src/ipc/backend_ipc_main.cpp
+            src/common/pflash_drafter_ipc_daemon.cpp
+        )
+        target_include_directories(backend_ipc_daemon PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(backend_ipc_daemon PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        else()
+            target_compile_definitions(backend_ipc_daemon PRIVATE
+                DFLASH27B_BACKEND_CUDA=1
+                DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
+        endif()
+        target_link_libraries(backend_ipc_daemon PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(backend_ipc_daemon PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(backend_ipc_daemon PRIVATE hip::host)
         endif()
     endif()
 
