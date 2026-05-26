@@ -21,7 +21,7 @@ DRAFTER = Path("/home/peppi/models/Qwen3-0.6B-BF16.gguf")
 PORT = 18099
 BASE_URL = f"http://127.0.0.1:{PORT}"
 
-CONDITION_SPECS = {"ee7": (14, 14)}  # (EARLY_EXIT_N, SCORE_LAYERS) — TEMP: ee14 bench run
+CONDITION_SPECS = {"ee7": (7, 7)}  # (EARLY_EXIT_N, SCORE_LAYERS)
 
 DEFAULT_DATA = Path("/tmp/longbench_hotpotqa.jsonl")
 
