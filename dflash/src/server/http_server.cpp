@@ -358,6 +358,155 @@ std::string render_tool_call_xml(const std::string & name, const json & argument
     return out;
 }
 
+// Keys that the Unsloth Jinja template's render_extra_keys macro would expand into
+// XML tags, polluting the rendered prompt (e.g. <$schema>, <additionalProperties>).
+// We strip these at every level of the schema tree before the template sees it.
+static const std::vector<std::string> k_schema_metadata_keys = {
+    "$schema", "additionalProperties", "$defs", "$ref", "definitions"
+};
+
+// Strip JSON-Schema metadata keys from a single schema node and recurse into
+// nested object property schemas.  Only keys in k_schema_metadata_keys are
+// removed; all other keys (type, properties, required, enum, items, …) survive.
+static json scrub_schema_metadata(json schema) {
+    if (!schema.is_object()) return schema;
+    for (const auto & key : k_schema_metadata_keys) {
+        schema.erase(key);
+    }
+    // Recurse into each property's sub-schema.
+    if (schema.contains("properties") && schema["properties"].is_object()) {
+        for (auto & [prop_name, prop_schema] : schema["properties"].items()) {
+            prop_schema = scrub_schema_metadata(prop_schema);
+        }
+    }
+    // Recurse into array item schema.
+    if (schema.contains("items") && schema["items"].is_object()) {
+        schema["items"] = scrub_schema_metadata(schema["items"]);
+    }
+    // Recurse into JSON-Schema combinators. Claude tool defs frequently use
+    // these for polymorphic parameter types; without recursion the inner
+    // sub-schemas keep their $schema/additionalProperties noise.
+    for (const char * combinator : {"oneOf", "anyOf", "allOf"}) {
+        if (schema.contains(combinator) && schema[combinator].is_array()) {
+            for (auto & sub : schema[combinator]) {
+                sub = scrub_schema_metadata(sub);
+            }
+        }
+    }
+    if (schema.contains("not") && schema["not"].is_object()) {
+        schema["not"] = scrub_schema_metadata(schema["not"]);
+    }
+    return schema;
+}
+
+// Maximum bytes kept from any tool or parameter description before truncation.
+static constexpr size_t kMaxToolDescriptionChars = 500;
+
+// Truncate a description string to kMaxToolDescriptionChars bytes.
+// Priority: paragraph break (\n\n) before the cap, then last ". " before the
+// cap, then hard cut (snapping back to avoid splitting a UTF-8 multibyte sequence).
+// Appends U+2026 (…, 3 UTF-8 bytes) at the cut point.
+static std::string truncate_description(const std::string & s) {
+    if (s.size() <= kMaxToolDescriptionChars) return s;
+
+    // 1. First \n\n before cap.
+    size_t nn = s.find("\n\n");
+    if (nn != std::string::npos && nn < kMaxToolDescriptionChars) {
+        return s.substr(0, nn) + "\xE2\x80\xA6";
+    }
+
+    // 2. Last ". " at or before cap.
+    std::string_view sv(s.data(), kMaxToolDescriptionChars);
+    size_t dot = sv.rfind(". ");
+    if (dot != std::string_view::npos) {
+        // Include the period; cut before the trailing space.
+        return s.substr(0, dot + 1) + "\xE2\x80\xA6";
+    }
+
+    // 3. Hard cut, snap back to UTF-8 boundary.
+    size_t cut = kMaxToolDescriptionChars;
+    // While cut > 0 and the byte at `cut` is a UTF-8 continuation byte
+    // (0x80–0xBF), move back one byte.
+    while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80) {
+        --cut;
+    }
+    return s.substr(0, cut) + "\xE2\x80\xA6";
+}
+
+// Apply truncate_description to every property's "description" inside a
+// parameters/properties object (mutates in place).
+static json truncate_parameter_descriptions(json params) {
+    if (!params.is_object()) return params;
+    if (!params.contains("properties") || !params["properties"].is_object()) {
+        return params;
+    }
+    for (auto & [prop_name, prop_schema] : params["properties"].items()) {
+        if (prop_schema.is_object() && prop_schema.contains("description") &&
+            prop_schema["description"].is_string()) {
+            prop_schema["description"] =
+                truncate_description(prop_schema["description"].get<std::string>());
+        }
+    }
+    return params;
+}
+
+// Normalize tools array to OpenAI/Qwen3 shape: {"type":"function","function":{...}}.
+// Anthropic shape uses "input_schema"; bare Qwen shape has "parameters" at top level.
+// Also scrubs JSON-Schema metadata keys that the Unsloth Jinja template would render
+// as garbage XML tags (causing the model to hallucinate function names like <function=cls>).
+// Truncates function and parameter descriptions to kMaxToolDescriptionChars to prevent
+// prescriptive recipes embedded in long descriptions from leaking into the prompt.
+json normalize_tools_for_qwen(const json & tools) {
+    if (!tools.is_array()) return tools;
+    json out = json::array();
+    for (const auto & elem : tools) {
+        if (!elem.is_object()) { out.push_back(elem); continue; }
+        // Already OpenAI shape: scrub metadata, truncate descriptions, pass through.
+        if (elem.contains("type") && elem["type"] == "function" && elem.contains("function")) {
+            json e = elem;
+            if (e["function"].contains("description") && e["function"]["description"].is_string()) {
+                e["function"]["description"] =
+                    truncate_description(e["function"]["description"].get<std::string>());
+            }
+            if (e["function"].contains("parameters")) {
+                e["function"]["parameters"] = truncate_parameter_descriptions(
+                    scrub_schema_metadata(e["function"]["parameters"]));
+            }
+            out.push_back(std::move(e));
+            continue;
+        }
+        // Anthropic shape: input_schema → parameters (scrubbed + truncated).
+        if (elem.contains("input_schema")) {
+            out.push_back({
+                {"type", "function"},
+                {"function", {
+                    {"name",        elem.value("name", "")},
+                    {"description", truncate_description(elem.value("description", ""))},
+                    {"parameters",  truncate_parameter_descriptions(
+                                        scrub_schema_metadata(elem["input_schema"]))}
+                }}
+            });
+            continue;
+        }
+        // Bare Qwen shape: top-level name + parameters (scrubbed + truncated), no wrapper.
+        if (elem.contains("name") && elem.contains("parameters")) {
+            out.push_back({
+                {"type", "function"},
+                {"function", {
+                    {"name",        elem.value("name", "")},
+                    {"description", truncate_description(elem.value("description", ""))},
+                    {"parameters",  truncate_parameter_descriptions(
+                                        scrub_schema_metadata(elem["parameters"]))}
+                }}
+            });
+            continue;
+        }
+        // Unknown shape: pass through unchanged.
+        out.push_back(elem);
+    }
+    return out;
+}
+
 std::vector<ChatMessage> normalize_chat_messages(
     const json & messages,
     ApiFormat format,
@@ -783,9 +932,9 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             req.sampler.rep_window = body["rep_window"].get<int>();
         }
 
-        // Tools.
+        // Tools — normalize Anthropic/bare-Qwen shape to OpenAI envelope.
         if (body.contains("tools")) {
-            req.tools = body["tools"];
+            req.tools = normalize_tools_for_qwen(body["tools"]);
         }
         // Tool choice constraint for hint generation.
         if (body.contains("tool_choice")) {
@@ -1003,7 +1152,8 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                     eos_str,
                     /*add_generation_prompt=*/true,
                     enable_thinking,
-                    tools_json);
+                    tools_json,
+                    chat_format_);
             } catch (const std::exception & e) {
                 send_error(fd, 500,
                     std::string("chat template (jinja) render failed: ") + e.what());
