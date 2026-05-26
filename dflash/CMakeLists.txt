@@ -216,6 +216,7 @@ add_library(dflash_common STATIC
     src/draft/draft_gguf_loader.cpp
     src/draft/draft_safetensors_loader.cpp
     src/draft/draft_graph.cpp
+    src/qwen3/anchor_scan.cpp
     src/qwen3/qwen3_drafter.cpp
     src/qwen3/qwen3_loader.cpp
     src/qwen3/qwen3_graph.cpp
@@ -551,6 +552,15 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
         add_test(NAME test_drafter_early_exit_score_range
             COMMAND test_drafter_early_exit_score_range)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_anchor_transitive.cpp")
+        add_executable(test_anchor_transitive
+            test/test_anchor_transitive.cpp
+            src/qwen3/anchor_scan.cpp)
+        target_include_directories(test_anchor_transitive PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3)
+        add_test(NAME test_anchor_transitive
+            COMMAND test_anchor_transitive)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_warm_path_regression.cpp")
         add_executable(test_drafter_warm_path_regression
