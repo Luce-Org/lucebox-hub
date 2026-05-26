@@ -42,6 +42,10 @@ def start_server(condition, ctx, log_path):
     elif condition == "ee7":
         env["PFLASH_DRAFTER_EARLY_EXIT_N"] = "7"
         env["PFLASH_DRAFTER_SCORE_LAYERS"] = "7"
+    for k in ("DFLASH_COMPRESS_ANCHOR_TRANSITIVE", "DFLASH_COMPRESS_ANCHOR_MAX_ITERS",
+              "DFLASH_COMPRESS_RARE_MAX_FREQ", "DFLASH_COMPRESS_ANCHOR_NGRAM"):
+        if k in os.environ:
+            env[k] = os.environ[k]
 
     cmd = [
         str(SERVER_BIN), str(TARGET),
