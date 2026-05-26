@@ -85,3 +85,7 @@ models/.lucebox/
 
 # Claude Code session state (worktrees, agent scratchpads)
 .claude/
+
+# Benchmark snapshots live in the standalone luce-bench-baselines repo
+# (https://github.com/easel/luce-bench-baselines) — not in lucebox-hub.
+dflash/docs/tuning-snapshots/
