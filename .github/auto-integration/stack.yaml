@@ -61,12 +61,26 @@ included:
     merge_commit: 2564d1b
     status_at_selection: "ready, mergeable, CI pass, known contributor"
     notes: "Cleanly merged after #262 and #269."
+  - pr: 276
+    title: "fix(server): Qwen3.6-27B tool calling for claude-code Anthropic path"
+    author: dusterbloom
+    head_ref: dusterbloom:fix/qwen36-claude-code-tool-calling
+    head_commit: 0e3c79a74b15c93c97ba542b2339a87bed6f5372
+    merge_commit: 193d6ca
+    status_at_selection: "non-draft known contributor; upstream CI had build failure, but stack conflict was limited to test_server_unit.cpp and local stack verification passed after resolution"
+    notes: "Resolved test-only conflict by preserving both #269 /props+timings tests and #276 tool-normalization/native-tag tests; fixed stale SseEmitter ctor test call and Bash helper schema for alias tests."
+  - pr: 275
+    title: "feat(drafter): ee3 as production default (depends on #274)"
+    author: dusterbloom
+    head_ref: dusterbloom:feat/pflash-drafter-ee3-default
+    head_commit: dd9f7c64fdcdcff1bc64cc0e4b28c3dadd4f2174
+    merge_commit: 85bca8a
+    status_at_selection: "draft but CI green, known contributor, clean merge, explicit dependency on included #274"
+    notes: "Docs/bench follow-up to #274; included because it cleanly layers on the already-selected pFlash drafter stack."
 
 held:
-  - pr: 275
-    reason: "draft; depends on #274 but not strictly required for current stack"
-  - pr: 276
-    reason: "known contributor and non-draft, but upstream build CI failed; diagnose before inclusion"
+  - pr: 249
+    reason: "draft and upstream build CI failed; clean merge but local server_unit fails until pflash_threshold default test is updated for the 32000→2000 behavior change"
   - pr: 152
     reason: "first-contribution/unknown contributor; leave to human"
   - pr: 153
@@ -85,7 +99,7 @@ rebuild_commands: |
   git fetch easel auto-integration --prune
   git checkout auto-integration
   git reset --hard origin/main
-  for n in 262 269 274; do
+  for n in 262 269 274 276 275; do
     git fetch origin pull/$n/head:refs/heads/pr-$n
     git merge --no-ff pr-$n
   done
