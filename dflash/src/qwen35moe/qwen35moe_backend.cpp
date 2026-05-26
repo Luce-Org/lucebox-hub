@@ -250,9 +250,14 @@ void Qwen35MoeBackend::maybe_post_request_swap() {
 
 bool Qwen35MoeBackend::run_ar_decode_path(int committed, int n_gen,
                                           std::vector<int32_t> & out_tokens,
-                                          const DaemonIO & io) {
+                                          const DaemonIO & io,
+                                          const BudgetHook & budget_hook,
+                                          bool * forced_close_out,
+                                          bool * degenerate_close_out) {
     if (!hybrid_mode_ || !target_weights().moe_hybrid) {
-        return Qwen35Backend::run_ar_decode_path(committed, n_gen, out_tokens, io);
+        return Qwen35Backend::run_ar_decode_path(committed, n_gen, out_tokens, io,
+                                                budget_hook, forced_close_out,
+                                                degenerate_close_out);
     }
     if (n_gen <= 0) return true;
 

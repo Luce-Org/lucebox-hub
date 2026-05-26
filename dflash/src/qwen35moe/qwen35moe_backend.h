@@ -30,7 +30,10 @@ protected:
     bool load_target_model(ggml_backend_t backend, TargetWeights & out) override;
     bool run_ar_decode_path(int committed, int n_gen,
                             std::vector<int32_t> & out_tokens,
-                            const DaemonIO & io) override;
+                            const DaemonIO & io,
+                            const BudgetHook & budget_hook = {},
+                            bool * forced_close_out = nullptr,
+                            bool * degenerate_close_out = nullptr) override;
     bool should_capture_moe_router() const override { return routing_stats_ != nullptr; }
     void after_target_compute(StepGraph & sg, int kv_start, int n_tokens) override;
 
