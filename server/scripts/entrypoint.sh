@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-DFLASH_DIR="/opt/lucebox-hub/dflash"
+DFLASH_DIR="/opt/lucebox-hub/server"
 
 info()  { printf '\033[1;34m[INFO]\033[0m  %s\n' "$*"; }
 warn()  { printf '\033[1;33m[WARN]\033[0m  %s\n' "$*"; }
@@ -153,7 +153,7 @@ if [ -z "$DFLASH_TARGET" ] && [ -d "$DFLASH_DIR/models" ]; then
 fi
 
 if [ -z "$DFLASH_TARGET" ] || [ ! -f "$DFLASH_TARGET" ]; then
-    die "No target GGUF found. Mount a model dir: -v /host/models:/opt/lucebox-hub/dflash/models"
+    die "No target GGUF found. Mount a model dir: -v /host/models:/opt/lucebox-hub/server/models"
 fi
 [ -x "$DFLASH_SERVER_BIN" ] || die "dflash_server binary missing at $DFLASH_SERVER_BIN (image build failed?)"
 

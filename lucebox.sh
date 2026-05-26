@@ -236,7 +236,7 @@ build_orchestrator_argv() {
     [ -n "${HF_TOKEN:-}" ] && argv+=(-e "HF_TOKEN=$HF_TOKEN")
 
     argv+=("${IMAGE_BASE}:${variant}")
-    # `lucebox` is the entrypoint subcommand handled by dflash/scripts/entrypoint.sh
+    # `lucebox` is the entrypoint subcommand handled by server/scripts/entrypoint.sh
     # — it execs `python -m lucebox` with whatever args we pass on.
     argv+=(lucebox "$@")
     printf '%s\n' "${argv[@]}"
@@ -280,7 +280,7 @@ cmd_serve() {
         --gpus all \
         -p "$DEFAULT_PORT:8080" \
         -v "$HOME:$HOME" \
-        -v "$fallback_models:/opt/lucebox-hub/dflash/models" \
+        -v "$fallback_models:/opt/lucebox-hub/server/models" \
         "${IMAGE_BASE}:${variant}"
 }
 

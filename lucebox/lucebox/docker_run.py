@@ -23,7 +23,7 @@ def _runtime_volumes(cfg: Config) -> tuple[tuple[str, str], ...]:
     """Mount models plus $HOME so absolute symlink targets remain valid."""
     home = str(Path.home())
     models = str(cfg.models_dir)
-    volumes = [(models, "/opt/lucebox-hub/dflash/models")]
+    volumes = [(models, "/opt/lucebox-hub/server/models")]
     if home != models:
         volumes.append((home, home))
     return tuple(volumes)

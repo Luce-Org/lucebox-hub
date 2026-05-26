@@ -60,20 +60,23 @@ WORKDIR /src
 # ~25-minute CUDA template-instantiation layer below.
 
 # C++ build inputs only — sources, headers, submodules, build script.
-COPY dflash/CMakeLists.txt /src/dflash/CMakeLists.txt
-COPY dflash/include /src/dflash/include
-COPY dflash/src /src/dflash/src
-COPY dflash/test /src/dflash/test
-COPY dflash/hip_compat /src/dflash/hip_compat
-COPY dflash/deps /src/dflash/deps
+# Note: upstream rename (PR #281) moved dflash/ → server/. Source layout
+# uses server/; submodule binding names still write `dflash/deps/...`
+# inside .gitmodules (arbitrary identifiers; only paths matter).
+COPY server/CMakeLists.txt /src/server/CMakeLists.txt
+COPY server/include /src/server/include
+COPY server/src /src/server/src
+COPY server/test /src/server/test
+COPY server/hip_compat /src/server/hip_compat
+COPY server/deps /src/server/deps
 
-# Submodules (`dflash/deps/llama.cpp`, `dflash/deps/Block-Sparse-Attention`)
+# Submodules (`server/deps/llama.cpp`, `server/deps/Block-Sparse-Attention`)
 # must be populated on the host before `docker build` — `.git/` is excluded
 # by .dockerignore so we cannot re-fetch them inside the image. ggml's own
 # CMakeLists also asserts this and errors with the right command if missing,
 # but failing here gives a clearer message before nvcc spins up.
-RUN test -f /src/dflash/deps/llama.cpp/ggml/CMakeLists.txt \
-    || (echo "ERROR: dflash/deps/llama.cpp submodule not initialised. Run on host:" >&2 \
+RUN test -f /src/server/deps/llama.cpp/ggml/CMakeLists.txt \
+    || (echo "ERROR: server/deps/llama.cpp submodule not initialised. Run on host:" >&2 \
         && echo "       git submodule update --init --recursive" >&2 \
         && exit 1)
 
@@ -86,20 +89,20 @@ RUN test -f /src/dflash/deps/llama.cpp/ggml/CMakeLists.txt \
 # binary at link time, instead of the default absolute build-tree paths.
 # Without this the binary loses its ggml shared libs after COPY to the
 # runtime stage (`libggml.so.0: cannot open shared object file`).
-RUN cmake -S /src/dflash -B /src/dflash/build \
+RUN cmake -S /src/server -B /src/server/build \
         -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
         -DDFLASH27B_USER_CUDA_ARCHITECTURES="${DFLASH_CUDA_ARCHES}" \
         -DCMAKE_CUDA_ARCHITECTURES="${DFLASH_CUDA_ARCHES}" \
-    && cmake --build /src/dflash/build --target test_dflash dflash_server --parallel
+    && cmake --build /src/server/build --target test_dflash dflash_server --parallel
 
 # Prune the build tree to only what the runtime stage needs: the native server,
 # test_dflash, and the ggml shared libs their embedded rpath
 # ($ORIGIN/deps/...) looks up. Drops ~1 GB per image of CMakeFiles/,
 # libdflash27b.a (statically linked into the binaries), ninja state,
 # compile_commands.json, and the template-instance .o tree from ggml-cuda.
-RUN cd /src/dflash/build \
+RUN cd /src/server/build \
     && find . -mindepth 1 -maxdepth 1 \
             ! -name test_dflash ! -name dflash_server ! -name deps -exec rm -rf {} + \
     && find deps -mindepth 1 -type f ! -name 'lib*.so*' -delete \
@@ -110,11 +113,11 @@ RUN cd /src/dflash/build \
 # of these reuses the cached CUDA layers above and only re-runs the
 # runtime stage's uv sync (~70s) instead of the full ~25-minute build.
 COPY pyproject.toml uv.lock README.md /src/
-COPY dflash/pyproject.toml dflash/README.md /src/dflash/
-COPY dflash/scripts /src/dflash/scripts
+COPY server/pyproject.toml server/README.md /src/server/
+COPY server/scripts /src/server/scripts
 COPY lucebox /src/lucebox
-COPY pflash /src/pflash
-COPY megakernel /src/megakernel
+COPY optimizations/pflash /src/optimizations/pflash
+COPY optimizations/megakernel /src/optimizations/megakernel
 
 # ─── Stage 2: runtime ───────────────────────────────────────────────────────
 # Runtime image: ships nvidia driver libs but no nvcc / dev headers. Matches
@@ -141,50 +144,51 @@ WORKDIR /opt/lucebox-hub
 
 # Workspace files for uv sync (root pyproject + lock + README + workspace
 # member manifests). Each is a leaf file or small dir so layers stay tiny.
-# The in-container entrypoint lives at dflash/scripts/entrypoint.sh and
+# The in-container entrypoint lives at server/scripts/entrypoint.sh and
 # dispatches to either the dflash server, the lucebox Python CLI, or the
 # benchmark. The host-side `lucebox.sh` is the supported way to drive this
 # image; the Python CLI inside owns all orchestration logic.
 COPY --from=builder /src/pyproject.toml /src/uv.lock /src/README.md /opt/lucebox-hub/
-COPY --from=builder /src/pflash /opt/lucebox-hub/pflash
-COPY --from=builder /src/megakernel/pyproject.toml /src/megakernel/README.md \
-                   /opt/lucebox-hub/megakernel/
+COPY --from=builder /src/optimizations/pflash /opt/lucebox-hub/optimizations/pflash
+COPY --from=builder /src/optimizations/megakernel/pyproject.toml \
+                   /src/optimizations/megakernel/README.md \
+                   /opt/lucebox-hub/optimizations/megakernel/
 # The lucebox Python CLI ships in /opt/lucebox-hub/lucebox/ as a uv workspace
 # member; entrypoint.sh execs `python -m lucebox` for any host-wrapper
 # subcommand other than `serve` / `benchmark` / `shell`.
 COPY --from=builder /src/lucebox /opt/lucebox-hub/lucebox
 
-# dflash: ship the entrypoint/benchmark scripts, the pyproject + README that uv
+# server: ship the entrypoint/benchmark scripts, the pyproject + README that uv
 # resolves against, and the pruned build tree (binaries + .so files from the
 # prune step in the builder stage). Source code, headers, tests, and submodule
 # sources stay in the builder.
-COPY --from=builder /src/dflash/scripts /opt/lucebox-hub/dflash/scripts
-COPY --from=builder /src/dflash/pyproject.toml /src/dflash/README.md \
-                   /opt/lucebox-hub/dflash/
-COPY --from=builder /src/dflash/build /opt/lucebox-hub/dflash/build
+COPY --from=builder /src/server/scripts /opt/lucebox-hub/server/scripts
+COPY --from=builder /src/server/pyproject.toml /src/server/README.md \
+                   /opt/lucebox-hub/server/
+COPY --from=builder /src/server/build /opt/lucebox-hub/server/build
 
 # Model-card sidecars resolved at startup. The server's search path
 # (model_card.cpp) looks at <binary>/../share/model_cards first, so
-# placing them at /opt/lucebox-hub/dflash/share/model_cards/ makes
+# placing them at /opt/lucebox-hub/server/share/model_cards/ makes
 # them discoverable without DFLASH_MODEL_CARDS_DIR. Copied directly
 # from the build context (no builder roundtrip needed — these are
 # static JSON, not compiled).
-COPY share/model_cards /opt/lucebox-hub/dflash/share/model_cards
+COPY share/model_cards /opt/lucebox-hub/server/share/model_cards
 
-RUN test -x /opt/lucebox-hub/dflash/build/test_dflash \
-    && test -x /opt/lucebox-hub/dflash/build/dflash_server \
-    && test -f /opt/lucebox-hub/dflash/share/model_cards/qwen3.6-27b.json \
-    && chmod +x /opt/lucebox-hub/dflash/scripts/entrypoint.sh
+RUN test -x /opt/lucebox-hub/server/build/test_dflash \
+    && test -x /opt/lucebox-hub/server/build/dflash_server \
+    && test -f /opt/lucebox-hub/server/share/model_cards/qwen3.6-27b.json \
+    && chmod +x /opt/lucebox-hub/server/scripts/entrypoint.sh
 
 # Register the ggml lib dir with ld.so so libggml-cpu.so (loaded transitively
 # by libggml.so) resolves. CMakeLists.txt sets a `$ORIGIN/deps/...` RUNPATH
 # uniformly across all linked artefacts — correct for test_dflash in
-# dflash/build/, broken for the .so files in deps/llama.cpp/ggml/src/ which
+# server/build/, broken for the .so files in deps/llama.cpp/ggml/src/ which
 # would need a plain `$ORIGIN`. ld.so.conf side-steps the RPATH bug without
 # patching every shared lib.
 RUN printf '%s\n%s\n' \
-        /opt/lucebox-hub/dflash/build/deps/llama.cpp/ggml/src \
-        /opt/lucebox-hub/dflash/build/deps/llama.cpp/ggml/src/ggml-cuda \
+        /opt/lucebox-hub/server/build/deps/llama.cpp/ggml/src \
+        /opt/lucebox-hub/server/build/deps/llama.cpp/ggml/src/ggml-cuda \
         > /etc/ld.so.conf.d/lucebox-ggml.conf \
     && ldconfig
 
@@ -204,20 +208,20 @@ RUN uv sync --no-dev --frozen 2>/dev/null \
 # interpreter and workspace readable/executable for that non-root uid.
 RUN chmod -R a+rX /opt/lucebox-hub/.venv /opt/lucebox-hub
 
-# Models live in dflash/models/ — bind-mount or volume them in.
+# Models live in server/models/ — bind-mount or volume them in.
 # Example:
 #   docker run --rm --gpus all -p 8080:8080 \
-#       -v "$PWD/dflash/models:/opt/lucebox-hub/dflash/models" \
+#       -v "$PWD/server/models:/opt/lucebox-hub/server/models" \
 #       lucebox-hub
 # The VOLUME declaration keeps the path out of the image layer cache; the
 # bind mount above replaces it with the host directory at run time.
-VOLUME ["/opt/lucebox-hub/dflash/models"]
+VOLUME ["/opt/lucebox-hub/server/models"]
 
 ENV DFLASH_HOST=0.0.0.0 \
     DFLASH_PORT=8080 \
-    DFLASH_BIN=/opt/lucebox-hub/dflash/build/test_dflash \
-    DFLASH_SERVER_BIN=/opt/lucebox-hub/dflash/build/dflash_server
+    DFLASH_BIN=/opt/lucebox-hub/server/build/test_dflash \
+    DFLASH_SERVER_BIN=/opt/lucebox-hub/server/build/dflash_server
 
 EXPOSE 8080
 
-ENTRYPOINT ["/opt/lucebox-hub/dflash/scripts/entrypoint.sh"]
+ENTRYPOINT ["/opt/lucebox-hub/server/scripts/entrypoint.sh"]
