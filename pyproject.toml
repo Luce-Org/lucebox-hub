@@ -65,7 +65,7 @@ torch = { index = "pytorch-cu128" }
 # luce-bench is the standalone PyPI benchmark package (formerly
 # `dflash/scripts/bench_*.py`). Pinned to a git tag until we land the
 # trusted-publishing flow on PyPI; switch to a plain version pin then.
-luce-bench = { git = "https://github.com/easel/luce-bench.git", tag = "v0.2.3" }
+luce-bench = { git = "https://github.com/easel/luce-bench.git", tag = "v0.2.4" }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
