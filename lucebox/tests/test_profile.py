@@ -165,6 +165,55 @@ def test_profile_dry_run_reports_missing_without_running(tmp_path):
     assert rows[0]["status"] == "skipped_unavailable"
 
 
+def test_luce_bench_argv_shape_for_each_area(tmp_path):
+    """Each bench-running StepDefinition builds a luce-bench argv with the
+    right area, base-url, model, and per-step knobs (think mode, max_tokens,
+    timeout). Catches regressions in the argv builder shape — the framework
+    later writes the produced JSON back through the hash/dedup pipeline."""
+    srv, url = _server()
+    try:
+        cfg = _cfg(tmp_path)
+        ctx = profile.build_context(cfg, base_url=url, provider=StubProfileInfoProvider())
+        # Steps that drive luce-bench (4 of the 7 in the current registry).
+        expected_areas = {
+            "benchmark.code": ("code", None),
+            "benchmark.longctx": ("longctx", None),
+            "benchmark.agent": ("agent", "4096"),
+            "quality.ds4_eval": ("ds4-eval", "16000"),
+        }
+        for step in profile.registry():
+            if step.id not in expected_areas:
+                continue
+            area, max_tokens = expected_areas[step.id]
+            assert step.argv is not None
+            argv = step.argv(ctx, tmp_path)
+            # Every luce-bench step shells out to `python -m lucebench.cli`.
+            assert argv[1] == "-m"
+            assert argv[2] == "lucebench.cli"
+            # Area + base-url + model are mandatory.
+            assert "--area" in argv
+            assert argv[argv.index("--area") + 1] == area
+            assert argv[argv.index("--base-url") + 1] == url
+            assert argv[argv.index("--model") + 1] == "default"
+            # JSON output lands in the step's owned dest dir.
+            json_out = argv[argv.index("--json-out") + 1]
+            assert str(tmp_path) in json_out
+            # max_tokens only set when the step asked for it (agent, ds4_eval).
+            if max_tokens is None:
+                assert "--max-tokens" not in argv
+            else:
+                assert argv[argv.index("--max-tokens") + 1] == max_tokens
+        # quality.ds4_eval is the slow score-only step; verify its specific knobs.
+        ds4 = next(s for s in profile.registry() if s.id == "quality.ds4_eval")
+        argv = ds4.argv(ctx, tmp_path)
+        assert "--think" in argv  # ds4-eval runs with thinking enabled
+        assert ds4.timeout_s == 86400  # 24h ceiling for the full 92-case run
+        assert "--timeout" in argv  # per-case timeout (1800s)
+        assert argv[argv.index("--timeout") + 1] == "1800"
+    finally:
+        srv.shutdown()
+
+
 def test_profile_hash_ignores_volatile_machine_and_dirty_state(tmp_path):
     srv, url = _server()
     try:

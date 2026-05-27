@@ -660,6 +660,52 @@ def _pytest_argv(_ctx: ProfileContext, _dest: Path) -> list[str]:
     ]
 
 
+def _luce_bench_area_argv(
+    area: str,
+    report: str,
+    *,
+    think: bool | None = None,
+    max_tokens: int | None = None,
+    timeout: int | None = None,
+    model: str = "default",
+) -> Callable[[ProfileContext, Path], list[str]]:
+    """argv builder for a single luce-bench area.
+
+    Each StepDefinition's `argv` callable produces a fresh command per
+    invocation, parameterized by the live ProfileContext (base_url) and
+    the destination directory the framework owns. Writing the per-case
+    rows to `dest/<report>.json` lets the framework version and dedup
+    profile snapshots without luce-bench needing to know about that
+    machinery.
+    """
+
+    def build(ctx: ProfileContext, dest: Path) -> list[str]:
+        argv: list[str] = [
+            sys.executable,
+            "-m",
+            "lucebench.cli",
+            "--area",
+            area,
+            "--base-url",
+            ctx.base_url,
+            "--model",
+            model,
+            "--json-out",
+            str(dest / report),
+        ]
+        if think is True:
+            argv += ["--think"]
+        elif think is False:
+            argv += ["--no-think"]
+        if max_tokens is not None:
+            argv += ["--max-tokens", str(max_tokens)]
+        if timeout is not None:
+            argv += ["--timeout", str(timeout)]
+        return argv
+
+    return build
+
+
 def registry() -> list[StepDefinition]:
     live_tunables = (
         "budget",
@@ -685,6 +731,65 @@ def registry() -> list[StepDefinition]:
             requires_live_server=True,
             collector=_health_collector,
             availability=_live_available,
+        ),
+        # ── Capability + quality probes via luce-bench ───────────────
+        # Each area writes a JSON snapshot the framework versions by
+        # (hardware, model, tunable) hash. Re-running with the same
+        # config short-circuits to the existing snapshot; changing any
+        # tunable forces a fresh capture.
+        StepDefinition(
+            id="benchmark.code",
+            version=1,
+            description="HumanEval-style code-completion probe (10 cases).",
+            timeout_s=300,
+            max_age_hours=24,
+            requires_live_server=True,
+            argv=_luce_bench_area_argv("code", "bench-code.json"),
+            report_name="bench-code.json",
+            availability=_live_available,
+            tunable_keys=live_tunables,
+        ),
+        StepDefinition(
+            id="benchmark.longctx",
+            version=1,
+            description="Long-context frontier probe (6 cases up to 16k).",
+            timeout_s=600,
+            max_age_hours=24,
+            requires_live_server=True,
+            argv=_luce_bench_area_argv("longctx", "bench-longctx.json"),
+            report_name="bench-longctx.json",
+            availability=_live_available,
+            tunable_keys=live_tunables,
+        ),
+        StepDefinition(
+            id="benchmark.agent",
+            version=1,
+            description="Agent-shape probe (4 cases — tool calls + code blocks).",
+            timeout_s=600,
+            max_age_hours=24,
+            requires_live_server=True,
+            argv=_luce_bench_area_argv("agent", "bench-agent.json", max_tokens=4096),
+            report_name="bench-agent.json",
+            availability=_live_available,
+            tunable_keys=live_tunables,
+        ),
+        StepDefinition(
+            id="quality.ds4_eval",
+            version=1,
+            description="Full 92-case antirez/ds4 ds4-eval suite (score-only).",
+            timeout_s=86400,
+            max_age_hours=168,
+            requires_live_server=True,
+            argv=_luce_bench_area_argv(
+                "ds4-eval",
+                "bench-ds4-eval.json",
+                think=True,
+                max_tokens=16000,
+                timeout=1800,
+            ),
+            report_name="bench-ds4-eval.json",
+            availability=_live_available,
+            tunable_keys=live_tunables,
         ),
         StepDefinition(
             id="benchmark.autotune_latest",

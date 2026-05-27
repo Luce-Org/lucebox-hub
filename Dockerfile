@@ -140,6 +140,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -LsSf https://astral.sh/uv/install.sh \
         | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 INSTALLER_NO_MODIFY_PATH=1 sh
 
+# Install Python to a world-readable location, not /root/.local/share/uv/
+# (the default). The container runs as the host UID for bind-mount sanity
+# (so config.toml files in $HOME are user-owned, not root-owned), and a
+# non-root UID cannot traverse into root's home to exec python. Same for
+# the uv cache — must be world-readable so non-root reads from it.
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python \
+    UV_TOOL_DIR=/opt/uv/tools
+
 WORKDIR /opt/lucebox-hub
 
 # Workspace files for uv sync (root pyproject + lock + README + workspace
@@ -205,8 +213,13 @@ RUN uv sync --no-dev --frozen 2>/dev/null \
 
 # Host wrapper CLI containers run as the invoking host uid so bind-mounted
 # config/profile files are not left root-owned. Keep the uv-managed
-# interpreter and workspace readable/executable for that non-root uid.
-RUN chmod -R a+rX /opt/lucebox-hub/.venv /opt/lucebox-hub
+# interpreter, the python install, and the workspace readable/executable
+# for that non-root uid. UV_PYTHON_INSTALL_DIR redirects the python
+# install to /opt/uv/python (set as ENV before the sync above); we still
+# chmod the venv + workspace + uv-install dir so the non-root user can
+# reach interpreter, scripts, and the writable directories the runtime
+# might touch.
+RUN chmod -R a+rX /opt/lucebox-hub/.venv /opt/lucebox-hub /opt/uv
 
 # Models live in server/models/ — bind-mount or volume them in.
 # Example:
