@@ -26,7 +26,7 @@
 ## Quick start
 
 The prebuilt Docker image covers CUDA 12.8-compatible NVIDIA GPUs. The
-host wrapper `lucebox.sh` probes your driver + GPU, selects the `:cuda12`
+host wrapper `lucebox` probes your driver + GPU, selects the `:cuda12`
 image, and either runs the server foreground or
 manages it as a user systemd service. All orchestration logic — config,
 autotune, benchmarks, smoke tests, model download — lives in a typed
@@ -36,34 +36,34 @@ Python CLI inside the image.
 # 1. Install the host wrapper. ~80 lines of bash, zero deps beyond docker +
 #    nvidia-smi. No uv or Python required on the host.
 curl -fsSL https://raw.githubusercontent.com/Luce-Org/lucebox-hub/main/lucebox.sh \
-     -o ~/.local/bin/lucebox.sh && chmod +x ~/.local/bin/lucebox.sh
+     -o ~/.local/bin/lucebox && chmod +x ~/.local/bin/lucebox
 
 # 2. Sanity check: driver, docker, NVIDIA Container Toolkit, VRAM, systemd.
-lucebox.sh check
+lucebox check
 
 # 3. Pick image + autotune defaults. Writes ~/.lucebox/config.toml.
-lucebox.sh configure
+lucebox configure
 
 # 4. Pull the image (~14 GB).
-lucebox.sh pull
+lucebox pull
 
 # 5. Fetch the default target + DFlash draft (~17 GB) via the container —
 #    no host-side huggingface-cli install needed.
-lucebox.sh download-models
+lucebox download-models
 
 # 6. Run the server. Either foreground:
-lucebox.sh serve
+lucebox serve
 #    …or install + start as a user systemd service:
-lucebox.sh install        # writes ~/.config/systemd/user/lucebox.service
-lucebox.sh start          # systemctl --user start lucebox
-lucebox.sh status         # journalctl-style status
-lucebox.sh logs           # follow the journal
+lucebox install        # writes ~/.config/systemd/user/lucebox.service
+lucebox start          # systemctl --user start lucebox
+lucebox status         # journalctl-style status
+lucebox logs           # follow the journal
 
 # 7. Use it.
 curl http://localhost:8080/v1/models
 ```
 
-Prefer raw docker? `lucebox.sh print-run` emits the exact `docker run`
+Prefer raw docker? `lucebox print-run` emits the exact `docker run`
 command without executing — copy, tweak, paste. Or skip the wrapper
 entirely:
 
@@ -92,9 +92,9 @@ kernels assume sm_75+ with no fallback below.
 
 ### Configuration
 
-`lucebox.sh configure` writes `~/.lucebox/config.toml` with VRAM-tiered
-heuristics; edit it, then `lucebox.sh start` (or `serve`). For a tuned
-config, run `lucebox.sh benchmark` after `pull`. The optimizer is organized as
+`lucebox configure` writes `~/.lucebox/config.toml` with VRAM-tiered
+heuristics; edit it, then `lucebox start` (or `serve`). For a tuned
+config, run `lucebox benchmark` after `pull`. The optimizer is organized as
 a progression:
 
 - `--profile level1` (default): start from conservative VRAM heuristics, sweep
@@ -128,7 +128,7 @@ API smoke gate.
 the Anthropic Messages wire shape emitted by Claude Code: streamed `tool_use`
 blocks followed by deterministic `tool_result` history. It tracks wall-bound
 first-content, wall-time, decode, and context-growth behavior as tool results
-accumulate across turns. `lucebox.sh profile --export-snapshot` updates the
+accumulate across turns. `lucebox profile --export-snapshot` updates the
 local append-only profile store, selects the newest matching artifact for each
 registered step, and writes the normalized tuning and benchmark format described
 in `server/docs/BENCHMARK_SNAPSHOT_SPEC.md`. Use `--force-refresh` to regenerate
@@ -156,7 +156,7 @@ which is not enough for CUDA/VMM scratch allocations. Use
 | `LUCEBOX_IMAGE`               | `ghcr.io/luce-org/lucebox-hub` | Override the image repository
 | `LUCEBOX_VARIANT`             | `cuda12`        | Override the image tag for release-candidate builds
 
-CLI reference: [`lucebox.sh`](lucebox.sh) (host) and
+CLI reference: [`lucebox`](lucebox) (host) and
 [`lucebox/`](lucebox/) (Python package inside the container).
 
 ### Available tags
