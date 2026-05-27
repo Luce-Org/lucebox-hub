@@ -1,74 +1,68 @@
-updated_at: 2026-05-27T16:10:00-04:00
+updated_at: 2026-05-27T12:52:00-04:00
 repository: Luce-Org/lucebox-hub
 integration_branch: auto-integration
 remotes:
   upstream: origin
   writable: easel
 heads:
-  upstream_main: aee0591
-  previous_integration_head: 5e504f1
+  upstream_main: d947c70
+  previous_integration_head: 2889213
   base_before_run: easel/auto-integration
-  integration_worktree_head_before_metadata_commit: 3c4a370
+  integration_worktree_head_before_metadata_commit: dfe3f42
 stack:
   included:
     - pr: 284
-      status: integrated-this-run
+      status: already-represented
       head: 697198a
-      evidence: clean merge added config.json-based rope_theta loading for the safetensors draft path; compile-only verification of draft_safetensors_loader.cpp succeeded after syncing server/deps/llama.cpp.
-      merge_commit: 3c4a370
+      evidence: exact ancestor of refreshed stack; config.json rope_theta loading remains integrated.
     - pr: 276
       status: already-represented
       head: 0e3c79a
-      evidence: merge-tree into refreshed stack is tree-identical; Qwen3.6 Claude-code Anthropic tool-calling fix is represented by current server/chat_template and tool parsing changes.
+      evidence: exact ancestor of refreshed stack; Qwen3.6 Claude-code Anthropic tool-calling fix remains integrated.
     - pr: 274
-      status: integrated-this-run
+      status: already-represented
       head: 5037b28
-      evidence: clean worktree merge added latest adaptive anchor_radius and PFLASH_COMPRESS_* cascade-env rename commits on top of the previously included ee7 stack.
-      merge_commit: da28161
+      evidence: exact ancestor of refreshed stack; ee7/adaptive anchor_radius and PFLASH_COMPRESS cascade rename remain integrated.
     - pr: 264
       status: already-represented
       head: 3cdcf7b
-      evidence: merge-tree into refreshed stack is tree-identical; adaptive keep_ratio bandit MVP already present.
+      evidence: adaptive keep_ratio bandit MVP remains represented by the current server-side stack.
     - pr: 152
       status: already-represented
       head: cf735be
-      evidence: merge-tree into refreshed stack is tree-identical; Gemma 4 RTX 4090 backend helper docs/scripts already present.
+      evidence: exact ancestor of refreshed stack; Gemma 4 RTX 4090 backend helper docs/scripts remain integrated.
     - pr: 142
       status: already-represented
       head: f2fbf62
-      evidence: merge-tree into refreshed stack is tree-identical; FP16 safetensors drafter support already present.
+      evidence: exact ancestor of refreshed stack; FP16 safetensors drafter support remains integrated.
   attempted_this_run:
-    - pr: 284
-      status: integrated
-      worktree: /home/erik/Projects/luce2
-      evidence: git merge --no-ff --no-edit pr-284 completed without conflicts after first merging origin/main.
-    - pr: 274
-      status: integrated
-      worktree: /home/erik/Projects/luce2-worktrees/auto-int-20260527-0938
-      evidence: git merge --no-ff origin/pr/274 completed without conflicts.
+    - pr: upstream-main
+      status: integrated-this-run
+      worktree: /tmp/luce-auto-int-20260527-124447
+      evidence: git merge --no-edit origin/main completed cleanly; origin/main advanced from aee0591 to d947c70 with README-only upstream changes.
     - pr: 266
-      status: still-blocked-after-new-conflict-attempt
-      worktree: /home/erik/Projects/luce2-worktrees/codex-pr266-20260527-0942
-      evidence: actual git merge --no-commit --no-ff origin/pr/266 after PR #274 update still conflicts in CI, harness files, server/CMakeLists, model_backend, qwen35 backend/header, adaptive_keep_ratio tests, http_server, and server unit tests; it also reintroduces obsolete dflash/src/server and dflash/bench result artifacts.
-      delegation: Claude Code remains unauthenticated; Codex CLI exists but Hermes command safety blocked the codex exec --full-auto conflict-resolution invocation, so no delegated resolution was accepted.
+      status: still-blocked-after-actual-merge-and-delegated-analysis
+      worktree: /tmp/luce-pr266-attempt-20260527-1245
+      evidence: actual git merge --no-commit --no-ff origin/pr/266 conflicts in CI, harness adapter/proxy files, server CMake/backend/qwen35/http_server/adaptive tests, plus obsolete dflash/src and dflash/bench artifacts.
+      delegation: Claude Code is unauthenticated; Codex CLI exists but returned 401 Unauthorized. Hermes delegate_task analysis recommends manual hunk-porting of typed harness adapters, format-aware session_inject_proxy, metrics parser/tests, and possibly DFLASH_BANDIT_MAX_SESSIONS while rejecting obsolete dflash artifacts and old qwen35/server rewrites.
     - pr: 237
       status: blocked-by-server-rename-and-mtp-foundation-conflicts
-      evidence: merge-tree reports modify/delete conflicts under obsolete dflash paths plus conflicts in backend_factory, step_graph, qwen35 loader/graph/backend, CMake, and dflash tests.
+      evidence: merge-tree reports modify/delete conflicts under obsolete dflash paths plus conflicts in backend_factory, step_graph, qwen35 loader/graph/backend, CMake, and tests.
     - pr: 221
       status: blocked-by-server-rename-and-mtp-prefix-cache-conflicts
       evidence: merge-tree reports obsolete dflash script/backend paths and conflicts across prefix/MTP common and qwen35 files.
     - pr: 183
       status: blocked-by-gemma4-mtp-stack-conflicts
-      evidence: merge-tree reports Gemma4 target/MTP file-location and internal/CMake conflicts.
+      evidence: merge-tree reports Gemma4 target/MTP file-location and internal/CMake conflicts; latest non-draft Gemma4 split stack but likely needs a planned port.
     - pr: 182
-      status: blocked-by-gemma4-mtp-stack-conflicts
-      evidence: merge-tree reports Gemma4 target/MTP file-location and internal/CMake conflicts.
+      status: superseded-by-pr-183-and-blocked
+      evidence: ancestor/split predecessor of PR 183; same Gemma4 target/MTP file-location and internal/CMake conflicts.
     - pr: 181
-      status: blocked-by-gemma4-dflash-runtime-conflicts
-      evidence: merge-tree reports dflash/CMake modify-delete, Gemma4 file-location conflicts, and errors/internal conflicts.
+      status: superseded-by-pr-182/pr-183-and-blocked
+      evidence: ancestor/split predecessor of later Gemma4 stack; same dflash/CMake, Gemma4 file-location, and errors/internal conflicts.
     - pr: 180
-      status: blocked-by-gemma4-draft-loader-conflicts
-      evidence: merge-tree reports dflash/CMake modify-delete, Gemma4 file-location conflicts, and errors/internal conflicts.
+      status: superseded-by-pr-181/pr-182/pr-183-and-blocked
+      evidence: ancestor/split predecessor of later Gemma4 stack; same dflash/CMake, Gemma4 file-location, and errors/internal conflicts.
     - pr: 177
       status: blocked-by-gemma4-kv-conflicts
       evidence: merge-tree reports dflash/CMake modify-delete, Gemma4 file-location conflicts, and errors/internal conflicts.
@@ -76,40 +70,50 @@ stack:
       status: blocked-by-gemma4-docs/code-stack-conflicts
       evidence: merge-tree reports dflash/CMake modify-delete plus Gemma4 file-location and errors/internal conflicts.
     - pr: 154
-      status: blocked-by-native-mtp-stack-conflicts
-      evidence: merge-tree reports MTP docs/scripts/test file-location conflicts and qwen35 target graph/loader/internal conflicts.
+      status: superseded-by-later-mtp-foundation-candidate-and-blocked
+      evidence: stacked on PR 153 and conflicts across MTP docs/scripts/tests plus qwen35 target graph/loader/internal; likely superseded if PR 237 is the survivor.
     - pr: 153
-      status: blocked-by-native-mtp-stack-conflicts
-      evidence: merge-tree reports MTP docs/src/test file-location conflicts and qwen35 target graph/loader/internal conflicts.
+      status: superseded-by-pr-154-and-blocked
+      evidence: ancestor/base of PR 154; same native MTP stack conflicts in relocated CMake, qwen35, and tests.
     - pr: 137
       status: stale-or-path-duplicate
-      evidence: merge-tree conflicts only on obsolete dflash/CMakeLists.txt, while the active build file is server/CMakeLists.txt.
+      evidence: conflicts only on obsolete dflash/CMakeLists.txt while the active build file is server/CMakeLists.txt.
     - pr: 135
       status: blocked-by-qwen35-target-graph-conflicts
-      evidence: merge-tree reports conflicts in server/src/internal.h, qwen35_target_graph.cpp, and test_dflash.cpp.
+      evidence: merge-tree reports conflicts in server/src/internal.h, qwen35_target_graph.cpp, and server/test/test_dflash.cpp.
     - pr: 131
-      status: blocked-by-large-gemma4-support-stack-conflicts
-      evidence: merge-tree reports .gitignore/.gitmodules, obsolete dflash paths/submodule, Gemma4 file-location, pflash adapter add/add, and test conflicts.
+      status: superseded-by-later-gemma4-work-and-blocked
+      evidence: older broad Gemma4 support stack conflicts in .gitignore/.gitmodules, obsolete dflash paths/submodule, Gemma4 file-location, pflash adapter add/add, and tests.
     - pr: 94
       status: blocked-by-draft-loader-conflicts
       evidence: merge-tree reports draft_graph, draft_safetensors_loader, and internal.h conflicts.
     - pr: 62
-      status: blocked-by-obsolete-dflash-test-path-conflicts
-      evidence: merge-tree reports dflash/test/test_dflash.cpp modify-delete and test_daemon_reset file-location conflict.
+      status: low-value-manual-test-port-or-close
+      evidence: conflicts only in obsolete dflash/test/test_dflash.cpp and relocated test_daemon_reset_merge_resolution.py.
     - pr: 39
-      status: blocked-by-moe-and-obsolete-dflash-path-conflicts
-      evidence: merge-tree reports obsolete dflash CMake/submodule/src/test modify-deletes plus draft loader/graph conflicts.
+      status: likely-superseded-by-newer-draft/gemma-work-and-blocked
+      evidence: merge-tree reports obsolete dflash CMake/submodule/src/test conflicts plus active draft loader/graph conflicts.
   pending: []
   blocked_needs_human:
     - pr: 266
-      reason: Harness typed-adapter stack overlaps already-integrated adaptive keep-ratio/server work and still needs a deliberate server-layout port. Latest PR #266 also adds LRU HttpServerSessions changes and pflash-only harness fixes that should be reviewed/ported without obsolete dflash artifacts.
-    - prs: [237, 221, 183, 182, 181, 180, 177, 174, 154, 153, 135, 131, 94, 62, 39]
-      reason: Broad pre-rename dflash/Gemma4/MTP stacks conflict with the current server/ layout and each other; require a planned path-migration/rebase strategy.
+      reason: Valuable harness typed-adapter/session-inject work remains, but direct merge is unsafe. It needs a manual selective port against current harness/server layout, not wholesale merge.
+    - prs: [237, 221, 183, 177, 174, 135, 94]
+      reason: Potentially valuable server/MTP/Gemma/Qwen work, but all require a deliberate rebase/port to the current server/ layout and interaction review with already-integrated pFlash/draft changes.
   suggested_close_or_superseded:
     - pr: 137
-      reason: Appears stale after dflash-to-server layout migration; active CMake changes should be re-authored against server/CMakeLists.txt if still needed.
+      reason: Obsolete dflash/CMake-only change after server/ layout migration.
+    - prs: [153, 154]
+      reason: Native MTP stack appears superseded by later MTP foundation direction; close if PR 237 is the intended survivor.
+    - prs: [180, 181, 182]
+      reason: Split-stack predecessors superseded by PR 183.
+    - pr: 131
+      reason: Older broad Gemma4 stack overlapped by later Gemma4 work and draft PR 193.
+    - pr: 62
+      reason: Mostly layout-obsolete tests; either manually port the daemon-reset test or close.
+    - pr: 39
+      reason: Old MoE/draft work conflicts with current server and likely newer Gemma/draft stacks.
     - pr: 48
-      reason: maintainer-authored non-draft excluded from contributor priority; previous runs classified as represented/stale in active server/CMakeLists path.
+      reason: maintainer-authored non-draft excluded from contributor priority; stale active-CMake equivalent should be reauthored against server/CMakeLists.txt if still needed.
   draft_excluded:
     - pr: 278
     - pr: 275
@@ -120,33 +124,24 @@ stack:
     - pr: 193
     - pr: 75
   upstream_sync:
-    - merged_origin_main: refreshed_this_run
-    - note: origin/main advanced to aee0591 (readme); merged cleanly into the integration branch before replaying PR #284.
+    - merged_origin_main: d947c70
+    - note: origin/main advanced from aee0591 to d947c70; merged cleanly into the integration branch before triage.
   tests_and_checks:
     - date -Is
-    - git status --short --branch
+    - git status --short; git branch --show-current; git remote -v
     - gh auth status
     - /home/erik/.local/bin/claude auth status --text
     - /home/linuxbrew/.linuxbrew/bin/codex --version
-    - git ls-remote origin main
-    - git ls-remote easel auto-integration
     - git fetch --prune origin
     - git fetch --prune easel
-    - git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*' (submodule recursion emitted known missing dflash/deps warning after refs fetched)
-    - gh pr list --repo Luce-Org/lucebox-hub --state open --limit 100 --json ...
-    - git merge --no-ff --no-edit origin/main
-    - git fetch origin pull/284/head:pr-284
-    - git merge --no-ff --no-edit pr-284
-    - git submodule update --init --recursive server/deps/llama.cpp
-    - cmake -S server -B /tmp/luce2-server-build -DDFLASH27B_GPU_BACKEND=cuda -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
-    - cmake --build /tmp/luce2-server-build --target dflash_server -j2 (timed out after 600s while compiling ggml-cuda sources)
-    - /usr/bin/c++ ... -c /home/erik/Projects/luce2/server/src/draft/draft_safetensors_loader.cpp (succeeded; existing unused-result warning only)
-    - git merge-tree --write-tree HEAD origin/pr/<n> for open non-draft contributor PRs
-    - git merge --no-ff --no-edit origin/pr/274 in isolated worktree
-    - git merge --no-commit --no-ff origin/pr/266 in isolated worktree
-    - python3 -m compileall harness
+    - git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'
+    - gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ... --jq ...
+    - git merge --no-edit origin/main
+    - git merge-tree --write-tree HEAD origin/pr/<n> for conflicted open non-draft contributor PRs
+    - git merge --no-commit --no-ff origin/pr/266 in isolated worktree /tmp/luce-pr266-attempt-20260527-1245
+    - /home/linuxbrew/.linuxbrew/bin/codex exec ... in PR266 worktree (failed auth with 401 Unauthorized)
+    - delegate_task analysis/review for PR266 and PR-stack close suggestions
   notes:
-    - Primary checkout remained clean and unchanged during experiments.
-    - Retained conflicted PR #266 worktree for inspection because cleanup/abort is not needed for the primary checkout and dangerous cleanup commands are forbidden.
-    - 2026-05-27T16:10-04:00 recheck: upstream/main is now aee0591 and PR #284 is integrated on top of it; PRs 274/276/264 remain represented in the stack, and PR 266 remains the next non-draft candidate but is still blocked by server-layout and obsolete-artifact conflicts.
-    - server/deps/llama.cpp had to be initialized locally before the CUDA build check could proceed.
+    - Primary checkout /home/erik/Projects/luce2 remained clean and unchanged.
+    - Retained conflicted PR #266 worktree for inspection: /tmp/luce-pr266-attempt-20260527-1245.
+    - Retained integration worktree: /tmp/luce-auto-int-20260527-124447.
