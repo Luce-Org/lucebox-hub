@@ -189,7 +189,50 @@ def _row_is_unreachable(row: dict) -> bool:
     return any(marker in err for marker in _UNREACHABLE_ERRORS)
 
 
-def _preflight(url: str, *, auth_header: str = "", timeout_s: int = 5) -> tuple[bool, list[str]]:
+def _format_models_inline(ids: list[str], selected: str, budget: int = 62) -> str:
+    """Render a comma-separated `/v1/models` listing for the preflight grid.
+
+    Marks the chosen id with a `*` prefix. If the full list fits in
+    `budget` characters, it's shown verbatim. Otherwise the layout is:
+    first model, then the selected model (if different), then sequential
+    fillers until the budget is hit, ending with `… (+N more)`.
+    """
+    if not ids:
+        return "(none)"
+
+    def render(picked_idx: list[int], remaining: int) -> str:
+        parts = [(f"*{ids[i]}" if ids[i] == selected else ids[i]) for i in picked_idx]
+        s = ", ".join(parts)
+        if remaining:
+            s += f", … (+{remaining} more)"
+        return s
+
+    full = render(list(range(len(ids))), 0)
+    if len(full) <= budget:
+        return full
+
+    picked = [0]
+    if selected in ids and ids[0] != selected:
+        picked.append(ids.index(selected))
+    for i in range(1, len(ids)):
+        if i in picked:
+            continue
+        candidate = sorted(picked + [i])
+        remaining = len(ids) - len(candidate)
+        if len(render(candidate, remaining)) > budget:
+            break
+        picked = candidate
+    remaining = len(ids) - len(picked)
+    return render(sorted(picked), remaining)
+
+
+def _preflight(
+    url: str,
+    *,
+    auth_header: str = "",
+    timeout_s: int = 5,
+    requested_model: str | None = None,
+) -> tuple[bool, list[str]]:
     """Probe the server's liveness + OpenAI shape + dflash /props endpoint.
 
     Returns ``(ok, lines)`` where ``lines`` is the printed grid (already
@@ -250,12 +293,18 @@ def _preflight(url: str, *, auth_header: str = "", timeout_s: int = 5) -> tuple[
     if isinstance(models_payload, dict):
         data = models_payload.get("data")
         if isinstance(data, list):
-            models_ok = True
             ids = [m.get("id") for m in data if isinstance(m, dict) and isinstance(m.get("id"), str)]
-            if len(ids) == 1:
-                models_detail = f"1 model exposed: {ids[0]}"
+            if not ids:
+                models_detail = "0 models exposed"
             else:
-                models_detail = f"{len(ids)} models exposed"
+                models_ok = True
+                # Selected = explicit --model if in the list; else first.
+                # The `*` marker visualizes what the bench would send.
+                if requested_model and requested_model != "default" and requested_model in ids:
+                    selected = requested_model
+                else:
+                    selected = ids[0]
+                models_detail = _format_models_inline(ids, selected)
         else:
             models_detail = "response missing 'data' list"
     else:
@@ -729,7 +778,12 @@ def main() -> int:
             auth_for_probe = f"Bearer {token}"
 
     if not args.no_preflight:
-        ok, lines = _preflight(args.url, auth_header=auth_for_probe, timeout_s=5)
+        ok, lines = _preflight(
+            args.url,
+            auth_header=auth_for_probe,
+            timeout_s=5,
+            requested_model=args.model,
+        )
         for line in lines:
             print(line, flush=True)
         if not ok:
@@ -744,40 +798,22 @@ def main() -> int:
     # /v1/models auto-resolution. Only fires when the user left --model
     # at the literal default; an explicit value (even if wrong) is
     # respected so gateways with hundreds of models stay predictable.
+    # The preflight grid above already prints the list with `*` on the
+    # selected id, so this stage only needs a terse one-liner.
     if args.model == "default":
         resolved, models = list_models(args.url, auth_header=auth_for_probe)
         if resolved:
             args.model = resolved
-            if len(models) == 1:
-                # Single model — no ambiguity; one-line note.
-                print(
-                    f"[lucebench] --model default → '{resolved}' (only model exposed at {args.url}/v1/models)",
-                    flush=True,
-                )
-            else:
-                # Short list: print all + mark the auto-pick. The user
-                # sees what was on offer and which one we took.
-                print(
-                    f"[lucebench] --model default → '{resolved}' "
-                    f"(first of {len(models)} at {args.url}/v1/models):",
-                    flush=True,
-                )
-                for mid in models:
-                    marker = "→" if mid == resolved else " "
-                    print(f"  {marker} {mid}", flush=True)
+            print(f"[lucebench] --model default → '{resolved}'", flush=True)
         elif models:
-            # Long list — refuse to guess.
+            # Long list — refuse to guess; preflight already showed the list.
             print(
                 f"[lucebench] --model default: {len(models)} models exposed at "
                 f"{args.url}/v1/models — sending 'default' as-is. "
-                "Pass --model explicitly to pick one. Sample:",
+                "Pass --model explicitly to pick one.",
                 file=sys.stderr,
                 flush=True,
             )
-            for mid in models[:5]:
-                print(f"    {mid}", file=sys.stderr, flush=True)
-            if len(models) > 5:
-                print(f"    ... and {len(models) - 5} more", file=sys.stderr, flush=True)
         else:
             print(
                 f"[lucebench] --model default: /v1/models at {args.url} "
