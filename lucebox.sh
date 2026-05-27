@@ -388,6 +388,84 @@ cmd_pull() {
     exec docker pull "${IMAGE_BASE}:${variant}"
 }
 
+cmd_check() {
+    # Host-only readiness report. Pure shell — never enters the container,
+    # since the point is to verify the host can run the container in the
+    # first place. Reuses probe_host (LUCEBOX_HOST_* env vars) for the
+    # actual detection so the formatting is the only thing here.
+    probe_host
+
+    local variant
+    variant=$(pick_variant)
+
+    # Two-column grid: "  name        ✓  detail" — matches the visual
+    # style of the lucebench preflight output.
+    local mark detail
+    _row() {
+        if [ "$1" = "1" ]; then mark="$C_OK✓$C_RST"
+        elif [ "$1" = "warn" ]; then mark="$C_WARN!$C_RST"
+        else mark="$C_ERR✗$C_RST"; fi
+        printf '  %-22s %b  %s\n' "$2" "$mark" "$3"
+    }
+
+    echo "[lucebox] host readiness report"
+
+    # docker
+    if [ "$LUCEBOX_HOST_HAS_DOCKER" = "1" ]; then
+        _row 1 "docker daemon" "reachable (server ${LUCEBOX_HOST_DOCKER_VERSION:-?})"
+    elif command -v docker &>/dev/null; then
+        _row 0 "docker daemon" "installed but unreachable — start the daemon or add user to 'docker' group"
+    else
+        _row 0 "docker daemon" "not installed — https://docs.docker.com/engine/install/"
+    fi
+
+    # nvidia container toolkit
+    case "$LUCEBOX_HOST_HAS_CTK" in
+        runtime)            _row 1    "nvidia ctk"     "wired into docker (runtime)" ;;
+        cdi)                _row 1    "nvidia ctk"     "wired via CDI (nvidia.com/gpu)" ;;
+        installed-unwired)  _row warn "nvidia ctk"     "installed but not registered with docker — sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker" ;;
+        none|*)             _row 0    "nvidia ctk"     "not installed — https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html" ;;
+    esac
+
+    # nvidia-smi + driver
+    if [ "$LUCEBOX_HOST_GPU_VENDOR" = "nvidia" ]; then
+        if [ "$LUCEBOX_HOST_DRIVER_MAJOR" -ge "$MIN_DRIVER_CUDA12" ]; then
+            _row 1 "nvidia driver" "$LUCEBOX_HOST_DRIVER_VERSION (≥ $MIN_DRIVER_CUDA12 required for cuda12)"
+        else
+            _row 0 "nvidia driver" "$LUCEBOX_HOST_DRIVER_VERSION (< $MIN_DRIVER_CUDA12 — cuda12 image will fail)"
+        fi
+    elif command -v nvidia-smi &>/dev/null; then
+        _row 0 "nvidia driver" "nvidia-smi present but NVML calls fail — driver/library mismatch, try reboot"
+    else
+        _row 0 "nvidia driver" "nvidia-smi not found — install the NVIDIA driver"
+    fi
+
+    # GPU detail
+    if [ "$LUCEBOX_HOST_GPU_VENDOR" = "nvidia" ]; then
+        _row 1 "gpu" "$LUCEBOX_HOST_GPU_NAME × $LUCEBOX_HOST_GPU_COUNT (sm_$LUCEBOX_HOST_GPU_SM, ${LUCEBOX_HOST_VRAM_GB} GB VRAM)"
+        # cuda12 image arch coverage: sm_75;80;86;89;90;120 (see docker-bake.hcl)
+        case "$LUCEBOX_HOST_GPU_SM" in
+            75|80|86|89|90|120) _row 1    "cuda12 arch" "sm_$LUCEBOX_HOST_GPU_SM covered by image" ;;
+            "")                 _row warn "cuda12 arch" "compute_cap not detected" ;;
+            *)                  _row warn "cuda12 arch" "sm_$LUCEBOX_HOST_GPU_SM not in image arch list (75;80;86;89;90;120)" ;;
+        esac
+    fi
+
+    # systemd
+    if [ "$LUCEBOX_HOST_HAS_SYSTEMD" = "1" ]; then
+        _row 1 "user systemd" "available (needed for '$SCRIPT_NAME install')"
+    elif [ "$LUCEBOX_HOST_IS_WSL" = "1" ]; then
+        _row warn "user systemd" "WSL detected — set 'systemd=true' under [boot] in /etc/wsl.conf, then 'wsl --shutdown'"
+    else
+        _row warn "user systemd" "not available — '$SCRIPT_NAME install' (service unit) won't work; '$SCRIPT_NAME serve' (foreground) will"
+    fi
+
+    # image we'd pull
+    _row 1 "image" "${IMAGE_BASE}:${variant}"
+    # RAM / cores (informational)
+    _row 1 "host" "${LUCEBOX_HOST_NPROC} cpus, ${LUCEBOX_HOST_RAM_GB} GB RAM"
+}
+
 cmd_in_container() {
     # Generic dispatcher: anything that isn't a systemd action goes here.
     # Runs the in-container Python CLI with the supplied argv.
@@ -458,6 +536,9 @@ main() {
         # Direct server
         serve)            cmd_serve "$@" ;;
         pull)             cmd_pull "$@" ;;
+
+        # Host-only readiness check — pure shell, never enters the container.
+        check)            cmd_check "$@" ;;
 
         # Help / version
         help|--help|-h)   usage ;;
