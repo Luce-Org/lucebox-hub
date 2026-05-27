@@ -38,7 +38,7 @@ class DockerRunSpec:
     gpus: bool = True
     detach: bool = False
     remove: bool = True
-    port_publish: tuple[int, int] | None = None     # (host, container)
+    port_publish: tuple[int, int] | None = None  # (host, container)
     volumes: tuple[tuple[str, str], ...] = ()
     env: tuple[tuple[str, str], ...] = ()
     entrypoint_args: tuple[str, ...] = ()
@@ -76,8 +76,17 @@ class DockerRunSpec:
             tok = argv[i]
             out += " \\\n    " + tok
             # Glue value-taking flags onto the same line.
-            if tok in {"-p", "-v", "-e", "--name", "--gpus", "--env",
-                       "--volume", "--publish", "--entrypoint"} and i + 1 < len(argv):
+            if tok in {
+                "-p",
+                "-v",
+                "-e",
+                "--name",
+                "--gpus",
+                "--env",
+                "--volume",
+                "--publish",
+                "--entrypoint",
+            } and i + 1 < len(argv):
                 i += 1
                 out += " " + shlex.quote(argv[i])
             i += 1
@@ -85,6 +94,7 @@ class DockerRunSpec:
 
 
 # ── server argv from Config ────────────────────────────────────────────────
+
 
 def server_run_spec(cfg: Config) -> DockerRunSpec:
     """Long-running OpenAI-compatible server. Foreground (systemd manages
@@ -169,6 +179,7 @@ def benchmark_run_spec(cfg: Config, args: tuple[str, ...] = ()) -> DockerRunSpec
 
 # ── subprocess helpers ─────────────────────────────────────────────────────
 
+
 def run(argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
     """Run a command, streaming stdout/stderr to the user. `check=False` to
     inspect exit codes manually."""
@@ -185,7 +196,8 @@ def docker_inspect_running(name: str) -> bool:
     try:
         out = subprocess.check_output(
             ["docker", "inspect", "-f", "{{.State.Running}}", name],
-            text=True, stderr=subprocess.DEVNULL,
+            text=True,
+            stderr=subprocess.DEVNULL,
         )
         return out.strip() == "true"
     except subprocess.CalledProcessError:

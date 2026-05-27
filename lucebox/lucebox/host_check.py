@@ -38,7 +38,8 @@ def run_checks(host: HostFacts) -> list[CheckResult]:
 def _check_docker(host: HostFacts) -> CheckResult:
     if not host.has_docker:
         return CheckResult(
-            "docker", "fail",
+            "docker",
+            "fail",
             "docker daemon unreachable",
             "sudo systemctl start docker, or add your user to the 'docker' group",
         )
@@ -49,20 +50,23 @@ def _check_nvidia_driver(host: HostFacts) -> CheckResult:
     if host.gpu_vendor != "nvidia":
         if host.gpu_vendor == "amd":
             return CheckResult(
-                "gpu", "fail",
+                "gpu",
+                "fail",
                 "AMD GPU detected — prebuilt images are NVIDIA-only",
                 "Build dflash from source with HIP; see dflash/README.md",
             )
         return CheckResult("gpu", "fail", "no NVIDIA GPU detected")
     if not host.driver_version:
         return CheckResult(
-            "driver", "warn",
+            "driver",
+            "warn",
             "nvidia-smi present but NVML query failed (likely driver/library mismatch)",
             "reboot, or reinstall the matching NVIDIA driver",
         )
     if host.driver_major < 525:
         return CheckResult(
-            "driver", "fail",
+            "driver",
+            "fail",
             f"driver r{host.driver_major} too old (need r525+ for cuda12)",
             "upgrade the NVIDIA driver",
         )
@@ -77,14 +81,16 @@ def _check_ctk(host: HostFacts) -> CheckResult:
             return CheckResult("ctk", "ok", "NVIDIA Container Toolkit available via CDI")
         case "installed-unwired":
             return CheckResult(
-                "ctk", "warn",
+                "ctk",
+                "warn",
                 "NVIDIA Container Toolkit installed but not wired into docker",
                 "sudo nvidia-ctk runtime configure --runtime=docker && "
                 "sudo systemctl restart docker",
             )
         case _:
             return CheckResult(
-                "ctk", "fail",
+                "ctk",
+                "fail",
                 "NVIDIA Container Toolkit not installed",
                 "https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html",
             )
@@ -103,13 +109,15 @@ def _check_vram(host: HostFacts) -> CheckResult:
         return CheckResult("vram", "warn", "VRAM unknown")
     if host.vram_gb < 12:
         return CheckResult(
-            "vram", "fail",
+            "vram",
+            "fail",
             f"VRAM {host.vram_gb} GB < 12 GB — 27B target won't fit",
             "use a smaller model preset or larger GPU",
         )
     if host.vram_gb < 22:
         return CheckResult(
-            "vram", "warn",
+            "vram",
+            "warn",
             f"VRAM {host.vram_gb} GB — 27B fits but max_ctx will be capped near 32K",
         )
     return CheckResult("vram", "ok", f"VRAM {host.vram_gb} GB ({host.gpu_name})")
@@ -118,7 +126,8 @@ def _check_vram(host: HostFacts) -> CheckResult:
 def _check_systemd(host: HostFacts) -> CheckResult:
     if not host.has_systemd:
         return CheckResult(
-            "systemd", "warn",
+            "systemd",
+            "warn",
             "user systemd not available",
             "WSL: enable systemd in /etc/wsl.conf; otherwise 'lucebox.sh serve' "
             "still works in the foreground",
@@ -136,13 +145,10 @@ def aggregate(results: list[CheckResult]) -> Severity:
 
 def render(console: Console, host: HostFacts, results: list[CheckResult]) -> Severity:
     """Print a status block, return the worst severity."""
-    summary = (
-        f"[bold]Host:[/bold] {host.nproc} CPUs · {host.ram_gb} GB RAM"
-    )
+    summary = f"[bold]Host:[/bold] {host.nproc} CPUs · {host.ram_gb} GB RAM"
     if host.gpu_vendor == "nvidia" and host.gpu_name:
-        summary += (
-            f" · {host.gpu_name} · {host.vram_gb} GB VRAM"
-            + (f" (sm_{host.gpu_sm})" if host.gpu_sm else "")
+        summary += f" · {host.gpu_name} · {host.vram_gb} GB VRAM" + (
+            f" (sm_{host.gpu_sm})" if host.gpu_sm else ""
         )
     if host.is_wsl:
         summary += " · WSL2"
@@ -167,7 +173,6 @@ def render(console: Console, host: HostFacts, results: list[CheckResult]) -> Sev
         console.print("[yellow]Checks passed with warnings.[/yellow]")
     else:
         console.print(
-            "[red]Critical checks failed — fix the issues above before "
-            "'lucebox.sh start'.[/red]"
+            "[red]Critical checks failed — fix the issues above before 'lucebox.sh start'.[/red]"
         )
     return worst

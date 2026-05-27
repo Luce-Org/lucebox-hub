@@ -65,10 +65,14 @@ def download_preset(cfg: Config, preset: ModelPreset = DEFAULT_PRESET) -> int:
         # Already downloaded (>1 GB suggests it's not a partial). Skip.
         pass
     else:
-        rc = _hf_download([
-            preset.target_repo, preset.target_file,
-            "--local-dir", str(models),
-        ])
+        rc = _hf_download(
+            [
+                preset.target_repo,
+                preset.target_file,
+                "--local-dir",
+                str(models),
+            ]
+        )
         if rc != 0:
             return rc
 
@@ -76,10 +80,14 @@ def download_preset(cfg: Config, preset: ModelPreset = DEFAULT_PRESET) -> int:
     if draft_path.exists() and draft_path.stat().st_size > MIN_DRAFT_BYTES:
         pass
     else:
-        rc = _hf_download([
-            preset.draft_repo, preset.draft_file,
-            "--local-dir", str(draft),
-        ])
+        rc = _hf_download(
+            [
+                preset.draft_repo,
+                preset.draft_file,
+                "--local-dir",
+                str(draft),
+            ]
+        )
         if rc != 0:
             return rc
 

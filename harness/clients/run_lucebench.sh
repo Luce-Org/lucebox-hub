@@ -79,7 +79,10 @@ wait_lucebox_server
 
 set +e
 cd "$REPO_DIR"
-uv run python -m lucebench.cli "${lucebench_args[@]}" \
+# Delegate to harness.bench (the Python entry point) so this wrapper, the
+# `lucebox profile` framework, and ad-hoc operators all go through the
+# same argv-building source of truth.
+uv run python -m harness.bench "${lucebench_args[@]}" \
   > "$CLIENT_OUT" 2>&1
 RC=$?
 set -e

@@ -62,8 +62,13 @@ def _check_props(client: httpx.Client, base_url: str) -> tuple[bool, str]:
         props = resp.json()
     except ValueError as e:
         return False, f"/props invalid JSON: {e}"
-    required_top = ("default_generation_settings", "model_alias",
-                    "model_path", "build_info", "speculative_mode")
+    required_top = (
+        "default_generation_settings",
+        "model_alias",
+        "model_path",
+        "build_info",
+        "speculative_mode",
+    )
     missing = [k for k in required_top if k not in props]
     if missing:
         return False, f"/props missing {', '.join(missing)}"
@@ -83,25 +88,29 @@ def _check_props(client: httpx.Client, base_url: str) -> tuple[bool, str]:
 def _check_tool_call(client: httpx.Client, base_url: str, timeout_s: float) -> tuple[bool, str]:
     body = {
         "model": "luce-dflash",
-        "messages": [{
-            "role": "user",
-            "content": (
-                "Use the provided tool now. Call report_status with "
-                'status="ok". Do not answer in prose.'
-            ),
-        }],
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "report_status",
-                "description": "Report smoke-test status.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"status": {"type": "string"}},
-                    "required": ["status"],
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "Use the provided tool now. Call report_status with "
+                    'status="ok". Do not answer in prose.'
+                ),
+            }
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "report_status",
+                    "description": "Report smoke-test status.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"status": {"type": "string"}},
+                        "required": ["status"],
+                    },
                 },
-            },
-        }],
+            }
+        ],
         "tool_choice": {"type": "function", "function": {"name": "report_status"}},
         "temperature": 0,
         "max_tokens": 128,
@@ -133,8 +142,7 @@ def _check_tool_call(client: httpx.Client, base_url: str, timeout_s: float) -> t
             finish = choices[0].get("finish_reason")
             content = (msg.get("content") or "")[:300]
             last_err = (
-                f"attempt {attempt}: no tool_calls emitted "
-                f"(finish={finish}, content={content!r})"
+                f"attempt {attempt}: no tool_calls emitted (finish={finish}, content={content!r})"
             )
             continue
         names = [((c.get("function") or {}).get("name")) for c in calls]
@@ -144,9 +152,13 @@ def _check_tool_call(client: httpx.Client, base_url: str, timeout_s: float) -> t
     return False, last_err
 
 
-def run(cfg: Config, *, prompt: str = DEFAULT_PROMPT,
-        timeout_s: float = DEFAULT_TIMEOUT_S,
-        check_tools: bool = True) -> SmokeResult:
+def run(
+    cfg: Config,
+    *,
+    prompt: str = DEFAULT_PROMPT,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+    check_tools: bool = True,
+) -> SmokeResult:
     base_url = _server_base_url(cfg)
     url = base_url + "/v1/chat/completions"
     body = {
@@ -163,18 +175,25 @@ def run(cfg: Config, *, prompt: str = DEFAULT_PROMPT,
             props_ok, props_err = _check_props(client, base_url)
             if not props_ok:
                 return SmokeResult(
-                    ok=False, http_status=0, n_tokens=0,
+                    ok=False,
+                    http_status=0,
+                    n_tokens=0,
                     wall_s=time.perf_counter() - t0,
-                    props_ok=False, tool_ok=False, error=props_err,
+                    props_ok=False,
+                    tool_ok=False,
+                    error=props_err,
                 )
 
             with client.stream("POST", url, json=body) as resp:
                 status = resp.status_code
                 if status != 200:
                     return SmokeResult(
-                        ok=False, http_status=status, n_tokens=0,
+                        ok=False,
+                        http_status=status,
+                        n_tokens=0,
                         wall_s=time.perf_counter() - t0,
-                        props_ok=props_ok, tool_ok=False,
+                        props_ok=props_ok,
+                        tool_ok=False,
                         error=f"HTTP {status}",
                     )
                 for line in resp.iter_lines():
@@ -195,9 +214,12 @@ def run(cfg: Config, *, prompt: str = DEFAULT_PROMPT,
                         n_tokens += 1
             if n_tokens < 1:
                 return SmokeResult(
-                    ok=False, http_status=status, n_tokens=n_tokens,
+                    ok=False,
+                    http_status=status,
+                    n_tokens=n_tokens,
                     wall_s=time.perf_counter() - t0,
-                    props_ok=props_ok, tool_ok=False,
+                    props_ok=props_ok,
+                    tool_ok=False,
                     error="no tokens streamed",
                 )
 
@@ -208,13 +230,18 @@ def run(cfg: Config, *, prompt: str = DEFAULT_PROMPT,
             wall = time.perf_counter() - t0
             return SmokeResult(
                 ok=(status == 200 and n_tokens >= 1 and props_ok and tool_ok),
-                http_status=status, n_tokens=n_tokens, wall_s=wall,
-                props_ok=props_ok, tool_ok=tool_ok,
+                http_status=status,
+                n_tokens=n_tokens,
+                wall_s=wall,
+                props_ok=props_ok,
+                tool_ok=tool_ok,
                 error=tool_err,
             )
     except httpx.HTTPError as e:
         return SmokeResult(
-            ok=False, http_status=0, n_tokens=n_tokens,
+            ok=False,
+            http_status=0,
+            n_tokens=n_tokens,
             wall_s=time.perf_counter() - t0,
             error=str(e),
         )

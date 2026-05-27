@@ -14,6 +14,11 @@ Subcommand inventory:
     smoke                  — hit /props + /v1/chat/completions on a running server
     download-models        — fetch target + draft via the container
     claude                 — launch Claude Code pointed at the running server
+    codex                  — launch Codex pointed at the running server
+    opencode               — launch OpenCode pointed at the running server
+    hermes                 — launch Hermes pointed at the running server
+    pi                     — launch Pi pointed at the running server
+    openclaw               — launch OpenClaw pointed at the running server
 """
 
 from __future__ import annotations
@@ -51,6 +56,7 @@ console = Console()
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
+
 def _now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -86,6 +92,7 @@ def _load_or_build() -> Config:
 
 
 # ── subcommands ────────────────────────────────────────────────────────────
+
 
 @app.command()
 def check() -> None:
@@ -193,9 +200,7 @@ def benchmark(
     ] = "",
     kv_values: Annotated[
         str,
-        typer.Option(
-            help="Comma-separated KV modes: auto,f16,q4_0,q4_1,q5_0,q5_1,q8_0,tq3_0."
-        ),
+        typer.Option(help="Comma-separated KV modes: auto,f16,q4_0,q4_1,q5_0,q5_1,q8_0,tq3_0."),
     ] = "",
     prefill_modes: Annotated[
         str, typer.Option(help="Comma-separated PFlash modes to sweep: off,auto,always.")
@@ -209,12 +214,8 @@ def benchmark(
     prefill_drafter: Annotated[
         str, typer.Option(help="PFlash drafter GGUF path for non-off prefill modes.")
     ] = "",
-    n_prompts: Annotated[
-        int, typer.Option("--n-prompts", help="HE prompts per budget cell.")
-    ] = 5,
-    n_gen: Annotated[
-        int, typer.Option("--n-gen", help="Generated tokens per prompt.")
-    ] = 256,
+    n_prompts: Annotated[int, typer.Option("--n-prompts", help="HE prompts per budget cell.")] = 5,
+    n_gen: Annotated[int, typer.Option("--n-gen", help="Generated tokens per prompt.")] = 256,
     ready_timeout: Annotated[
         int, typer.Option(help="Seconds to wait for each server cell to become ready.")
     ] = 180,
@@ -270,28 +271,50 @@ def benchmark(
     """Sweep DFLASH_* knobs inside the container, merge winner into config."""
     cfg = _load_or_build()
     bench_args = [
-        "--profile", profile,
-        "--budgets", budgets,
-        "--ctx-values", ctx_values,
-        "--min-context-speed-ratio", str(min_context_speed_ratio),
-        "--lazy-values", lazy_values,
-        "--prefix-cache-slots-values", prefix_cache_slots_values,
-        "--prefill-cache-slots-values", prefill_cache_slots_values,
-        "--kv-values", kv_values,
-        "--prefill-modes", prefill_modes,
-        "--prefill-keep-ratios", prefill_keep_ratios,
-        "--prefill-thresholds", prefill_thresholds,
-        "--prefill-drafter", prefill_drafter,
-        "--n-prompts", str(n_prompts),
-        "--n-gen", str(n_gen),
-        "--ready-timeout", str(ready_timeout),
-        "--cell-timeout", str(cell_timeout),
-        "--extra-suites", extra_suites,
-        "--frontiers", frontiers,
-        "--frontiers-repeat", str(frontiers_repeat),
-        "--agentic-repeat", str(agentic_repeat),
-        "--agentic-session-turns", str(agentic_session_turns),
-        "--agentic-session-sessions", str(agentic_session_sessions),
+        "--profile",
+        profile,
+        "--budgets",
+        budgets,
+        "--ctx-values",
+        ctx_values,
+        "--min-context-speed-ratio",
+        str(min_context_speed_ratio),
+        "--lazy-values",
+        lazy_values,
+        "--prefix-cache-slots-values",
+        prefix_cache_slots_values,
+        "--prefill-cache-slots-values",
+        prefill_cache_slots_values,
+        "--kv-values",
+        kv_values,
+        "--prefill-modes",
+        prefill_modes,
+        "--prefill-keep-ratios",
+        prefill_keep_ratios,
+        "--prefill-thresholds",
+        prefill_thresholds,
+        "--prefill-drafter",
+        prefill_drafter,
+        "--n-prompts",
+        str(n_prompts),
+        "--n-gen",
+        str(n_gen),
+        "--ready-timeout",
+        str(ready_timeout),
+        "--cell-timeout",
+        str(cell_timeout),
+        "--extra-suites",
+        extra_suites,
+        "--frontiers",
+        frontiers,
+        "--frontiers-repeat",
+        str(frontiers_repeat),
+        "--agentic-repeat",
+        str(agentic_repeat),
+        "--agentic-session-turns",
+        str(agentic_session_turns),
+        "--agentic-session-sessions",
+        str(agentic_session_sessions),
     ]
     if allow_extra_suite_failures:
         bench_args.append("--allow-extra-suite-failures")
@@ -418,10 +441,14 @@ def download_models() -> None:
     pres = download_mod.DEFAULT_PRESET
     current = download_mod.status(cfg, pres)
     console.print(f"Models dir: [bold]{cfg.models_dir}[/bold]")
-    console.print(f"  target ({pres.target_repo}/{pres.target_file}):"
-                  f"  {'present' if current['target_present'] else 'will download'}")
-    console.print(f"  draft  ({pres.draft_repo}/{pres.draft_file}):"
-                  f"  {'present' if current['draft_present'] else 'will download'}")
+    console.print(
+        f"  target ({pres.target_repo}/{pres.target_file}):"
+        f"  {'present' if current['target_present'] else 'will download'}"
+    )
+    console.print(
+        f"  draft  ({pres.draft_repo}/{pres.draft_file}):"
+        f"  {'present' if current['draft_present'] else 'will download'}"
+    )
     if current["target_present"] and current["draft_present"]:
         console.print("[green]Both present. Nothing to do.[/green]")
         return
@@ -488,6 +515,60 @@ def profile(
         console.print(f"[green]Wrote[/green] {written}")
 
 
+def _detect_server_url(cfg_url: str | None) -> str:
+    """Auto-detect a live Lucebox server URL.
+
+    Tries an explicit override first, otherwise probes the standard
+    localhost/docker-host base URLs from profile_mod and takes the first
+    that answers /health within 1s. Falls back to the first probe candidate
+    if nothing answers — lets the client fail with a clearer "server down"
+    error than the auto-detect can give.
+    """
+    if cfg_url:
+        return cfg_url
+    cfg = _load_or_build()
+    bases = profile_mod._server_base_urls(cfg)
+    for candidate in bases:
+        if profile_mod._json_get(candidate + "/health", timeout_s=1.0):
+            return candidate
+    console.print(
+        f"[yellow]warning:[/yellow] no /health response at {bases[0]} "
+        f"— starting client anyway (server may be down)."
+    )
+    return bases[0]
+
+
+def _exec_client(launcher_mod, *, url: str | None, model: str, prompt: str | None) -> None:
+    """Common entry: probe server, exec the harness client launcher.
+
+    All six ``lucebox <client>`` subcommands delegate here. The launcher
+    module's launch() owns the per-client env + config-file convention;
+    this wrapper owns server discovery + the typer exit-code translation.
+    """
+    base_url = _detect_server_url(url)
+    try:
+        rc = launcher_mod.launch(
+            base_url=base_url,
+            model=model,
+            prompt=prompt,
+            interactive=prompt is None,
+        )
+    except FileNotFoundError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=127) from e
+    if rc != 0:
+        raise typer.Exit(code=rc)
+
+
+def _client_prompt_option() -> Annotated[str | None, typer.Option]:
+    """Shared --prompt option spec for every client subcommand."""
+    return typer.Option(
+        "--prompt",
+        "-p",
+        help="One-shot prompt (non-interactive). Omit for the TUI.",
+    )
+
+
 @app.command()
 def claude(
     prompt: Annotated[
@@ -500,11 +581,15 @@ def claude(
     ] = None,
     url: Annotated[
         str | None,
-        typer.Option(help="Lucebox base URL. Auto-detects localhost / docker host."),
+        typer.Option(
+            help="Lucebox base URL. Auto-detects localhost / docker host.",
+        ),
     ] = None,
     model: Annotated[
         str,
-        typer.Option(help="Model ID to advertise to Claude Code."),
+        typer.Option(
+            help="Model ID to advertise to Claude Code.",
+        ),
     ] = "luce-dflash",
 ) -> None:
     """Launch Claude Code pointed at the running Lucebox server.
@@ -522,36 +607,189 @@ def claude(
     test-harness path (``harness/clients/run_claude_code.sh``) go through
     one env-config source.
     """
-    from harness.clients import claude_code as claude_launcher
+    from harness.clients import claude_code as launcher
 
-    cfg = _load_or_build()
-    base_url = url
-    if base_url is None:
-        bases = profile_mod._server_base_urls(cfg)
-        # Take the first that answers /health within a second.
-        for candidate in bases:
-            if profile_mod._json_get(candidate + "/health", timeout_s=1.0):
-                base_url = candidate
-                break
-        if base_url is None:
-            base_url = bases[0]  # fall through; let claude error if down
-            console.print(
-                f"[yellow]warning:[/yellow] no /health response at {bases[0]} "
-                f"— starting claude anyway (server may be down)."
-            )
+    _exec_client(launcher, url=url, model=model, prompt=prompt)
 
-    try:
-        rc = claude_launcher.launch(
-            base_url=base_url,
-            model=model,
-            prompt=prompt,
-            interactive=prompt is None,
-        )
-    except FileNotFoundError as e:
-        console.print(f"[red]{e}[/red]")
-        raise typer.Exit(code=127) from e
-    if rc != 0:
-        raise typer.Exit(code=rc)
+
+@app.command()
+def codex(
+    prompt: Annotated[
+        str | None,
+        typer.Option(
+            "--prompt",
+            "-p",
+            help="One-shot prompt (non-interactive). Omit for the TUI.",
+        ),
+    ] = None,
+    url: Annotated[
+        str | None,
+        typer.Option(
+            help="Lucebox base URL. Auto-detects localhost / docker host.",
+        ),
+    ] = None,
+    model: Annotated[
+        str,
+        typer.Option(
+            help="Model ID to advertise to Codex.",
+        ),
+    ] = "luce-dflash",
+) -> None:
+    """Launch Codex pointed at the running Lucebox server.
+
+    Writes a per-run CODEX_HOME config.toml that registers Lucebox as a
+    custom model provider, then exec's the codex binary. The Responses
+    API is the default wire format (matches what current Codex versions
+    speak).
+
+    Delegates to ``harness.clients.codex.launch``.
+    """
+    from harness.clients import codex as launcher
+
+    _exec_client(launcher, url=url, model=model, prompt=prompt)
+
+
+@app.command()
+def opencode(
+    prompt: Annotated[
+        str | None,
+        typer.Option(
+            "--prompt",
+            "-p",
+            help="One-shot prompt (non-interactive). Omit for the TUI.",
+        ),
+    ] = None,
+    url: Annotated[
+        str | None,
+        typer.Option(
+            help="Lucebox base URL. Auto-detects localhost / docker host.",
+        ),
+    ] = None,
+    model: Annotated[
+        str,
+        typer.Option(
+            help="Model ID to advertise to OpenCode.",
+        ),
+    ] = "luce-dflash",
+) -> None:
+    """Launch OpenCode pointed at the running Lucebox server.
+
+    Writes opencode.json to the cwd (interactive) or a fresh tempdir
+    (--prompt) registering Lucebox via the AI SDK OpenAI-compatible
+    provider, then exec's the opencode binary.
+
+    Delegates to ``harness.clients.opencode.launch``.
+    """
+    from harness.clients import opencode as launcher
+
+    _exec_client(launcher, url=url, model=model, prompt=prompt)
+
+
+@app.command()
+def hermes(
+    prompt: Annotated[
+        str | None,
+        typer.Option(
+            "--prompt",
+            "-p",
+            help="One-shot prompt (non-interactive). Omit for the TUI.",
+        ),
+    ] = None,
+    url: Annotated[
+        str | None,
+        typer.Option(
+            help="Lucebox base URL. Auto-detects localhost / docker host.",
+        ),
+    ] = None,
+    model: Annotated[
+        str,
+        typer.Option(
+            help="Model ID to advertise to Hermes.",
+        ),
+    ] = "luce-dflash",
+) -> None:
+    """Launch Hermes Agent pointed at the running Lucebox server.
+
+    Writes config.yaml + .env to a per-run home dir pointing at Lucebox
+    as a chat-completions provider, then exec's the hermes binary.
+
+    Delegates to ``harness.clients.hermes.launch``.
+    """
+    from harness.clients import hermes as launcher
+
+    _exec_client(launcher, url=url, model=model, prompt=prompt)
+
+
+@app.command()
+def pi(
+    prompt: Annotated[
+        str | None,
+        typer.Option(
+            "--prompt",
+            "-p",
+            help="One-shot prompt (non-interactive). Omit for the TUI.",
+        ),
+    ] = None,
+    url: Annotated[
+        str | None,
+        typer.Option(
+            help="Lucebox base URL. Auto-detects localhost / docker host.",
+        ),
+    ] = None,
+    model: Annotated[
+        str,
+        typer.Option(
+            help="Model ID to advertise to Pi.",
+        ),
+    ] = "luce-dflash",
+) -> None:
+    """Launch Pi pointed at the running Lucebox server.
+
+    Writes $HOME/agent/{settings,models}.json registering Lucebox as the
+    default provider (openai-responses wire format), then exec's the pi
+    binary.
+
+    Delegates to ``harness.clients.pi.launch``.
+    """
+    from harness.clients import pi as launcher
+
+    _exec_client(launcher, url=url, model=model, prompt=prompt)
+
+
+@app.command()
+def openclaw(
+    prompt: Annotated[
+        str | None,
+        typer.Option(
+            "--prompt",
+            "-p",
+            help="One-shot prompt (non-interactive). Omit for the TUI.",
+        ),
+    ] = None,
+    url: Annotated[
+        str | None,
+        typer.Option(
+            help="Lucebox base URL. Auto-detects localhost / docker host.",
+        ),
+    ] = None,
+    model: Annotated[
+        str,
+        typer.Option(
+            help="Model ID to advertise to OpenClaw.",
+        ),
+    ] = "luce-dflash",
+) -> None:
+    """Launch OpenClaw pointed at the running Lucebox server.
+
+    Writes a JSON config patch that merges Lucebox as the default
+    provider into OpenClaw's baked-in registry, then exec's the
+    openclaw binary.
+
+    Delegates to ``harness.clients.openclaw.launch``.
+    """
+    from harness.clients import openclaw as launcher
+
+    _exec_client(launcher, url=url, model=model, prompt=prompt)
 
 
 @app.command()

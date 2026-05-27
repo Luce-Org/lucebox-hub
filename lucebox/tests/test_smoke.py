@@ -14,14 +14,16 @@ def test_tool_smoke_disables_thinking_for_deterministic_tool_calls():
         return httpx.Response(
             200,
             json={
-                "choices": [{
-                    "message": {
-                        "tool_calls": [{
-                            "function": {"name": "report_status", "arguments": "{}"}
-                        }]
-                    },
-                    "finish_reason": "tool_calls",
-                }]
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {"function": {"name": "report_status", "arguments": "{}"}}
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
             },
         )
 

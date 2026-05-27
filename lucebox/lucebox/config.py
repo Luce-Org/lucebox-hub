@@ -46,6 +46,7 @@ def default_config_path() -> Path:
 
 # ── load ───────────────────────────────────────────────────────────────────
 
+
 def load(path: Path | None = None) -> Config | None:
     """Load config.toml, or return None if missing.
 
@@ -71,14 +72,14 @@ def _load_toml(path: Path) -> Config:
 
 
 _LEGACY_KEY_MAP: dict[str, tuple[str, str, Callable[[str], Any]]] = {
-    "DFLASH_BUDGET":             ("dflash", "budget", int),
-    "DFLASH_MAX_CTX":            ("dflash", "max_ctx", int),
-    "DFLASH_LAZY":               ("dflash", "lazy", lambda v: v in ("1", "true", "yes")),
+    "DFLASH_BUDGET": ("dflash", "budget", int),
+    "DFLASH_MAX_CTX": ("dflash", "max_ctx", int),
+    "DFLASH_LAZY": ("dflash", "lazy", lambda v: v in ("1", "true", "yes")),
     "DFLASH_PREFIX_CACHE_SLOTS": ("dflash", "prefix_cache_slots", int),
-    "DFLASH_PORT":               ("runtime", "port", int),
-    "LUCEBOX_VARIANT":           ("image", "variant", str),
-    "LUCEBOX_IMAGE":             ("image", "registry", str),
-    "LUCEBOX_MODELS":            ("paths", "models", str),
+    "DFLASH_PORT": ("runtime", "port", int),
+    "LUCEBOX_VARIANT": ("image", "variant", str),
+    "LUCEBOX_IMAGE": ("image", "registry", str),
+    "LUCEBOX_MODELS": ("paths", "models", str),
 }
 
 
@@ -203,6 +204,7 @@ def _from_dict(raw: dict[str, Any]) -> Config:
 
 
 # ── save ───────────────────────────────────────────────────────────────────
+
 
 def save(cfg: Config, path: Path | None = None) -> Path:
     path = path or default_config_path()

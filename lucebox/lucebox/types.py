@@ -28,8 +28,8 @@ class HostFacts:
     gpu_name: str = ""
     gpu_count: int = 0
     vram_gb: int = 0
-    gpu_sm: str = ""              # e.g. "120" — matches docker-bake arch lists
-    driver_version: str = ""      # e.g. "595.71.05"
+    gpu_sm: str = ""  # e.g. "120" — matches docker-bake arch lists
+    driver_version: str = ""  # e.g. "595.71.05"
     driver_major: int = 0
     has_systemd: bool = False
     is_wsl: bool = False
@@ -63,7 +63,7 @@ class DflashRuntime:
 @dataclass(frozen=True, slots=True)
 class AutotuneMeta:
     source: AutotuneSource = "heuristic"
-    timestamp: str = ""           # ISO-8601
+    timestamp: str = ""  # ISO-8601
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,7 +71,7 @@ class BenchmarkMeta:
     """Filled in by the optimizer; absent until the user runs `benchmark`."""
 
     ran_at: str = ""
-    profile: str = ""             # e.g. "he-decode"
+    profile: str = ""  # e.g. "he-decode"
     winner_budget: int | None = None
     winner_max_ctx: int | None = None
     winner_lazy: bool | None = None
@@ -81,7 +81,7 @@ class BenchmarkMeta:
     winner_cache_type_v: str = ""
     winner_prefill_mode: str = ""
     mean_tps: float | None = None
-    report_path: str = ""         # relative to config dir
+    report_path: str = ""  # relative to config dir
 
 
 @dataclass(frozen=True, slots=True)

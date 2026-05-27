@@ -3,11 +3,7 @@ from lucebox import config
 
 def test_legacy_env_migration_skips_invalid_values(tmp_path):
     legacy = tmp_path / "config.env"
-    legacy.write_text(
-        "DFLASH_BUDGET=not-an-int\n"
-        "DFLASH_MAX_CTX=65536\n"
-        "DFLASH_LAZY=true\n"
-    )
+    legacy.write_text("DFLASH_BUDGET=not-an-int\nDFLASH_MAX_CTX=65536\nDFLASH_LAZY=true\n")
 
     cfg = config._load_legacy_env(legacy)
 

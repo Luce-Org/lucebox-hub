@@ -117,6 +117,7 @@ COPY server/pyproject.toml server/README.md /src/server/
 COPY server/scripts /src/server/scripts
 COPY lucebox /src/lucebox
 COPY luce-bench /src/luce-bench
+COPY harness /src/harness
 COPY optimizations/pflash /src/optimizations/pflash
 COPY optimizations/megakernel /src/optimizations/megakernel
 
@@ -172,6 +173,11 @@ COPY --from=builder /src/lucebox /opt/lucebox-hub/lucebox
 # the runtime stage's `uv sync` can resolve `luce-bench = { workspace = true }`
 # in the root pyproject.toml without falling over.
 COPY --from=builder /src/luce-bench /opt/lucebox-hub/luce-bench
+
+# harness is the "run X against a Lucebox server" abstraction — workspace
+# member at harness/ that profile.py imports for `python -m harness.bench`.
+# Required so the runtime stage's `uv sync` can resolve the workspace dep.
+COPY --from=builder /src/harness /opt/lucebox-hub/harness
 
 # server: ship the entrypoint/benchmark scripts, the pyproject + README that uv
 # resolves against, and the pruned build tree (binaries + .so files from the
