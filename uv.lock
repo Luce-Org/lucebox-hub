@@ -665,7 +665,7 @@ version = "0.0.0"
 source = { virtual = "." }
 dependencies = [
     { name = "harness" },
-    { name = "luce-bench" },
+    { name = "luce-bench", extra = ["forge"] },
     { name = "lucebox" },
     { name = "lucebox-dflash" },
     { name = "pflash" },
@@ -684,7 +684,7 @@ megakernel = [
 [package.metadata]
 requires-dist = [
     { name = "harness", editable = "harness" },
-    { name = "luce-bench", editable = "luce-bench" },
+    { name = "luce-bench", extras = ["forge"], editable = "luce-bench" },
     { name = "lucebox", editable = "lucebox" },
     { name = "lucebox-dflash", virtual = "server" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10,<2" },

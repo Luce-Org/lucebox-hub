@@ -10,7 +10,7 @@ authors = [{ name = "Lucebox" }]
 dependencies = [
     "lucebox",
     "lucebox-dflash",
-    "luce-bench",
+    "luce-bench[forge]",
     "harness",
     "pflash",
 ]
