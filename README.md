@@ -315,32 +315,6 @@ DFLASH_FP_PROFILE=1     # log mean / score / select / forward stage timings
 
 ---
 
-## AMD Strix Halo (HIP backend)
-
-**Same DFlash + PFlash stack on an AMD iGPU.** PR #119 ports the Phase 2 rocWMMA flashprefill kernels to HIP. End-to-end on a single Ryzen AI MAX+ 395 box (Radeon 8060S iGPU, gfx1151, 128 GiB LPDDR5X-8000 unified): **37.0 tok/s** DFlash decode on Qwen3.5-27B Q4_K_M, **27.6 s** TTFT at 16K context with NIAH retrieval intact. That is **3.08×** decode and **2.24×** prefill over llama.cpp HIP AR on the same iGPU. End-to-end wall clock at a realistic 16K prompt + 1K generation workload: **2.66×** faster than vanilla llama.cpp.
-
-```bash
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
-
-# Build for gfx1151 (Strix Halo). Swap the arch for gfx1100 / gfx1201.
-cmake -B build -S . \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DDFLASH27B_GPU_BACKEND=hip \
-  -DDFLASH27B_HIP_ARCHITECTURES=gfx1151 \
-  -DDFLASH27B_HIP_SM80_EQUIV=ON
-cmake --build build --target test_dflash -j
-```
-
-`DFLASH27B_HIP_SM80_EQUIV=ON` enables the rocWMMA Phase 2 flashprefill kernels (the path that delivers the prefill speedup). `OFF` falls back to ggml's `flash_attn_ext` (slower but no rocwmma headers needed).
-
-**Per-arch DDTree tuning**: gfx1151 (Strix Halo iGPU, bandwidth-bound on LPDDR5X) peaks at `--ddtree-budget=22`. gfx1100 (7900 XTX, GDDR6) prefers `budget=8` per the [PR #156 cross-arch perf plan](https://github.com/Luce-Org/lucebox-hub/pull/156). Run `scripts/bench_he.py --ddtree-budget N` to verify on your card.
-
-**Drafter recipe for max decode**: target = Qwen3.5-27B Q4_K_M, drafter = same gen quantized to Q8_0 via `server/scripts/quantize_draft_q8.py`. The matching Q8_0 GGUF on the unsloth Qwen3.6 target needs `DFLASH27B_DRAFT_SWA=2048` for sliding-window correctness.
-
-[Blog post →](https://lucebox.com/blog/amd) · [PR #119 →](https://github.com/Luce-Org/lucebox-hub/pull/119) · [PR #156 cross-arch perf plan →](https://github.com/Luce-Org/lucebox-hub/pull/156)
-
----
-
 ## Why this exists
 
 Local AI should be a default, not a privilege: private data, no per-token bill, no vendor lock-in. The hardware to run capable models already sits on desks. The software to run those chips well doesn't.
