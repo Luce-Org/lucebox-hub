@@ -57,17 +57,17 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 
 Reference target: **RTX 3090 (Ampere sm_86)** — all headline numbers. Other NVIDIA archs auto-detected by CMake / `setup.py`; AMD HIP backend separate ([Strix Halo section](#amd-strix-halo-hip-backend)).
 
-| Arch | GPUs | Min CUDA | Status | Bench |
-|------|------|:--------:|--------|:-----:|
-| Ampere `sm_86` | RTX 3090, A-series | 12.0 | ✅ reference | [megakernel](optimizations/megakernel/RESULTS.md#rtx-3090-pp520-tg128) · [dflash](server/RESULTS.md) |
-| Blackwell `sm_120` | RTX 5090 | 12.8 | ✅ 205 tok/s, 4.84× | [↗](server/RESULTS.md#rtx-5090-blackwell-sm_120sm_120a-32-gb) |
-| Blackwell `sm_121` | DGX Spark / GB10 | 12.9 | ✅ megakernel NVFP4 | [↗](optimizations/megakernel/RESULTS.md#nvidia-dgx-spark-gb10-sm_121a) |
-| Turing `sm_75` | RTX 2080 Ti | 12.0 | ✅ 53 tok/s DFlash | [↗](server/RESULTS.md#rtx-2080-ti-turing-sm_75-22-gb) |
-| Ada `sm_89` | RTX 40xx | 12.0 | 🟡 community WSL2 bench | [↗](server/RESULTS.md#rtx-4090-ada-sm_89-24-gb--wsl2-community) |
-| Blackwell `sm_110` | Jetson AGX Thor | 13.0 | 🟡 builds, unbenched | — |
-| Volta `sm_70` / Pascal `sm_61` | V100, P40 | 12.0 | 🟡 fallback paths, unbenched | — |
-| RDNA3.5 `gfx1151` | Ryzen AI MAX+ 395 / Strix Halo | ROCm 6+ | ✅ 37 tok/s HIP | [↗](#amd-strix-halo-hip-backend) |
-| RDNA3 `gfx1100` | Radeon RX 7900 XTX | ROCm 6+ | ✅ 50 tok/s HIP | [↗](server/docs/HIP_PERF_PLAN.md) |
+| | Arch | GPU | Min CUDA / ROCm | Status | Bench |
+|:---:|------|-----|:---------------:|--------|:-----:|
+| <img src="assets/gpus/3090.png" width="80" /> | Ampere `sm_86` | RTX 3090, A-series | CUDA 12.0 | ✅ reference | [megakernel](optimizations/megakernel/RESULTS.md#rtx-3090-pp520-tg128) · [dflash](server/RESULTS.md) |
+| <img src="assets/gpus/5090.png" width="80" /> | Blackwell `sm_120` | RTX 5090 | CUDA 12.8 | ✅ 205 tok/s, 4.84× | [↗](server/RESULTS.md#rtx-5090-blackwell-sm_120sm_120a-32-gb) |
+| <img src="assets/gpus/gb10.png" width="80" /> | Blackwell `sm_121` | DGX Spark / GB10 | CUDA 12.9 | ✅ megakernel NVFP4 | [↗](optimizations/megakernel/RESULTS.md#nvidia-dgx-spark-gb10-sm_121a) |
+| <img src="assets/gpus/2080ti.png" width="80" /> | Turing `sm_75` | RTX 2080 Ti | CUDA 12.0 | ✅ 53 tok/s DFlash | [↗](server/RESULTS.md#rtx-2080-ti-turing-sm_75-22-gb) |
+| <img src="assets/gpus/4090.png" width="80" /> | Ada `sm_89` | RTX 40xx | CUDA 12.0 | 🟡 community WSL2 bench | [↗](server/RESULTS.md#rtx-4090-ada-sm_89-24-gb--wsl2-community) |
+| — | Blackwell `sm_110` | Jetson AGX Thor | CUDA 13.0 | 🟡 builds, unbenched | — |
+| <img src="assets/gpus/v100.png" width="80" /> | Volta `sm_70` / Pascal `sm_61` | V100, P40 | CUDA 12.0 | 🟡 fallback paths, unbenched | — |
+| <img src="assets/gpus/ryze395.png" width="80" /> | RDNA3.5 `gfx1151` | Ryzen AI MAX+ 395 / Strix Halo | ROCm 6+ | ✅ 37 tok/s HIP | [↗](#amd-strix-halo-hip-backend) |
+| <img src="assets/gpus/7900xtx.png" width="80" /> | RDNA3 `gfx1100` | Radeon RX 7900 XTX | ROCm 6+ | ✅ 50 tok/s HIP | [↗](server/docs/HIP_PERF_PLAN.md) |
 
 Build needs CMake 3.18+, PyTorch 2.0+, `--recurse-submodules` for `Luce-Org/llama.cpp@luce-dflash`. Power-tune: `sudo nvidia-smi -pl 220` (3090 sweet spot, re-sweep for other cards).
 
@@ -331,7 +331,9 @@ General-purpose frameworks dominated the last decade because hand-tuning kernels
 
 AI-assisted development flips that calculus. Rewrites that took a quarter now fit in a release cycle. Lucebox is where we publish them, one chip and one model family at a time. Apache 2.0 source, full writeup, reproducible benchmarks.
 
----
+<p align="center">
+  <a href="https://lucebox.com"><img src="assets/lucebox.png" alt="Lucebox local AI PC" width="85%" /></a>
+</p>
 
 ---
 
