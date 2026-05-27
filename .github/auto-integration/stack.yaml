@@ -1,4 +1,4 @@
-updated_at: 2026-05-27T16:45:00-04:00
+updated_at: 2026-05-27T16:55:00-04:00
 repository: Luce-Org/lucebox-hub
 integration_branch: auto-integration
 remotes:
@@ -7,14 +7,14 @@ remotes:
 heads:
   upstream_main: 9761c6f
   previous_integration_head: de82e89
-  integration_worktree_head_before_metadata_commit: c6df337
+  integration_worktree_head_before_metadata_commit: 17cce02
   base_before_run: easel/auto-integration
 stack:
   included:
     - pr: 285
       status: integrated-draft-maintainer-dependency
-      head: 5777151
-      evidence: Docker stack, lucebox CLI/package, harness, luce-bench, benchmark/profile stack, build_image fixes, version-from-git-tags work, and latest lucebox.sh install-name docs are integrated.
+      head: dd69a25
+      evidence: Docker stack, lucebox CLI/package, harness, luce-bench, benchmark/profile stack, build_image fixes, version-from-git-tags work, lucebox.sh install-name docs, and latest host-only `lucebox.sh check` support are integrated.
     - pr: 288
       status: already-integrated
       head: 5e8136a
@@ -99,7 +99,7 @@ stack:
     - git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*' (submodule warning for dflash/deps/Block-Sparse-Attention at bcddec6)
     - gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ... --jq ...
     - git merge --no-edit origin/main in /tmp/luce-auto-int-20260527-1635
-    - git merge --no-edit origin/pr/285 in /tmp/luce-auto-int-20260527-1635
+    - git merge --no-edit origin/pr/285 in /tmp/luce-auto-int-20260527-1635 (to 5777151, then refreshed again to dd69a25)
     - git merge --no-edit origin/pr/174 in /tmp/luce-auto-int-20260527-1635 (conflicted; aborted)
     - git merge --no-edit origin/pr/221 in /tmp/luce-auto-int-20260527-1635 (conflicted; aborted)
 notes:
