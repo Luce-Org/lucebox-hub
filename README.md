@@ -23,6 +23,163 @@
 
 ---
 
+## Quick start
+
+The prebuilt Docker image covers CUDA 12.8-compatible NVIDIA GPUs. The
+host wrapper `lucebox.sh` probes your driver + GPU, selects the `:cuda12`
+image, and either runs the server foreground or
+manages it as a user systemd service. All orchestration logic — config,
+autotune, benchmarks, smoke tests, model download — lives in a typed
+Python CLI inside the image.
+
+```bash
+# 1. Install the host wrapper. ~80 lines of bash, zero deps beyond docker +
+#    nvidia-smi. No uv or Python required on the host.
+curl -fsSL https://raw.githubusercontent.com/Luce-Org/lucebox-hub/main/lucebox.sh \
+     -o ~/.local/bin/lucebox.sh && chmod +x ~/.local/bin/lucebox.sh
+
+# 2. Sanity check: driver, docker, NVIDIA Container Toolkit, VRAM, systemd.
+lucebox.sh check
+
+# 3. Pick image + autotune defaults. Writes ~/.lucebox/config.toml.
+lucebox.sh configure
+
+# 4. Pull the image (~14 GB).
+lucebox.sh pull
+
+# 5. Fetch the default target + DFlash draft (~17 GB) via the container —
+#    no host-side huggingface-cli install needed.
+lucebox.sh download-models
+
+# 6. Run the server. Either foreground:
+lucebox.sh serve
+#    …or install + start as a user systemd service:
+lucebox.sh install        # writes ~/.config/systemd/user/lucebox.service
+lucebox.sh start          # systemctl --user start lucebox
+lucebox.sh status         # journalctl-style status
+lucebox.sh logs           # follow the journal
+
+# 7. Use it.
+curl http://localhost:8080/v1/models
+```
+
+Prefer raw docker? `lucebox.sh print-run` emits the exact `docker run`
+command without executing — copy, tweak, paste. Or skip the wrapper
+entirely:
+
+```bash
+docker run --rm --gpus all -p 8080:8080 \
+    -v "$PWD/models:/opt/lucebox-hub/server/models" \
+    ghcr.io/luce-org/lucebox-hub:cuda12
+```
+
+The container falls back to VRAM-tiered autotune when env vars aren't
+supplied — ~112K ctx with TQ3_0 KV on a 24 GB card, full 128K on 32+ GB.
+
+### Hardware coverage
+
+| GPU                              | sm   | cuda12 |
+|----------------------------------|------|:------:|
+| RTX 2080 Ti                      | 75   | ✓      |
+| A100                             | 80   | ✓      |
+| RTX 3090 / A40 / A10             | 86   | ✓      |
+| RTX 4090 / L40                   | 89   | ✓      |
+| H100                             | 90   | ✓      |
+| RTX 5090 / RTX 5090 Laptop       | 120  | ✓      |
+
+Pre-Turing GPUs (Pascal sm_60/61, Volta sm_70) aren't supported — dflash's
+kernels assume sm_75+ with no fallback below.
+
+### Configuration
+
+`lucebox.sh configure` writes `~/.lucebox/config.toml` with VRAM-tiered
+heuristics; edit it, then `lucebox.sh start` (or `serve`). For a tuned
+config, run `lucebox.sh benchmark` after `pull`. The optimizer is organized as
+a progression:
+
+- `--profile level1` (default): start from conservative VRAM heuristics, sweep
+  selected tunables at the configured context, then require smoke capability,
+  short HTTP frontiers, and agentic tool-call validation before persisting.
+- `--profile level2`: sweep `DFLASH_MAX_CTX × DFLASH_BUDGET` plus any
+  requested cache/pFlash/lazy tunables, then choose the highest reliable
+  context that stays within the configured speed floor and passes the standard
+  validation gates.
+- `--profile level3`: stress validation for new architectures or code changes:
+  context-first sweep, repeated agentic tool calls, a multi-turn agentic
+  session, and broader HTTP frontier coverage before accepting aggressive
+  settings.
+
+Winning `DFLASH_BUDGET`, `DFLASH_MAX_CTX`, lazy-draft, prefix-cache, KV-cache,
+and pFlash values are merged back into `config.toml`; reports are written
+under `models/.lucebox/`. Use `--lazy-values`, `--prefix-cache-slots-values`,
+`--kv-values`, `--prefill-modes`, `--prefill-keep-ratios`, and
+`--prefill-thresholds` to widen the sweep. Use
+`--extra-suites http-frontiers,capability,ds4-eval,capability-long,agentic-tools,agentic-session` to
+attach validation suites to any profile; failed hard-gated suites reject the
+current candidate and the optimizer tries the next ranked candidate before
+leaving the config unchanged.
+`http-frontiers` is a DS4-bench-inspired HTTP probe, not antirez/ds4's
+`ds4-eval`; the `ds4-eval` suite ports all 92 embedded `ds4-eval` questions
+with the same `source/id` names, final-answer grading, and trace pattern for
+lucebox's HTTP API. It is score-only and uses the upstream-sized 16k-token
+generation budget with thinking enabled. `capability` remains the short lucebox
+API smoke gate.
+`agentic-session` is inspired by club-3090's coding-session benchmark and uses
+the Anthropic Messages wire shape emitted by Claude Code: streamed `tool_use`
+blocks followed by deterministic `tool_result` history. It tracks wall-bound
+first-content, wall-time, decode, and context-growth behavior as tool results
+accumulate across turns. `lucebox.sh profile --export-snapshot` updates the
+local append-only profile store, selects the newest matching artifact for each
+registered step, and writes the normalized tuning and benchmark format described
+in `server/docs/BENCHMARK_SNAPSHOT_SPEC.md`. Use `--force-refresh` to regenerate
+matching artifacts instead of reusing fresh results. Or override per-run via
+`-e VAR=value` on `docker run`:
+
+On WSL2, 24 GB-class NVIDIA GPUs default to a safer `DFLASH_MAX_CTX=65536`
+and `DFLASH_BUDGET=16`. Stress testing on a 3090 Ti showed that `114688/22`
+can leave only a few hundred MiB of VRAM headroom under repeated tool traffic,
+which is not enough for CUDA/VMM scratch allocations. Use
+`benchmark --profile level3` to prove higher settings before keeping them.
+
+| Env var                       | Default         | What it does
+|-------------------------------|-----------------|--------------
+| `DFLASH_PORT`                 | `8080`          | HTTP port
+| `DFLASH_MAX_CTX`              | autotuned       | Force a specific context length
+| `DFLASH_BUDGET`               | `22`            | DDTree tree budget (8 on AMD RDNA3)
+| `DFLASH_PREFIX_CACHE_SLOTS`   | `1`             | System-prompt prefix cache snapshots
+| `DFLASH_CACHE_TYPE_K`         | auto            | Explicit K-cache type override
+| `DFLASH_CACHE_TYPE_V`         | auto            | Explicit V-cache type override
+| `DFLASH_PREFILL_MODE`         | `off`           | `auto` / `always` for pFlash long-prompt speedups
+| `DFLASH_PREFILL_DRAFTER`      | unset           | Qwen3-0.6B BF16 GGUF for pFlash
+| `DFLASH_TARGET`               | auto-detected   | Override the target `.gguf` path
+| `DFLASH_DRAFT`                | `models/draft/` | Override the DFlash draft dir/file
+| `LUCEBOX_IMAGE`               | `ghcr.io/luce-org/lucebox-hub` | Override the image repository
+| `LUCEBOX_VARIANT`             | `cuda12`        | Override the image tag for release-candidate builds
+
+CLI reference: [`lucebox.sh`](lucebox.sh) (host) and
+[`lucebox/`](lucebox/) (Python package inside the container).
+
+### Available tags
+
+| Tag                            | Notes
+|--------------------------------|-------
+| `:cuda12`                      | rolling latest CUDA 12.8 image
+| `:vX.Y.Z-cuda12`               | pinned to a specific release
+| `:X.Y-cuda12`                  | latest patch in a minor series
+| `:sha-<short>-cuda12`          | exact commit
+
+### Building from source
+
+Megakernel isn't in the Docker images yet (its CUDA extension links against
+a `torch.utils.cpp_extension` wheel at build time and has to be compiled in
+your venv). For megakernel benchmarks, dflash kernel development, or
+running dflash with a non-default arch list, see
+[`optimizations/megakernel/README.md`](optimizations/megakernel/README.md),
+[`server/README.md`](server/README.md), and
+[`optimizations/pflash/README.md`](optimizations/pflash/README.md).
+
+---
+
 ## Inference Engine Optimizations
 
 Each one is self-contained with setup instructions and benchmark notes.
@@ -143,7 +300,7 @@ Implementation notes: 82 blocks, 512 threads, cooperative grid sync, no CPU roun
 
 ## 02 · DFlash DDtree Qwen3.5 & Qwen3.6 27B GGUF on RTX 3090
 
-DFlash speculative decoding for Qwen3.5/Qwen3.6 27B GGUF targets on a single GPU. The default setup uses Qwen3.6-27B Q4_K_M plus the Lucebox Q8_0 GGUF DFlash draft.
+DFlash speculative decoding for Qwen3.5/Qwen3.6 27B GGUF targets on a single GPU. The default setup uses Qwen3.6-27B Q4_K_M plus a Q4_K_M GGUF DFlash draft.
 
 - **Up to 207 tok/s** in the demo (207.6 tok/s DFlash vs 38.0 tok/s AR, 5.46×)
 - **129.5 tok/s mean** on the HumanEval 10-prompt bench
@@ -184,7 +341,7 @@ uv run --directory server python scripts/bench_llm.py
 | Math500 | 37.7 | 110.5 | 2.93× |
 | GSM8K | 37.7 | 96.2 | 2.55× |
 
-**Why GGUF/Q4_K_M:** on 24 GB GPUs, the target, draft, DDTree verify state, and KV cache need to fit together. The default Qwen3.6 setup uses a ~16 GB Q4_K_M target and a 1.84 GB GGUF draft.
+**Why GGUF/Q4_K_M:** on 24 GB GPUs, the target, draft, DDTree verify state, and KV cache need to fit together. The default Qwen3.6 setup uses a ~16 GB Q4_K_M target and a quantized GGUF draft.
 
 Algorithms used:
 - [**DFlash**](https://arxiv.org/abs/2602.06036) (z-lab, 2026): block-diffusion draft conditioned on target hidden states.
@@ -263,11 +420,11 @@ cmake --build build --target test_dflash test_flashprefill_kernels -j
 # 2. fetch weights: 27B Q4_K_M target + 0.6B BF16 drafter (GGUF) + DFlash spec-decode draft
 hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
 hf download unsloth/Qwen3-0.6B-GGUF Qwen3-0.6B-BF16.gguf --local-dir models/
-hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q8_0.gguf --local-dir models/draft/
+hf download spiritbuun/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf --local-dir models/draft/
 
 # 3. run the daemon: compress (drafter scoring) + generate (target spec decode)
 DFLASH_FP_USE_BSA=1 DFLASH_FP_ALPHA=0.85 \
-./build/test_dflash models/Qwen3.6-27B-Q4_K_M.gguf models/draft/dflash-draft-3.6-q8_0.gguf --daemon
+./build/test_dflash models/Qwen3.6-27B-Q4_K_M.gguf models/draft/dflash-draft-3.6-q4_k_m.gguf --daemon
 # stdin protocol: `compress <ids.bin> <keep_x1000> <drafter.gguf>` →
 #                 stream of compressed token ids, then `generate <…>` →
 #                 stream of generated tokens.
