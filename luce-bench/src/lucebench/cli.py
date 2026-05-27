@@ -22,7 +22,6 @@ from lucebench import __version__
 from lucebench.areas import agent, ds4_eval, humaneval, longctx, smoke
 from lucebench.runner import run_case
 
-
 # Threshold below which we'll auto-pick the first model and surface the
 # full list. Gateways with hundreds of models still need an explicit
 # --model — silently picking from a long list masks user mistakes.
