@@ -130,30 +130,49 @@ fi
 : "${DFLASH_THINK_MAX:=15488}"
 
 # ── auto-detect target ─────────────────────────────────────────────────────
-# Largest .gguf wins (target ~16 GB vs ~1 GB drafter). Follow symlinks so a
-# symlinked 27B target is ranked by target size instead of being skipped.
+# Target .gguf is typically 10-30 GB (Q4_K_M). Drafts are 1-2 GB (Q8_0 / Q4)
+# and live under models/draft/ or have a dflash- prefix. The 5 GB threshold
+# excludes drafts cleanly without needing to parse GGUF arch metadata.
+#
+# CRITICAL UX RULE: when multiple candidate targets exist, we DO NOT silently
+# pick one based on filename pattern. That hid a real bug for the matrix
+# bench — a hardcoded Qwen3.6 preference made the container run the wrong
+# model when both gemma4 and qwen3.6 GGUFs were present, and the operator
+# only noticed when the bench numbers came out wrong. Either set
+# DFLASH_TARGET=... explicitly, or have exactly one .gguf in models/.
 if [ -z "$DFLASH_TARGET" ] && [ -d "$DFLASH_DIR/models" ]; then
-    # Prefer the canonical Qwen3.6 Q4_K_M target when several same-sized
-    # variants are present; otherwise fall back to largest GGUF.
-    DFLASH_TARGET=$(find -L "$DFLASH_DIR/models" -maxdepth 4 -type f \
-                      -name '*Qwen3.6-27B-Q4_K_M.gguf' \
-                      -printf '%s %p\n' 2>/dev/null \
-                      | sort -nr | head -1 | awk '{ $1=""; sub(/^ /,""); print }')
-    if [ -z "$DFLASH_TARGET" ]; then
-        DFLASH_TARGET=$(find -L "$DFLASH_DIR/models" -maxdepth 4 -type f \
-                          -name '*Qwen3.6*Q4_K_M*.gguf' \
-                          -printf '%s %p\n' 2>/dev/null \
-                          | sort -nr | head -1 | awk '{ $1=""; sub(/^ /,""); print }')
-    fi
-    if [ -z "$DFLASH_TARGET" ]; then
-        DFLASH_TARGET=$(find -L "$DFLASH_DIR/models" -maxdepth 4 -type f -name '*.gguf' \
-                          -printf '%s %p\n' 2>/dev/null \
-                          | sort -nr | head -1 | awk '{ $1=""; sub(/^ /,""); print }')
-    fi
+    # Collect candidates: .gguf files ≥5 GB (target-sized), excluding
+    # anything under models/draft/. Sort alphabetically for determinism.
+    mapfile -t TARGET_CANDIDATES < <(
+        find -L "$DFLASH_DIR/models" -maxdepth 4 -type f -name '*.gguf' \
+            -size +5G \
+            -not -path '*/draft/*' \
+            -printf '%p\n' 2>/dev/null \
+          | sort
+    )
+    case "${#TARGET_CANDIDATES[@]}" in
+        0)
+            : # fall through to the missing-target die below
+            ;;
+        1)
+            DFLASH_TARGET="${TARGET_CANDIDATES[0]}"
+            info "Auto-detected target: $(basename "$DFLASH_TARGET")"
+            ;;
+        *)
+            warn "Multiple candidate targets in $DFLASH_DIR/models — running the FIRST alphabetically."
+            warn "To pick a specific one, set DFLASH_TARGET=<path>. Candidates:"
+            for c in "${TARGET_CANDIDATES[@]}"; do
+                marker=" "
+                [ "$c" = "${TARGET_CANDIDATES[0]}" ] && marker="*"
+                warn "  ${marker} $c"
+            done
+            DFLASH_TARGET="${TARGET_CANDIDATES[0]}"
+            ;;
+    esac
 fi
 
 if [ -z "$DFLASH_TARGET" ] || [ ! -f "$DFLASH_TARGET" ]; then
-    die "No target GGUF found. Mount a model dir: -v /host/models:/opt/lucebox-hub/server/models"
+    die "No target GGUF found. Mount a model dir: -v /host/models:/opt/lucebox-hub/server/models, or set DFLASH_TARGET=<path-inside-container>."
 fi
 [ -x "$DFLASH_SERVER_BIN" ] || die "dflash_server binary missing at $DFLASH_SERVER_BIN (image build failed?)"
 
