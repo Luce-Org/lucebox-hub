@@ -19,6 +19,12 @@ jobs:
         # full sync and builds megakernel against torch.
         run: bash scripts/check_uv_workspace.sh
 
+      - name: Lint Python surfaces touched by lucebox tooling
+        run: uv run --frozen --extra dev ruff check .
+
+      - name: Typecheck lucebox CLI
+        run: uv run --frozen --extra dev python -m mypy --package lucebox
+
   build:
     name: Build (cmake + uv sync --extra megakernel)
     runs-on: ubuntu-latest
