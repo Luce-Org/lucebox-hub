@@ -1,121 +1,104 @@
-updated_at: 2026-05-27T14:20:12-04:00
+updated_at: 2026-05-27T15:58:00-04:00
 repository: Luce-Org/lucebox-hub
 integration_branch: auto-integration
 remotes:
   upstream: origin
   writable: easel
 heads:
-  upstream_main: d947c70
-  previous_integration_head: 9a392e7
+  upstream_main: 1b51de6
+  previous_integration_head: a340048
+  integration_worktree_head_before_metadata_commit: fb02219
   base_before_run: easel/auto-integration
-  integration_worktree_head_before_metadata_commit: 9a392e7
 stack:
   included:
     - pr: 285
-      status: integrated-this-run
+      status: already-integrated
       head: 3642703
-      evidence: "Merged cleanly; adds the Dockerfile, host wrapper, lucebox CLI/package, harness, luce-bench, and the in-tree benchmark/profile stack."
+      evidence: Docker stack, lucebox CLI/package, harness, luce-bench, and benchmark/profile stack remain integrated.
     - pr: 288
-      status: integrated-this-run
+      status: already-integrated
       head: 5e8136a
-      evidence: "Laguna chat rendering now matches the upstream template and eos_chat_id falls back to </assistant> when the GGUF lacks an explicit eot token."
+      evidence: Laguna chat template and eos_chat_id fallback remain integrated.
     - pr: 287
-      status: integrated-this-run
+      status: already-integrated
       head: b3163f4
-      evidence: "Gemma4 now stamps prefill/decode timings into GenerateResult; README/asset updates from the branch came along cleanly."
+      evidence: Gemma4 prefill/decode timing fields remain integrated.
     - pr: 284
-      status: already-represented
+      status: already-integrated
       head: 697198a
-      evidence: exact ancestor of refreshed stack; config.json rope_theta loading remains integrated.
+      evidence: config.json rope_theta loading remains integrated.
     - pr: 276
-      status: already-represented
+      status: already-integrated
       head: 0e3c79a
-      evidence: exact ancestor of refreshed stack; Qwen3.6 Claude-code Anthropic tool-calling fix remains integrated.
+      evidence: Qwen3.6 Claude-code Anthropic tool-calling fix remains integrated.
     - pr: 274
-      status: already-represented
+      status: already-integrated
       head: 5037b28
-      evidence: exact ancestor of refreshed stack; ee7/adaptive anchor_radius and PFLASH_COMPRESS cascade rename remain integrated.
+      evidence: ee7/adaptive anchor_radius and PFLASH_COMPRESS cascade rename remain integrated.
     - pr: 264
       status: already-represented
       head: 3cdcf7b
       evidence: adaptive keep_ratio bandit MVP remains represented by the current server-side stack.
     - pr: 152
-      status: already-represented
+      status: already-integrated
       head: cf735be
-      evidence: exact ancestor of refreshed stack; Gemma 4 RTX 4090 backend helper docs/scripts remain integrated.
+      evidence: Gemma 4 RTX 4090 backend helper docs/scripts remain integrated.
     - pr: 142
-      status: already-represented
+      status: already-integrated
       head: f2fbf62
-      evidence: exact ancestor of refreshed stack; FP16 safetensors drafter support remains integrated.
+      evidence: FP16 safetensors drafter support remains integrated.
   attempted_this_run:
-    - pr: 287
-      status: integrated-this-run
-      worktree: /home/erik/Projects/luce2
-      evidence: "Merged via local git merge after refreshing from origin/main; compileall passed for lucebox, harness, and luce-bench."
-    - pr: 288
-      status: integrated-this-run
-      worktree: /home/erik/Projects/luce2
-      evidence: "Merged via local git merge after PR 287; Laguna template and eos fallback now match the upstream chat template."
-    - pr: 285
-      status: integrated-this-run
-      worktree: /home/erik/Projects/luce2
-      evidence: "Merged via local git merge after PRs 287/288; the large lucebox/harness/luce-bench stack integrated without conflicts."
-  pending: []
+    - pr: 237
+      status: blocked-needs-human
+      worktree: /tmp/luce-pr237-attempt-20260527-1550
+      evidence: Direct merge into refreshed stack produced broad server layout/MTP conflicts; Claude Code and Codex were both invoked through tmux for conservative conflict-resolution attempts, but unresolved conflicts remain across CMake, backend_factory, step_graph, qwen35 loader/graph/backend, MTP files, and test_dflash.
+  pending:
+    - prs: [266, 221, 183, 177, 174, 135, 94]
+      reason: Non-draft contributor PRs with likely value, still requiring deliberate selective ports against the current server/harness layout.
   blocked_needs_human:
+    - pr: 237
+      reason: MTP foundation requires manual architecture-aware port from the old dflash/src layout into current server/src; automated attempts did not reach a coherent buildable merge.
     - pr: 266
-      reason: Valuable harness typed-adapter/session-inject work remains, but direct merge is unsafe. It needs a manual selective port against current harness/server layout, not wholesale merge.
-    - prs: [237, 221, 183, 177, 174, 135, 94]
-      reason: Potentially valuable server/MTP/Gemma/Qwen work, but all require a deliberate rebase/port to the current server/ layout and interaction review with already-integrated pFlash/draft changes.
+      reason: Harness typed-adapter/session-inject work remains valuable, but previous direct merge was unsafe and needs selective porting against current harness/server layout.
   suggested_close_or_superseded:
     - pr: 137
       reason: Obsolete dflash/CMake-only change after server/ layout migration.
     - prs: [153, 154]
-      reason: Native MTP stack appears superseded by later MTP foundation direction; close if PR 237 is the intended survivor.
+      reason: Native MTP stack appears superseded by later MTP foundation direction; close if PR 237 is intended survivor.
     - prs: [180, 181, 182]
       reason: Split-stack predecessors superseded by PR 183.
     - pr: 131
-      reason: Older broad Gemma4 stack overlapped by later Gemma4 work and draft PR 193.
+      reason: Older broad Gemma4 stack overlaps later Gemma4 work and draft PR 193.
     - pr: 62
-      reason: Mostly layout-obsolete tests; either manually port the daemon-reset test or close.
+      reason: Mostly layout-obsolete tests; manually port daemon-reset regression or close.
     - pr: 39
       reason: Old MoE/draft work conflicts with current server and likely newer Gemma/draft stacks.
     - pr: 48
-      reason: maintainer-authored non-draft excluded from contributor priority; stale active-CMake equivalent should be reauthored against server/CMakeLists.txt if still needed.
+      reason: Maintainer-authored stale active-CMake equivalent should be reauthored against server/CMakeLists.txt if still needed.
   draft_excluded:
-    - pr: 278
-    - pr: 275
-    - pr: 273
-    - pr: 265
-    - pr: 249
-    - pr: 226
-    - pr: 193
-    - pr: 75
+    - prs: [286, 285, 278, 275, 273, 265, 249, 193, 75]
+      reason: Draft PRs are excluded from primary contributor integration target, but noted for dependency awareness.
+  maintainer_non_draft_lower_priority:
+    - prs: [288, 287, 48]
+      reason: Maintainer/easel branches are lower priority than contributor PRs; 287 and 288 are already integrated, 48 remains stale/suggested-close.
   upstream_sync:
-    - merged_origin_main: d947c70
-    - note: origin/main advanced from aee0591 to d947c70; merged cleanly into the integration branch before triage.
+    - merged_origin_main: 1b51de6
+    - note: origin/main advanced from dd463e3 to 1b51de6 with README/GPU asset updates; merged cleanly into the integration worktree before metadata refresh.
   tests_and_checks:
     - date -Is
     - git status --short; git branch --show-current; git remote -v
     - gh auth status
-    - /home/erik/.local/bin/claude auth status --text
-    - /home/linuxbrew/.linuxbrew/bin/codex --version
+    - HOME=/home/erik /home/erik/.local/bin/claude auth status --text
+    - HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --help
     - git fetch --prune origin
     - git fetch --prune easel
-    - git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'
+    - git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*' (submodule warning for dflash/deps/Block-Sparse-Attention at bcddec6)
     - gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ... --jq ...
-    - git merge --no-edit origin/main
-    - git merge --no-commit --no-ff origin/pr/266 in isolated worktree /tmp/luce-pr266-attempt-20260527-1245
-    - /home/linuxbrew/.linuxbrew/bin/codex exec ... in PR266 worktree (failed auth with 401 Unauthorized)
-    - delegate_task analysis/review for PR266 and PR-stack close suggestions
-    - python3 -m compileall lucebox harness luce-bench
-    - python3 -m pytest lucebox/tests/test_cli.py lucebox/tests/test_config.py lucebox/tests/test_autotune.py luce-bench/tests/test_runner.py -q
-    - cmake -S server -B server/build -DDFLASH27B_GPU_BACKEND=cuda -DCMAKE_CUDA_ARCHITECTURES=75 -DGGML_NATIVE=OFF && cmake --build server/build --target test_dflash test_generate test_laguna_daemon -j2
-  notes:
-    - Primary checkout /home/erik/Projects/luce2 remained clean and unchanged.
-    - Merged PRs #285, #287, and #288 into auto-integration.
-    - PR #284 was already represented in the refreshed stack and was not re-merged.
-    - Python compileall passed across lucebox, harness, and luce-bench.
-    - Direct pytest smoke was blocked because the system Python does not have pytest installed.
-    - The CMake server build attempt failed during CUDA compiler identification with the local nvcc/ptxas toolchain reporting sm_52 as unsupported.
-    - Retained conflicted PR #266 worktree for inspection: /tmp/luce-pr266-attempt-20260527-1245.
-    - Retained integration worktree: /tmp/luce-auto-int-20260527-124447.
+    - git merge --no-edit origin/main in /tmp/luce-auto-int-20260527-1548
+    - git merge --no-commit --no-ff origin/pr/237 in /tmp/luce-pr237-attempt-20260527-1550
+    - HOME=/home/erik /home/erik/.local/bin/claude -p ... --max-turns 20 via tmux session luce-pr237-1552 (hit max turns; conflicts remained)
+    - HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex exec ... via tmux session luce-pr237-codex-1555 (inspected conflict surface; conflicts remained)
+notes:
+  - Primary checkout /home/erik/Projects/luce2 remained clean.
+  - Retained refreshed integration worktree: /tmp/luce-auto-int-20260527-1548.
+  - Retained conflicted PR 237 worktree for inspection: /tmp/luce-pr237-attempt-20260527-1550.
