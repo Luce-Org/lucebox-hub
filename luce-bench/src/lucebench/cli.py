@@ -1,10 +1,9 @@
 """Command-line entry point: ``lucebench --area X --url Y --model Z``.
 
-Minimal dispatcher around lucebench.runner. The full-featured
-multi-area runner from luce-dflash (parallelism, forge, agent areas,
-sampling-from-card, per-area max_tokens defaults) is the bigger
-brother; this CLI exists so external users can `pip install
-luce-bench` and benchmark any OpenAI-compatible endpoint.
+Minimal dispatcher around lucebench.runner — exposes parallelism,
+forge / agent areas, sampling-from-card, and per-area max_tokens
+defaults so external users can `pip install luce-bench` and benchmark
+any OpenAI-compatible endpoint.
 """
 
 from __future__ import annotations
@@ -20,8 +19,14 @@ from pathlib import Path
 from typing import Any
 
 from lucebench import __version__
-from lucebench.areas import agent, ds4_eval, humaneval, longctx
+from lucebench.areas import agent, ds4_eval, humaneval, longctx, smoke
 from lucebench.runner import run_case
+
+
+# Threshold below which we'll auto-pick the first model and surface the
+# full list. Gateways with hundreds of models still need an explicit
+# --model — silently picking from a long list masks user mistakes.
+_SMALL_MODEL_LIST_THRESHOLD = 5
 
 
 def resolve_model(url: str, auth_header: str = "", timeout_s: int = 10) -> str | None:
@@ -29,14 +34,30 @@ def resolve_model(url: str, auth_header: str = "", timeout_s: int = 10) -> str |
 
     Returns:
       * the single model id if the server exposes exactly one
-      * None if the server exposes zero, multiple, or doesn't speak the
-        OpenAI /v1/models shape
-
-    The caller decides whether to fall back to a hard default or error
-    out. We deliberately don't pick one when multiple are exposed —
-    silently picking would mask user mistakes (e.g. forgetting to set
-    --model when a gateway exposes 200+ models).
+      * the first model id if the server exposes 2..4 (small list —
+        likely a single-model server with aliases). The full list is
+        printed by the caller via :func:`list_models` so the choice
+        is visible.
+      * None if the server exposes zero, 5+, or doesn't speak the
+        OpenAI /v1/models shape.
     """
+    chosen, _ = _list_models(url, auth_header=auth_header, timeout_s=timeout_s)
+    return chosen
+
+
+def list_models(
+    url: str, auth_header: str = "", timeout_s: int = 10
+) -> tuple[str | None, list[str]]:
+    """Same as :func:`resolve_model` but also returns the full model id
+    list (or an empty list on probe failure). Callers use this to surface
+    the available models alongside the auto-pick.
+    """
+    return _list_models(url, auth_header=auth_header, timeout_s=timeout_s)
+
+
+def _list_models(
+    url: str, auth_header: str = "", timeout_s: int = 10
+) -> tuple[str | None, list[str]]:
     req = urllib.request.Request(
         url.rstrip("/") + "/v1/models", headers={"Accept": "application/json"}
     )
@@ -46,18 +67,39 @@ def resolve_model(url: str, auth_header: str = "", timeout_s: int = 10) -> str |
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             data = json.loads(resp.read())
     except (urllib.error.URLError, OSError, ValueError):
-        return None
+        return None, []
     models = data.get("data") if isinstance(data, dict) else None
-    if not isinstance(models, list) or len(models) != 1:
-        return None
-    entry = models[0]
-    if not isinstance(entry, dict):
-        return None
-    mid = entry.get("id")
-    return mid if isinstance(mid, str) and mid else None
+    if not isinstance(models, list):
+        return None, []
+    ids: list[str] = []
+    for entry in models:
+        if isinstance(entry, dict):
+            mid = entry.get("id")
+            if isinstance(mid, str) and mid:
+                ids.append(mid)
+    if not ids:
+        return None, []
+    # Auto-pick when the list is short enough to be useful — gateways
+    # with 5+ models still require an explicit --model.
+    if len(ids) < _SMALL_MODEL_LIST_THRESHOLD:
+        return ids[0], ids
+    return None, ids
 
 
 AREAS = {
+    "smoke": {
+        "load": smoke.load_smoke_cases,
+        "grade": smoke.grade_smoke_case,
+        # Roomy. The prompts only need a few tokens of actual answer,
+        # but servers with thinking on (ds4-server forces it, ignoring
+        # the client's `thinking: disabled`) can spend thousands of
+        # tokens on reasoning before emitting visible content. Most
+        # servers will EOS naturally well before the cap on these
+        # short prompts; the budget just keeps "model trips length
+        # mid-think" out of the smoke failure modes.
+        "default_max_tokens": 4096,
+        "default_thinking": False,
+    },
     "ds4-eval": {
         "load": ds4_eval.load_ds4_eval_cases,
         "grade": ds4_eval.grade_case,
@@ -114,11 +156,72 @@ def format_row(idx: int, row: dict, graded: dict) -> str:
     correct = graded.get("correct") or "?"
     wall = row.get("wall_seconds") or 0
     timings = row.get("timings") or {}
-    tps = timings.get("decode_tokens_per_sec") or 0
+    if not isinstance(timings, dict):
+        timings = {}
+
+    # ── Throughput. Prefer the server-reported decode rate (lucebox /
+    # llama.cpp populate `decode_tokens_per_sec`); fall back to a wall-
+    # clock estimate so OpenRouter / vLLM (which don't surface decode_tps)
+    # don't always read "0tps". The fallback rolls prefill into the rate,
+    # so mark it with a trailing `*` to keep the distinction visible.
+    tps_val = timings.get("decode_tokens_per_sec")
+    completion_tokens = row.get("completion_tokens")
+    if tps_val:
+        tps_str = f"{tps_val:.0f}tps"
+    elif completion_tokens and wall and wall > 0:
+        tps_str = f"{completion_tokens / wall:.0f}tps*"
+    else:
+        tps_str = "?tps"
+
+    # ── Prefill / decode split. lucebox-server surfaces both in
+    # `usage.timings` (prefill_ms + decode_ms); OpenRouter / vLLM
+    # typically surface neither. Render whichever pair is available; if
+    # both are missing fall back to the plain wall time.
+    prefill_ms = timings.get("prefill_ms")
+    decode_ms = timings.get("decode_ms")
+
+    def _fmt_ms(ms: float) -> str:
+        # Sub-second renders as e.g. "210ms"; >=1s as "3.5s" to keep the line tight.
+        if ms < 1000:
+            return f"{ms:.0f}ms"
+        return f"{ms / 1000:.1f}s"
+
+    time_parts: list[str] = []
+    if prefill_ms is not None and decode_ms is not None:
+        time_parts.append(f"prefill={_fmt_ms(prefill_ms)}")
+        time_parts.append(f"decode={_fmt_ms(decode_ms)}")
+    elif prefill_ms is not None:
+        time_parts.append(f"prefill={_fmt_ms(prefill_ms)} wall={wall:.2f}s")
+    elif decode_ms is not None:
+        time_parts.append(f"decode={_fmt_ms(decode_ms)} wall={wall:.2f}s")
+    else:
+        time_parts.append(f"wall={wall:.2f}s")
+    time_str = " ".join(time_parts)
+
+    # ── Token breakdown: input / thinking / non-thinking. `reasoning_tokens`
+    # is captured by runner.run_case from `usage.completion_tokens_details`
+    # (OpenAI/OR) or the deprecated top-level `usage.reasoning_tokens`. We
+    # do NOT count tokens ourselves — no tokenizer dep — so when the server
+    # only ships `reasoning_content` text we leave `think` out and show `out`
+    # as the full completion_tokens count.
+    prompt_tokens = row.get("prompt_tokens")
+    reasoning_tokens = row.get("reasoning_tokens")
+    tok_bits: list[str] = []
+    if prompt_tokens is not None:
+        tok_bits.append(f"in={prompt_tokens}")
+    if isinstance(reasoning_tokens, int) and isinstance(completion_tokens, int):
+        non_thinking = max(completion_tokens - reasoning_tokens, 0)
+        tok_bits.append(f"think={reasoning_tokens}")
+        tok_bits.append(f"out={non_thinking}")
+    elif completion_tokens is not None:
+        tok_bits.append(f"out={completion_tokens}")
+    tok_str = " ".join(tok_bits)
+
     return (
         f"  {idx:3d} {verdict} {src:14s} {cid:24s} "
         f"given={given:20s} correct={correct:20s} "
-        f"wall={wall:.2f}s {tps:.0f}tps"
+        f"{time_str} {tps_str}"
+        + (f" {tok_str}" if tok_str else "")
     )
 
 
@@ -144,6 +247,158 @@ def _row_is_unreachable(row: dict) -> bool:
     """
     err = row.get("error") or ""
     return any(marker in err for marker in _UNREACHABLE_ERRORS)
+
+
+def _format_models_inline(ids: list[str], selected: str, budget: int = 62) -> str:
+    """Render a comma-separated `/v1/models` listing for the preflight grid.
+
+    Marks the chosen id with a `*` prefix. If the full list fits in
+    `budget` characters, it's shown verbatim. Otherwise the layout is:
+    first model, then the selected model (if different), then sequential
+    fillers until the budget is hit, ending with `… (+N more)`.
+    """
+    if not ids:
+        return "(none)"
+
+    def render(picked_idx: list[int], remaining: int) -> str:
+        parts = [(f"*{ids[i]}" if ids[i] == selected else ids[i]) for i in picked_idx]
+        s = ", ".join(parts)
+        if remaining:
+            s += f", … (+{remaining} more)"
+        return s
+
+    full = render(list(range(len(ids))), 0)
+    if len(full) <= budget:
+        return full
+
+    picked = [0]
+    if selected in ids and ids[0] != selected:
+        picked.append(ids.index(selected))
+    for i in range(1, len(ids)):
+        if i in picked:
+            continue
+        candidate = sorted(picked + [i])
+        remaining = len(ids) - len(candidate)
+        if len(render(candidate, remaining)) > budget:
+            break
+        picked = candidate
+    remaining = len(ids) - len(picked)
+    return render(sorted(picked), remaining)
+
+
+def _preflight(
+    url: str,
+    *,
+    auth_header: str = "",
+    timeout_s: int = 5,
+    requested_model: str | None = None,
+) -> tuple[bool, list[str]]:
+    """Probe the server's liveness + OpenAI shape + lucebox /props endpoint.
+
+    Returns ``(ok, lines)`` where ``lines`` is the printed grid (already
+    formatted, one check per line) and ``ok`` is False iff a HARD check
+    failed — which is "liveness" or "/v1/models doesn't return a data
+    list". The /props check is lucebox-specific: missing/404 prints a
+    warning line but does NOT fail (OpenRouter, vLLM, stock ds4_server
+    don't expose /props).
+
+    Designed to run before any case fires so a typo'd --url surfaces in
+    ~50ms instead of after 92 timeouts. The CLI gates this behind
+    ``--no-preflight`` for the rare case where preflight gets in the way
+    (e.g. CI testing against a deliberately-flaky endpoint).
+    """
+    import time as _time
+
+    base = url.rstrip("/")
+    lines: list[str] = [f"[lucebench] preflight {url}"]
+
+    def _line(name: str, ok: bool, detail: str) -> str:
+        mark = "✓" if ok else "✗"  # ✓ / ✗
+        return f"  {name:12s} {mark}  {detail}"
+
+    # 1. Liveness — GET /v1/models with a tight timeout. Reusing the
+    # /v1/models endpoint (rather than a bare TCP connect) gives us a
+    # cheap two-for-one: if it returns JSON we already know the server
+    # speaks the OpenAI shape, so check #2 reuses the response.
+    req = urllib.request.Request(base + "/v1/models", headers={"Accept": "application/json"})
+    if auth_header:
+        req.add_header("Authorization", auth_header)
+    t0 = _time.perf_counter()
+    models_payload: Any = None
+    liveness_ok = False
+    liveness_detail = ""
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            body = resp.read()
+        liveness_ok = True
+        liveness_detail = f"reached in {_time.perf_counter() - t0:.2f}s"
+        try:
+            models_payload = json.loads(body)
+        except ValueError:
+            models_payload = None
+    except urllib.error.URLError as e:
+        reason = getattr(e, "reason", e)
+        liveness_detail = f"connection refused ({reason})" if "refused" in str(reason).lower() else str(reason)
+    except OSError as e:
+        liveness_detail = f"{type(e).__name__}: {e}"
+    except Exception as e:  # last-resort guard so preflight never raises
+        liveness_detail = f"{type(e).__name__}: {e}"
+    lines.append(_line("liveness", liveness_ok, liveness_detail))
+    if not liveness_ok:
+        return False, lines
+
+    # 2. /v1/models shape — OpenAI-compat servers return {"data": [...]}.
+    models_ok = False
+    models_detail = ""
+    if isinstance(models_payload, dict):
+        data = models_payload.get("data")
+        if isinstance(data, list):
+            ids = [m.get("id") for m in data if isinstance(m, dict) and isinstance(m.get("id"), str)]
+            if not ids:
+                models_detail = "0 models exposed"
+            else:
+                models_ok = True
+                # Selected = explicit --model if in the list; else first.
+                # The `*` marker visualizes what the bench would send.
+                if requested_model and requested_model != "default" and requested_model in ids:
+                    selected = requested_model
+                else:
+                    selected = ids[0]
+                models_detail = _format_models_inline(ids, selected)
+        else:
+            models_detail = "response missing 'data' list"
+    else:
+        models_detail = "response was not JSON"
+    lines.append(_line("/v1/models", models_ok, models_detail))
+    if not models_ok:
+        return False, lines
+
+    # 3. /props — lucebox-specific. Soft check: warn if absent, surface
+    # model_card_source + hard_limit_reply_budget if present.
+    props_req = urllib.request.Request(base + "/props", headers={"Accept": "application/json"})
+    if auth_header:
+        props_req.add_header("Authorization", auth_header)
+    try:
+        with urllib.request.urlopen(props_req, timeout=timeout_s) as resp:
+            props = json.loads(resp.read())
+    except Exception:
+        # Not a hard failure — OpenRouter, vLLM, ds4_server don't expose this.
+        lines.append(_line("/props", True, "absent (non-lucebox server) — skipped"))
+        return True, lines
+
+    # Pull from budget_envelope first (lucebox canonical), fall back to top-level.
+    env = props.get("budget_envelope") if isinstance(props, dict) else None
+    env = env if isinstance(env, dict) else {}
+    card = env.get("model_card_source") or (props.get("model_card_source") if isinstance(props, dict) else None)
+    reply = env.get("hard_limit_reply_budget")
+    bits = []
+    if card:
+        bits.append(f"model_card={card}")
+    if reply is not None:
+        bits.append(f"reply_budget={reply}")
+    detail = "  ".join(bits) if bits else "present (no envelope fields)"
+    lines.append(_line("/props", True, detail))
+    return True, lines
 
 
 def _forge_available() -> tuple[bool, str | None]:
@@ -180,13 +435,10 @@ def _run_sweep(args) -> int:
     out_root = args.out_dir / name
     out_root.mkdir(parents=True, exist_ok=True)
 
-    # Default sweep covers the stdlib areas. Forge is added when the
-    # `[forge]` extra is available; otherwise we print a "skipped"
-    # hint so users know how to opt in.
-    sweep_areas = ["ds4-eval", "code", "longctx", "agent"]
+    # The set of areas to run is supplied by main() in args.areas_list
+    # (computed from --areas, with back-compat for --area / --sweep).
+    sweep_areas = list(args.areas_list)
     forge_ok, forge_reason = _forge_available()
-    if forge_ok:
-        sweep_areas.append("forge")
     auth_header = ""
     if args.auth_env:
         token = os.environ.get(args.auth_env, "")
@@ -196,18 +448,19 @@ def _run_sweep(args) -> int:
         auth_header = f"Bearer {token}"
 
     print(
-        f"[lucebench] v{__version__} sweep name={name} "
+        f"[lucebench] sweep name={name} "
         f"areas={','.join(sweep_areas)} url={args.url} model={args.model} "
         f"out={out_root}",
         flush=True,
     )
 
-    if not forge_ok:
+    if "forge" in sweep_areas and not forge_ok:
         print(
             f"[lucebench] forge: skipped — {forge_reason}",
             file=sys.stderr,
             flush=True,
         )
+        sweep_areas = [a for a in sweep_areas if a != "forge"]
 
     summary_areas: list[dict[str, Any]] = []
     for area in sweep_areas:
@@ -416,16 +669,37 @@ def main() -> int:
         "404 on — pass --model explicitly for gateways).",
     )
     ap.add_argument(
+        "--areas",
+        default=None,
+        help="Comma-separated list of areas to run, OR the literal "
+        "'all' to run every stdlib area (smoke, ds4-eval, code, "
+        "longctx, agent, plus forge if [forge] extra is installed). "
+        "Defaults to 'smoke' — a three-prompt sanity check that "
+        "completes in seconds. Valid names: "
+        + ", ".join(sorted(set(AREAS) | {"forge"}))
+        + ". Examples: --areas smoke / --areas all / --areas ds4-eval,forge.",
+    )
+    # Back-compat aliases. Kept accepted (and forwarded into --areas) so
+    # external scripts and docs that predate v0.2.5 don't break — a
+    # deprecation note is printed when either is used.
+    ap.add_argument(
         "--area",
         choices=sorted(set(AREAS) | {"forge"}),
-        help="Evaluation area to run. Required unless --sweep is set.",
+        default=None,
+        help="DEPRECATED (v0.2.5): use --areas <name>. Still accepted.",
     )
     ap.add_argument(
         "--sweep",
         action="store_true",
-        help="Run all stdlib areas (ds4-eval, code, longctx, agent) "
-        "in sequence. Forge requires --area forge explicitly "
-        "since it needs the [forge] extra.",
+        help="DEPRECATED (v0.2.5): use --areas all. Still accepted.",
+    )
+    ap.add_argument(
+        "--no-preflight",
+        action="store_true",
+        help="Skip the pre-run liveness / /v1/models / /props checks. "
+        "Use when running against a deliberately-degraded endpoint "
+        "(chaos tests, CI fixtures) where the preflight would "
+        "false-fail.",
     )
     ap.add_argument(
         "--name",
@@ -500,40 +774,125 @@ def main() -> int:
     args = ap.parse_args()
     if args.parallel < 1:
         ap.error("--parallel must be >= 1")
-    if not args.area and not args.sweep:
-        ap.error("one of --area or --sweep is required")
-    if args.sweep and args.area:
-        ap.error("--area and --sweep are mutually exclusive — pick one")
+
+    # ── Resolve --areas (canonical) + back-compat with --area / --sweep.
+    # Exactly one of {--areas, --area, --sweep} can be supplied; if
+    # nothing is set we default to the smoke area (the new "is the
+    # server alive?" sanity check). All three forms collapse to a
+    # single list of area names in args.areas_list.
+    if args.areas is not None and (args.area or args.sweep):
+        ap.error("--areas cannot be combined with --area or --sweep — use --areas")
+    if args.area and args.sweep:
+        ap.error("--area and --sweep are mutually exclusive — pick one (or use --areas)")
+
+    all_areas = ["smoke", "ds4-eval", "code", "longctx", "agent", "forge"]
+
+    if args.sweep:
+        print(
+            "[lucebench] note: --sweep is deprecated in v0.2.5; use --areas all instead.",
+            file=sys.stderr,
+            flush=True,
+        )
+        # Old sweep behavior: every stdlib area except smoke + forge-if-available.
+        # New "all" matches the spec (every stdlib area). Keep them in sync.
+        args.areas_list = list(all_areas)
+    elif args.area:
+        print(
+            f"[lucebench] note: --area is deprecated in v0.2.5; "
+            f"use --areas {args.area} instead.",
+            file=sys.stderr,
+            flush=True,
+        )
+        args.areas_list = [args.area]
+    else:
+        raw = args.areas if args.areas is not None else "smoke"
+        if raw.strip().lower() == "all":
+            args.areas_list = list(all_areas)
+        else:
+            wanted = [a.strip() for a in raw.split(",") if a.strip()]
+            if not wanted:
+                ap.error("--areas got an empty list")
+            valid = set(AREAS) | {"forge"}
+            bad = [a for a in wanted if a not in valid]
+            if bad:
+                ap.error(
+                    f"--areas: unknown area(s) {bad!r}. Valid: {sorted(valid)}"
+                )
+            args.areas_list = wanted
+
+    # First line out: which version of lucebench is actually running.
+    # Surfaces stale uvx / pip caches at a glance — debugging "wait,
+    # which lucebench is this?" used to require digging through the
+    # area-header line buried after preflight + model resolution.
+    print(f"[lucebench] v{__version__}", flush=True)
+
+    # ── Preflight: bail fast on an unreachable / mis-shaped server BEFORE
+    # firing case requests. The old behavior was to fall through to the
+    # per-case loop and burn ~92 timeouts on a typo'd --url; preflight
+    # surfaces "connection refused" in ~50ms with a one-line diagnostic.
+    # Skip when --no-preflight is set (chaos tests, intentional-failure CI).
+    auth_for_probe = ""
+    if args.auth_env:
+        token = os.environ.get(args.auth_env, "")
+        if token:
+            auth_for_probe = f"Bearer {token}"
+
+    if not args.no_preflight:
+        ok, lines = _preflight(
+            args.url,
+            auth_header=auth_for_probe,
+            timeout_s=5,
+            requested_model=args.model,
+        )
+        for line in lines:
+            print(line, flush=True)
+        if not ok:
+            print(
+                f"abort: server not reachable. Did you forget to start it? "
+                f"Or pass --url? (got {args.url})",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 4
 
     # /v1/models auto-resolution. Only fires when the user left --model
     # at the literal default; an explicit value (even if wrong) is
     # respected so gateways with hundreds of models stay predictable.
+    # The preflight grid above already prints the list with `*` on the
+    # selected id, so this stage only needs a terse one-liner.
     if args.model == "default":
-        auth_for_probe = ""
-        if args.auth_env:
-            token = os.environ.get(args.auth_env, "")
-            if token:
-                auth_for_probe = f"Bearer {token}"
-        resolved = resolve_model(args.url, auth_header=auth_for_probe)
+        resolved, models = list_models(args.url, auth_header=auth_for_probe)
         if resolved:
+            args.model = resolved
+            print(f"[lucebench] --model default → '{resolved}'", flush=True)
+        elif models:
+            # Long list — refuse to guess; preflight already showed the list.
             print(
-                f"[lucebench] --model default → resolved to '{resolved}' via {args.url}/v1/models",
+                f"[lucebench] --model default: {len(models)} models exposed at "
+                f"{args.url}/v1/models — sending 'default' as-is. "
+                "Pass --model explicitly to pick one.",
+                file=sys.stderr,
                 flush=True,
             )
-            args.model = resolved
         else:
             print(
                 f"[lucebench] --model default: /v1/models at {args.url} "
-                "didn't expose exactly one model — sending 'default' as-is. "
+                "exposed no models — sending 'default' as-is. "
                 "Most servers will 404 on this; pass --model explicitly.",
                 file=sys.stderr,
                 flush=True,
             )
 
-    # ── Sweep mode: run all stdlib areas sequentially, write into a
-    # snapshot dir keyed on --name (default: today's date + a sweep tag).
-    if args.sweep:
+    # ── Multi-area dispatch: anything > 1 area in args.areas_list runs
+    # through the sweep path, which writes per-area JSON + a combined
+    # summary under <out-dir>/<name>/. Single-area runs use the slimmer
+    # in-place path below (single JSON-out, no snapshot dir).
+    if len(args.areas_list) > 1:
         return _run_sweep(args)
+
+    # Single area from here on — alias into args.area so the existing
+    # forge / generic-area branches keep working unchanged.
+    args.area = args.areas_list[0]
 
     # Forge takes a completely different path — it owns its own runner
     # (recording AnthropicClient + scenario driver) instead of using
@@ -614,7 +973,7 @@ def main() -> int:
         auth_header = f"Bearer {token}"
 
     print(
-        f"[lucebench] v{__version__} area={args.area} cases={len(selected)} "
+        f"[lucebench] area={args.area} cases={len(selected)} "
         f"url={args.url} model={args.model} think={think} max_tokens={max_tokens}",
         flush=True,
     )
