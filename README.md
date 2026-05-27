@@ -27,13 +27,13 @@
 Each directory is self-contained with setup instructions and benchmark notes.
 
 <p align="center">
-  <a href="optimizations/megakernel/"><img src="assets/svg/card-megakernel-dark.svg" alt="Megakernel" width="46%"></a>
+  <a href="optimizations/megakernel/"><img src="assets/cards/megakernel_card.png" alt="Megakernel" width="46%"></a>
   &nbsp;&nbsp;
-  <a href="server/"><img src="assets/svg/card-dflash-dark.svg" alt="DFlash 27B" width="46%"></a>
+  <a href="server/"><img src="assets/cards/dflash_card.png" alt="DFlash 27B" width="46%"></a>
 </p>
 
 <p align="center">
-  <a href="optimizations/pflash/"><img src="assets/svg/card-pflash-dark.svg" alt="PFlash speculative prefill" width="46%"></a>
+  <a href="optimizations/pflash/"><img src="assets/cards/pflash_card.png" alt="PFlash speculative prefill" width="46%"></a>
 </p>
 
 ---
