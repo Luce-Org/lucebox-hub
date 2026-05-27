@@ -3,7 +3,7 @@ name = "harness"
 version = "0.1.0"
 description = "Client launchers, server-profile sweeps, and bench orchestration for Lucebox."
 readme = "README.md"
-license = { file = "../LICENSE" }
+license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 authors = [{ name = "Lucebox" }]
 
