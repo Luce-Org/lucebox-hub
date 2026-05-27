@@ -1,20 +1,20 @@
-updated_at: 2026-05-27T15:58:00-04:00
+updated_at: 2026-05-27T16:45:00-04:00
 repository: Luce-Org/lucebox-hub
 integration_branch: auto-integration
 remotes:
   upstream: origin
   writable: easel
 heads:
-  upstream_main: 1b51de6
-  previous_integration_head: a340048
-  integration_worktree_head_before_metadata_commit: fb02219
+  upstream_main: 9761c6f
+  previous_integration_head: de82e89
+  integration_worktree_head_before_metadata_commit: c6df337
   base_before_run: easel/auto-integration
 stack:
   included:
     - pr: 285
-      status: already-integrated
-      head: 3642703
-      evidence: Docker stack, lucebox CLI/package, harness, luce-bench, and benchmark/profile stack remain integrated.
+      status: integrated-draft-maintainer-dependency
+      head: 5777151
+      evidence: Docker stack, lucebox CLI/package, harness, luce-bench, benchmark/profile stack, build_image fixes, version-from-git-tags work, and latest lucebox.sh install-name docs are integrated.
     - pr: 288
       status: already-integrated
       head: 5e8136a
@@ -48,16 +48,20 @@ stack:
       head: f2fbf62
       evidence: FP16 safetensors drafter support remains integrated.
   attempted_this_run:
-    - pr: 237
-      status: blocked-needs-human
-      worktree: /tmp/luce-pr237-attempt-20260527-1550
-      evidence: Direct merge into refreshed stack produced broad server layout/MTP conflicts; Claude Code and Codex were both invoked through tmux for conservative conflict-resolution attempts, but unresolved conflicts remain across CMake, backend_factory, step_graph, qwen35 loader/graph/backend, MTP files, and test_dflash.
+    - pr: 174
+      status: conflict-not-integrated
+      worktree: /tmp/luce-auto-int-20260527-1635
+      evidence: Direct merge after origin/main and PR 285 refresh conflicted in deleted/renamed dflash layout files and server/src/errors.cpp plus server/src/internal.h; merge was aborted to preserve the verified stack.
+    - pr: 221
+      status: conflict-not-integrated
+      worktree: /tmp/luce-auto-int-20260527-1635
+      evidence: Direct merge after origin/main and PR 285 refresh produced broad deleted/renamed dflash-to-server layout conflicts across scripts, common MTP/prefix cache files, qwen35 graph/backend files, and tests; merge was aborted.
   pending:
     - prs: [266, 221, 183, 177, 174, 135, 94]
-      reason: Non-draft contributor PRs with likely value, still requiring deliberate selective ports against the current server/harness layout.
+      reason: Non-draft contributor PRs with likely value, still requiring deliberate selective ports against the current server/harness layout. PRs 174 and 221 were re-probed this run and remain pending rather than newly marked blocked because no delegated conflict-resolution attempt was run for them yet.
   blocked_needs_human:
     - pr: 237
-      reason: MTP foundation requires manual architecture-aware port from the old dflash/src layout into current server/src; automated attempts did not reach a coherent buildable merge.
+      reason: MTP foundation requires manual architecture-aware port from the old dflash/src layout into current server/src; prior direct merge plus Claude Code and Codex tmux attempts did not reach a coherent buildable merge.
     - pr: 266
       reason: Harness typed-adapter/session-inject work remains valuable, but previous direct merge was unsafe and needs selective porting against current harness/server layout.
   suggested_close_or_superseded:
@@ -77,28 +81,28 @@ stack:
       reason: Maintainer-authored stale active-CMake equivalent should be reauthored against server/CMakeLists.txt if still needed.
   draft_excluded:
     - prs: [286, 285, 278, 275, 273, 265, 249, 193, 75]
-      reason: Draft PRs are excluded from primary contributor integration target, but noted for dependency awareness.
+      reason: Draft PRs are excluded from the primary contributor integration target. PR 285 is nevertheless already carried as a maintainer/integration dependency and was refreshed to its latest head.
   maintainer_non_draft_lower_priority:
     - prs: [288, 287, 48]
       reason: Maintainer/easel branches are lower priority than contributor PRs; 287 and 288 are already integrated, 48 remains stale/suggested-close.
   upstream_sync:
-    - merged_origin_main: 1b51de6
-    - note: origin/main advanced from dd463e3 to 1b51de6 with README/GPU asset updates; merged cleanly into the integration worktree before metadata refresh.
+    - merged_origin_main: 9761c6f
+    - note: origin/main advanced from 1b51de6 to 9761c6f with README updates; merged cleanly into the integration worktree before PR 285 refresh.
   tests_and_checks:
     - date -Is
-    - git status --short; git branch --show-current; git remote -v
+    - git status --porcelain=v1; git branch --show-current; git remote -v
     - gh auth status
     - HOME=/home/erik /home/erik/.local/bin/claude auth status --text
-    - HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --help
+    - HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --version
     - git fetch --prune origin
     - git fetch --prune easel
     - git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*' (submodule warning for dflash/deps/Block-Sparse-Attention at bcddec6)
     - gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ... --jq ...
-    - git merge --no-edit origin/main in /tmp/luce-auto-int-20260527-1548
-    - git merge --no-commit --no-ff origin/pr/237 in /tmp/luce-pr237-attempt-20260527-1550
-    - HOME=/home/erik /home/erik/.local/bin/claude -p ... --max-turns 20 via tmux session luce-pr237-1552 (hit max turns; conflicts remained)
-    - HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex exec ... via tmux session luce-pr237-codex-1555 (inspected conflict surface; conflicts remained)
+    - git merge --no-edit origin/main in /tmp/luce-auto-int-20260527-1635
+    - git merge --no-edit origin/pr/285 in /tmp/luce-auto-int-20260527-1635
+    - git merge --no-edit origin/pr/174 in /tmp/luce-auto-int-20260527-1635 (conflicted; aborted)
+    - git merge --no-edit origin/pr/221 in /tmp/luce-auto-int-20260527-1635 (conflicted; aborted)
 notes:
-  - Primary checkout /home/erik/Projects/luce2 remained clean.
-  - Retained refreshed integration worktree: /tmp/luce-auto-int-20260527-1548.
-  - Retained conflicted PR 237 worktree for inspection: /tmp/luce-pr237-attempt-20260527-1550.
+  - Primary checkout /home/erik/Projects/luce2 remained clean until the final verified fast-forward step.
+  - Retained refreshed integration worktree: /tmp/luce-auto-int-20260527-1635.
+  - Retained prior conflicted PR 237 worktree for inspection: /tmp/luce-pr237-attempt-20260527-1550.
