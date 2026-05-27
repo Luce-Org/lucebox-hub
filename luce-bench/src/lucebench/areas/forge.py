@@ -275,7 +275,7 @@ def run_forge_area(
     # (client, scenario, config) — positional order matters.
     cfg = EvalConfig()
 
-    def _build_client() -> "_RecordingAnthropicClient":
+    def _build_client() -> _RecordingAnthropicClient:
         return _RecordingAnthropicClient(
             api_key=api_key,
             base_url=url.rstrip("/"),
