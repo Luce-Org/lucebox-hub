@@ -711,6 +711,12 @@ def main() -> int:
                 )
             args.areas_list = wanted
 
+    # First line out: which version of lucebench is actually running.
+    # Surfaces stale uvx / pip caches at a glance — debugging "wait,
+    # which lucebench is this?" used to require digging through the
+    # area-header line buried after preflight + model resolution.
+    print(f"[lucebench] v{__version__}", flush=True)
+
     # ── Preflight: bail fast on an unreachable / mis-shaped server BEFORE
     # firing case requests. The old behavior was to fall through to the
     # per-case loop and burn ~92 timeouts on a typo'd --url; preflight
