@@ -4,8 +4,8 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-27T18:34:57-04:00
-Current branch tip before this metadata refresh: `e656ff0` (`easel/auto-integration`).
+Last refresh: 2026-05-27T18:51:10-04:00
+Current branch tip before this metadata refresh: `6a54c27` (`auto-integration`, ahead of `easel/auto-integration` until pushed).
 
 ## Included in the current stack
 
@@ -22,12 +22,15 @@ Current branch tip before this metadata refresh: `e656ff0` (`easel/auto-integrat
 | #94 | `feat/dflash-qwen36-swa-draft` | absorbed / selectively included | Not an ancestor after the `dflash/` → `server/` migration, but its safetensors SWA config parsing and causal-mask support are present under `server/src/draft/` and `server/src/common/dflash_draft_graph.cpp`. |
 | #62 | `fix/issue-55-stable-kv-pad` | absorbed / selectively included | Not an ancestor after layout migration, but the daemon reset regression test exists as `server/test/test_daemon_reset_merge_resolution.py` and the stack carries follow-up daemon reset fixes. |
 | #48 | `fix/consumer-blackwell-auto-detect` | superseded / selectively included | The old `dflash/CMakeLists.txt` change is obsolete; `server/CMakeLists.txt` now resolves CUDA architectures explicitly, including Blackwell/GB10 handling. |
+| #174 | `split/gemma4-14-small-vram-docs` | selectively included | Ported the documentation-only head commit `8b1caba` to current `server/README.md` as `6a54c27`, updating the CMake command for the current layout and omitting stale follow-up wording. Earlier commits on the branch are inherited Gemma4 code and remain outside this docs-only port. |
 | #285 | `feat/lucebox-docker` | partially included / draft dependency | Integrated through `dd69a25`; draft branch has since advanced to `32961a1`, outside the primary non-draft contributor target unless it becomes a required dependency. |
 
 ## Attempted this run
 
 | PR | Outcome | Notes |
 |---:|---|---|
+| #174 | partially integrated | A read-only delegated assessment confirmed the final docs-only commit was safe to port to `server/README.md`; committed as `6a54c27`. The older inherited Gemma4 commits on the branch were not cherry-picked. |
+| #237 | not integrated | Revalidated with a read-only delegated feasibility review. Direct merge/cherry-pick still conflicts across the legacy `dflash/` to current `server/` migration, including `server/CMakeLists.txt`, `backend_factory`, `DFlashTarget`, Qwen35 backend/target internals, and native server CLI. Smallest coherent functional subset is still a manual MTP foundation port, not a safe cherry-pick. |
 | #137 | not integrated | Manual cherry-pick probe in `/tmp/luce-auto-run-20260527-1815` produced a modify/delete conflict on deleted legacy `dflash/CMakeLists.txt`; the current `server/CMakeLists.txt` architecture handling makes the old standalone BSA/sm_89 patch stale. |
 | #135 | not integrated | Manual cherry-pick probe conflicts in `server/src/internal.h`, `server/src/qwen35/qwen35_target_graph.cpp`, and `server/test/test_dflash.cpp`. Codex tmux review (`codex-pr135-1819`) concluded it is a selective architecture port, not a safe cherry-pick: the old daemon scheduler must be redesigned around current `HttpServer`/`ModelBackend`/Qwen35 cache APIs while preserving newer MoE, KV rotation, snapshot, `last_token_logits_only`, remote-draft, and tool-hint behavior. |
 
@@ -35,14 +38,13 @@ Current branch tip before this metadata refresh: `e656ff0` (`easel/auto-integrat
 
 | PR | Head branch | State | Why held |
 |---:|---|---|---|
-| #237 | `feat/dflash-mtp-foundation` | DIRTY | Valuable, but prior direct/Claude/Codex attempts did not produce a coherent buildable port to current `server/`. Needs selective architecture port. |
+| #237 | `feat/dflash-mtp-foundation` | DIRTY | Valuable, but direct and delegated read-only reviews confirm it needs a selective architecture port to current `server/` rather than a normal merge. |
 | #221 | `feat/mtp-prefix-warm-ghost` | DIRTY | Has direct + external-agent attempt evidence; needs architecture-aware selective port, not a normal merge. |
 | #183 | `split/gemma4-11a-target-mtp-integration` | DIRTY | Older Gemma4 split chain; held pending dependency/supersession review against #237 and current Gemma4 backend. |
 | #182 | `split/gemma4-10-mtp-loader-step-graph` | DIRTY | Older Gemma4 split chain; likely superseded by #183/#237 direction. |
 | #181 | `split/gemma4-09-dflash-draft-runtime` | DIRTY | Older Gemma4 split chain; likely superseded. |
 | #180 | `split/gemma4-08-draft-loader-quant` | DIRTY | Older Gemma4 split chain; likely superseded. |
 | #177 | `split/gemma4-06-kv-correctness` | DIRTY | Older Gemma4 split chain; may need selective correctness-port review. |
-| #174 | `split/gemma4-14-small-vram-docs` | DIRTY | Title is docs-only, but current diff also contains inherited Gemma4 code because the branch stacks on older split work; not a safe standalone cherry-pick. |
 | #154 | `xabicasa/dflash-mtp-speculative-loop` | DIRTY | Older dFlash MTP line stacked on #153; suggested superseded by #237 if that remains survivor. |
 | #153 | `xabicasa/dflash-mtp-integrated` | DIRTY | Older dFlash MTP line; suggested superseded by #237. |
 | #137 | `xabicasa/dflash-build-cmake-sm89-bsa` | blocked-needs-human / stale | Revalidated this run: legacy `dflash/CMakeLists.txt` only; current `server/CMakeLists.txt` supersedes it. Suggested close unless the author re-targets current server layout. |
@@ -56,7 +58,7 @@ Draft PRs remain outside the primary contributor integration target: #286, #285,
 
 ## Validation run
 
-No code integration was committed this run; this update only refreshes integration metadata. Validation was limited to repository/auth/fetch status, PR classification, conflict probes, and integration metadata, including confirming PRs #287 and #288 are already in the stack as merge commits:
+This run committed the documentation-only payload from PR #174 and refreshed integration metadata. Validation covered repository/auth/fetch status, PR classification, delegated read-only feasibility checks, and docs sanity:
 
 - `date -Is`
 - `git status --porcelain=v1; git branch --show-current; git remote -v`
@@ -69,14 +71,17 @@ No code integration was committed this run; this update only refreshes integrati
 - `git merge-base --is-ancestor origin/main easel/auto-integration`
 - `git cherry easel/auto-integration origin/pr/<N>` for open non-draft heads
 - `git diff --name-status origin/main...origin/pr/<N>` for held/stale heads
+- `grep -n "Small-VRAM\|GGML_CUDA_NO_VMM" server/README.md`
+- Delegated read-only PR #174 assessment: safe docs-only port target was `server/README.md`, not removed `dflash/README.md`
+- Delegated read-only PR #237 assessment: still requires a manual MTP foundation port to current `server/`; not cherry-pickable
 - PR #137 cherry-pick probe in an isolated worktree, then restored to a clean index
 - PR #135 cherry-pick probe in an isolated worktree, then restored to a clean index
 - Codex tmux session `codex-pr135-1819` feasibility review for PR #135
 
 ## Notes
 
-- Primary checkout `/home/erik/Projects/luce2` was clean at start and kept clean.
-- This run's retained worktree: `/tmp/luce-auto-run-20260527-1815`.
+- Primary checkout `/home/erik/Projects/luce2` was clean at start; only `server/README.md` and this manifest were changed and committed.
+- This run did not create new temporary worktrees; delegated PR #174/#237 checks were read-only.
 - Retained conflicted PR #221 worktree from prior run: `/tmp/luce-pr221-delegated-20260527-1727`.
 - Retained prior metadata-update worktree from prior run: `/tmp/luce-auto-report-update-20260527-1727`.
 - Retained prior metadata refresh worktree from prior run: `/tmp/luce-auto-report-20260527-175019`.
