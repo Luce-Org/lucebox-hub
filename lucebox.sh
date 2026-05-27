@@ -18,9 +18,12 @@
 #
 # Install:
 #   curl -fsSL https://raw.githubusercontent.com/Luce-Org/lucebox-hub/main/lucebox.sh \
-#        -o ~/.local/bin/lucebox.sh && chmod +x ~/.local/bin/lucebox.sh
+#        -o ~/.local/bin/lucebox && chmod +x ~/.local/bin/lucebox
 #
-# Then: lucebox.sh check && lucebox.sh install && lucebox.sh start
+# Then: lucebox check && lucebox install && lucebox start
+#
+# The runtime works whether the file is installed as `lucebox` (preferred)
+# or `lucebox.sh` — all self-referencing hints use the actual basename.
 #
 # No root is ever taken automatically. Anything that needs sudo (package
 # install, loginctl enable-linger) is printed for the user to run.
@@ -184,7 +187,7 @@ require_systemd() {
     if [ "$LUCEBOX_HOST_HAS_SYSTEMD" != "1" ]; then
         err "user systemd is not available — required for $1"
         hint "On WSL: set 'systemd=true' under [boot] in /etc/wsl.conf, then 'wsl --shutdown'."
-        hint "Otherwise: install systemd, or run 'lucebox.sh serve' to run in the foreground without systemd."
+        hint "Otherwise: install systemd, or run '$SCRIPT_NAME serve' to run in the foreground without systemd."
         exit 1
     fi
 }
@@ -402,7 +405,7 @@ cmd_in_container() {
 
 usage() {
     cat <<EOF
-lucebox.sh $VERSION — host-side wrapper for the lucebox-hub container
+$SCRIPT_NAME $VERSION — host-side wrapper for the lucebox-hub container
 
 Service management (via user systemd):
   install               install user systemd unit
