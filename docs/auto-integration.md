@@ -5,7 +5,7 @@ Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
 Last refresh: 2026-05-27T20:26:50Z
-Current HEAD: `883dcbb` (`docs: record auto-integration refresh and PR 285 merge`)
+Current branch tip: updated in this push; see `git log --oneline` for the exact commit chain.
 
 ## Included in the current stack
 
