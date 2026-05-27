@@ -112,16 +112,24 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           # Suffix every tag with the variant so future CUDA stacks can
-          # coexist under the same image name. Examples:
-          #   ghcr.io/<owner>/lucebox-hub:cuda12
-          #   ghcr.io/<owner>/lucebox-hub:v0.2.0-cuda12
-          #   ghcr.io/<owner>/lucebox-hub:main-cuda12
-          #   ghcr.io/<owner>/lucebox-hub:sha-abc1234-cuda12
+          # coexist under the same image name. Examples (using cuda12):
+          #   ghcr.io/<owner>/lucebox-hub:cuda12              (moving — main/dispatch/release)
+          #   ghcr.io/<owner>/lucebox-hub:0.3.0-cuda12        (pinned — from `lucebox-v0.3.0` tag)
+          #   ghcr.io/<owner>/lucebox-hub:feat-x-cuda12       (per branch)
+          #   ghcr.io/<owner>/lucebox-hub:sha-abc1234-cuda12  (per commit)
           flavor: |
             latest=false
             suffix=-${{ matrix.variant }},onlatest=true
           tags: |
-            type=raw,value=${{ matrix.variant }},suffix=,priority=1000,enable=${{ github.event_name == 'release' }}
+            # Moving variant tag — emitted on main, release, and any
+            # workflow_dispatch with push:true. The `enable=` gate keeps
+            # branch + PR builds from clobbering the published `:cuda12`.
+            type=raw,value=${{ matrix.variant }},suffix=,priority=1000,enable=${{ github.event_name == 'release' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') || (github.event_name == 'workflow_dispatch' && inputs.push) }}
+            # Pinned version tag — extracts the version from a
+            # `lucebox-v<X.Y.Z>` git tag push, mirroring the hatch-vcs
+            # scheme used by luce-bench and lucebox. Yields e.g.
+            # `0.3.0-cuda12` when `lucebox-v0.3.0` is pushed.
+            type=match,pattern=lucebox-v(\d+\.\d+\.\d+),group=1
             type=ref,event=branch
             type=ref,event=tag
             type=ref,event=pr

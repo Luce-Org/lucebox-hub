@@ -3,7 +3,8 @@
 # Single CUDA 12 image from one Dockerfile. Additional CUDA stacks are
 # intentionally omitted.
 #
-#   docker buildx bake cuda12-local   # CUDA 12.8.1, tagged lucebox-hub:cuda12
+#   scripts/build_image.sh            # version-derived local build (preferred)
+#   docker buildx bake cuda12-local   # raw local build; tagged lucebox-hub:cuda12
 #   docker buildx bake cuda12         # CI target; tags come from metadata-action
 #                                 # Arches: sm_75;80;86;89;90;120
 #
@@ -12,12 +13,23 @@
 # (dflash/CMakeLists.txt:276).
 #
 # The CI `cuda12` target takes tags from docker/metadata-action. The local
-# `cuda12-local` target keeps a simple lucebox-hub:cuda12 tag for manual builds.
+# `cuda12-local` target tags `lucebox-hub:cuda12` (moving) and, when
+# `VERSION` is set, also tags `lucebox-hub:<version>-cuda12` (pinned).
+# `scripts/build_image.sh` is the recommended driver: it computes the
+# version from `git describe --tags --match 'lucebox-v*'` so the image
+# carries the same git-derived version as the Python packages (hatch-vcs).
 #
-# Override the registry/tag via env: `TAG=v0.1 REGISTRY=ghcr.io/luce-org/ \
-#   docker buildx bake cuda12-local`.
+# Override the registry / version via env: `VERSION=0.3.0 \
+#   REGISTRY=ghcr.io/luce-org/ docker buildx bake cuda12-local`.
 
 variable "REGISTRY" { default = "" }
+# `VERSION` should be the bare version (e.g. `0.2.7.dev0+gabc1234`) so the
+# image tag composes cleanly. Empty means "no pinned tag, just the moving
+# variant tag" — keeps `docker buildx bake cuda12-local` working with zero
+# config.
+variable "VERSION"  { default = "" }
+# `TAG` is the legacy override (pre-VERSION). Still honored for back-compat
+# but new callers should use `VERSION`.
 variable "TAG"      { default = "" }
 
 # Fat-binary CUDA arch list. Defaults to all supported arches so the
@@ -32,11 +44,13 @@ variable "TAG"      { default = "" }
 # multiple arches.
 variable "DFLASH_CUDA_ARCHES" { default = "75;80;86;89;90;120" }
 
-# Image name prefix. With the default empty REGISTRY/TAG you get
-# `lucebox-hub:cuda12`.
-function "image_tag" {
+# Image tag list. Default (no VERSION / no TAG) emits just the moving
+# `lucebox-hub:cuda12`. With VERSION set we also emit a pinned
+# `lucebox-hub:<version>-cuda12`. Both point at the same image so users
+# can pull either form. TAG (legacy) still works as a single-tag override.
+function "image_tags" {
     params = [variant]
-    result = TAG == "" ? "${REGISTRY}lucebox-hub:${variant}" : "${REGISTRY}lucebox-hub:${TAG}-${variant}"
+    result = TAG != "" ? ["${REGISTRY}lucebox-hub:${TAG}-${variant}"] : (VERSION != "" ? ["${REGISTRY}lucebox-hub:${variant}", "${REGISTRY}lucebox-hub:${VERSION}-${variant}"] : ["${REGISTRY}lucebox-hub:${variant}"])
 }
 
 group "default" {
@@ -70,5 +84,5 @@ target "cuda12" {
 
 target "cuda12-local" {
     inherits = ["_cuda12-base"]
-    tags = [image_tag("cuda12")]
+    tags = image_tags("cuda12")
 }
