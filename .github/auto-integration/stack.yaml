@@ -101,6 +101,14 @@ included:
     merge_commit: ce02bac
     status_at_selection: "non-draft + mergeable, taken after the upstream main refresh"
     notes: "Merged with small CMake/test-stack conflict resolution; kept both the adaptive keep_ratio sources and the test registration additions."
+  - pr: 152
+    title: "Add Gemma 4 RTX 4090 backend helpers"
+    author: adybag14-cyber
+    head_ref: adybag14-cyber:main
+    head_commit: cf735bee36b809799f76e0ea79ac7228e872cdb2
+    merge_commit: da1c567
+    status_at_selection: "non-draft + mergeable; clean merge after #264"
+    notes: "Adds Gemma 4 RTX 4090 helper docs/scripts. Reviewed for obvious secret/destructive-command patterns; no secrets found."
 
 attempted:
   - pr: 282
@@ -109,6 +117,9 @@ attempted:
   - pr: 264
     result: "merged"
     verification: "Merged after resolving server/CMakeLists.txt and server/test/test_server_unit.cpp conflicts, then verified uv.lock regeneration and merge cleanliness."
+  - pr: 152
+    result: "merged"
+    verification: "Merged cleanly; git diff --check, Python py_compile, and bash -n passed. PowerShell parse was skipped because pwsh is not installed in this WSL environment."
 
 held:
   - pr: 278
@@ -166,6 +177,16 @@ checks_run:
     result: "Passed with no whitespace or conflict-marker leftovers after the #264 merge."
   - command: "cmake -S /home/erik/Projects/luce2/server -B /tmp/luce2-build-cuda132 -DDFLASH27B_GPU_BACKEND=cuda -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc"
     result: "Configured with the local CUDA 13.2 toolchain, then stopped because deps/llama.cpp is missing from the source tree expected by server/CMakeLists.txt."
+  - command: "git merge-tree --write-tree easel/auto-integration pr-152"
+    result: "Reported PR #152 as a clean merge candidate."
+  - command: "git diff --check"
+    result: "Passed after merging #152 and updating stack metadata."
+  - command: "python3 -m py_compile scripts/probe_gemma4_context.py scripts/verify_gemma4_4090.py"
+    result: "Passed."
+  - command: "bash -n scripts/lucebox-gemma4-4090.sh"
+    result: "Passed."
+  - command: "PowerShell parse of scripts/Start-LuceboxGemma4090.ps1"
+    result: "Skipped because pwsh is not installed in this WSL environment."
 
 notes:
   - "No easel-only helper branches were needed for this run."
@@ -176,7 +197,7 @@ rebuild_commands: |
   git fetch easel auto-integration --prune
   git checkout auto-integration
   git reset --hard origin/main
-  for n in 262 269 274 276 275 282 264; do
+  for n in 262 269 274 276 275 282 264 152; do
     git fetch origin pull/$n/head:refs/heads/pr-$n
     git merge --no-ff pr-$n
   done
