@@ -4,7 +4,7 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-27T20:39:40-04:00 through 2026-05-27T20:39:40-04:00
+Last refresh: 2026-05-27T20:38:04-04:00 through 2026-05-27T20:49:41-04:00
 Current stack tip before this metadata refresh: `5a76218` (now aligned with `origin/main` `4f4d82e` and local `auto-integration` / `easel/auto-integration`; this run merged upstream main and then refreshed triage).
 
 ## Included in the current stack
@@ -31,6 +31,11 @@ Current stack tip before this metadata refresh: `5a76218` (now aligned with `ori
 | #153 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr153-20260527-2020` produced conflicts in legacy `dflash/CMakeLists.txt`, current `server/src/internal.h`, `server/src/qwen35/gguf_target_loader.cpp`, `server/src/qwen35/qwen35_target_graph.cpp`, and path-mapped MTP docs/tests. Codex tmux session `luce-pr153-codex-2020` wrote `/tmp/pr153-feasibility-20260527-2020.txt`: selective port is feasible, but not as conflict-marker resolution; current-layout loader/graph/token embedding/MoE/cache semantics need deliberate design. |
 | #39 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr39-20260527-2020` produced broad conflicts across deleted legacy `dflash/*` files plus current draft graph/safetensors loader and MoE smoke tests. A tmux-driven Claude assessment session was launched (`luce-pr39-claude-2020`) but exited without producing a report; the branch remains an older MoE/DDTree stack that needs a survivorship review against current qwen35moe support. |
 | #183 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr183-20260527-1959` produced unmerged paths across deleted legacy `dflash/CMakeLists.txt`, moved Gemma4 source/header files, `server/src/errors.cpp`, and `server/src/internal.h`. Codex tmux session `luce-pr183-codex-2003` wrote `/tmp/pr183-feasibility-20260527-1959.txt`: safe normal resolution is not feasible; PR #183 is an older Gemma4 MTP split-chain head whose direct semantic change needs a future current-layout MTP foundation port, likely after #237 or a replacement common MTP design. |
+| #182 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr182-20260527-2039` conflicted on deleted legacy `dflash/CMakeLists.txt`, moved Gemma4 target/draft/MTP source and tests, `server/src/errors.cpp`, and `server/src/internal.h`. Claude exited without a report; Codex session `luce-pr182-codex2-20260527-2039` wrote `/tmp/pr182-feasibility-20260527-2039.txt`: the MTP assistant loader/step graph are portable only as a current-layout `server/src/gemma4` rewrite, not as direct conflict resolution. |
+| #181 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr181-20260527-2039` hit the same old Gemma4 split-chain/current-layout boundary as #180/#182, including moved Gemma4 target/draft files, `server/src/errors.cpp`, and `server/src/internal.h`. It overlaps current Gemma4 DFlash backend and should be mined only after deciding the current Gemma4 MTP port shape. |
+| #180 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr180-20260527-2039` conflicted on legacy `dflash/CMakeLists.txt`, moved Gemma4 target/draft files and tests, `server/src/errors.cpp`, and `server/src/internal.h`. Its draft-loader/quant pieces overlap current `server/src/gemma4` loader/backend work and are not mechanically mergeable. |
+| #154 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr154-20260527-2039` conflicted in current Qwen35 loader/graph/test files plus old-layout MTP docs/scripts/tests. Codex session `luce-pr154-codex-20260527-2039` wrote `/tmp/pr154-feasibility-20260527-2039.txt`: the linear native MTP decode semantics are portable with moderate risk, but require a selective current-layout Qwen35 MTP design preserving current MoE/NVFP4/server abstractions. |
+| #131 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr131-20260527-2039` produced broad conflicts across `.gitmodules`, deleted `dflash/*`, current Gemma4 source/test files, `server/src/internal.h`, `server/src/errors.cpp`, and pFlash adapter/test code. Claude exited without a report; Codex session `luce-pr131-codex2-20260527-2039` wrote `/tmp/pr131-feasibility-20260527-2039.txt`: broad Gemma4 support can be mined, but direct merge would reintroduce the old `dflash27b` API and obsolete build layout. |
 | upstream sync | updated | `origin/main` advanced to `4f4d82e`; `easel/auto-integration` was refreshed from that tip during this run. |
 
 ## Previously attempted / still not integrated
@@ -40,15 +45,15 @@ Current stack tip before this metadata refresh: `5a76218` (now aligned with `ori
 | #237 | `feat/dflash-mtp-foundation` | blocked-needs-human / selective-port | Prior fresh worktree and Codex attempts found broad conflicts in server CMake/backend/MTP/Qwen35 graph/test code. Valuable, but needs a deliberate current-layout MTP foundation port rather than conflict-marker resolution. |
 | #221 | `feat/mtp-prefix-warm-ghost` | blocked-needs-human / dependency | Prior direct + Codex attempts left many unmerged paths and legacy artifacts; depends on a coherent #237-style MTP foundation first. |
 | #183 | `split/gemma4-11a-target-mtp-integration` | blocked-needs-human / superseded-by-current-architecture | Revalidated in the previous run. Its direct `h_prev` assertion has no current target location until Gemma4 MTP runtime is reintroduced in the current `server/src/gemma4` architecture. |
-| #182 | `split/gemma4-10-mtp-loader-step-graph` | pending / likely superseded | Older Gemma4 split chain; should be assessed only after the MTP foundation decision. |
-| #181 | `split/gemma4-09-dflash-draft-runtime` | pending / likely superseded | Older Gemma4 split chain; overlaps current Gemma4 DFlash backend. |
-| #180 | `split/gemma4-08-draft-loader-quant` | pending / likely superseded | Older Gemma4 split chain; overlaps current loader/backend work. |
+| #182 | `split/gemma4-10-mtp-loader-step-graph` | attempted / selective-port | Revalidated this run in `/tmp/luce-attempt-pr182-20260527-2039`; Codex report says the assistant loader/MTP graph are portable only as current-layout `server/src/gemma4` work. |
+| #181 | `split/gemma4-09-dflash-draft-runtime` | attempted / likely superseded | Revalidated this run in `/tmp/luce-attempt-pr181-20260527-2039`; conflicts overlap current Gemma4 DFlash backend and the #182 MTP port decision. |
+| #180 | `split/gemma4-08-draft-loader-quant` | attempted / likely superseded | Revalidated this run in `/tmp/luce-attempt-pr180-20260527-2039`; conflicts overlap current Gemma4 loader/backend work and are not mechanically mergeable. |
 | #177 | `split/gemma4-06-kv-correctness` | attempted / not mechanically mergeable | Revalidated this run in `/tmp/luce-attempt-pr177-20260527-2020`; conflicts are on the old Gemma4 split-chain/current-layout boundary. Needs selective correctness review, not a branch merge. |
-| #154 | `xabicasa/dflash-mtp-speculative-loop` | pending / likely superseded | Older dFlash MTP line stacked on #153; likely superseded by #237 or replacement MTP foundation. |
+| #154 | `xabicasa/dflash-mtp-speculative-loop` | attempted / selective-port | Revalidated this run in `/tmp/luce-attempt-pr154-20260527-2039`; Codex report says the linear native MTP decode semantics are portable with moderate risk, but require current-layout Qwen35 MTP design work. |
 | #153 | `xabicasa/dflash-mtp-integrated` | blocked-needs-human / selective-port | Revalidated this run in `/tmp/luce-attempt-pr153-20260527-2020`; Codex report says a current-layout Qwen35 MTP port is feasible but needs loader/graph/cache/MoE design rather than a mechanical merge. |
 | #137 | `xabicasa/dflash-build-cmake-sm89-bsa` | blocked-needs-human / stale | Legacy `dflash/CMakeLists.txt` only; current `server/CMakeLists.txt` supersedes it. Suggested close unless re-targeted to current server layout. |
 | #135 | `xabicasa/dflash-multi-request-scheduler-batched-target-step` | blocked-needs-human / selective-port | Prior manual and Codex review concluded the concept requires a current-tree scheduler redesign around `HttpServer`/`ModelBackend`/Qwen35 cache APIs. |
-| #131 | `feature/gemma4-support` | pending / likely superseded | Broad older Gemma4 support stack; overlaps later current Gemma4 work and draft #193. |
+| #131 | `feature/gemma4-support` | attempted / selective-port | Revalidated this run in `/tmp/luce-attempt-pr131-20260527-2039`; Codex report says broad Gemma4 support can be mined, but direct merge would resurrect old `dflash27b`/`dflash/` layout. |
 | #39 | `feat/moe-35b-a3b` | attempted / likely superseded | Revalidated this run in `/tmp/luce-attempt-pr39-20260527-2020`; direct merge conflicts with current qwen35moe/draft graph work. Needs a MoE/DDTree survivorship review rather than a branch merge. |
 
 ## Draft / excluded
@@ -83,6 +88,13 @@ This run performed:
 - tmux-driven Claude assessment sessions `luce-pr177-claude-2020` and `luce-pr39-claude-2020` (both exited before producing report files)
 - tmux-driven Codex assessment session `luce-pr153-codex-2020`, producing `/tmp/pr153-feasibility-20260527-2020.txt`
 - `git diff --check -- docs/auto-integration.md` before metadata commit (clean)
+- Fresh isolated PR #182 merge probe in `/tmp/luce-attempt-pr182-20260527-2039`
+- Fresh isolated PR #181 merge probe in `/tmp/luce-attempt-pr181-20260527-2039`
+- Fresh isolated PR #180 merge probe in `/tmp/luce-attempt-pr180-20260527-2039`
+- Fresh isolated PR #154 merge probe in `/tmp/luce-attempt-pr154-20260527-2039`
+- Fresh isolated PR #131 merge probe in `/tmp/luce-attempt-pr131-20260527-2039`
+- tmux-driven Claude assessment sessions `luce-pr182-claude-20260527-2039` and `luce-pr131-claude-20260527-2039` (both exited before producing report files)
+- tmux-driven Codex assessment sessions `luce-pr182-codex2-20260527-2039`, `luce-pr154-codex-20260527-2039`, and `luce-pr131-codex2-20260527-2039`, producing `/tmp/pr182-feasibility-20260527-2039.txt`, `/tmp/pr154-feasibility-20260527-2039.txt`, and `/tmp/pr131-feasibility-20260527-2039.txt`
 - `git diff --check HEAD^1..HEAD` after the upstream merge and metadata refresh (clean)
 - `uv run --directory luce-bench --with pytest pytest -q tests/test_runner.py tests/test_smoke_area.py` (passed in this run)
 
@@ -93,4 +105,9 @@ This run performed:
 - Retained conflicted worktree `/tmp/luce-attempt-pr177-20260527-2020` for audit; it contains unmerged PR #177 probe state.
 - Retained conflicted worktree `/tmp/luce-attempt-pr153-20260527-2020` for audit; it contains unmerged PR #153 probe state and corresponds to `/tmp/pr153-feasibility-20260527-2020.txt`.
 - Retained conflicted worktree `/tmp/luce-attempt-pr39-20260527-2020` for audit; it contains unmerged PR #39 probe state.
+- Retained conflicted worktree `/tmp/luce-attempt-pr182-20260527-2039` for audit; it contains unmerged PR #182 probe state and corresponds to `/tmp/pr182-feasibility-20260527-2039.txt`.
+- Retained conflicted worktree `/tmp/luce-attempt-pr181-20260527-2039` for audit; it contains unmerged PR #181 probe state.
+- Retained conflicted worktree `/tmp/luce-attempt-pr180-20260527-2039` for audit; it contains unmerged PR #180 probe state.
+- Retained conflicted worktree `/tmp/luce-attempt-pr154-20260527-2039` for audit; it contains unmerged PR #154 probe state and corresponds to `/tmp/pr154-feasibility-20260527-2039.txt`.
+- Retained conflicted worktree `/tmp/luce-attempt-pr131-20260527-2039` for audit; it contains unmerged PR #131 probe state and corresponds to `/tmp/pr131-feasibility-20260527-2039.txt`.
 - Retained prior conflicted worktrees from earlier runs as previously reported; cleanup would be separate maintenance.
