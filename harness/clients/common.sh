@@ -10,8 +10,26 @@ RUN_DIR="${RUN_DIR:-/workspace/lucebox-client-harness-runs}"
 
 DEFAULT_TARGET="$REPO_DIR/server/models/Qwen3.6-27B-Q4_K_M.gguf"
 DEFAULT_DRAFT="$REPO_DIR/server/models/draft/dflash-draft-3.6-q4_k_m.gguf"
-TARGET="${TARGET:-${DFLASH_TARGET:-$DEFAULT_TARGET}}"
-DRAFT="${DRAFT:-${DFLASH_DRAFT:-$DEFAULT_DRAFT}}"
+TARGET_WAS_EXPLICIT=0
+if [[ -n "${TARGET+x}" ]]; then
+  TARGET_WAS_EXPLICIT=1
+elif [[ -n "${DFLASH_TARGET+x}" ]]; then
+  TARGET="$DFLASH_TARGET"
+  TARGET_WAS_EXPLICIT=1
+else
+  TARGET="$DEFAULT_TARGET"
+fi
+if [[ -n "${DRAFT+x}" ]]; then
+  :
+elif [[ -n "${DFLASH_DRAFT+x}" ]]; then
+  DRAFT="$DFLASH_DRAFT"
+elif [[ "$TARGET_WAS_EXPLICIT" == "1" ]]; then
+  # A custom target may be Gemma/Laguna/Qwen3 or another model without a
+  # matching DFlash draft. Avoid attaching the default Qwen draft silently.
+  DRAFT=""
+else
+  DRAFT="$DEFAULT_DRAFT"
+fi
 MODEL_SERVER="${MODEL_SERVER:-lucebox}"
 DFLASH_SERVER_BIN="${DFLASH_SERVER_BIN:-$REPO_DIR/server/build/dflash_server}"
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/workspace/llama-cpp-server-build/bin/llama-server}"
@@ -54,6 +72,10 @@ SERVER_LOG="$LOG_DIR/server.log"
 
 mkdir -p "$LOG_DIR"
 
+draft_enabled() {
+  [[ -n "${DRAFT:-}" && "$DRAFT" != "none" && "$DRAFT" != "off" && "$DRAFT" != "0" ]]
+}
+
 start_lucebox_server() {
   if [[ "$MODEL_SERVER" == "llamacpp" ]]; then
     start_llamacpp_server
@@ -80,11 +102,15 @@ start_dflash_native_server() {
     echo "  hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir $REPO_DIR/server/models/" >&2
     return 1
   fi
-  if [[ ! -f "$DRAFT" ]]; then
+  if draft_enabled && [[ ! -f "$DRAFT" ]]; then
     echo "DFlash draft not found: $DRAFT" >&2
     echo "Set DRAFT=/path/to/dflash-draft.gguf or DFLASH_DRAFT=/path/to/dflash-draft.gguf, or download the default:" >&2
     echo "  hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf --local-dir $REPO_DIR/server/models/draft/" >&2
     return 1
+  fi
+  local draft_args=()
+  if draft_enabled; then
+    draft_args=(--draft "$DRAFT")
   fi
   local extra_args=()
   if [[ -n "$EXTRA_SERVER_ARGS" ]]; then
@@ -102,7 +128,7 @@ start_dflash_native_server() {
   export DFLASH27B_KV_K="$CACHE_TYPE_K"
   export DFLASH27B_KV_V="$CACHE_TYPE_V"
   "$DFLASH_SERVER_BIN" "$TARGET" \
-    --draft "$DRAFT" \
+    "${draft_args[@]}" \
     --host "$HOST" \
     --port "$PORT" \
     --max-ctx "$MAX_CTX" \
