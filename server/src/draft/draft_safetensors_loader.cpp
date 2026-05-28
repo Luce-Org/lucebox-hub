@@ -30,6 +30,7 @@
 #include "internal.h"
 
 #include <climits>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -462,6 +463,7 @@ static bool build_prefers_bf16_projection() {
 // HuggingFace models always ship config.json alongside the weights.
 // Returns 0.0f and prints a warning if the key is missing or the file is absent.
 static float read_rope_theta_from_config(const std::string & st_path) {
+    // Find directory: everything up to and including the last '/' (or '\' on Windows).
     std::string dir = st_path;
     const size_t slash = dir.find_last_of("/\\");
     if (slash != std::string::npos) dir.resize(slash + 1); else dir = "./";
@@ -473,11 +475,14 @@ static float read_rope_theta_from_config(const std::string & st_path) {
                      cfg_path.c_str());
         return 0.0f;
     }
+    // Read entire file into a string then do a simple key scan.
+    // A full JSON parser is overkill; we just look for "rope_theta": <number>.
     std::string buf;
     char tmp[4096];
     while (std::fgets(tmp, sizeof(tmp), f)) buf += tmp;
     std::fclose(f);
 
+    // Search for "rope_theta" key.
     const char * key = "\"rope_theta\"";
     size_t pos = buf.find(key);
     if (pos == std::string::npos) {
@@ -485,6 +490,7 @@ static float read_rope_theta_from_config(const std::string & st_path) {
                      cfg_path.c_str());
         return 0.0f;
     }
+    // Skip past the key, optional whitespace, colon, optional whitespace, then parse number.
     pos += std::strlen(key);
     while (pos < buf.size() && (buf[pos] == ' ' || buf[pos] == '\t' || buf[pos] == '\n' || buf[pos] == '\r')) pos++;
     if (pos >= buf.size() || buf[pos] != ':') {
@@ -494,7 +500,7 @@ static float read_rope_theta_from_config(const std::string & st_path) {
     pos++;
     while (pos < buf.size() && (buf[pos] == ' ' || buf[pos] == '\t' || buf[pos] == '\n' || buf[pos] == '\r')) pos++;
     float val = 0.0f;
-    if (std::sscanf(buf.c_str() + pos, "%f", &val) != 1 || val <= 0.0f) {
+    if (std::sscanf(buf.c_str() + pos, "%f", &val) != 1 || !std::isfinite(val) || val <= 0.0f) {
         std::fprintf(stderr, "[draft-st] WARNING: invalid rope_theta value in %s\n", cfg_path.c_str());
         return 0.0f;
     }
