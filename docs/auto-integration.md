@@ -11,18 +11,20 @@ Refreshed stack tip prepared in this run: this commit
 
 This branch is maintained as a reproducible patch stack over `origin/main`.
 The primary checkout was clean at the start of this unattended run. Since the
-previous refresh, `origin/main` remained at `cfdd2fd5` and a new non-draft
-contributor PR, #301, opened against `main`. This run created an isolated
-worktree from fetched `easel/auto-integration`, confirmed the upstream base was
-already an ancestor, merged #301, then re-enumerated and re-checked the remaining
-open non-draft contributor PRs. All currently mergeable non-draft contributor PRs
-are now included in the stack; the remaining non-ancestor PRs still require
-current-layout selective ports or are superseded.
+previous refresh, `origin/main` remained at `cfdd2fd5` and new non-draft
+contributor PRs #301 and #302 opened against `main`. This run created an
+isolated worktree from fetched `easel/auto-integration`, confirmed the upstream
+base was already an ancestor, merged #301, pushed once, then the required
+post-push re-enumeration found #302 and the same worktree merged it cleanly. The
+run then re-checked the remaining open non-draft contributor PRs. All currently
+mergeable non-draft contributor PRs are now included in the stack; the remaining
+non-ancestor PRs still require current-layout selective ports or are superseded.
 
 ## Included in the current stack
 
 | PR | Head branch | Head | State | Notes |
 |---:|---|---:|---|---|
+| #302 | `fix/harness-model-paths` | `ea40732` | included | Client harness launchers now honor `DFLASH_TARGET`/`DFLASH_DRAFT`, validate target/draft paths before spawning servers, and document model path overrides. |
 | #301 | `fix/ddtree-test-harness` | `1b3882d` | included | DDTree test harness now reads full verify logits, computes the posterior on CPU instead of relying on the tree GPU argmax shortcut, reuses the logits buffer for sampler bonus logits, and counts generated tokens before the early-exit path. |
 | #300 | `fix/sigterm-gpu-unload` | upstream | included through upstream | `origin/main` now includes the SIGTERM GPU-unload fix via merge commit `a308008a`. |
 | #299 | `feat/draft-swa-flag` | upstream | included through upstream | `origin/main` now includes the draft SWA env/flag support via merge commit `e1a75548`; the previous auto-integration merge is also still in history. |
@@ -43,8 +45,9 @@ current-layout selective ports or are superseded.
 | PR | Outcome | Notes |
 |---:|---|---|
 | upstream sync | checked | `origin/main` remains `cfdd2fd5`; it was already an ancestor of fetched `easel/auto-integration` `9e89ce5f` before this refresh. |
+| #302 | integrated | Required post-push re-enumeration found new PR #302. `git merge --no-ff --no-commit origin/pr/302` merged cleanly in the same isolated worktree and was committed as `cf0288f6`. The patch touches `README.md`, `harness/clients/README.md`, and `harness/clients/common.sh`. |
 | #301 | integrated | `git merge --no-ff --no-commit origin/pr/301` merged cleanly in the isolated worktree and was committed as `3bb44301`. The patch is limited to `server/test/test_dflash.cpp`. |
-| current integrated PRs | checked | `git merge-base --is-ancestor origin/pr/<n> HEAD` passed for open non-draft PRs #301, #295, #294, #292, #289, #276, #274, #266, #152, and #142. #298/#299/#300 are included through `origin/main`. |
+| current integrated PRs | checked | `git merge-base --is-ancestor origin/pr/<n> HEAD` passed for open non-draft PRs #302, #301, #295, #294, #292, #289, #276, #274, #266, #152, and #142. #298/#299/#300 are included through `origin/main`. |
 | #237 | blocked-needs-human / selective-port | Direct merge still conflicts across moved legacy `dflash/` paths, common MTP interfaces, Qwen35 backend/graph/loader files, CMake, daemon/server wiring, and tests. A fresh tmux-driven Codex feasibility pass (`/tmp/luce-pr237-codex-20260528-1643.txt`) used read-only inspection and concluded direct merge is unsafe; current-layout salvage is valuable but non-trivial because current `server/src` still lacks `MtpSource`, `IMtpModule`, `Qwen35MtpModule`, `--mtp-*`, and MTP backend support. |
 | #221 | blocked-needs-human / dependency | Direct merge still conflicts across prefix-cache/MTP/common/Qwen35 files and tests. It depends on a current-layout #237-equivalent MTP foundation before a useful port can be made. |
 | #154 | blocked-needs-human / dependency | Direct merge conflicts in old `dflash/CMakeLists.txt`, MTP docs, old internal/target graph paths, and MTP smoke/contract tests. Portable only after the current-layout Qwen35 MTP foundation exists. |
@@ -91,10 +94,12 @@ This run performed:
 - Worktree `/tmp/luce-auto-cron-20260528-170548` was created from `easel/auto-integration` `9e89ce5f`.
 - `git rev-list --left-right --count origin/main...HEAD` returned `0 333` and `git merge-base --is-ancestor origin/main HEAD` passed before merging #301.
 - `git merge --no-ff --no-commit origin/pr/301` succeeded cleanly; commit `3bb44301` integrated #301.
+- Initial push to `easel/auto-integration` succeeded, advancing the branch to `89dcc469`; required post-push PR re-enumeration then found new non-draft PR #302.
+- `git fetch origin pull/302/head:refs/remotes/origin/pr/302` succeeded, and `git merge --no-ff --no-commit origin/pr/302` merged cleanly; commit `cf0288f6` integrated #302.
 - Isolated direct probes attempted `git merge --no-commit --no-ff origin/pr/<n>` for #237, #221, #154, #153, #137, #135, #94, and #48; each conflicted and was aborted in the worktree. Log: `/tmp/luce-merge-probes-20260528-1705.txt`.
-- Ancestor checks passed for included open non-draft contributor PR refs #301, #295, #294, #292, #289, #276, #274, #266, #152, and #142.
-- `git diff --check` passed before the manifest commit.
-- Targeted conflict-marker scan over `docs/auto-integration.md` and `server/test/test_dflash.cpp` found no merge markers before this manifest commit.
+- Ancestor checks passed for included open non-draft contributor PR refs #302, #301, #295, #294, #292, #289, #276, #274, #266, #152, and #142.
+- `bash -n harness/clients/common.sh`, `git diff --check`, ancestor checks, and the targeted conflict-marker scan over `docs/auto-integration.md`, `server/test/test_dflash.cpp`, `README.md`, `harness/clients/README.md`, and `harness/clients/common.sh` passed before this manifest commit.
+- A local shell smoke check for #302's model-path selection/failure behavior was attempted but blocked by the unattended command-safety guard before execution, so the run did not retry it.
 - GitHub checks for draft PR #286 were inspected before push; `uv workspace` passed while `cuda12` and `Build (cmake + uv sync --extra megakernel)` were pending.
 - Push status is recorded after this manifest commit and final push attempt.
 
