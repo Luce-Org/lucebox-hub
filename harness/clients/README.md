@@ -15,12 +15,29 @@ Each launcher starts `server/build/dflash_server`, runs the client, writes logs
 under `/workspace/lucebox-client-harness-runs`, then stops the server.
 
 The launcher will start `server/build/dflash_server` by default, or the path in
-`DFLASH_SERVER_BIN`.
+`DFLASH_SERVER_BIN`. The default model paths are
+`server/models/Qwen3.6-27B-Q4_K_M.gguf` and
+`server/models/draft/dflash-draft-3.6-q4_k_m.gguf`; override them with
+`TARGET`/`DRAFT` or the standard `DFLASH_TARGET`/`DFLASH_DRAFT` env vars.
+When you set a custom target without setting a draft, the launcher does not
+attach the default Qwen draft. Use `DRAFT=none` explicitly for no-draft targets
+such as Gemma, Laguna, or standalone Qwen3.
 
 ```bash
 DFLASH_SERVER_BIN=server/build/dflash_server \
+DFLASH_TARGET=/path/to/Qwen3.6-27B-Q4_K_M.gguf \
+DFLASH_DRAFT=/path/to/dflash-draft-3.6-q4_k_m.gguf \
 MAX_CTX=32768 MAX_TOKENS=512 \
 BUDGET=22 VERIFY_MODE=ddtree \
+harness/clients/run_codex.sh
+```
+
+Gemma example:
+
+```bash
+DFLASH_TARGET=/path/to/gemma.gguf \
+DRAFT=none \
+MAX_CTX=32768 MAX_TOKENS=512 \
 harness/clients/run_codex.sh
 ```
 
