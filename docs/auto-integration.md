@@ -4,9 +4,9 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-27T23:28:35-04:00
+Last refresh: 2026-05-27T23:46:37-04:00
 Current base: `origin/main` `4f4d82e`
-Current integration tip before this refresh: `easel/auto-integration` `2dd4115`
+Current integration tip before this refresh: `easel/auto-integration` `e637507`
 
 This branch is maintained as a reproducible patch stack over `origin/main`. The
 primary checkout was clean at the start of this unattended run. This refresh did
@@ -37,22 +37,21 @@ carried.
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| upstream sync | checked | In isolated worktree `/tmp/luce-auto-cron-20260527-232446`, `git merge --no-edit origin/main` reported `Already up to date.` |
-| all non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated direct probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39. Every direct probe conflicted and was aborted in the isolated worktree. Consolidated output: `/tmp/luce-merge-probes-20260527-232446.txt`. |
-| #237 | delegated feasibility attempt incomplete | A tmux-driven Claude read-only feasibility run was attempted for the current-layout dFlash MTP foundation port, but the first session ended without a report and the narrower redirected rerun produced an empty report file (`/tmp/pr237-claude-feasibility-20260527-232446.txt`). Manual diff inspection still shows the PR is a large old-layout MTP foundation (`dflash/src/common/mtp_*`, `dflash/src/qwen35/qwen35_mtp*`, tests) that would need a deliberate current `server/` port rather than conflict-marker resolution. |
-| #221 | delegated feasibility attempt incomplete | A tmux-driven Codex read-only feasibility run was attempted for MTP prefix-cache warm/ghost follow-up behavior. It did not write the requested report (`/tmp/pr221-codex-feasibility-20260527-232446.txt` absent) and was stopped after emitting diff/log excerpts. Manual diff inspection confirms #221 layers a large PR #237-like MTP stack plus bench artifacts, matrix scripts, Qwen36 MTP files, and prefix-cache snapshot/shape-contract pieces; it remains dependent on a current-layout MTP foundation. |
+| upstream sync | checked | In isolated worktree `/tmp/luce-auto-cron-20260527-234243`, `git merge --no-edit origin/main` reported `Already up to date.` |
+| all non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated direct probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39. Every direct probe conflicted and was aborted in the isolated worktree. Consolidated output: `/tmp/luce-merge-probes-20260527-234243.txt`. |
+| #177 | delegated/manual feasibility attempt | Created conflicted probe worktree `/tmp/luce-pr177-feas-20260527-234303` and attempted two tmux-driven Claude read-only feasibility runs. Both exited with only `Error: Reached max turns` (`/tmp/pr177-claude-feasibility-20260527-234314.txt`, `/tmp/pr177-claude-feasibility-20260527-234433.txt`), so no delegated conclusion is claimed. Manual diff/status inspection shows #177 is a 9-file / ~2.5k-line old-layout Gemma4 KV/target-graph slice that maps mostly from deleted `dflash/*` into current `server/*` and conflicts in `server/src/errors.cpp` and `server/src/internal.h`; it remains a selective current-layout Gemma4 correctness port, not a mechanical merge. |
 
 ## Pending / blocked-needs-human / selective-port candidates
 
 | PR | Head branch | Current status | Next useful action |
 |---:|---|---|---|
-| #237 | `feat/dflash-mtp-foundation` | blocked-needs-human / selective-port | Keep open for deliberate current-layout MTP foundation port with MTP off by default. This run revalidated that the direct merge still conflicts and that the branch is a 33-file / ~7.2k-line old-layout MTP foundation touching `dflash/src/common/mtp_*`, `dflash/src/qwen35/qwen35_mtp*`, backend interfaces, daemon/server wiring, and tests. Prior Codex report remains `/tmp/pr237-feasibility-20260527-2124.txt`; this run's Claude delegation failed to produce a usable report. |
-| #221 | `feat/mtp-prefix-warm-ghost` | blocked-needs-human / dependency | Follow-on after #237/equivalent MTP foundation; salvage prefix-cache MTP warm/range-warm behavior only after current-layout MTP exists. This run revalidated that the branch is ~88 files / ~18k lines and includes many bench/result artifacts plus Qwen36 MTP files. Prior Codex report remains `/tmp/pr221-feasibility-20260527-2149.txt`; this run's Codex delegation only emitted excerpts and no final report. |
+| #237 | `feat/dflash-mtp-foundation` | blocked-needs-human / selective-port | Keep open for deliberate current-layout MTP foundation port with MTP off by default. Direct merge still conflicts; previous reports identify a large old-layout MTP foundation touching `dflash/src/common/mtp_*`, `dflash/src/qwen35/qwen35_mtp*`, backend interfaces, daemon/server wiring, and tests. |
+| #221 | `feat/mtp-prefix-warm-ghost` | blocked-needs-human / dependency | Follow-on after #237/equivalent MTP foundation; salvage prefix-cache MTP warm/range-warm behavior only after current-layout MTP exists. |
 | #183 | `split/gemma4-11a-target-mtp-integration` | blocked-needs-human / superseded-by-current-architecture | Needs a current-layout Gemma4 MTP target integration design; direct old split-chain merge remains unsafe. |
 | #182 | `split/gemma4-10-mtp-loader-step-graph` | selective-port | Portable only as current-layout `server/src/gemma4` assistant loader/MTP graph work. Prior Codex report: `/tmp/pr182-feasibility-20260527-2039.txt`. |
 | #181 | `split/gemma4-09-dflash-draft-runtime` | likely superseded / selective-port | Overlaps current Gemma4 DFlash backend and should be mined only after the current Gemma4 MTP shape is chosen. |
 | #180 | `split/gemma4-08-draft-loader-quant` | likely superseded / selective-port | Overlaps current Gemma4 loader/backend code; not mechanically mergeable. |
-| #177 | `split/gemma4-06-kv-correctness` | not mechanically mergeable | Needs selective correctness review against current `server/src/gemma4`. |
+| #177 | `split/gemma4-06-kv-correctness` | selective-port / blocked-needs-human | Current run revalidated conflict shape: old-layout additions `dflash/include/gemma4.h`, `dflash/src/gemma4_target_graph.cpp`, `dflash/src/gemma4_target_loader.cpp`, and Gemma4 tests need deliberate mapping into current `server/` APIs; no safe standalone conflict resolution was found. |
 | #154 | `xabicasa/dflash-mtp-speculative-loop` | selective-port | Linear native MTP decode semantics are portable with moderate risk after a current-layout Qwen35 MTP design. Prior Codex report: `/tmp/pr154-feasibility-20260527-2039.txt`. |
 | #153 | `xabicasa/dflash-mtp-integrated` | blocked-needs-human / selective-port | Current-layout Qwen35 MTP port is feasible but requires loader/graph/cache/MoE design, not conflict-marker resolution. Prior Codex report: `/tmp/pr153-feasibility-20260527-2020.txt`. |
 | #137 | `xabicasa/dflash-build-cmake-sm89-bsa` | stale / suggested close | Edits only deleted legacy `dflash/CMakeLists.txt`; close or ask author to retarget current `server/CMakeLists.txt`. |
@@ -73,22 +72,21 @@ and #75. #285 remains partially carried only as an integration dependency.
 
 This run performed:
 
-- `date -Is` -> 2026-05-27T23:23:44-04:00 during preflight, 2026-05-27T23:28:35-04:00 for this metadata refresh.
+- `date -Is` -> 2026-05-27T23:41:51-04:00 during preflight, 2026-05-27T23:46:37-04:00 for this metadata refresh.
 - Primary checkout `git status --short` was clean before work began and remained clean while probing in worktrees.
 - `git remote -v` verified `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
 - `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status` succeeded for account `easel`.
 - `HOME=/home/erik /home/erik/.local/bin/claude auth status --text` succeeded for the Claude Team account.
 - `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --version` reported `codex-cli 0.130.0`.
 - `/home/linuxbrew/.linuxbrew/bin/tmux -V` reported `tmux 3.6a`.
-- `git fetch --prune origin` and `git fetch --prune easel` completed; fetch pruned stale local `origin/pr/*` refs from the previous run, then targeted fetches recreated current open non-draft PR refs.
+- `git fetch --prune origin` and `git fetch --prune easel` completed; targeted fetches recreated current open non-draft PR refs.
 - `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ... --jq ...` enumerated all open PRs.
 - Targeted fetches for all open non-draft PR refs (`origin/pr/<n>`).
 - `git merge-base --is-ancestor origin/pr/<n> easel/auto-integration` classification checks: #284, #276, #274, #266, #152, and #142 are current ancestors; #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39 remain non-ancestor/selective-port candidates.
-- Isolated reconciliation/probe worktree `/tmp/luce-auto-cron-20260527-232446`; `git merge --no-edit origin/main` reported already up to date.
-- Fresh direct merge probes for all currently non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all direct probes conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260527-232446.txt`.
-- Tmux-driven Claude and Codex delegation attempts for #237/#221 were monitorable but did not produce usable final reports; this is recorded above rather than treated as a successful delegated conclusion.
-- Manual read-only `git diff --stat` / `git diff --name-status` inspection of #237 and #221 against the integration tip to confirm scope and dependency ordering.
-- `git diff --check -- docs/auto-integration.md` (clean).
+- Isolated reconciliation/probe worktree `/tmp/luce-auto-cron-20260527-234243`; `git merge --no-edit origin/main` reported already up to date.
+- Fresh direct merge probes for all currently non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all direct probes conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260527-234243.txt`.
+- Tmux-driven Claude delegation attempts for #177 were monitorable but did not produce usable final reports; this is recorded above rather than treated as a successful delegated conclusion.
+- Manual read-only `git diff --stat` / `git diff --name-status` / `git status --short` inspection of #177 against the integration tip to confirm scope and conflict mapping.
 
 No source/build validation was rerun because this refresh changes only
 integration metadata. Previous source validation remains unchanged: local
@@ -98,8 +96,8 @@ Value 'sm_52' is not defined for option 'gpu-name'`).
 
 ## Notes
 
-- Primary checkout `/home/erik/Projects/luce2` stayed clean during probing and will only be fast-forwarded after the metadata push is verified.
-- Retained worktree `/tmp/luce-auto-cron-20260527-232446` for this metadata refresh and direct-merge probe audit.
-- Retained consolidated direct-merge probe output at `/tmp/luce-merge-probes-20260527-232446.txt`.
-- Retained empty/incomplete delegated report path `/tmp/pr237-claude-feasibility-20260527-232446.txt`; `/tmp/pr221-codex-feasibility-20260527-232446.txt` was not created.
+- Primary checkout `/home/erik/Projects/luce2` stayed clean during probing and was modified only for this metadata refresh.
+- Retained worktree `/tmp/luce-auto-cron-20260527-234243` for this metadata refresh and direct-merge probe audit.
+- Retained conflicted probe worktree `/tmp/luce-pr177-feas-20260527-234303` because it contains conflict state useful for the next selective-port attempt.
+- Retained delegated report/error paths `/tmp/pr177-claude-feasibility-20260527-234314.txt` and `/tmp/pr177-claude-feasibility-20260527-234433.txt`.
 - Prior retained conflicted worktrees and agent reports remain as listed in earlier manifest revisions; cleanup is separate maintenance.
