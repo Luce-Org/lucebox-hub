@@ -416,6 +416,11 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
 
     reset_recurrent_state(target_cache());
 
+    // Invalidate cached pipelined decode state between requests.
+    // The cached DeltaNet graphs reference conv_state/ssm_state tensors that were
+    // just zeroed; rebuilding is cheap (~30 graphs) and avoids stale-pointer crashes.
+    pipe_state_.reset();
+
     const int hidden = target_weights().n_embd;
     const int vocab  = target_weights().n_vocab;
     std::vector<float> act_cur((size_t)hidden);

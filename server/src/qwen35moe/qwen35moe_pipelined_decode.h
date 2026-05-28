@@ -34,6 +34,7 @@ struct CachedPrefnGraph {
     ggml_tensor * moe_selected = nullptr;  // output: selected expert IDs
     ggml_tensor * moe_weights = nullptr;   // output: routing weights
 
+    ~CachedPrefnGraph() { free(); }
     bool valid() const { return ctx && gf && alloc && ffn_post && ffn_residual; }
     void free();
 };
@@ -74,6 +75,7 @@ struct PipelinedDecodeState {
     int n_expert_used = 0;
     int full_attention_interval = 0;
 
+    ~PipelinedDecodeState() { destroy(); }
     bool valid() const { return gpu_state.valid() && n_layer > 0; }
     void destroy();
 };
