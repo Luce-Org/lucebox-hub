@@ -7,12 +7,21 @@ change did not break that tool.
 Run from the repo on the GPU machine:
 
 ```bash
-cd /workspace/lucebox-hub-harness
+cd lucebox-hub
 harness/clients/run_codex.sh
 ```
 
 Each launcher starts `server/build/dflash_server`, runs the client, writes logs
-under `/workspace/lucebox-client-harness-runs`, then stops the server.
+under `.harness-work/runs`, then stops the server. Override `REPO_DIR`,
+`CLIENT_WORK_DIR`, or `RUN_DIR` for custom/shared locations.
+If a client CLI is missing, the launcher installs it automatically. Set
+`AUTO_INSTALL_CLIENTS=0` to require a preinstalled binary instead.
+
+To preinstall real-client CLIs yourself:
+
+```bash
+python3 harness/client_test_runner.py install --clients codex,hermes,openwebui
+```
 
 The launcher will start `server/build/dflash_server` by default, or the path in
 `DFLASH_SERVER_BIN`. The default model paths are
