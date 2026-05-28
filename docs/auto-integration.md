@@ -89,6 +89,10 @@ This run performed:
 - Isolated direct probes attempted `git merge --no-commit --no-ff origin/pr/<n>` for #237, #221, #154, #153, #137, #135, #94, and #48; each conflicted and was aborted in the worktree. Log: `/tmp/luce-merge-probes-20260528-1643.txt`.
 - tmux-driven Codex feasibility analysis for #237 completed without file modifications and produced `/tmp/luce-pr237-codex-20260528-1643.txt`; the tmux session was then closed.
 - Ancestor checks passed for included open non-draft contributor PR refs #295, #294, #292, #289, #276, #274, #266, #152, and #142.
+- `git diff --check` passed before the manifest commit.
+- Push to `easel/auto-integration` succeeded, advancing the branch to `2a351ca1`.
+- Required post-push PR re-enumeration found no new non-draft PRs beyond the same open set listed above.
+- `gh pr checks 286 --repo Luce-Org/lucebox-hub` after the push showed both workflow checks pending for run `26601442201`.
 
 ## Notes
 
