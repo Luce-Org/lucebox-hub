@@ -34,7 +34,25 @@ struct CachedPrefnGraph {
     ggml_tensor * moe_selected = nullptr;  // output: selected expert IDs
     ggml_tensor * moe_weights = nullptr;   // output: routing weights
 
+    CachedPrefnGraph() = default;
     ~CachedPrefnGraph() { free(); }
+    CachedPrefnGraph(const CachedPrefnGraph &) = delete;
+    CachedPrefnGraph & operator=(const CachedPrefnGraph &) = delete;
+    CachedPrefnGraph(CachedPrefnGraph && o) noexcept { *this = std::move(o); }
+    CachedPrefnGraph & operator=(CachedPrefnGraph && o) noexcept {
+        if (this != &o) {
+            free();
+            ctx = o.ctx; gf = o.gf; alloc = o.alloc;
+            inp_embed = o.inp_embed; ffn_post = o.ffn_post;
+            ffn_residual = o.ffn_residual;
+            moe_selected = o.moe_selected; moe_weights = o.moe_weights;
+            o.ctx = nullptr; o.gf = nullptr; o.alloc = nullptr;
+            o.inp_embed = nullptr; o.ffn_post = nullptr;
+            o.ffn_residual = nullptr;
+            o.moe_selected = nullptr; o.moe_weights = nullptr;
+        }
+        return *this;
+    }
     bool valid() const { return ctx && gf && alloc && ffn_post && ffn_residual; }
     void free();
 };
@@ -75,7 +93,38 @@ struct PipelinedDecodeState {
     int n_expert_used = 0;
     int full_attention_interval = 0;
 
+    PipelinedDecodeState() = default;
     ~PipelinedDecodeState() { destroy(); }
+    PipelinedDecodeState(const PipelinedDecodeState &) = delete;
+    PipelinedDecodeState & operator=(const PipelinedDecodeState &) = delete;
+    PipelinedDecodeState(PipelinedDecodeState && o) noexcept
+        : gpu_state(std::move(o.gpu_state)),
+          cached_prefn(std::move(o.cached_prefn)),
+          routing_ids_buf(std::move(o.routing_ids_buf)),
+          routing_weights_buf(std::move(o.routing_weights_buf)),
+          ffn_post_host_buf(std::move(o.ffn_post_host_buf)),
+          cold_in_zeroed(o.cold_in_zeroed),
+          n_layer(o.n_layer), n_embd(o.n_embd),
+          n_expert_used(o.n_expert_used),
+          full_attention_interval(o.full_attention_interval) {
+        o.n_layer = 0;
+    }
+    PipelinedDecodeState & operator=(PipelinedDecodeState && o) noexcept {
+        if (this != &o) {
+            destroy();
+            gpu_state = std::move(o.gpu_state);
+            cached_prefn = std::move(o.cached_prefn);
+            routing_ids_buf = std::move(o.routing_ids_buf);
+            routing_weights_buf = std::move(o.routing_weights_buf);
+            ffn_post_host_buf = std::move(o.ffn_post_host_buf);
+            cold_in_zeroed = o.cold_in_zeroed;
+            n_layer = o.n_layer; n_embd = o.n_embd;
+            n_expert_used = o.n_expert_used;
+            full_attention_interval = o.full_attention_interval;
+            o.n_layer = 0;
+        }
+        return *this;
+    }
     bool valid() const { return gpu_state.valid() && n_layer > 0; }
     void destroy();
 };
