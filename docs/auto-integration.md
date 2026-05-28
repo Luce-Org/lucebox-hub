@@ -92,7 +92,7 @@ This run performed:
 - Isolated direct probes attempted `git merge --no-commit --no-ff origin/pr/<n>` for #237, #221, #154, #153, #137, #135, #94, and #48; each conflicted and was aborted in the worktree. Logs: `/tmp/luce-merge-probes-20260528-173715.txt` and `/tmp/luce-merge-probe-237-20260528-173715.txt`.
 - Ancestor checks passed for included open non-draft contributor PR refs #295, #294, #289, #276, #274, #266, #152, and #142.
 - `bash -n harness/clients/common.sh`, `git diff --check`, and an anchored conflict-marker scan (`git grep -n -E '^(<<<<<<<|>>>>>>>|=======)( |$)' -- . ':!server/eval/humaneval_plus/humanevalplus.jsonl'`) passed after the manifest refresh.
-- `git push easel auto-integration` updated the writable remote from `dd5e556e` to `9080285`.
+- `git push easel auto-integration` updated the writable remote to the latest auto-integration head.
 
 ## Notes
 
