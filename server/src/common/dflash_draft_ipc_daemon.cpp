@@ -132,6 +132,69 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
             stream_status(stream_fd, 0);
             continue;
         }
+        if (cmd == "get_feature_range") {
+            int start_pos = -1;
+            int n_tokens = 0;
+            iss >> start_pos >> n_tokens;
+            if (start_pos < 0 || n_tokens <= 0 || n_tokens > feature_ring.cap) {
+                std::fprintf(stderr, "[draft-ipc-daemon] bad get_feature_range: %s\n",
+                             line.c_str());
+                stream_status(stream_fd, -1);
+                continue;
+            }
+            const int fc_in = feature_ring.n_target_layers * feature_ring.hidden_size;
+            const size_t row_bytes = (size_t)fc_in * sizeof(float);
+            const size_t src_stride = feature_ring.target_feat->nb[1];
+            std::vector<float> data((size_t)n_tokens * (size_t)fc_in);
+            for (int i = 0; i < n_tokens; ++i) {
+                const int slot = (start_pos + i) % feature_ring.cap;
+                ggml_backend_tensor_get(feature_ring.target_feat,
+                                        data.data() + (size_t)i * (size_t)fc_in,
+                                        (size_t)slot * src_stride,
+                                        row_bytes);
+            }
+            const size_t bytes = data.size() * sizeof(float);
+            if (!stream_status(stream_fd, 0) ||
+                !write_exact_fd(stream_fd, data.data(), bytes)) {
+                std::fprintf(stderr, "[draft-ipc-daemon] feature range stream failed\n");
+                break;
+            }
+            continue;
+        }
+        if (cmd == "set_feature_range") {
+            int start_pos = -1;
+            int n_tokens = 0;
+            iss >> start_pos >> n_tokens;
+            std::string path = read_line_tail(iss);
+            if (start_pos < 0 || n_tokens <= 0 || n_tokens > feature_ring.cap ||
+                path.empty()) {
+                std::fprintf(stderr, "[draft-ipc-daemon] bad set_feature_range: %s\n",
+                             line.c_str());
+                stream_status(stream_fd, -1);
+                continue;
+            }
+            const int fc_in = feature_ring.n_target_layers * feature_ring.hidden_size;
+            const size_t row_bytes = (size_t)fc_in * sizeof(float);
+            const size_t dst_stride = feature_ring.target_feat->nb[1];
+            const size_t bytes = (size_t)n_tokens * row_bytes;
+            std::vector<float> data(bytes / sizeof(float));
+            if (!read_binary_file_exact(path, data.data(), bytes)) {
+                std::fprintf(stderr, "[draft-ipc-daemon] read feature range failed: %s\n",
+                             path.c_str());
+                stream_status(stream_fd, -1);
+                continue;
+            }
+            for (int i = 0; i < n_tokens; ++i) {
+                const int slot = (start_pos + i) % feature_ring.cap;
+                ggml_backend_tensor_set(feature_ring.target_feat,
+                                        data.data() + (size_t)i * (size_t)fc_in,
+                                        (size_t)slot * dst_stride,
+                                        row_bytes);
+            }
+            ggml_backend_synchronize(backend);
+            stream_status(stream_fd, 0);
+            continue;
+        }
         if (cmd == "propose") {
             int committed = -1;
             int ctx_len = 0;

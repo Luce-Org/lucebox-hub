@@ -55,6 +55,10 @@ public:
                  const std::vector<float> & noise_embed,
                  std::vector<float> & hidden_out);
 
+    bool get_feature_range(int start_pos, int n_tokens, std::vector<float> & out);
+    bool set_feature_range(int start_pos, int n_tokens,
+                           const std::vector<float> & data);
+
     bool active() const { return active_; }
     int ring_cap() const { return ring_cap_; }
     int hidden_size() const { return hidden_size_; }

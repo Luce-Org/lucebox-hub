@@ -2,10 +2,9 @@
 
 #include "layer_split_daemon_loop.h"
 #include "layer_split_types.h"
-#include "layer_split_daemon.h"  // run_target_layer_split_request
-#include "layer_split_forward.h" // free_target_layer_split_shards
+#include "layer_split_daemon.h"  // run_qwen35_layer_split_request
+#include "layer_split_forward.h" // free_qwen35_layer_split_shards
 #include "dflash_feature_ring.h"
-#include "peer_access.h"
 #include "common/io_utils.h"
 #include "common/sampler.h"
 #include "common/layer_split_utils.h"
@@ -38,34 +37,19 @@ int run_layer_split_daemon(const LayerSplitDaemonConfig & cfg) {
     }
 
     // Initialize shards.
-    std::vector<TargetLayerSplitShard> shards(cfg.target_gpus.size());
-    for (size_t i = 0; i < cfg.target_gpus.size(); i++) {
-        shards[i].gpu = cfg.target_gpus[i];
-        shards[i].layer_begin = ranges[i].first;
-        shards[i].layer_end = ranges[i].second;
-        shards[i].backend = ggml_backend_cuda_init(shards[i].gpu);
-        if (!shards[i].backend) {
-            std::fprintf(stderr, "target-split cuda init failed for gpu %d\n", shards[i].gpu);
-            free_target_layer_split_shards(shards);
-            return 1;
-        }
+    std::vector<Qwen35LayerSplitShard> shards(cfg.target_gpus.size());
+    auto shard_metas = layer_split_shard_metas(shards);
+    if (!init_layer_split_shard_metas(
+            shard_metas, cfg.target_gpus, ranges, "target-split")) {
+        free_qwen35_layer_split_shards(shards);
+        return 1;
     }
-
-    // Enable peer access between all GPU pairs.
-    for (size_t i = 0; i < cfg.target_gpus.size(); i++) {
-        for (size_t j = i + 1; j < cfg.target_gpus.size(); j++) {
-            if (cfg.peer_access) {
-                (void)enable_peer_access_pair(cfg.target_gpus[i], cfg.target_gpus[j]);
-            }
-        }
-    }
+    (void)enable_layer_split_peer_access(cfg.target_gpus, cfg.peer_access);
 
     // Load partial target weights + caches.
     for (auto & shard : shards) {
-        TargetLoadPlan plan;
-        plan.layer_begin = shard.layer_begin;
-        plan.layer_end = shard.layer_end;
-        plan.load_output = (&shard == &shards.back());
+        const TargetLoadPlan plan =
+            make_layer_split_load_plan<TargetLoadPlan>(shard, &shard == &shards.back());
         if (!load_target_gguf_partial(cfg.target_path, shard.backend, plan, shard.weights) ||
             !create_target_cache_partial(shard.weights, cfg.max_ctx, cfg.max_verify_tokens,
                                          shard.backend, shard.cache,
@@ -74,7 +58,7 @@ int run_layer_split_daemon(const LayerSplitDaemonConfig & cfg) {
                                          /*allocate_target_feat=*/false)) {
             std::fprintf(stderr, "target-split load/cache gpu=%d: %s\n",
                          shard.gpu, dflash27b_last_error());
-            free_target_layer_split_shards(shards);
+            free_qwen35_layer_split_shards(shards);
             return 1;
         }
     }
@@ -91,7 +75,7 @@ int run_layer_split_daemon(const LayerSplitDaemonConfig & cfg) {
         if (!draft_backend) {
             draft_backend = ggml_backend_cuda_init(cfg.draft_gpu);
             if (!draft_backend) {
-                free_target_layer_split_shards(shards);
+                free_qwen35_layer_split_shards(shards);
                 return 1;
             }
             draft_backend_owned = true;
@@ -105,7 +89,7 @@ int run_layer_split_daemon(const LayerSplitDaemonConfig & cfg) {
             std::fprintf(stderr, "target-split draft load gpu=%d: %s\n",
                          cfg.draft_gpu, dflash27b_last_error());
             if (draft_backend_owned) ggml_backend_free(draft_backend);
-            free_target_layer_split_shards(shards);
+            free_qwen35_layer_split_shards(shards);
             return 1;
         }
         const int cap = std::min(cfg.max_ctx, 4096);
@@ -117,7 +101,7 @@ int run_layer_split_daemon(const LayerSplitDaemonConfig & cfg) {
                          cfg.draft_gpu);
             free_draft_weights(draft_weights);
             if (draft_backend_owned) ggml_backend_free(draft_backend);
-            free_target_layer_split_shards(shards);
+            free_qwen35_layer_split_shards(shards);
             return 1;
         }
     }
@@ -172,7 +156,7 @@ int run_layer_split_daemon(const LayerSplitDaemonConfig & cfg) {
         for (auto & shard : shards) {
             reset_target_cache(shard.cache);
         }
-        const bool ok = run_target_layer_split_request(
+        const bool ok = run_qwen35_layer_split_request(
             shards,
             cfg.load_draft ? &draft_weights : nullptr,
             draft_backend,
@@ -188,7 +172,7 @@ int run_layer_split_daemon(const LayerSplitDaemonConfig & cfg) {
     draft_feature_mirror_free(feature_ring);
     free_draft_weights(draft_weights);
     if (draft_backend_owned && draft_backend) ggml_backend_free(draft_backend);
-    free_target_layer_split_shards(shards);
+    free_qwen35_layer_split_shards(shards);
     return 0;
 }
 

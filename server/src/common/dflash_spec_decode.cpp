@@ -34,7 +34,30 @@ bool run_dflash_spec_decode(
         int draft_ctx_max,
         int stream_fd,
         DFlashDraftIpcClient * remote_draft,
-        const std::vector<int32_t> * hint_tokens) {
+        const std::vector<int32_t> * hint_tokens,
+        int base_pos) {
+    DaemonIO io;
+    io.stream_fd = stream_fd;
+    return run_dflash_spec_decode(target, draft_weights, draft_backend,
+                                  feature_ring, prompt, n_gen, last_tok,
+                                  out_path, draft_ctx_max, io,
+                                  remote_draft, hint_tokens, base_pos);
+}
+
+bool run_dflash_spec_decode(
+        DFlashTarget & target,
+        DraftWeights & draft_weights,
+        ggml_backend_t draft_backend,
+        DraftFeatureMirror & feature_ring,
+        const std::vector<int32_t> & prompt,
+        int n_gen,
+        int last_tok,
+        const char * out_path,
+        int draft_ctx_max,
+        const DaemonIO & io,
+        DFlashDraftIpcClient * remote_draft,
+        const std::vector<int32_t> * hint_tokens,
+        int base_pos) {
     const bool use_remote_draft = remote_draft && remote_draft->active();
     if (!use_remote_draft && !feature_ring.target_feat) return false;
 
@@ -54,7 +77,7 @@ bool run_dflash_spec_decode(
     std::vector<float>   remote_hidden;      // host buffer for remote-draft hidden states
 
     std::vector<int32_t> out_all = prompt;
-    int committed       = (int)prompt.size();
+    int committed       = base_pos + (int)prompt.size();
     int n_generated     = 0;
     int n_draft_steps   = 0;
     int n_accept_sum    = 0;
@@ -199,15 +222,19 @@ bool run_dflash_spec_decode(
         last_tok = replay_last_tok;
 
         bool hit_eos = false;
+        int emitted = 0;
         for (int i = 0; i < commit_n; i++) {
             out_all.push_back(replay_tok[i]);
-            stream_emit_fd(stream_fd, replay_tok[i]);
+            io.emit(replay_tok[i]);
+            if (io.cancelled) break;
+            ++emitted;
             if (target.is_eos(replay_tok[i])) hit_eos = true;
         }
-        committed   += commit_n;
-        n_generated += commit_n;
-        n_accept_sum += std::min(accept_n, commit_n);
+        committed   += emitted;
+        n_generated += emitted;
+        n_accept_sum += std::min(accept_n, emitted);
         n_draft_steps++;
+        if (io.cancelled) break;
         if (hit_eos) break;
     }
     if (!use_remote_draft && draft_backend) ggml_backend_synchronize(draft_backend);
@@ -231,4 +258,3 @@ bool run_dflash_spec_decode(
 }
 
 } // namespace dflash::common
-

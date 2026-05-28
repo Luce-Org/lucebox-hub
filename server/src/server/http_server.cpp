@@ -1658,7 +1658,8 @@ void HttpServer::worker_loop() {
 
         // Confirm or abort the inline snapshot.
         if (snap_prepared) {
-            if (completion_tokens > 0 && !client_disconnected) {
+            if (completion_tokens > 0 && !client_disconnected &&
+                backend_.snapshot_used(snap_slot)) {
                 prefix_cache_.confirm_inline_snap(snap_slot, snap_cut, effective_prompt);
                 // Track for shutdown save.
                 slot_tokens_[snap_slot] = std::vector<int32_t>(

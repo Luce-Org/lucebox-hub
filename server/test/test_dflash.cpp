@@ -169,8 +169,11 @@ using dflash::common::g_peer_access_opt_in;
 using dflash::common::g_peer_pair_ok_cache;
 using dflash::common::enable_peer_access_one_way;
 using dflash::common::enable_peer_access_pair;
+using dflash::common::enable_layer_split_peer_access;
 using dflash::common::cross_device_peer_memcpy_ok;
 using dflash::common::copy_peer_async;
+using dflash::common::init_layer_split_shard_metas;
+using dflash::common::layer_split_shard_metas;
 using dflash::common::DraftFeatureMirror;
 using dflash::common::draft_feature_mirror_free;
 using dflash::common::draft_feature_mirror_init;
@@ -190,11 +193,11 @@ using dflash::common::build_lm_head_projection_step;
 // ─── Layer split types — extracted to src/qwen35/layer_split_types.h ──
 #include "layer_split_types.h"
 using dflash::common::LayerSplitRuntimeConfig;
-using dflash::common::TargetLayerSplitShard;
+using dflash::common::Qwen35LayerSplitShard;
 using dflash::common::ActivationPair;
 using dflash::common::activation_pair_free;
 using dflash::common::activation_pair_init;
-using dflash::common::find_target_shard;
+using dflash::common::find_layer_split_shard;
 
 static bool parse_int_list(const char * text, std::vector<int> & out) {
     out.clear();
@@ -251,8 +254,8 @@ using dflash::common::copy_feature_ring_range_to_tensor;
 // ─── Layer-split forward — extracted to src/qwen35/layer_split_forward.{h,cpp} ──
 #include "layer_split_forward.h"
 using dflash::common::compute_target_split_argmax;
-using dflash::common::run_target_layer_split_forward;
-using dflash::common::free_target_layer_split_shards;
+using dflash::common::run_qwen35_layer_split_forward;
+using dflash::common::free_qwen35_layer_split_shards;
 
 
 // ─── Speculative decode — generic loop in common/, qwen35 layer-split adapter.
@@ -262,7 +265,7 @@ using dflash::common::is_eos_tok;
 
 // ─── Layer-split daemon — extracted to src/qwen35/layer_split_daemon.{h,cpp} ─
 #include "layer_split_daemon.h"
-using dflash::common::run_target_layer_split_request;
+using dflash::common::run_qwen35_layer_split_request;
 
 static int run_target_layer_split_daemon(
         const char * target_path,
@@ -330,39 +333,22 @@ static int run_target_layer_split_harness(
                      target_gpus.size(), n_layer);
         return 2;
     }
-    std::vector<TargetLayerSplitShard> shards;
+    std::vector<Qwen35LayerSplitShard> shards;
     shards.resize(target_gpus.size());
-    for (size_t i = 0; i < target_gpus.size(); i++) {
-        shards[i].gpu = target_gpus[i];
-        shards[i].layer_begin = ranges[i].first;
-        shards[i].layer_end = ranges[i].second;
+    auto shard_metas = layer_split_shard_metas(shards);
+    if (!init_layer_split_shard_metas(
+            shard_metas, target_gpus, ranges, "target-split")) {
+        free_qwen35_layer_split_shards(shards);
+        return 1;
     }
+    (void)enable_layer_split_peer_access(target_gpus, peer_access);
     for (auto & shard : shards) {
-        shard.backend = ggml_backend_cuda_init(shard.gpu);
-        if (!shard.backend) {
-            std::fprintf(stderr, "target-split cuda init failed for gpu %d\n", shard.gpu);
-            free_target_layer_split_shards(shards);
-            return 1;
-        }
-    }
-    for (size_t i = 0; i < target_gpus.size(); i++) {
-        for (size_t j = i + 1; j < target_gpus.size(); j++) {
-            if (!enable_peer_access_pair(target_gpus[i], target_gpus[j])) {
-                std::fprintf(stderr,
-                             "warning: CUDA peer access not fully enabled for target gpus %d,%d\n",
-                             target_gpus[i], target_gpus[j]);
-            }
-        }
-    }
-    for (auto & shard : shards) {
-        TargetLoadPlan plan;
-        plan.layer_begin = shard.layer_begin;
-        plan.layer_end = shard.layer_end;
-        plan.load_output = (&shard == &shards.back());
+        const TargetLoadPlan plan =
+            make_layer_split_load_plan<TargetLoadPlan>(shard, &shard == &shards.back());
         if (!load_target_gguf_partial(target_path, shard.backend, plan, shard.weights)) {
             std::fprintf(stderr, "target-split load gpu=%d: %s\n",
                          shard.gpu, dflash27b_last_error());
-            free_target_layer_split_shards(shards);
+            free_qwen35_layer_split_shards(shards);
             return 1;
         }
         std::printf("[target-split] gpu=%d layers=[%d,%d) %s\n",
@@ -376,7 +362,7 @@ static int run_target_layer_split_harness(
                                          allocate_target_feat)) {
             std::fprintf(stderr, "target-split cache gpu=%d: %s\n",
                          shard.gpu, dflash27b_last_error());
-            free_target_layer_split_shards(shards);
+            free_qwen35_layer_split_shards(shards);
             return 1;
         }
     }
@@ -395,7 +381,7 @@ static int run_target_layer_split_harness(
             if (!remote_draft.start(draft_ipc_bin, draft_path, draft_ipc_gpu,
                                     cap, draft_ipc_work_dir ? draft_ipc_work_dir : "")) {
                 std::fprintf(stderr, "target-split remote draft start failed\n");
-                free_target_layer_split_shards(shards);
+                free_qwen35_layer_split_shards(shards);
                 return 1;
             }
         } else {
@@ -409,7 +395,7 @@ static int run_target_layer_split_harness(
                 draft_backend = ggml_backend_cuda_init(draft_gpu);
                 if (!draft_backend) {
                     std::fprintf(stderr, "target-split draft cuda init failed for gpu %d\n", draft_gpu);
-                    free_target_layer_split_shards(shards);
+                    free_qwen35_layer_split_shards(shards);
                     return 1;
                 }
                 draft_backend_owned = true;
@@ -426,7 +412,7 @@ static int run_target_layer_split_harness(
                              draft_gpu, dflash27b_last_error());
                 free_draft_weights(draft_weights);
                 if (draft_backend_owned) ggml_backend_free(draft_backend);
-                free_target_layer_split_shards(shards);
+                free_qwen35_layer_split_shards(shards);
                 return 1;
             }
             std::printf("[target-split] draft loaded on gpu=%d format=%s\n",
@@ -450,7 +436,7 @@ static int run_target_layer_split_harness(
                 draft_feature_mirror_free(feature_ring);
                 free_draft_weights(draft_weights);
                 if (draft_backend_owned) ggml_backend_free(draft_backend);
-                free_target_layer_split_shards(shards);
+                free_qwen35_layer_split_shards(shards);
                 return 1;
             }
             std::printf("[target-split] draft feature ring cap=%d gpu=%d\n", cap, draft_gpu);
@@ -463,7 +449,7 @@ static int run_target_layer_split_harness(
         draft_feature_mirror_free(feature_ring);
         free_draft_weights(draft_weights);
         if (draft_backend_owned) ggml_backend_free(draft_backend);
-        free_target_layer_split_shards(shards);
+        free_qwen35_layer_split_shards(shards);
         return 1;
     }
     if ((int)prompt.size() + n_gen + 1 > max_ctx) {
@@ -472,7 +458,7 @@ static int run_target_layer_split_harness(
         draft_feature_mirror_free(feature_ring);
         free_draft_weights(draft_weights);
         if (draft_backend_owned) ggml_backend_free(draft_backend);
-        free_target_layer_split_shards(shards);
+        free_qwen35_layer_split_shards(shards);
         return 1;
     }
 
@@ -485,7 +471,7 @@ static int run_target_layer_split_harness(
 
     int last_tok = -1;
     auto t_pf0 = std::chrono::steady_clock::now();
-    if (!run_target_layer_split_forward(shards, shards.front().weights,
+    if (!run_qwen35_layer_split_forward(shards, shards.front().weights,
                                         prompt, 0, ubatch, last_tok,
                                         g_kq_stride_pad, g_fa_window,
                                         (load_draft && !use_remote_draft) ? &feature_ring : nullptr,
@@ -495,7 +481,7 @@ static int run_target_layer_split_harness(
         draft_feature_mirror_free(feature_ring);
         free_draft_weights(draft_weights);
         if (draft_backend_owned) ggml_backend_free(draft_backend);
-        free_target_layer_split_shards(shards);
+        free_qwen35_layer_split_shards(shards);
         return 1;
     }
     auto t_pf1 = std::chrono::steady_clock::now();
@@ -517,7 +503,7 @@ static int run_target_layer_split_harness(
             draft_feature_mirror_free(feature_ring);
             free_draft_weights(draft_weights);
             if (draft_backend_owned) ggml_backend_free(draft_backend);
-            free_target_layer_split_shards(shards);
+            free_qwen35_layer_split_shards(shards);
             return 1;
         }
         if (use_remote_draft) {
@@ -531,7 +517,7 @@ static int run_target_layer_split_harness(
                 draft_feature_mirror_free(feature_ring);
                 free_draft_weights(draft_weights);
                 if (draft_backend_owned) ggml_backend_free(draft_backend);
-                free_target_layer_split_shards(shards);
+                free_qwen35_layer_split_shards(shards);
                 return 1;
             }
             std::printf("[target-split] remote draft smoke ctx=%d q=%d time=%.3f ms\n",
@@ -551,7 +537,7 @@ static int run_target_layer_split_harness(
                 draft_feature_mirror_free(feature_ring);
                 free_draft_weights(draft_weights);
                 if (draft_backend_owned) ggml_backend_free(draft_backend);
-                free_target_layer_split_shards(shards);
+                free_qwen35_layer_split_shards(shards);
                 return 1;
             }
             if (!use_mirror_view &&
@@ -563,7 +549,7 @@ static int run_target_layer_split_harness(
                 draft_feature_mirror_free(feature_ring);
                 free_draft_weights(draft_weights);
                 if (draft_backend_owned) ggml_backend_free(draft_backend);
-                free_target_layer_split_shards(shards);
+                free_qwen35_layer_split_shards(shards);
                 return 1;
             }
             ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
@@ -584,7 +570,7 @@ static int run_target_layer_split_harness(
                 draft_feature_mirror_free(feature_ring);
                 free_draft_weights(draft_weights);
                 if (draft_backend_owned) ggml_backend_free(draft_backend);
-                free_target_layer_split_shards(shards);
+                free_qwen35_layer_split_shards(shards);
                 return 1;
             }
             std::printf("[target-split] draft smoke ctx=%d q=%d time=%.3f ms\n",
@@ -606,7 +592,7 @@ static int run_target_layer_split_harness(
         draft_feature_mirror_free(feature_ring);
         free_draft_weights(draft_weights);
         if (draft_backend_owned) ggml_backend_free(draft_backend);
-        free_target_layer_split_shards(shards);
+        free_qwen35_layer_split_shards(shards);
         return ok ? 0 : 1;
     }
 
@@ -616,7 +602,7 @@ static int run_target_layer_split_harness(
     for (; generated < n_gen; generated++) {
         std::vector<int32_t> one(1, last_tok);
         int next_tok = -1;
-        if (!run_target_layer_split_forward(shards, shards.front().weights,
+        if (!run_qwen35_layer_split_forward(shards, shards.front().weights,
                                             one, (int)out_all.size(), 1, next_tok,
                                             g_kq_stride_pad, g_fa_window,
                                             (load_draft && !use_remote_draft) ? &feature_ring : nullptr,
@@ -626,7 +612,7 @@ static int run_target_layer_split_harness(
             draft_feature_mirror_free(feature_ring);
             free_draft_weights(draft_weights);
             if (draft_backend_owned) ggml_backend_free(draft_backend);
-            free_target_layer_split_shards(shards);
+            free_qwen35_layer_split_shards(shards);
             return 1;
         }
         out_all.push_back(last_tok);
@@ -644,7 +630,7 @@ static int run_target_layer_split_harness(
     draft_feature_mirror_free(feature_ring);
     free_draft_weights(draft_weights);
     if (draft_backend_owned) ggml_backend_free(draft_backend);
-    free_target_layer_split_shards(shards);
+    free_qwen35_layer_split_shards(shards);
     return 0;
 }
 

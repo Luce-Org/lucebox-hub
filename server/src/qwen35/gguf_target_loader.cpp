@@ -44,6 +44,7 @@
 // tensor's bytes from the mmap'd file.
 
 #include "internal.h"
+#include "common/layer_split_utils.h"
 
 #include <cinttypes>
 #include <cstdint>

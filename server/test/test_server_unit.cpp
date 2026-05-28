@@ -19,6 +19,10 @@
 #include "common/sampler.h"
 #include "common/backend_ipc.h"
 #include "placement/pflash_placement.h"
+#include "common/io_utils.h"
+#include "placement/placement_config.h"
+#include "common/layer_split_backend.h"
+#include "common/layer_split_utils.h"
 #include <nlohmann/json.hpp>
 
 #include <cmath>
@@ -1186,6 +1190,211 @@ static void test_normalize_responses_tool_followup_messages() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Placement config tests
+// ═══════════════════════════════════════════════════════════════════════
+
+static void test_parse_target_device_list_same_backend() {
+    DevicePlacement placement;
+    TEST_ASSERT(parse_placement_device_list("cuda:0,cuda:1", placement));
+    TEST_ASSERT(placement.backend == PlacementBackend::Cuda);
+    TEST_ASSERT(placement.gpu == 0);
+    TEST_ASSERT(placement.is_layer_split());
+    TEST_ASSERT(placement.layer_split_gpus.size() == 2);
+    TEST_ASSERT(placement.layer_split_gpus[0] == 0);
+    TEST_ASSERT(placement.layer_split_gpus[1] == 1);
+    TEST_ASSERT(placement.layer_split_weights.empty());
+}
+
+static void test_parse_target_device_list_rejects_mixed_backend() {
+    DevicePlacement placement;
+    TEST_ASSERT(!parse_placement_device_list("cuda:0,hip:1", placement));
+}
+
+static void test_parse_target_device_list_single_gpu_is_not_layer_split() {
+    DevicePlacement placement;
+    TEST_ASSERT(parse_placement_device_list("hip:2", placement));
+    TEST_ASSERT(placement.backend == PlacementBackend::Hip);
+    TEST_ASSERT(placement.gpu == 2);
+    TEST_ASSERT(!placement.is_layer_split());
+    TEST_ASSERT(placement.layer_split_gpus.empty());
+}
+
+static void test_validate_layer_split_weights_shape() {
+    DevicePlacement placement;
+    TEST_ASSERT(parse_placement_device_list("cuda:0,cuda:1", placement));
+
+    placement.layer_split_weights = {1.0};
+    TEST_ASSERT(!validate_device_placement(placement, -1).empty());
+
+    placement.layer_split_weights = {1.0, 0.0};
+    TEST_ASSERT(!validate_device_placement(placement, -1).empty());
+
+    placement.layer_split_weights = {1.0, 2.0};
+    TEST_ASSERT(validate_device_placement(placement, -1).empty());
+}
+
+struct MockLayerSplitAdapter : LayerSplitAdapter {
+    int max_ctx = 128;
+    bool reset_called = false;
+    int saved_slot = -1;
+    int saved_pos = 0;
+    int restored_slot = -1;
+    int current_pos = 0;
+    int current_last = -1;
+    std::vector<int> prefill_bases;
+    std::vector<int> prefill_sizes;
+    int dflash_base = -1;
+    int dflash_last = -1;
+    std::vector<int32_t> emitted_tokens;
+    bool dflash_enabled = false;
+    bool dflash_called = false;
+    ModelBackend::CompressRequest last_compress_req;
+
+    const char * name() const override { return "mock"; }
+    bool init() override { return true; }
+    int max_context() const override { return max_ctx; }
+    void reset_request_state() override {
+        reset_called = true;
+        current_pos = 0;
+        current_last = -1;
+    }
+    bool prefill(const std::vector<int32_t> & prompt,
+                 int base_pos, int & last_tok) override {
+        prefill_bases.push_back(base_pos);
+        prefill_sizes.push_back((int)prompt.size());
+        current_pos = base_pos + (int)prompt.size();
+        current_last = prompt.empty() ? current_last : prompt.back();
+        last_tok = current_last;
+        return true;
+    }
+    bool decode_ar(int last_tok, int committed, int n_gen,
+                   std::vector<int32_t> & out_tokens,
+                   const DaemonIO & io) override {
+        TEST_ASSERT(committed == current_pos);
+        for (int i = 0; i < n_gen; ++i) {
+            int32_t tok = last_tok + i + 1;
+            out_tokens.push_back(tok);
+            emitted_tokens.push_back(tok);
+            io.emit(tok);
+        }
+        io.emit(-1);
+        return true;
+    }
+    bool can_dflash_decode() const override { return dflash_enabled; }
+    bool decode_dflash(const std::vector<int32_t> & prompt, int base_pos,
+                       int last_tok, int n_gen, std::vector<int32_t> & out_tokens,
+                       const DaemonIO & io) override {
+        (void)prompt;
+        dflash_called = true;
+        dflash_base = base_pos;
+        dflash_last = last_tok;
+        for (int i = 0; i < n_gen; ++i) {
+            int32_t tok = last_tok + i + 10;
+            out_tokens.push_back(tok);
+            emitted_tokens.push_back(tok);
+            io.emit(tok);
+        }
+        io.emit(-1);
+        return true;
+    }
+    void free_drafter() override {}
+    bool snapshot_save(int slot) override {
+        saved_slot = slot;
+        saved_pos = current_pos;
+        return true;
+    }
+    bool snapshot_used(int slot) const override {
+        return slot == saved_slot && saved_pos > 0;
+    }
+    int snapshot_cur_pos(int slot) const override {
+        return snapshot_used(slot) ? saved_pos : 0;
+    }
+    bool snapshot_restore(int slot) override {
+        if (!snapshot_used(slot)) return false;
+        restored_slot = slot;
+        current_pos = saved_pos;
+        current_last = saved_pos;
+        return true;
+    }
+    int current_last_token() const override { return current_last; }
+    const char * default_compress_drafter_path() const override {
+        return "/tmp/default-layer-split-drafter.gguf";
+    }
+    ModelBackend::CompressResult
+    compress(const ModelBackend::CompressRequest & req) override {
+        last_compress_req = req;
+        ModelBackend::CompressResult result;
+        result.ok = true;
+        result.compressed_ids = {77, 88};
+        return result;
+    }
+    void shutdown() override {}
+};
+
+static void test_layer_split_backend_inline_snapshot_and_restore_delta() {
+    auto * raw = new MockLayerSplitAdapter();
+    LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
+
+    GenerateRequest req;
+    req.prompt = {10, 11, 12, 13};
+    req.n_gen = 1;
+    req.snap_slot = 2;
+    req.snap_pos = 3;
+    DaemonIO io;
+    GenerateResult result = backend.generate(req, io);
+
+    TEST_ASSERT(result.ok);
+    TEST_ASSERT(raw->reset_called);
+    TEST_ASSERT(raw->saved_slot == 2);
+    TEST_ASSERT(raw->saved_pos == 3);
+    TEST_ASSERT(raw->prefill_bases.size() == 2);
+    TEST_ASSERT(raw->prefill_bases[0] == 0);
+    TEST_ASSERT(raw->prefill_sizes[0] == 3);
+    TEST_ASSERT(raw->prefill_bases[1] == 3);
+    TEST_ASSERT(raw->prefill_sizes[1] == 1);
+    TEST_ASSERT(backend.snapshot_used(2));
+    TEST_ASSERT(backend.snapshot_cur_pos(2) == 3);
+
+    raw->reset_called = false;
+    raw->prefill_bases.clear();
+    raw->prefill_sizes.clear();
+    raw->dflash_enabled = true;
+    GenerateRequest restore_req;
+    restore_req.prompt = {10, 11, 12, 99};
+    restore_req.n_gen = 1;
+    GenerateResult restored = backend.restore_and_generate(2, restore_req, io);
+
+    TEST_ASSERT(restored.ok);
+    TEST_ASSERT(raw->dflash_called);
+    TEST_ASSERT(raw->restored_slot == 2);
+    TEST_ASSERT(!raw->reset_called);
+    TEST_ASSERT(raw->prefill_bases.size() == 1);
+    TEST_ASSERT(raw->prefill_bases[0] == 3);
+    TEST_ASSERT(raw->prefill_sizes[0] == 1);
+    TEST_ASSERT(raw->dflash_base == 3);
+    TEST_ASSERT(raw->dflash_last == 99);
+}
+
+static void test_layer_split_compress_nopark_uses_default_drafter_path() {
+    const std::string ids_path = "/tmp/dflash_test_layer_split_compress_ids.bin";
+    unlink(ids_path.c_str());
+    TEST_ASSERT(write_int32_file(ids_path, {1, 2, 3, 4}));
+
+    auto * raw = new MockLayerSplitAdapter();
+    LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
+    DaemonIO io;
+
+    const std::string cmd = "compress " + ids_path + " 250 nopark";
+    TEST_ASSERT(backend.handle_compress(cmd, io));
+    TEST_ASSERT(raw->last_compress_req.skip_park);
+    TEST_ASSERT(std::abs(raw->last_compress_req.keep_ratio - 0.25f) < 1e-5f);
+    TEST_ASSERT(raw->last_compress_req.input_ids.size() == 4);
+    TEST_ASSERT(raw->last_compress_req.drafter_path ==
+                "/tmp/default-layer-split-drafter.gguf");
+
+    unlink(ids_path.c_str());
+}
+
 // Disk Prefix Cache Tests
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -2947,6 +3156,14 @@ int main() {
     RUN_TEST(test_jinja_render_empty_template_throws);
     RUN_TEST(test_jinja_render_bad_tools_json_throws);
     RUN_TEST(test_normalize_responses_tool_followup_messages);
+
+    std::fprintf(stderr, "\n── Placement config ──\n");
+    RUN_TEST(test_parse_target_device_list_same_backend);
+    RUN_TEST(test_parse_target_device_list_rejects_mixed_backend);
+    RUN_TEST(test_parse_target_device_list_single_gpu_is_not_layer_split);
+    RUN_TEST(test_validate_layer_split_weights_shape);
+    RUN_TEST(test_layer_split_backend_inline_snapshot_and_restore_delta);
+    RUN_TEST(test_layer_split_compress_nopark_uses_default_drafter_path);
 
     std::fprintf(stderr, "\n── Disk prefix cache ──\n");
     RUN_TEST(test_disk_cache_config_defaults);

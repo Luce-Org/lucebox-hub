@@ -14,6 +14,7 @@
 #include "dflash_target.h"
 #include "dflash_feature_ring.h"
 #include "dflash_draft_ipc.h"
+#include "model_backend.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -53,6 +54,22 @@ bool run_dflash_spec_decode(
         int draft_ctx_max,
         int stream_fd = -1,
         DFlashDraftIpcClient * remote_draft = nullptr,
-        const std::vector<int32_t> * hint_tokens = nullptr);
+        const std::vector<int32_t> * hint_tokens = nullptr,
+        int base_pos = 0);
+
+bool run_dflash_spec_decode(
+        DFlashTarget & target,
+        DraftWeights & draft_weights,
+        ggml_backend_t draft_backend,
+        DraftFeatureMirror & feature_ring,
+        const std::vector<int32_t> & prompt,
+        int n_gen,
+        int last_tok,
+        const char * out_path,
+        int draft_ctx_max,
+        const DaemonIO & io,
+        DFlashDraftIpcClient * remote_draft = nullptr,
+        const std::vector<int32_t> * hint_tokens = nullptr,
+        int base_pos = 0);
 
 } // namespace dflash::common

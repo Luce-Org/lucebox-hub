@@ -13,7 +13,7 @@ Qwen35LayerSplitDFlashTarget::~Qwen35LayerSplitDFlashTarget() {
 }
 
 Qwen35LayerSplitDFlashTarget::Qwen35LayerSplitDFlashTarget(
-        std::vector<TargetLayerSplitShard> & shards,
+        std::vector<Qwen35LayerSplitShard> & shards,
         DraftFeatureMirror * feature_ring,
         int kq_stride_pad,
         int fa_window,
@@ -36,7 +36,7 @@ bool Qwen35LayerSplitDFlashTarget::verify_batch(
         int & last_tok,
         std::vector<int32_t> * all_argmax) {
     if (shards_.empty()) return false;
-    return run_target_layer_split_forward(
+    return run_qwen35_layer_split_forward(
         shards_, shards_.front().weights, tokens, base_pos, (int)tokens.size(),
         last_tok, kq_stride_pad_, fa_window_,
         feature_ring_,

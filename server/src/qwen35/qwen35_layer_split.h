@@ -8,7 +8,7 @@
 // (run_target_layer_split_daemon) because it depends on many helpers and
 // globals defined there. This header defines the DevicePlacement-based
 // args struct as the migration target. The implementation will move here
-// once the helper functions (run_target_layer_split_forward, etc.) are
+// once the helper functions (run_qwen35_layer_split_forward, etc.) are
 // extracted to src/qwen35/.
 
 #pragma once

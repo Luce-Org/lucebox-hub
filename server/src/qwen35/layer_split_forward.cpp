@@ -61,8 +61,8 @@ bool compute_target_split_argmax(
     return true;
 }
 
-bool run_target_layer_split_forward(
-        std::vector<TargetLayerSplitShard> & shards,
+bool run_qwen35_layer_split_forward(
+        std::vector<Qwen35LayerSplitShard> & shards,
         const TargetWeights & embed_source,
         const std::vector<int32_t> & tokens,
         int base_pos,
@@ -104,11 +104,11 @@ bool run_target_layer_split_forward(
         }
     }
 
-    TargetLayerSplitShard * current_shard = &shards.front();
+    Qwen35LayerSplitShard * current_shard = &shards.front();
     std::vector<uint16_t> mask_buf;
     std::vector<int32_t> pos_buf;
     for (int il = 0; il < embed_source.n_layer; il++) {
-        TargetLayerSplitShard * shard = find_target_shard(shards, il);
+        Qwen35LayerSplitShard * shard = find_layer_split_shard(shards, il);
         if (!shard) {
             std::fprintf(stderr, "target-split missing owner for layer %d\n", il);
             activation_pair_free(acts);
@@ -204,7 +204,7 @@ bool run_target_layer_split_forward(
 
     StepGraph final_sg;
     std::vector<int32_t> argmax_tokens;
-    TargetLayerSplitShard & last_shard = shards.back();
+    Qwen35LayerSplitShard & last_shard = shards.back();
     const bool need_all_argmax = argmax_out != nullptr;
     const int argmax_offset = need_all_argmax ? 0 : (n_tokens_total - 1);
     const int argmax_count = need_all_argmax ? n_tokens_total : 1;
@@ -215,12 +215,16 @@ bool run_target_layer_split_forward(
     activation_pair_free(acts);
     if (!ok) return false;
     last_tok = argmax_tokens.empty() ? -1 : argmax_tokens.back();
+    for (auto & shard : shards) {
+        shard.cache.cur_pos = base_pos + n_tokens_total;
+        shard.cache.last_tok = last_tok;
+    }
     if (argmax_out) *argmax_out = std::move(argmax_tokens);
     if (logits_out) logits_out->clear();
     return true;
 }
 
-void free_target_layer_split_shards(std::vector<TargetLayerSplitShard> & shards) {
+void free_qwen35_layer_split_shards(std::vector<Qwen35LayerSplitShard> & shards) {
     for (auto & shard : shards) {
         step_graph_destroy(shard.layer_graph);
         free_target_cache(shard.cache);

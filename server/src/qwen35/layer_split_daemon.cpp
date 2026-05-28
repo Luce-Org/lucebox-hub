@@ -14,8 +14,8 @@
 
 namespace dflash::common {
 
-bool run_target_layer_split_request(
-        std::vector<TargetLayerSplitShard> & shards,
+bool run_qwen35_layer_split_request(
+        std::vector<Qwen35LayerSplitShard> & shards,
         DraftWeights * draft_weights,
         ggml_backend_t draft_backend,
         int draft_gpu,
@@ -41,7 +41,7 @@ bool run_target_layer_split_request(
         ubatch = std::max(1, std::atoi(s));
     }
     int last_tok = -1;
-    if (!run_target_layer_split_forward(shards, shards.front().weights,
+    if (!run_qwen35_layer_split_forward(shards, shards.front().weights,
                                         prompt, 0, ubatch, last_tok,
                                         kq_stride_pad, fa_window,
                                         feature_ring)) {
@@ -66,7 +66,7 @@ bool run_target_layer_split_request(
     for (; generated < n_gen; generated++) {
         std::vector<int32_t> one(1, last_tok);
         int next_tok = -1;
-        if (!run_target_layer_split_forward(shards, shards.front().weights,
+        if (!run_qwen35_layer_split_forward(shards, shards.front().weights,
                                             one, (int)out_all.size(), 1, next_tok,
                                             kq_stride_pad, fa_window,
                                             feature_ring)) {
