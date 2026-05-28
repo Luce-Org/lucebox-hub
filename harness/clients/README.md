@@ -14,10 +14,15 @@ Each launcher starts `server/build/dflash_server`, runs the client, writes logs
 under `/workspace/lucebox-client-harness-runs`, then stops the server.
 
 The launcher will start `server/build/dflash_server` by default, or the path in
-`DFLASH_SERVER_BIN`.
+`DFLASH_SERVER_BIN`. The default model paths are
+`server/models/Qwen3.6-27B-Q4_K_M.gguf` and
+`server/models/draft/dflash-draft-3.6-q4_k_m.gguf`; override them with
+`TARGET`/`DRAFT` or the standard `DFLASH_TARGET`/`DFLASH_DRAFT` env vars.
 
 ```bash
 DFLASH_SERVER_BIN=server/build/dflash_server \
+DFLASH_TARGET=/path/to/Qwen3.6-27B-Q4_K_M.gguf \
+DFLASH_DRAFT=/path/to/dflash-draft-3.6-q4_k_m.gguf \
 MAX_CTX=32768 MAX_TOKENS=512 \
 BUDGET=22 VERIFY_MODE=ddtree \
 harness/clients/run_codex.sh

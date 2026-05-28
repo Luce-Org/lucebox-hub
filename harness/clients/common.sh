@@ -8,8 +8,10 @@ REPO_DIR="${REPO_DIR:-/workspace/lucebox-hub-harness}"
 CLIENT_WORK_DIR="${CLIENT_WORK_DIR:-/workspace/lucebox-harness-work}"
 RUN_DIR="${RUN_DIR:-/workspace/lucebox-client-harness-runs}"
 
-TARGET="${TARGET:-$REPO_DIR/server/models/Qwen3.6-27B-Q4_K_M.gguf}"
-DRAFT="${DRAFT:-$REPO_DIR/server/models/draft/dflash-draft-3.6-q4_k_m.gguf}"
+DEFAULT_TARGET="$REPO_DIR/server/models/Qwen3.6-27B-Q4_K_M.gguf"
+DEFAULT_DRAFT="$REPO_DIR/server/models/draft/dflash-draft-3.6-q4_k_m.gguf"
+TARGET="${TARGET:-${DFLASH_TARGET:-$DEFAULT_TARGET}}"
+DRAFT="${DRAFT:-${DFLASH_DRAFT:-$DEFAULT_DRAFT}}"
 MODEL_SERVER="${MODEL_SERVER:-lucebox}"
 LUCEBOX_SERVER_BACKEND="${LUCEBOX_SERVER_BACKEND:-cpp}"
 DFLASH_SERVER_BIN="${DFLASH_SERVER_BIN:-$REPO_DIR/server/build/dflash_server}"
@@ -82,6 +84,18 @@ start_dflash_native_server() {
     echo "  cmake --build $REPO_DIR/server/build --target dflash_server -j\$(nproc)" >&2
     return 1
   fi
+  if [[ ! -f "$TARGET" ]]; then
+    echo "target GGUF not found: $TARGET" >&2
+    echo "Set TARGET=/path/to/model.gguf or DFLASH_TARGET=/path/to/model.gguf, or download the default:" >&2
+    echo "  hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir $REPO_DIR/server/models/" >&2
+    return 1
+  fi
+  if [[ ! -f "$DRAFT" ]]; then
+    echo "DFlash draft not found: $DRAFT" >&2
+    echo "Set DRAFT=/path/to/dflash-draft.gguf or DFLASH_DRAFT=/path/to/dflash-draft.gguf, or download the default:" >&2
+    echo "  hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf --local-dir $REPO_DIR/server/models/draft/" >&2
+    return 1
+  fi
   local extra_args=()
   if [[ -n "$EXTRA_SERVER_ARGS" ]]; then
     read -r -a extra_args <<< "$EXTRA_SERVER_ARGS"
@@ -117,6 +131,12 @@ start_llamacpp_server() {
     echo "Build it first, for example:" >&2
     echo "  cmake -S $REPO_DIR/server/deps/llama.cpp -B /workspace/llama-cpp-server-build -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF" >&2
     echo "  cmake --build /workspace/llama-cpp-server-build --target llama-server -j2" >&2
+    return 1
+  fi
+  if [[ ! -f "$TARGET" ]]; then
+    echo "target GGUF not found: $TARGET" >&2
+    echo "Set TARGET=/path/to/model.gguf or DFLASH_TARGET=/path/to/model.gguf, or download the default:" >&2
+    echo "  hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir $REPO_DIR/server/models/" >&2
     return 1
   fi
   local extra_args=()
