@@ -4,8 +4,8 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-27T20:20:41-04:00 through 2026-05-27T20:27:00-04:00
-Current stack tip before this metadata refresh: `7f2973c` (already aligned with `origin/main` `3474edf` and `easel/auto-integration` `7f2973c`; this run is a metadata/triage refresh after additional worktree probes).
+Last refresh: 2026-05-27T20:39:40-04:00 through 2026-05-27T20:39:40-04:00
+Current stack tip before this metadata refresh: `5a76218` (now aligned with `origin/main` `4f4d82e` and local `auto-integration` / `easel/auto-integration`; this run merged upstream main and then refreshed triage).
 
 ## Included in the current stack
 
@@ -31,7 +31,7 @@ Current stack tip before this metadata refresh: `7f2973c` (already aligned with 
 | #153 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr153-20260527-2020` produced conflicts in legacy `dflash/CMakeLists.txt`, current `server/src/internal.h`, `server/src/qwen35/gguf_target_loader.cpp`, `server/src/qwen35/qwen35_target_graph.cpp`, and path-mapped MTP docs/tests. Codex tmux session `luce-pr153-codex-2020` wrote `/tmp/pr153-feasibility-20260527-2020.txt`: selective port is feasible, but not as conflict-marker resolution; current-layout loader/graph/token embedding/MoE/cache semantics need deliberate design. |
 | #39 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr39-20260527-2020` produced broad conflicts across deleted legacy `dflash/*` files plus current draft graph/safetensors loader and MoE smoke tests. A tmux-driven Claude assessment session was launched (`luce-pr39-claude-2020`) but exited without producing a report; the branch remains an older MoE/DDTree stack that needs a survivorship review against current qwen35moe support. |
 | #183 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr183-20260527-1959` produced unmerged paths across deleted legacy `dflash/CMakeLists.txt`, moved Gemma4 source/header files, `server/src/errors.cpp`, and `server/src/internal.h`. Codex tmux session `luce-pr183-codex-2003` wrote `/tmp/pr183-feasibility-20260527-1959.txt`: safe normal resolution is not feasible; PR #183 is an older Gemma4 MTP split-chain head whose direct semantic change needs a future current-layout MTP foundation port, likely after #237 or a replacement common MTP design. |
-| upstream sync | unchanged | `origin/main` remained at `3474edf`; `easel/auto-integration` was already based on that tip at the start of this run. |
+| upstream sync | updated | `origin/main` advanced to `4f4d82e`; `easel/auto-integration` was refreshed from that tip during this run. |
 
 ## Previously attempted / still not integrated
 
@@ -53,7 +53,7 @@ Current stack tip before this metadata refresh: `7f2973c` (already aligned with 
 
 ## Draft / excluded
 
-Draft PRs remain outside the primary contributor integration target: #286, #285, #278, #275, #273, #265, #249, #193, #75. #285 remains partially carried only as an integration dependency.
+Draft PRs remain outside the primary contributor integration target: #289, #286, #285, #278, #275, #273, #265, #249, #193, #75. #285 remains partially carried only as an integration dependency.
 
 ## Suggested close / author action
 
@@ -65,6 +65,7 @@ Draft PRs remain outside the primary contributor integration target: #286, #285,
 
 This run performed:
 
+- `git merge --no-edit origin/main` to refresh the branch against the latest upstream main (`4f4d82e`)
 - `date -Is`
 - `git status --short`, `git remote -v`, branch and revision checks in the primary checkout
 - `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status`
@@ -82,8 +83,8 @@ This run performed:
 - tmux-driven Claude assessment sessions `luce-pr177-claude-2020` and `luce-pr39-claude-2020` (both exited before producing report files)
 - tmux-driven Codex assessment session `luce-pr153-codex-2020`, producing `/tmp/pr153-feasibility-20260527-2020.txt`
 - `git diff --check -- docs/auto-integration.md` before metadata commit (clean)
-- `git diff --check origin/main..HEAD` after metadata commit (reported two pre-existing blank-line-at-EOF warnings in `luce-bench/src/lucebench/fixtures/forge_eval/scenarios/_model_quality.py` and `_stateful_model_quality.py`; not introduced by this run)
-- `uv run --directory luce-bench --with pytest pytest -q tests/test_runner.py tests/test_smoke_area.py` (passed in the previous refresh; not rerun because this run changed only `docs/auto-integration.md`)
+- `git diff --check HEAD^1..HEAD` after the upstream merge and metadata refresh (clean)
+- `uv run --directory luce-bench --with pytest pytest -q tests/test_runner.py tests/test_smoke_area.py` (passed in this run)
 
 ## Notes
 
