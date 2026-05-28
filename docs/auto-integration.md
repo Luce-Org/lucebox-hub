@@ -4,104 +4,107 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T13:34:07-04:00
-Current base: `origin/main` `315a9bdb`
-Current integration tip before this refresh: `easel/auto-integration` `90d4aac1`
+Last refresh: 2026-05-28T17:05:19-04:00
+Current base: `origin/main` `cfdd2fd5`
+Current integration tip before this refresh: `easel/auto-integration` `9e89ce5f`
 Refreshed stack tip prepared in this run: this commit
 
 This branch is maintained as a reproducible patch stack over `origin/main`.
 The primary checkout was clean at the start of this unattended run. Since the
-prior refresh, `origin/main` advanced by the merge commit for PR #284, so this
-run first synced that upstream change into the integration branch. All previously
-integrated non-draft contributor PR refs remained ancestors of the stack, and no
-new non-draft contributor PR head required a fresh integration merge. After the
-first manifest-only push, CI exposed integration-only build breakage; this
-refresh also removes duplicate CMake test target registrations and installs
-libcurl development headers for the new server target in CI/Docker builds.
+previous refresh, `origin/main` remained at `cfdd2fd5` and new non-draft
+contributor PRs #301 and #302 opened against `main`. This run created an
+isolated worktree from fetched `easel/auto-integration`, confirmed the upstream
+base was already an ancestor, merged #301, pushed once, then the required
+post-push re-enumeration found #302 and the same worktree merged it cleanly. The
+run then re-checked the remaining open non-draft contributor PRs. All currently
+mergeable non-draft contributor PRs are now included in the stack; the remaining
+non-ancestor PRs still require current-layout selective ports or are superseded.
 
 ## Included in the current stack
 
 | PR | Head branch | Head | State | Notes |
 |---:|---|---:|---|---|
-| #294 | `feat/server-passthrough-proxy` | `0883c2e` | included | Adds server passthrough proxy wiring, piecewise keep-ratio curve, query survival checks, and unit coverage. Manual conflict resolution from the previous refresh preserved the stack's canonical Qwen3 drafter loader while adopting #294's qwen3.5/qwen35 path-based drafter arch inference for compatibility overloads. |
-| #292 | `feat-backend-ipc-payload-pipe-open` | `90bc52f` | included | Adds backend IPC payload-pipe support for remote draft feature/noise payloads, with integration-only pipe-drain hardening and shared feature-slice storage helper. |
-| #289 | `pipeline_moe` | `0ffab8a` | included | Pipelined hybrid Qwen35 MoE decode update is carried. The inaccessible submodule pointer from earlier PR history remains excluded. |
-| #284 | `fix/draft-safetensors-rope-theta` | `63bba30` | included | Reads and validates `rope_theta` from draft safetensors `config.json`. |
-| #278 | `fix-pflash-drafter-backend-precision-submit` | upstream | included through upstream | `origin/main` now contains this PR via merge commit `6a6b0081`; the integration stack was rebased over it. |
-| #276 | `fix/qwen36-claude-code-tool-calling` | `0e3c79a` | included | Qwen3.6-27B tool-calling fix for Claude-code Anthropic path. |
-| #274 | `feat/pflash-drafter-ee7` | `2c19f66` | included | Adaptive pFlash compression docs/config, transitive anchor default, backup-suffix ignores, EE7/drafter updates, and Qwen3 closed-`<think>` Jinja prefill docs/tests are carried. |
-| #266 | `feat/harness-typed-adapters` | `17525ea` | included | Typed harness adapters and format-aware session-inject proxy. |
-| #265 | `feat-cpp-server-target-layer-split-prep` | upstream | included through upstream | Upstream main contains this PR. |
-| #177 | `split/gemma4-06-kv-correctness` | `0a95d4b` | selectively included | Previously carried split-on-wrap SWA KV writes and larger SWA ring allocation for chunked long-context prefill in `server/src/gemma4/gemma4_loader.cpp`. Remaining TQ3/large-head KV alignment and tests still require manual design. |
-| #174 | `split/gemma4-14-small-vram-docs` | `8b1caba` | selectively included | Useful small-VRAM/VMM documentation is already ported into current `server/README.md`. |
-| #152 | `main` | `cf735be` | included | Gemma 4 RTX 4090 backend helpers already carried. |
-| #142 | `xabicasa/dflash-safetensors-draft-fp16` | `f2fbf62` | included | FP16 safetensors drafter support already carried. |
-| #94 | `feat/dflash-qwen36-swa-draft` | `d2f9c9d` | absorbed / selectively included | Current draft/common code carries safetensors SWA config parsing and causal-mask behavior; remaining branch edits target old paths. |
-| #62 | `fix/issue-55-stable-kv-pad` | `0ce6832` | absorbed / selectively included | Current server layout carries daemon reset behavior and regression coverage; remaining branch conflicts are legacy tests. |
-| #48 | `fix/consumer-blackwell-auto-detect` | `858b84b` | superseded / selectively included | Current `server/CMakeLists.txt` owns CUDA architecture resolution and Blackwell/GB10 handling. |
-| #39 | `feat/moe-35b-a3b` | `c86ec86` | partially integrated / mostly superseded | Draft safetensors `config.json`/YaRN survivorship was previously ported; remaining old loader/FFN/target-graph pieces are superseded by current qwen35moe/DDTree code. |
+| #302 | `fix/harness-model-paths` | `ea40732` | included | Client harness launchers now honor `DFLASH_TARGET`/`DFLASH_DRAFT`, validate target/draft paths before spawning servers, and document model path overrides. |
+| #301 | `fix/ddtree-test-harness` | `1b3882d` | included | DDTree test harness now reads full verify logits, computes the posterior on CPU instead of relying on the tree GPU argmax shortcut, reuses the logits buffer for sampler bonus logits, and counts generated tokens before the early-exit path. |
+| #300 | `fix/sigterm-gpu-unload` | upstream | included through upstream | `origin/main` now includes the SIGTERM GPU-unload fix via merge commit `a308008a`. |
+| #299 | `feat/draft-swa-flag` | upstream | included through upstream | `origin/main` now includes the draft SWA env/flag support via merge commit `e1a75548`; the previous auto-integration merge is also still in history. |
+| #298 | `fix/gemma4-destructor-link` | upstream | included through upstream | `origin/main` now includes the Gemma4 destructor-link fix via merge commit `cfdd2fd5`; the previous auto-integration merge is also still in history. |
+| #295 | `fix-layer-split-sampling` | `a9aedf7d` | included | Target layer-split sampling support remains an ancestor of the stack. |
+| #294 | `feat/server-passthrough-proxy` | `0883c2e` | included | Server passthrough proxy wiring, piecewise keep-ratio curve, query survival checks, and unit coverage are carried. |
+| #292 | `feat-backend-ipc-payload-pipe-open` | `90bc52f` | included | Backend IPC payload-pipe support for remote draft feature/noise payloads is carried. |
+| #289 | `pipeline_moe` | `0ffab8a` | included | Pipelined hybrid Qwen35 MoE decode update is carried; inaccessible submodule history remains excluded. |
+| #276 | `fix/qwen36-claude-code-tool-calling` | `5e861b4` | included | Qwen3.6-27B tool-calling fix for Claude-code Anthropic path is carried. |
+| #274 | `feat/pflash-drafter-ee7` | `e64a2b8` | included | Adaptive pFlash composition, EE7/drafter updates, docs, tests, and follow-up fixes are carried. |
+| #266 | `feat/harness-typed-adapters` | `17525ea` | included | Typed harness adapters and format-aware session-inject proxy are carried. |
+| #152 | `main` | `cf735be` | included | Gemma 4 RTX 4090 backend helpers are carried. |
+| #142 | `xabicasa/dflash-safetensors-draft-fp16` | `f2fbf62` | included | FP16 safetensors drafter support is carried. |
 | #285 | `feat/lucebox-docker` | draft | partial draft dependency | Draft PR, outside the non-draft target, but earlier Docker/CLI/bench integration dependency remains carried. |
 
 ## Fresh probe results from this run
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| upstream sync | checked | `origin/main` remains `315a9bdb`; `easel/auto-integration` was at `90d4aac1` before this refresh, and the branch already contained the latest upstream merge plus the integration-only CI fixes. |
-| current integrated PRs | checked | `git merge-base --is-ancestor origin/pr/<n> HEAD` shows #294, #292, #289, #276, #274, #266, #152, and #142 are ancestors of the refreshed stack. #284, #278, and #265 are included through `origin/main`. |
-| remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39 against current stack tip `90d4aac1` in probe branch `auto-integration-probe-20260528-133529`. Every direct probe conflicted and was aborted in the isolated probe worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-133529.txt`. |
-| #237 manual/delegated status | still blocked-needs-human | No new #237 head since the prior deep manual/delegated recheck. This run's direct probe again showed broad conflicts across old `dflash/` paths, common MTP interfaces, Qwen35 graph/backend files, CMake, daemon/server wiring, and tests. Prior Claude/Codex tmux attempts did not produce a trusted ready-to-apply resolution, and the required next step remains a deliberate current-layout MTP port rather than conflict-marker resolution. |
-| integration-only CI fix | pending verification | The pushed stack contains the earlier duplicate-CMake-target and libcurl CI/Docker fixes. At this refresh, GitHub checks for PR #286 had a new run in progress (`Build (cmake + uv sync --extra megakernel)` and `uv workspace` pending); previous `cuda12` check for `3b27fc1e` was still pending when the newer run superseded it. |
+| upstream sync | checked | `origin/main` remains `cfdd2fd5`; it was already an ancestor of fetched `easel/auto-integration` `9e89ce5f` before this refresh. |
+| #302 | integrated | Required post-push re-enumeration found new PR #302. `git merge --no-ff --no-commit origin/pr/302` merged cleanly in the same isolated worktree and was committed as `cf0288f6`. The patch touches `README.md`, `harness/clients/README.md`, and `harness/clients/common.sh`. |
+| #301 | integrated | `git merge --no-ff --no-commit origin/pr/301` merged cleanly in the isolated worktree and was committed as `3bb44301`. The patch is limited to `server/test/test_dflash.cpp`. |
+| current integrated PRs | checked | `git merge-base --is-ancestor origin/pr/<n> HEAD` passed for open non-draft PRs #302, #301, #295, #294, #292, #289, #276, #274, #266, #152, and #142. #298/#299/#300 are included through `origin/main`. |
+| #237 | blocked-needs-human / selective-port | Direct merge still conflicts across moved legacy `dflash/` paths, common MTP interfaces, Qwen35 backend/graph/loader files, CMake, daemon/server wiring, and tests. A fresh tmux-driven Codex feasibility pass (`/tmp/luce-pr237-codex-20260528-1643.txt`) used read-only inspection and concluded direct merge is unsafe; current-layout salvage is valuable but non-trivial because current `server/src` still lacks `MtpSource`, `IMtpModule`, `Qwen35MtpModule`, `--mtp-*`, and MTP backend support. |
+| #221 | blocked-needs-human / dependency | Direct merge still conflicts across prefix-cache/MTP/common/Qwen35 files and tests. It depends on a current-layout #237-equivalent MTP foundation before a useful port can be made. |
+| #154 | blocked-needs-human / dependency | Direct merge conflicts in old `dflash/CMakeLists.txt`, MTP docs, old internal/target graph paths, and MTP smoke/contract tests. Portable only after the current-layout Qwen35 MTP foundation exists. |
+| #153 | blocked-needs-human / dependency | Same old-layout MTP integrated runtime conflict class as #154; requires current-layout loader/graph/cache design work. |
+| #137 | suggested-close/superseded | Direct merge conflicts only in legacy `dflash/CMakeLists.txt`; current `server/CMakeLists.txt` owns CUDA arch/BSA handling. |
+| #135 | blocked-needs-human / selective-port | Direct merge conflicts in old internal/Qwen35 target graph/test paths. Needs current multi-request scheduler design rather than direct conflict resolution. |
+| #94 | suggested-close/superseded | Direct merge conflicts in draft graph/safetensors loader/old internal paths. Current code already carries the useful SWA draft parsing and causal-mask behavior; remaining branch edits are old-layout. |
+| #48 | suggested-close/superseded | Direct merge conflicts only in legacy `dflash/CMakeLists.txt`; current server CMake supersedes the old Blackwell arch detection patch. |
+
+Direct-probe log: `/tmp/luce-merge-probes-20260528-1705.txt`.
+Worktree used for this refresh: `/tmp/luce-auto-cron-20260528-170548`.
 
 ## Pending / blocked-needs-human / selective-port candidates
 
 | PR | Head branch | Current status | Next useful action |
 |---:|---|---|---|
-| #237 | `feat/dflash-mtp-foundation` | blocked-needs-human / selective-port | Direct merge still conflicts across current server/common/qwen35 files and old `dflash/` paths. Port common MTP interfaces/runners and tests under `server/`, add MTP fields to `BackendArgs`/`ModelBackend`, reauthor Qwen35 hidden/logit/rollback capture against current `StepGraph`/MoE changes, then wire `qwen35_mtp*`, CLI flags, CMake, and focused tests. |
-| #221 | `feat/mtp-prefix-warm-ghost` | blocked-needs-human / dependency | Requires #237/equivalent MTP foundation, then a current-layout feature port for hidden-state/speculator hooks, backend dispatcher, daemon wiring, and WARM tests. |
-| #183 | `split/gemma4-11a-target-mtp-integration` | blocked-needs-human / selective-port | Direct merge is unsafe because it targets retired `dflash/` plus flat Gemma4 paths. Port KV fix, `h_prev`/asymmetric KV hook, MTP loader/graph, hardening, and tests into current `server/src/gemma4/*`. |
-| #182 | `split/gemma4-10-mtp-loader-step-graph` | blocked-needs-human / selective-port | Port MTP declarations/cache fields, assistant loader pieces, a current `gemma4_mtp_graph.cpp`, CMake wiring, and tests into current layout. |
-| #181 | `split/gemma4-09-dflash-draft-runtime` | blocked-needs-human / selective-port | Mine quantizer metadata/error-reporting/runtime metadata concepts and reauthor tests against current Gemma4/draft plumbing. |
-| #180 | `split/gemma4-08-draft-loader-quant` | blocked-needs-human / selective-port | Reconcile quantizer metadata with current `draft_gguf_loader.cpp`, validate capture/target-layer IDs, and reauthor smoke tests. |
-| #177 | `split/gemma4-06-kv-correctness` | partially integrated / selective-port | SWA split-on-wrap and larger SWA ring allocation are ported. Remaining work: TQ3/large-head KV alignment/type resolution, FA rotation path, and adapted `test_gemma4_kv_tq3.cpp`. |
-| #154 | `xabicasa/dflash-mtp-speculative-loop` | selective-port | Linear native MTP decode semantics are portable after a current-layout Qwen35 MTP design. |
-| #153 | `xabicasa/dflash-mtp-integrated` | blocked-needs-human / selective-port | Feasible but requires loader/graph/cache/MoE design work, not conflict-marker resolution. |
-| #137 | `xabicasa/dflash-build-cmake-sm89-bsa` | stale / suggested close | Edits only deleted legacy `dflash/CMakeLists.txt`; close or ask author to retarget current `server/CMakeLists.txt`. |
-| #135 | `xabicasa/dflash-multi-request-scheduler-batched-target-step` | blocked-needs-human / selective-port | Port `n_seqs` primitives/test helpers first, then design multi-slot `Qwen35Backend` state and scheduler API. |
-| #131 | `feature/gemma4-support` | selective-port | Broad Gemma4 support can be mined, but direct merge would resurrect old `dflash27b`/`dflash/` layout. |
-| #94 | `feat/dflash-qwen36-swa-draft` | absorbed / verify-only | Remaining conflicts are old-layout draft/common paths; current code carries the useful SWA pieces. |
-| #62 | `fix/issue-55-stable-kv-pad` | absorbed / verify-only | Remaining conflicts are old-layout tests; current code carries reset behavior. |
-| #48 | `fix/consumer-blackwell-auto-detect` | superseded / suggested close | Current CMake supersedes the old `dflash/CMakeLists.txt` change. |
-| #39 | `feat/moe-35b-a3b` | partially integrated / mostly superseded | Ask maintainers whether any remaining old MoE smoke coverage should be reauthored against current qwen35moe APIs before closing. |
+| #237 | `feat/dflash-mtp-foundation` | blocked-needs-human / selective-port | Create a fresh current-layout port from `auto-integration`: add MTP core under `server/src/common` and `server/src/qwen35`, wire CMake disabled-by-default, then port hidden capture, rollback, CLI, and tests while preserving current pFlash, remote-draft, and reasoning-budget behavior. |
+| #221 | `feat/mtp-prefix-warm-ghost` | blocked-needs-human / dependency | Revisit after #237-equivalent MTP foundation; then port hidden-state/speculator hooks, backend dispatcher, daemon wiring, and WARM tests to current `server/` layout. |
+| #154 | `xabicasa/dflash-mtp-speculative-loop` | blocked-needs-human / dependency | Mine linear MTP decode semantics after current-layout Qwen35 MTP exists. |
+| #153 | `xabicasa/dflash-mtp-integrated` | blocked-needs-human / dependency | Mine loader/graph/cache/test ideas after current-layout Qwen35 MTP exists. |
+| #135 | `xabicasa/dflash-multi-request-scheduler-batched-target-step` | blocked-needs-human / selective-port | Port only after designing current multi-slot `Qwen35Backend` state and scheduler API. |
+| #137 | `xabicasa/dflash-build-cmake-sm89-bsa` | suggested-close/superseded | Ask author to close or retarget to current `server/CMakeLists.txt` if anything remains. |
+| #94 | `feat/dflash-qwen36-swa-draft` | suggested-close/superseded | Useful behavior appears absorbed; ask author/maintainers whether any remaining old-layout tests should be reauthored before close. |
+| #48 | `fix/consumer-blackwell-auto-detect` | suggested-close/superseded | Close or retarget to current `server/CMakeLists.txt` if still needed. |
 
 ## Draft / excluded
 
 Draft PRs remain outside the primary non-draft integration target except for
-dependency awareness: #291, #290, #286, #285, #275, #249, #193, and #75. #286 is
-the current draft auto-integration snapshot. #285 remains partially carried only
-as an integration dependency.
+dependency awareness: #297, #291, #290, #286, #285, #275, #249, #193, and #75.
+#286 is the draft PR for the current auto-integration snapshot.
 
 ## Validation run
 
 This run performed:
 
-- `date -Is` -> 2026-05-28T13:32:10-04:00 at preflight.
-- Primary checkout `git status --short --branch` was clean before work began and reported `## auto-integration...easel/auto-integration`.
+- `date -Is` -> 2026-05-28T17:05:19-04:00 at preflight; manifest refresh timestamp 2026-05-28T17:05:19-04:00.
+- Primary checkout `/home/erik/Projects/luce2` `git status --short` was clean before work began.
 - `git branch --show-current` reported `auto-integration` in the primary checkout.
 - `git remote -v` verified `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
 - `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status` succeeded for account `easel` with repo/workflow scopes.
 - `HOME=/home/erik /home/erik/.local/bin/claude auth status --text` succeeded for the Claude Team account.
-- `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --version` succeeded with `codex-cli 0.130.0`.
-- `git fetch --prune origin` and `git fetch --prune easel` completed; targeted fetches recreated current open non-draft contributor PR refs.
-- `origin/main`, `easel/auto-integration`, and local `HEAD` were checked as `315a9bdb`, `90d4aac1`, and `90d4aac1` respectively before this manifest-only refresh; `git rev-list --left-right --count HEAD...easel/auto-integration` returned `0 0`.
-- Isolated probe worktree `/tmp/luce-probe-20260528-133529` reran direct conflict probes for all remaining non-ancestor non-draft PRs.
-- Ancestor checks passed for included contributor PR refs #294, #292, #289, #276, #274, #266, #152, and #142; #284, #278, and #265 are included through upstream main.
-- `git diff --check` passed for this manifest-only refresh before commit.
-- Targeted conflict-marker scan over `docs/auto-integration.md` found no merge markers before this manifest refresh.
-- GitHub checks for PR #286 were inspected with `gh pr checks 286`; at the time of this refresh the new workflow run was still pending for `Build (cmake + uv sync --extra megakernel)` and `uv workspace`.
-- Local `cmake -S server -B /tmp/luce-cmake-fix-124202 ...` from the earlier CI-fix run could not reach project configure due to the known local WSL CUDA compiler-id blocker (`ptxas fatal: Value 'sm_52' is not defined`), so CI remains the authoritative CMake verifier for this fix.
+- `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --version` completed successfully with `codex-cli 0.130.0`.
+- `git fetch --prune origin` and `git fetch --prune easel` completed separately; targeted fetches recreated open non-draft contributor PR refs.
+- Worktree `/tmp/luce-auto-cron-20260528-170548` was created from `easel/auto-integration` `9e89ce5f`.
+- `git rev-list --left-right --count origin/main...HEAD` returned `0 333` and `git merge-base --is-ancestor origin/main HEAD` passed before merging #301.
+- `git merge --no-ff --no-commit origin/pr/301` succeeded cleanly; commit `3bb44301` integrated #301.
+- Initial push to `easel/auto-integration` succeeded, advancing the branch to `89dcc469`; required post-push PR re-enumeration then found new non-draft PR #302.
+- `git fetch origin pull/302/head:refs/remotes/origin/pr/302` succeeded, and `git merge --no-ff --no-commit origin/pr/302` merged cleanly; commit `cf0288f6` integrated #302.
+- Isolated direct probes attempted `git merge --no-commit --no-ff origin/pr/<n>` for #237, #221, #154, #153, #137, #135, #94, and #48; each conflicted and was aborted in the worktree. Log: `/tmp/luce-merge-probes-20260528-1705.txt`.
+- Ancestor checks passed for included open non-draft contributor PR refs #302, #301, #295, #294, #292, #289, #276, #274, #266, #152, and #142.
+- `bash -n harness/clients/common.sh`, `git diff --check`, ancestor checks, and the targeted conflict-marker scan over `docs/auto-integration.md`, `server/test/test_dflash.cpp`, `README.md`, `harness/clients/README.md`, and `harness/clients/common.sh` passed before this manifest commit.
+- A local shell smoke check for #302's model-path selection/failure behavior was attempted but blocked by the unattended command-safety guard before execution, so the run did not retry it.
+- GitHub checks for draft PR #286 were inspected before push; `uv workspace` passed while `cuda12` and `Build (cmake + uv sync --extra megakernel)` were pending.
+- Push status is recorded after this manifest commit and final push attempt.
 
 ## Notes
 
-- Primary checkout `/home/erik/Projects/luce2` was clean at preflight and matched fetched `easel/auto-integration` (`90d4aac1`) before this manifest-only refresh.
-- Retained probe worktree `/tmp/luce-probe-20260528-133529` plus direct-probe log `/tmp/luce-merge-probes-20260528-133529.txt`.
+- The primary checkout is clean but its local `auto-integration` branch remains at `89f80c58`, diverged from fetched `easel/auto-integration`; the pushed `easel/auto-integration` branch remains source of truth until supervised local branch cleanup.
+- Retained worktree `/tmp/luce-auto-cron-20260528-170548`, direct-probe log `/tmp/luce-merge-probes-20260528-1705.txt`, and earlier Codex report `/tmp/luce-pr237-codex-20260528-1643.txt`.
 - Prior retained worktrees, probe logs, agent reports, and configure directories remain as listed in earlier manifest revisions; cleanup is separate maintenance.

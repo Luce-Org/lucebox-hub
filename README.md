@@ -123,6 +123,8 @@ All launchers spawn the native C++ HTTP server (`dflash_server`). Override defau
 
 ```bash
 DFLASH_SERVER_BIN=server/build/dflash_server \
+DFLASH_TARGET=server/models/Qwen3.6-27B-Q4_K_M.gguf \
+DFLASH_DRAFT=server/models/draft/dflash-draft-3.6-q4_k_m.gguf \
 MAX_CTX=32768 BUDGET=22 VERIFY_MODE=ddtree \
 harness/clients/run_codex.sh
 ```

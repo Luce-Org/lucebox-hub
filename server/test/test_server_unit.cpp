@@ -23,6 +23,7 @@
 #include "placement/placement_config.h"
 #include "common/layer_split_backend.h"
 #include "common/layer_split_utils.h"
+#include "qwen35/c2_gate.h"
 #include <nlohmann/json.hpp>
 
 #include <cmath>
@@ -1400,6 +1401,7 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     std::vector<int32_t> emitted_tokens;
     bool dflash_enabled = false;
     bool dflash_called = false;
+    bool sampling_enabled = false;
     int shutdown_calls = 0;
     ModelBackend::CompressRequest last_compress_req;
 
@@ -1434,6 +1436,7 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
         return true;
     }
     bool can_dflash_decode() const override { return dflash_enabled; }
+    bool supports_cpu_sampling() const override { return sampling_enabled; }
     bool decode_dflash(const std::vector<int32_t> & prompt, int base_pos,
                        int last_tok, int n_gen, std::vector<int32_t> & out_tokens,
                        const DaemonIO & io) override {
@@ -1526,6 +1529,42 @@ static void test_layer_split_backend_inline_snapshot_and_restore_delta() {
     TEST_ASSERT(raw->prefill_sizes[0] == 1);
     TEST_ASSERT(raw->dflash_base == 3);
     TEST_ASSERT(raw->dflash_last == 99);
+}
+
+static void test_layer_split_backend_sampling_capability_gate() {
+    {
+        auto * raw = new MockLayerSplitAdapter();
+        LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
+
+        GenerateRequest req;
+        req.prompt = {10, 11};
+        req.n_gen = 1;
+        req.do_sample = true;
+        req.sampler.temp = 0.8f;
+        DaemonIO io;
+        GenerateResult result = backend.generate(req, io);
+
+        TEST_ASSERT(!result.ok);
+        TEST_ASSERT(result.error == "sampling_unsupported");
+    }
+
+    {
+        auto * raw = new MockLayerSplitAdapter();
+        raw->sampling_enabled = true;
+        LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
+
+        GenerateRequest req;
+        req.prompt = {10, 11};
+        req.n_gen = 1;
+        req.do_sample = true;
+        req.sampler.temp = 0.8f;
+        DaemonIO io;
+        GenerateResult result = backend.generate(req, io);
+
+        TEST_ASSERT(result.ok);
+        TEST_ASSERT(result.tokens.size() == 1);
+        TEST_ASSERT(result.tokens[0] == 12);
+    }
 }
 
 static void test_layer_split_compress_nopark_uses_default_drafter_path() {
@@ -3279,6 +3318,58 @@ static void test_generate_result_accept_rate_zero_when_no_spec_decode() {
     TEST_ASSERT(r.accept_rate == 0.0f);
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// C2 gate: c2_spec_decode_permitted() unit tests
+//
+// Gate logic: permit spec-decode when eff_fa_window <= 2*fa_window_cfg.
+// eff_fa_window = fa_window_override when set, else fa_window_cfg.
+//
+// Empirical validation (Round 5 bench):
+// - D_composition 128K: effective_in=10988, eff_fa_window=11244 > 4096
+//   → gate BLOCKS spec-decode → AR at 27.5 tok/s (correct — spec at 5.74)
+// - D_composition short: eff_fa_window <= 4096 → gate permits spec-decode
+// ═══════════════════════════════════════════════════════════════════════
+
+static void test_c2_gate_no_override_always_permits() {
+    // fa_window_override == 0 → no pflash, always spec-decode permitted.
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(0, 2048, 1));
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(0, 2048, 4096));
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(0, 2048, 131072));
+}
+
+static void test_c2_gate_128k_compressed_blocks_spec() {
+    // Round 5 D 128K: effective_in=10988, fa_window_override=11244.
+    // 11244 > 2*2048=4096 → gate correctly BLOCKS spec-decode (AR wins empirically).
+    int fa_window_cfg = 2048;
+    int compressed_size = 10988;
+    int fa_window_override = compressed_size + 256;  // = 11244
+    TEST_ASSERT(!dflash::common::c2_spec_decode_permitted(
+        fa_window_override, fa_window_cfg, compressed_size));
+}
+
+static void test_c2_gate_65k_compressed_blocks_spec() {
+    // D 65K cell: effective_in≈5383, fa_window_override≈5639 > 4096 → blocks.
+    int compressed_size = 5383;
+    int fa_window_override = compressed_size + 256;
+    TEST_ASSERT(!dflash::common::c2_spec_decode_permitted(
+        fa_window_override, 2048, compressed_size));
+}
+
+static void test_c2_gate_small_compressed_permits_spec() {
+    // Small compressed KV (override <= 2*fa_window): spec-decode permitted.
+    // fa_window_override=3000 <= 4096 → permit
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(3000, 2048, 2744));
+    // fa_window_override=4096 == 2*2048 → permit (at boundary)
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(4096, 2048, 3840));
+}
+
+static void test_c2_gate_boundary_at_2x_fa_window() {
+    // At exactly 2*fa_window_cfg: permit (<=).
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(4096, 2048, 3840));
+    // At 2*fa_window_cfg + 1: block.
+    TEST_ASSERT(!dflash::common::c2_spec_decode_permitted(4097, 2048, 3841));
+}
+
 int main() {
     std::fprintf(stderr, "══════════════════════════════════════════\n");
     std::fprintf(stderr, " Server Unit Tests\n");
@@ -3389,6 +3480,7 @@ int main() {
     RUN_TEST(test_parse_target_device_list_single_gpu_is_not_layer_split);
     RUN_TEST(test_validate_layer_split_weights_shape);
     RUN_TEST(test_layer_split_backend_inline_snapshot_and_restore_delta);
+    RUN_TEST(test_layer_split_backend_sampling_capability_gate);
     RUN_TEST(test_layer_split_compress_nopark_uses_default_drafter_path);
     RUN_TEST(test_layer_split_compress_rejects_bad_keep_ratio);
     RUN_TEST(test_layer_split_backend_shutdown_is_idempotent);
@@ -3490,6 +3582,13 @@ int main() {
     RUN_TEST(test_generate_result_accept_rate_in_usage_openai);
     RUN_TEST(test_generate_result_accept_rate_in_usage_anthropic);
     RUN_TEST(test_generate_result_accept_rate_zero_when_no_spec_decode);
+
+    std::fprintf(stderr, "\n── C2 gate (spec-decode gate) ──\n");
+    RUN_TEST(test_c2_gate_no_override_always_permits);
+    RUN_TEST(test_c2_gate_128k_compressed_blocks_spec);
+    RUN_TEST(test_c2_gate_65k_compressed_blocks_spec);
+    RUN_TEST(test_c2_gate_small_compressed_permits_spec);
+    RUN_TEST(test_c2_gate_boundary_at_2x_fa_window);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");
     std::fprintf(stderr, " Results: %d assertions, %d failures\n",
