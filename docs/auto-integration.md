@@ -4,22 +4,26 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T16:29:05-04:00
+Last refresh: 2026-05-28T16:31:00-04:00
 Current base: `origin/main` `3ba525e0`
-Current integration tip before this refresh: `easel/auto-integration` `ea777e0c`
+Current integration tip before this refresh: `easel/auto-integration` `01f0dab7`
 Refreshed stack tip prepared in this run: this commit
 
 This branch is maintained as a reproducible patch stack over `origin/main`.
 The primary checkout was clean at the start of this unattended run. `origin/main`
 was already an ancestor of `easel/auto-integration`, so no upstream merge was
 needed. This run refreshed the manifest after re-enumerating open PRs, fetching
-all open non-draft contributor refs, verifying the included PR heads, and rerunning
-isolated direct-merge probes for the remaining non-ancestor PR heads.
+all open non-draft contributor refs, verifying the included PR heads, rerunning
+isolated direct-merge probes for the remaining non-ancestor PR heads, and then
+performing the required post-push re-enumeration. That post-push check found new
+non-draft PR #299, which was fetched, merged cleanly, verified with changed-file
+`git diff --check`, documented here, and pushed in a second update.
 
 ## Included in the current stack
 
 | PR | Head branch | Head | State | Notes |
 |---:|---|---:|---|---|
+| #299 | `feat/draft-swa-flag` | `79c86c0` | included this run | Adds `DFLASH27B_DRAFT_SWA` env fallback for draft SWA window when `--draft-swa` is absent. Found during the required post-push re-enumeration and merged cleanly. |
 | #298 | `fix/gemma4-destructor-link` | `32ba96e9` | included | Gemma4 destructor-link fix is an ancestor of the stack. |
 | #295 | `fix-layer-split-sampling` | `a9aedf7d` | included | Target layer-split sampling support is an ancestor of the stack. |
 | #294 | `feat/server-passthrough-proxy` | `0883c2e` | included | Server passthrough proxy wiring, piecewise keep-ratio curve, query survival checks, and unit coverage are carried. |
@@ -37,7 +41,7 @@ isolated direct-merge probes for the remaining non-ancestor PR heads.
 | PR | Outcome | Notes |
 |---:|---|---|
 | upstream sync | checked | `origin/main` `3ba525e0` is already an ancestor of `easel/auto-integration` `ea777e0c`; no upstream merge was required. |
-| current integrated PRs | checked | `git merge-base --is-ancestor origin/pr/<n> HEAD` passed for open non-draft PRs #298, #295, #294, #292, #289, #276, #274, #266, #152, and #142. |
+| current integrated PRs | checked | Initial `git merge-base --is-ancestor origin/pr/<n> HEAD` passed for open non-draft PRs #298, #295, #294, #292, #289, #276, #274, #266, #152, and #142. Post-push re-enumeration discovered #299, which was fetched and cleanly merged. |
 | #237 | blocked-needs-human / selective-port | Direct merge still conflicts across moved legacy `dflash/` paths, common MTP interfaces, Qwen35 backend/graph/loader files, CMake, daemon/server wiring, and tests. A tmux-driven Codex feasibility pass (`/tmp/luce-pr237-codex-20260528-162440.txt`) concluded there is no safe mechanical production port; the next step is a deliberate current-layout MTP design/port. |
 | #221 | blocked-needs-human / dependency | Direct merge still conflicts across prefix-cache/MTP/common/Qwen35 files and tests. It depends on a current-layout #237-equivalent MTP foundation before a useful port can be made. |
 | #154 | blocked-needs-human / dependency | Direct merge conflicts in old `dflash/CMakeLists.txt`, MTP docs, old internal/target graph paths, and MTP smoke/contract tests. Portable only after the current-layout Qwen35 MTP foundation exists. |
@@ -73,7 +77,7 @@ dependency awareness: #297, #291, #290, #286, #285, #275, #249, #193, and #75.
 
 This run performed:
 
-- `date -Is` -> 2026-05-28T16:23:47-04:00 at preflight; manifest refresh timestamp 2026-05-28T16:29:05-04:00.
+- `date -Is` -> 2026-05-28T16:23:47-04:00 at preflight; manifest refresh timestamp 2026-05-28T16:31:00-04:00.
 - Primary checkout `/home/erik/Projects/luce2` `git status --short` was clean before work began.
 - `git branch --show-current` reported `auto-integration` in the primary checkout.
 - `git remote -v` verified `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
@@ -85,7 +89,11 @@ This run performed:
 - Isolated direct probes attempted `git merge --no-commit --no-ff origin/pr/<n>` for #237, #221, #154, #153, #137, #135, #94, and #48; each conflicted and was aborted in the worktree. Log: `/tmp/luce-merge-probes-20260528-162440.txt`.
 - tmux-driven Codex feasibility analysis for #237 completed without file modifications and produced `/tmp/luce-pr237-codex-20260528-162440.txt`.
 - Ancestor checks passed for included open non-draft contributor PR refs #298, #295, #294, #292, #289, #276, #274, #266, #152, and #142.
-- `git diff --check` passed for this manifest-only refresh before commit.
+- First `git diff --check` passed for the manifest-only refresh before commit.
+- First push advanced `easel/auto-integration` from `ea777e0c` to `01f0dab7`.
+- Required post-push PR re-enumeration discovered new non-draft PR #299 (`origin/pr/299` `79c86c0`), fetched it, and merged it cleanly as `9427369d`.
+- Changed-file `git diff --check HEAD^..HEAD` passed for the #299 merge; full-stack `git diff --check origin/main...HEAD` still reports two pre-existing blank-line-at-EOF warnings in `luce-bench/src/lucebench/fixtures/forge_eval/scenarios/_model_quality.py` and `_stateful_model_quality.py`.
+- `gh pr checks 286 --repo Luce-Org/lucebox-hub` after the first push showed both checks pending for run `26600417835`.
 
 ## Notes
 
