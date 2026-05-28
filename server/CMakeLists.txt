@@ -780,6 +780,7 @@ if(DFLASH27B_TESTS)
 
     # ─── dflash_server: native C++ HTTP server ─────────────────────────
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/server/server_main.cpp")
+        find_package(CURL REQUIRED)
         add_executable(dflash_server
             src/server/server_main.cpp
             src/server/http_server.cpp
@@ -793,7 +794,7 @@ if(DFLASH27B_TESTS)
                 DFLASH27B_BACKEND_CUDA=1
                 DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
         endif()
-        target_link_libraries(dflash_server PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread)
+        target_link_libraries(dflash_server PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread CURL::libcurl)
         if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             find_package(CUDAToolkit REQUIRED)
             target_link_libraries(dflash_server PRIVATE CUDA::cudart)
@@ -860,7 +861,7 @@ if(DFLASH27B_TESTS)
                 DFLASH27B_BACKEND_CUDA=1
                 DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
         endif()
-        target_link_libraries(test_server_unit PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        target_link_libraries(test_server_unit PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} CURL::libcurl)
         if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             find_package(CUDAToolkit REQUIRED)
             target_link_libraries(test_server_unit PRIVATE CUDA::cudart)

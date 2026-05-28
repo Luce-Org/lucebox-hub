@@ -149,6 +149,13 @@ struct ServerConfig {
     bool        pflash_remote_drafter = false; // use IPC drafter for mixed backends
     RemoteDraftConfig pflash_remote;        // IPC binary/work-dir for remote PFlash drafter
     bool        pflash_skip_park = false;   // skip park/unpark for >=32GB GPUs
+    // Passthrough proxy — forward to upstream OpenAI-compatible server
+    std::string pflash_upstream_base;      // e.g. "http://localhost:8080/v1"
+    std::string pflash_upstream_key;       // Bearer token for upstream
+    std::string pflash_upstream_model;     // model name in forwarded requests
+    // Piecewise keep-ratio curve: (token_threshold, keep_ratio) sorted ascending.
+    // If empty, uses pflash_keep_ratio as flat value.
+    std::vector<std::pair<int, float>> pflash_curve;
     bool        lazy_draft      = false;   // park decode draft when idle to save VRAM
 
     // Disk prefix cache
@@ -180,6 +187,8 @@ struct ParsedRequest {
     json                      tool_choice;
     // Original messages (for response formatting)
     json                      messages;
+    // Original request body (for upstream proxy forwarding)
+    json                      raw_body;
     // Response ID
     std::string               response_id;
     // Thinking/reasoning state
