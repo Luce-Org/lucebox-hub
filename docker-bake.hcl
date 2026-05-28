@@ -4,7 +4,9 @@
 # intentionally omitted.
 #
 #   scripts/build_image.sh            # version-derived local build (preferred)
+#   scripts/docker_build_env.sh       # mounted-worktree dev build env + build
 #   docker buildx bake cuda12-local   # raw local build; tagged lucebox-hub:cuda12
+#   docker buildx bake build-env-local # local mounted-worktree build env
 #   docker buildx bake cuda12         # CI target; tags come from metadata-action
 #                                 # Arches: sm_75;80;86;89;90;120
 #
@@ -85,4 +87,10 @@ target "cuda12" {
 target "cuda12-local" {
     inherits = ["_cuda12-base"]
     tags = image_tags("cuda12")
+}
+
+target "build-env-local" {
+    inherits = ["_cuda12-base"]
+    target = "build-env"
+    tags = image_tags("build-env")
 }

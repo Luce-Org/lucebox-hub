@@ -33,6 +33,7 @@ MANIFEST
 *.cubin
 *.fatbin
 *.ncu-rep
+.docker-build/
 
 # virtualenvs
 venv/

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-# ─── Stage 1: builder ───────────────────────────────────────────────────────
+# ─── Stage 1: shared CUDA build toolchain ────────────────────────────────────
 # CUDA_VERSION / UBUNTU_VERSION / DFLASH_CUDA_ARCHES are build args so the
 # same Dockerfile can be repinned later. The prebuilt image is the
 # CUDA 12.8 path:
@@ -8,24 +8,9 @@
 # See docker-bake.hcl for the canonical invocation.
 ARG CUDA_VERSION=12.8.1
 ARG UBUNTU_VERSION=22.04
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS build-base
 
 ARG DEBIAN_FRONTEND=noninteractive
-
-# Fat-binary CUDA arch list, semicolon-separated. Defaults cover the CUDA 12.8
-# image. dflash-supported arches in this image:
-#   75  Turing      RTX 2080 Ti
-#   80  Ampere      A100
-#   86  Ampere      RTX 3090, A40, A10
-#   89  Ada         RTX 4090, L40
-#   90  Hopper      H100
-#   120 Blackwell   RTX 5090, RTX 5090 Laptop
-# Thor and GB10 prebuilt-image coverage is intentionally omitted.
-# Pre-Turing arches (sm_60/61/70/72) are intentionally excluded — dflash's
-# BF16/WMMA paths have no fallback below sm_75. Each arch adds ~50-200 MB
-# of fat-binary kernel code and ~3-5 min of nvcc time per .cu translation
-# unit.
-ARG DFLASH_CUDA_ARCHES="75;80;86;89;90;120"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -50,6 +35,41 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN ln -sf libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 \
     && echo "/usr/local/cuda/lib64/stubs" > /etc/ld.so.conf.d/cuda-stubs.conf \
     && ldconfig
+
+# Mounted-worktree development/build image. This intentionally derives from the
+# exact same CUDA/toolchain layer as the production builder, but does not COPY
+# source into the image; scripts/docker_build_env.sh bind-mounts the checkout at
+# /workspace so repeated integration builds exercise the same compiler stack
+# without invalidating Docker layers on every source edit.
+FROM build-base AS build-env
+ARG DFLASH_CUDA_ARCHES="75;80;86;89;90;120"
+ENV DFLASH_CUDA_ARCHES="${DFLASH_CUDA_ARCHES}" \
+    UV_PYTHON_INSTALL_DIR=/opt/uv/python \
+    UV_TOOL_DIR=/opt/uv/tools \
+    UV_LINK_MODE=hardlink
+RUN curl -LsSf https://astral.sh/uv/install.sh \
+        | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 INSTALLER_NO_MODIFY_PATH=1 sh \
+    && mkdir -p /workspace /work
+WORKDIR /workspace
+CMD ["bash"]
+
+# ─── Stage 2: production builder ────────────────────────────────────────────
+FROM build-base AS builder
+
+# Fat-binary CUDA arch list, semicolon-separated. Defaults cover the CUDA 12.8
+# image. dflash-supported arches in this image:
+#   75  Turing      RTX 2080 Ti
+#   80  Ampere      A100
+#   86  Ampere      RTX 3090, A40, A10
+#   89  Ada         RTX 4090, L40
+#   90  Hopper      H100
+#   120 Blackwell   RTX 5090, RTX 5090 Laptop
+# Thor and GB10 prebuilt-image coverage is intentionally omitted.
+# Pre-Turing arches (sm_60/61/70/72) are intentionally excluded — dflash's
+# BF16/WMMA paths have no fallback below sm_75. Each arch adds ~50-200 MB
+# of fat-binary kernel code and ~3-5 min of nvcc time per .cu translation
+# unit.
+ARG DFLASH_CUDA_ARCHES="75;80;86;89;90;120"
 
 WORKDIR /src
 
@@ -122,7 +142,7 @@ COPY harness /src/harness
 COPY optimizations/pflash /src/optimizations/pflash
 COPY optimizations/megakernel /src/optimizations/megakernel
 
-# ─── Stage 2: runtime ───────────────────────────────────────────────────────
+# ─── Stage 3: runtime ───────────────────────────────────────────────────────
 # Runtime image: ships nvidia driver libs but no nvcc / dev headers. Matches
 # the builder's CUDA version so the test_dflash binary's libcudart SONAME
 # resolves at runtime against the same major.minor.
