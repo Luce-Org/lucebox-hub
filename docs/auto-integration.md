@@ -4,19 +4,17 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T02:45:38-04:00
+Last refresh: 2026-05-28T03:03:56-04:00
 Current base: `origin/main` `4f4d82e`
-Current integration tip before this refresh: `easel/auto-integration` `cf468ab`
+Current integration tip before this refresh: `easel/auto-integration` `ce22790`
 
 This branch is maintained as a reproducible patch stack over `origin/main`. The
 primary checkout was clean at the start of this unattended run. Upstream
-`origin/main` and all currently included non-draft contributor PR heads were
+`origin/main` and the current included non-draft contributor PR heads were
 unchanged relative to the prior pushed stack, so this refresh did not add source
-code. The remaining non-ancestor non-draft PRs were re-probed in the isolated
-integration worktree; every direct merge still conflicts. PR #237 received a
-fresh tmux-driven Codex feasibility pass in a conflicted worktree, which
-confirmed it is feasible only as a deliberate current-layout MTP port rather
-than a conflict-marker resolution.
+code or alter the stack. No new non-draft candidate displaced the current patch
+order, so this pass was a manifest refresh rather than a stack mutation. The
+existing blocked/selective-port notes remain the reference for future work.
 
 ## Included in the current stack
 
@@ -39,7 +37,7 @@ Recently closed contributor PRs #287 and #288 are no longer open non-draft
 integration targets; their heads remain in the historical stack where already
 carried.
 
-## Attempted this run
+## Prior probe results (retained)
 
 | PR | Outcome | Notes |
 |---:|---|---|
