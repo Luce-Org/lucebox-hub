@@ -227,8 +227,8 @@ static void print_usage(const char * prog) {
         "                               renderer. Empty or missing falls back\n"
         "                               to the hardcoded template.\n"
         "\n"
-        "Context compaction:\n"
-        "  --compaction                 Enable auto context compaction\n"
+        "Context compaction (enabled by default, triggered by client request):\n"
+        "  --no-compaction              Disable auto context compaction\n"
         "  --compaction-threshold <F>   Trigger ratio of max_ctx (default: 0.9)\n"
         "  --compaction-max-tokens <N>  Max tokens for self-summary (default: 1024)\n"
         "  --compaction-keep-recent <F> Fraction of recent turns kept verbatim\n"
@@ -428,8 +428,8 @@ int main(int argc, char ** argv) {
                 sconfig.chat_template_path = path;
                 std::fprintf(stderr, "[server] loaded chat template from %s (%ld bytes)\n", path, n);
             }
-        } else if (std::strcmp(argv[i], "--compaction") == 0) {
-            sconfig.compaction_enabled = true;
+        } else if (std::strcmp(argv[i], "--no-compaction") == 0) {
+            sconfig.compaction_enabled = false;
         } else if (std::strcmp(argv[i], "--compaction-threshold") == 0 && i + 1 < argc) {
             sconfig.compaction_threshold = std::stof(argv[++i]);
         } else if (std::strcmp(argv[i], "--compaction-max-tokens") == 0 && i + 1 < argc) {

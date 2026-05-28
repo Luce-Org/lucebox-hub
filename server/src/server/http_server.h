@@ -164,7 +164,7 @@ struct ServerConfig {
     std::string chat_template_src;          // literal Jinja source (loaded from file)
     std::string chat_template_path;         // path it was loaded from (logged at startup)
 
-    bool        compaction_enabled        = false;
+    bool        compaction_enabled        = true;
     float       compaction_threshold      = 0.9f;
     int         compaction_max_tokens     = 1024;
     float       compaction_keep_recent    = 0.3f;

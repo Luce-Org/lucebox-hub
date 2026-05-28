@@ -93,7 +93,6 @@ def build_command(args: argparse.Namespace) -> list[str]:
         str(args.max_ctx),
         "--max-tokens",
         str(args.max_output_tokens),
-        "--compaction",
         "--compaction-threshold",
         "0.5",
     ]
