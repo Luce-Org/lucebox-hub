@@ -4,15 +4,16 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T00:53:49-04:00
+Last refresh: 2026-05-28T01:01:19-04:00
 Current base: `origin/main` `4f4d82e`
-Current integration tip before this refresh: `easel/auto-integration` `6599b09`
+Current integration tip before this refresh: `easel/auto-integration` `bf41287`
 
 This branch is maintained as a reproducible patch stack over `origin/main`. The
-primary checkout was clean at the start of this unattended run. This refresh did
-not find an upstream-base advance or a newly mergeable non-draft PR head, but it
-reran direct merge probes for all remaining non-ancestor non-draft PRs and added
-fresh conflicted-worktree/delegated evidence for PR #183.
+primary checkout was clean at the start of this unattended run. This refresh
+rechecked upstream/main and the open PR set, found no upstream-base advance and
+no newly mergeable non-draft PR head, and therefore made no stack changes. It
+left the prior direct-merge probe evidence intact for the remaining
+non-ancestor non-draft PRs, including PR #183.
 
 ## Included in the current stack
 
