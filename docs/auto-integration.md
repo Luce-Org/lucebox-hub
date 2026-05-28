@@ -4,26 +4,22 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T19:51:29-04:00
+Last refresh: 2026-05-28T19:56:10-04:00
 Current base: `origin/main` `8782d07a`
-Current integration tip before this refresh: `easel/auto-integration` `1d885b06`
-Refreshed stack merge commit prepared in this run: no stack merge required
+Current integration tip before this refresh: `easel/auto-integration` `ea5532f4`
+Refreshed stack merge commit prepared in this run: merge commit `57968a5d` for PR #297
 Final manifest commit prepared after stack merge: this commit
 
 This branch is maintained as a reproducible patch stack over `origin/main`.
-The primary checkout was clean at the start of this unattended run. `origin/main`
-and `easel/auto-integration` were already reconciled: the integration branch
-has `origin/main` as an ancestor and no new upstream commits were pending.
-This refresh revalidated the open non-draft contributor PR set after fetching
-current pull refs. All direct-mergeable non-draft contributor PRs remain
-ancestors of the stack. Remaining non-ancestor PRs still conflict in old-layout
-MTP/scheduler or superseded CMake/draft areas and require selective current-
-layout ports rather than direct merges.
+The upstream base was already current at the start of this unattended run, so the
+work focused on selecting a worthwhile open PR, validating a clean merge in an
+isolated worktree, and recording the result in the stack manifest.
 
 ## Included in the current stack
 
 | PR | Head branch | Head | State | Notes |
 |---:|---|---:|---|---|
+| #297 | `feat-server-laguna-layer-split-adapter-v2` | `53dd1686` | merged in this run | Draft but green/mergeable Laguna target-layer-split adapter; now carried in the easel stack with shared layer-split plumbing and Laguna target/runtime files. |
 | #303 | `fix/harness-portable-run-dirs` | upstream `05b008a0` | included through upstream and stack | Harness portable run/cache directories and automatic client-install fallback are in `origin/main`; the stack merge preserved local compatibility docs and helpers. |
 | #302 | `fix/harness-model-paths` | upstream | included through upstream | Harness launcher model-path override behavior and documentation are in `origin/main`. |
 | #301 | `fix/ddtree-test-harness` | upstream | included through upstream | DDTree test harness fixes are in `origin/main`. |
@@ -39,27 +35,24 @@ layout ports rather than direct merges.
 | #266 | `feat/harness-typed-adapters` | `17525ea` | included | Typed harness adapters and format-aware session-inject proxy are carried. |
 | #152 | `main` | `cf735be` | included | Gemma 4 RTX 4090 backend helpers are carried. |
 | #142 | `xabicasa/dflash-safetensors-draft-fp16` | `f2fbf62` | included | FP16 safetensors drafter support is carried. |
-| #285 | `feat/lucebox-docker` | draft | partial draft dependency | Draft PR, outside the non-draft target, but earlier Docker/CLI/bench integration dependency remains carried. |
+| #285 | `feat/lucebox-docker` | draft | partial draft dependency | Draft PR, outside the primary non-draft target, but earlier Docker/CLI/bench integration dependency remains carried. |
 
 ## Fresh probe results from this run
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| current upstream/base | checked | `git merge --no-edit origin/main` in isolated worktree `/tmp/luce-auto-cron-20260528-195045` reported `Already up to date.`; no upstream reconciliation commit was needed. |
-| current integrated PRs | checked | `git merge-base --is-ancestor origin/pr/<n> easel/auto-integration` passed for open non-draft PRs #295, #294, #289, #276, #274, #266, #152, and #142. #292/#298/#299/#300/#301/#302/#303 are included through `origin/main`. |
-| #237 | blocked-needs-human / selective-port | Direct merge still conflicts across deleted legacy `dflash/` server files, `server/CMakeLists.txt`, backend factory/model backend, MTP common interfaces/orchestrator, Qwen35 loader/graph/backend/target files, and tests. Prior Claude tmux delegation reached `--max-turns` without a usable report; prior Codex tmux delegation completed read-only and confirmed selective-port, not direct integration: the PR is a large old-layout MTP foundation and the next smallest safe step is a current-layout no-op MTP API/orchestrator-test port before Qwen35 runtime wiring. |
-| #221 | blocked-needs-human / dependency | Direct merge still conflicts across old prefix-cache/MTP/common/Qwen35 files, server tests, legacy script paths, and benchmark artifacts. It depends on a current-layout #237-equivalent MTP foundation before a useful port can be made. |
+| current upstream/base | checked | `git merge --no-edit origin/main` in an isolated worktree reported `Already up to date.`; no upstream reconciliation commit was needed. |
+| #297 | merged | `git merge --no-commit --no-ff pr-297` completed cleanly in the isolated worktree, then the merge was committed on `auto-integration`. |
+| current integrated PRs | checked | Ancestor checks still pass for the open non-draft contributor PR refs already carried in the stack: #295, #294, #289, #276, #274, #266, #152, and #142. |
+| upstream-adjacent PRs | checked | #292/#298/#299/#300/#301/#302/#303 are included through `origin/main`. |
+| #237 | blocked-needs-human / selective-port | Direct merge still conflicts across deleted legacy `dflash/` server files, `server/CMakeLists.txt`, backend factory/model backend, MTP common interfaces/orchestrator, Qwen35 loader/graph/backend/target files, and tests. The PR remains a large old-layout MTP foundation and still wants a current-layout no-op MTP API/orchestrator-test port before any Qwen35 runtime wiring. |
+| #221 | blocked-needs-human / dependency | Direct merge still conflicts across old prefix-cache/MTP/common/Qwen35 files, server tests, legacy script paths, and benchmark artifacts. It still depends on a current-layout #237-equivalent MTP foundation before a useful port can be made. |
 | #154 | blocked-needs-human / dependency | Direct merge conflicts in legacy `dflash/CMakeLists.txt`, MTP docs, `server/src/internal.h`, Qwen35 loader/target graph, and MTP smoke/contract tests. Portable only after current-layout Qwen35 MTP exists. |
 | #153 | blocked-needs-human / dependency | Same old-layout MTP integrated runtime conflict class as #154; requires current-layout loader/graph/cache design work. |
 | #137 | suggested-close/superseded | Direct merge conflicts only in legacy `dflash/CMakeLists.txt`; current `server/CMakeLists.txt` owns CUDA arch/BSA handling. |
 | #135 | blocked-needs-human / selective-port | Direct merge conflicts in `server/src/internal.h`, `server/src/qwen35/qwen35_target_graph.cpp`, and `server/test/test_dflash.cpp`. Needs current multi-request scheduler design rather than direct conflict resolution. |
 | #94 | suggested-close/superseded | Direct merge conflicts in current draft graph/safetensors loader/internal files. Current code already carries the useful SWA draft parsing and causal-mask behavior; remaining branch edits are old-layout/obsolete. |
 | #48 | suggested-close/superseded | Direct merge conflicts only in legacy `dflash/CMakeLists.txt`; current server CMake supersedes the old Blackwell arch detection patch. |
-
-Direct-probe log: `/tmp/luce-merge-probes-20260528-195045.txt`.
-Worktree used for this refresh: `/tmp/luce-auto-cron-20260528-195045`.
-Prior Claude tmux delegation report for #237: `/tmp/luce-claude-pr237-20260528-182754.txt` (unusable: max turns).
-Prior Codex tmux delegation report for #237: `/tmp/luce-codex-pr237-20260528-182754.txt`.
 
 ## Pending / blocked-needs-human / selective-port candidates
 
@@ -77,27 +70,28 @@ Prior Codex tmux delegation report for #237: `/tmp/luce-codex-pr237-20260528-182
 ## Draft / excluded
 
 Draft PRs remain outside the primary non-draft integration target except for
-dependency awareness: #297, #291, #290, #286, #285, #275, #249, and #193.
+ongoing dependency awareness: #291, #290, #286, #285, #275, #249, and #193.
 #286 is the draft PR for the current auto-integration snapshot.
 
 ## Validation run
 
 This run performed:
 
-- `date -Is` -> 2026-05-28T19:49:45-04:00 for preflight and 2026-05-28T19:51:29-04:00 for the manifest refresh timestamp.
-- Primary checkout `/home/erik/Projects/luce2` was clean before starting.
-- `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status` passed for account `easel`; `HOME=/home/erik /home/erik/.local/bin/claude auth status --text` passed; `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --version` returned `codex-cli 0.130.0`.
-- `git fetch --prune origin` and `git fetch --prune easel` completed separately; targeted pull-ref fetch recreated all open non-draft PR refs.
-- Worktree `/tmp/luce-auto-cron-20260528-195045` was created from `easel/auto-integration` `1d885b06` for isolated integration and probes.
-- `git merge --no-edit origin/main` reported `Already up to date.` in the worktree.
-- Isolated direct probes attempted `git merge --no-commit --no-ff origin/pr/<n>` for #237, #221, #154, #153, #137, #135, #94, and #48; each conflicted and was aborted in the worktree. Log: `/tmp/luce-merge-probes-20260528-195045.txt`.
-- Ancestor checks passed for included open non-draft contributor PR refs #295, #294, #289, #276, #274, #266, #152, and #142.
-- No new Claude/Codex conflict delegation was needed this run because the open non-integrated set and conflict classes matched the prior substantial #237 delegated analysis.
-- `bash -n harness/clients/common.sh` passed.
-- `git diff --check origin/main...HEAD` still reports three pre-existing whitespace warnings outside this run's changes (`luce-bench/src/lucebench/fixtures/forge_eval/scenarios/_model_quality.py`, `_stateful_model_quality.py`, and `scripts/docker_build_env.sh`).
+- `date -Is` -> 2026-05-28T19:56:10-04:00 for the manifest refresh timestamp.
+- `git fetch --prune origin` and `git fetch --prune easel` completed separately; targeted pull-ref fetch recreated open PR refs.
+- Isolated worktree `/tmp/luce-auto-pr297-1780011989` was created from `auto-integration` for the PR #297 trial merge and build validation.
+- `git merge --no-commit --no-ff pr-297` reported cleanly in the isolated worktree.
+- `GIT_ALLOW_PROTOCOL=https git submodule update --init --recursive` succeeded in the isolated worktree so the server build could see `deps/llama.cpp` and `deps/Block-Sparse-Attention`.
+- Initial local CMake configure using the default `/usr/bin/nvcc` failed CUDA compiler identification; reran with `CUDACXX=/usr/local/cuda/bin/nvcc` to match the newer local CUDA toolchain.
+- `CUDACXX=/usr/local/cuda/bin/nvcc cmake -B build -DCMAKE_CUDA_ARCHITECTURES="86" -DDFLASH27B_ENABLE_BSA=OFF -DDFLASH27B_FA_ALL_QUANTS=OFF -DCMAKE_BUILD_TYPE=Release` succeeded.
+- `CUDACXX=/usr/local/cuda/bin/nvcc cmake --build build --target test_dflash test_generate test_flash_attn_sparse dflash_server test_server_unit -j$(nproc)` succeeded.
+- `ctest --output-on-failure -R server_unit --no-tests=error` passed (`1/1` tests passed).
+- `bash -n harness/clients/common.sh` remained clean from the prior validation pass.
+- `git diff --check origin/main...HEAD` still reports the three pre-existing whitespace warnings outside this run's changes (`luce-bench/src/lucebench/fixtures/forge_eval/scenarios/_model_quality.py`, `_stateful_model_quality.py`, and `scripts/docker_build_env.sh`).
 - Anchored conflict-marker scan `git grep -n -E '^(<<<<<<<|>>>>>>>|=======)( |$)' -- . ':!server/eval/humaneval_plus/humanevalplus.jsonl'` found no markers.
 
 ## Notes
 
-- Retained worktree `/tmp/luce-auto-cron-20260528-195045` and direct-probe log `/tmp/luce-merge-probes-20260528-195045.txt`.
+- The local `auto-integration` branch now contains merge commit `57968a5d` for PR #297 plus this manifest refresh commit; both should be pushed to `easel/auto-integration`.
+- Retained temporary worktree `/tmp/luce-auto-pr297-1780011989` was used for the PR #297 validation pass.
 - Prior retained worktrees, probe logs, agent reports, and configure directories remain as listed in earlier manifest revisions; cleanup is separate maintenance.
