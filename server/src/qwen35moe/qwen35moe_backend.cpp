@@ -876,21 +876,16 @@ bool Qwen35MoeBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
 
     // Feature capture: write act_cur (F32) → cache_.target_feat (BF16)
     if (target_cache().target_feat) {
-        for (int k = 0; k < target_weights().n_capture_layers; k++) {
-            const int il = target_weights().capture_layer_ids[k];
-            (void)il;  // capture_layer_ids marks which layers — for spec-decode
-            // we capture the final output at every verify position
-        }
         const int cap = target_cache().target_feat_cap;
         const int slot = kv_pos % cap;
         const size_t elt = ggml_element_size(target_cache().target_feat);
         const size_t col_stride = target_cache().target_feat->nb[1];
-        // Write all capture layers from the final hidden state
+        // Convert once — all capture layers store the same final hidden state
+        std::vector<ggml_bf16_t> bf16_buf((size_t)hidden);
+        ggml_fp32_to_bf16_row(act_cur.data(), bf16_buf.data(), hidden);
         for (int k = 0; k < target_weights().n_capture_layers; k++) {
             const size_t offset = (size_t)slot * col_stride +
                                   (size_t)k * (size_t)hidden * elt;
-            std::vector<ggml_bf16_t> bf16_buf((size_t)hidden);
-            ggml_fp32_to_bf16_row(act_cur.data(), bf16_buf.data(), hidden);
             ggml_backend_tensor_set(target_cache().target_feat, bf16_buf.data(),
                                      offset, (size_t)hidden * elt);
         }
