@@ -133,7 +133,8 @@ For no-draft targets such as Gemma, set only `DFLASH_TARGET` or pass
 `DRAFT=none`; the harness will not attach the default Qwen draft to a custom
 target.
 
-Install real-client CLIs before running launcher scripts:
+Launcher scripts install missing real-client CLIs automatically under
+`.harness-work/`. To preinstall them yourself:
 
 ```bash
 python3 harness/client_test_runner.py install --clients codex,hermes,openwebui

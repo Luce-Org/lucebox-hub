@@ -36,6 +36,8 @@ python3 -m harness.client_test_runner bandit --clients opencode
 The launchers default to the current repo, install/use client packages under
 `.harness-work/`, and write logs under `.harness-work/runs/`. Override
 `REPO_DIR`, `CLIENT_WORK_DIR`, or `RUN_DIR` if you want shared paths.
+If a client CLI is missing, the launcher installs it automatically. Set
+`AUTO_INSTALL_CLIENTS=0` to require a preinstalled binary instead.
 
 Common overrides:
 
@@ -99,7 +101,7 @@ python3 harness/client_test_runner.py probe \
 Add `--install-packages` when you also want the runner to install/smoke the
 client packages. Without it, the HTTP protocol probes still run.
 
-The real-client launchers expect their CLI packages to be installed first:
+To preinstall real-client CLIs yourself:
 
 ```bash
 python3 harness/client_test_runner.py install --clients codex,hermes,openwebui

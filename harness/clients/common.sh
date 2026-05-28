@@ -9,6 +9,7 @@ DEFAULT_REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 REPO_DIR="${REPO_DIR:-$DEFAULT_REPO_DIR}"
 CLIENT_WORK_DIR="${CLIENT_WORK_DIR:-$REPO_DIR/.harness-work}"
 RUN_DIR="${RUN_DIR:-$CLIENT_WORK_DIR/runs}"
+AUTO_INSTALL_CLIENTS="${AUTO_INSTALL_CLIENTS:-1}"
 
 DEFAULT_TARGET="$REPO_DIR/server/models/Qwen3.6-27B-Q4_K_M.gguf"
 DEFAULT_DRAFT="$REPO_DIR/server/models/draft/dflash-draft-3.6-q4_k_m.gguf"
@@ -93,9 +94,21 @@ require_client_binary() {
   if [[ -x "$path" ]]; then
     return 0
   fi
+  if [[ "$AUTO_INSTALL_CLIENTS" == "1" ]]; then
+    echo "$label binary not found; installing client package into $CLIENT_WORK_DIR" >&2
+    if ! python3 "$REPO_DIR/harness/client_test_runner.py" \
+      --work-dir "$CLIENT_WORK_DIR" \
+      install \
+      --clients "$client" >&2; then
+      echo "$label auto-install failed." >&2
+    fi
+    if [[ -x "$path" ]]; then
+      return 0
+    fi
+  fi
   echo "$label binary not found or not executable: $path" >&2
   echo "Install it with:" >&2
-  echo "  python3 $REPO_DIR/harness/client_test_runner.py install --clients $client" >&2
+  echo "  python3 $REPO_DIR/harness/client_test_runner.py --work-dir $CLIENT_WORK_DIR install --clients $client" >&2
   echo "or set $env_var=/path/to/$(basename "$path")." >&2
   return 1
 }
