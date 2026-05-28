@@ -4,9 +4,9 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T06:55:39-04:00
+Last refresh: 2026-05-28T07:10:09-04:00
 Current base: `origin/main` `4f4d82e`
-Current integration tip before this refresh: `easel/auto-integration` `d735948`
+Current integration tip before this refresh: `easel/auto-integration` `9fdfad4`
 
 This branch is maintained as a reproducible patch stack over `origin/main`. The
 primary checkout was clean at the start of this unattended run. Upstream
@@ -84,14 +84,16 @@ carried.
 ## Draft / excluded
 
 Draft PRs remain outside the primary non-draft integration target except for
-dependency awareness: #291, #290, #286, #285, #275, #249, #193, and #75. #285
-remains partially carried only as an integration dependency.
+dependency awareness: #291, #290, #286, #285, #275, #249, #193, and #75. #291
+and #290 are new draft-only candidates in this refresh; #286 is the current
+draft auto-integration snapshot. #285 remains partially carried only as an
+integration dependency.
 
 ## Validation run
 
 This run performed:
 
-- `date -Is` -> 2026-05-28T06:55:39-04:00 at preflight and manifest refresh.
+- `date -Is` -> 2026-05-28T07:10:09-04:00 at preflight and manifest refresh.
 - Primary checkout `git status --short` was clean before work began.
 - `git remote -v` verified `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
 - `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status` succeeded for account `easel`.
@@ -110,7 +112,7 @@ This run performed:
 
 ## Notes
 
-- Primary checkout `/home/erik/Projects/luce2` was clean at preflight and matched fetched `easel/auto-integration` (`d735948`).
+- Primary checkout `/home/erik/Projects/luce2` was clean at preflight and matched fetched `easel/auto-integration` (`9fdfad4`).
 - Retained worktree `/tmp/luce-auto-cron-20260528-065539` for direct-merge probe audit and final commit preparation until the pushed branch is reviewed.
 - Retained direct-probe log `/tmp/luce-merge-probes-20260528-065539.txt`.
 - Retained #181 probe worktree `/tmp/luce-pr181-feas-20260528-065539` plus reports `/tmp/pr181-claude-feasibility-20260528-065539.txt` (empty report) and `/tmp/pr181-codex-feasibility-20260528-065539.txt` (completed feasibility).
