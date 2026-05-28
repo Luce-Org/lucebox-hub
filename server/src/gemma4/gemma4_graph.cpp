@@ -203,21 +203,53 @@ static ggml_tensor * build_gemma4_attn_block(
                               0, rope_base, 1.0f,
                               0.0f, 1.0f, 32.0f, 1.0f);
 
-        // Write K/V to cache (ring-buffer position for SWA layers)
+        // Write K/V to cache.  SWA cache is a ring buffer, so a prefill chunk
+        // can straddle the physical end of the cache; split that copy instead
+        // of creating an out-of-bounds view.
         const int write_pos = is_swa ? (kv_start % cache_len) : kv_start;
         ggml_tensor * Kcur_T = ggml_permute(ctx, Kcur, 0, 2, 1, 3);
         ggml_tensor * Vcur_T = ggml_permute(ctx, Vcur, 0, 2, 1, 3);
 
+        const int first_n = is_swa ? std::min(n_tokens, cache_len - write_pos)
+                                   : n_tokens;
+        const int wrap_n  = is_swa ? (n_tokens - first_n) : 0;
+
         ggml_tensor * k_slot = ggml_view_3d(ctx, cache_k,
-            head_dim, n_tokens, n_head_kv,
+            head_dim, first_n, n_head_kv,
             cache_k->nb[1], cache_k->nb[2],
             cache_k->nb[1] * (size_t)write_pos);
         ggml_tensor * v_slot = ggml_view_3d(ctx, cache_v,
-            head_dim, n_tokens, n_head_kv,
+            head_dim, first_n, n_head_kv,
             cache_v->nb[1], cache_v->nb[2],
             cache_v->nb[1] * (size_t)write_pos);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_T, k_slot));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_T, v_slot));
+        ggml_tensor * k_src = ggml_view_3d(ctx, Kcur_T,
+            head_dim, first_n, n_head_kv,
+            Kcur_T->nb[1], Kcur_T->nb[2], 0);
+        ggml_tensor * v_src = ggml_view_3d(ctx, Vcur_T,
+            head_dim, first_n, n_head_kv,
+            Vcur_T->nb[1], Vcur_T->nb[2], 0);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, k_src, k_slot));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, v_src, v_slot));
+
+        if (wrap_n > 0) {
+            GGML_ASSERT(wrap_n <= cache_len && "Gemma4 SWA prefill chunk exceeds ring capacity");
+            ggml_tensor * k_wrap_slot = ggml_view_3d(ctx, cache_k,
+                head_dim, wrap_n, n_head_kv,
+                cache_k->nb[1], cache_k->nb[2], 0);
+            ggml_tensor * v_wrap_slot = ggml_view_3d(ctx, cache_v,
+                head_dim, wrap_n, n_head_kv,
+                cache_v->nb[1], cache_v->nb[2], 0);
+            ggml_tensor * k_wrap_src = ggml_view_3d(ctx, Kcur_T,
+                head_dim, wrap_n, n_head_kv,
+                Kcur_T->nb[1], Kcur_T->nb[2],
+                Kcur_T->nb[1] * (size_t)first_n);
+            ggml_tensor * v_wrap_src = ggml_view_3d(ctx, Vcur_T,
+                head_dim, wrap_n, n_head_kv,
+                Vcur_T->nb[1], Vcur_T->nb[2],
+                Vcur_T->nb[1] * (size_t)first_n);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, k_wrap_src, k_wrap_slot));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, v_wrap_src, v_wrap_slot));
+        }
     }
     // else: KV-sharing layer — cache already written by source layer
 

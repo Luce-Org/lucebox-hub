@@ -4,19 +4,21 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T05:14:46-04:00
+Last refresh: 2026-05-28T05:43:22-04:00
 Current base: `origin/main` `4f4d82e`
-Current integration tip before this refresh: `easel/auto-integration` `b08646b`
+Current integration tip before this refresh: `easel/auto-integration` `6da5a0a`
 
 This branch is maintained as a reproducible patch stack over `origin/main`. The
 primary checkout was clean at the start of this unattended run. Upstream
 `origin/main` was already merged into the stack, and the fetched
 `easel/auto-integration` tip already contained the latest integrated non-draft
-contributor head updates (#265, #278, and #284). This refresh therefore makes
-no code-stack change; it revalidated the current stack, re-probed the remaining
-old-layout/non-ancestor PRs in an isolated worktree, and performed a fresh
-Claude-assisted feasibility pass for #183. Direct merge still conflicts for
-those remaining PRs, so the selective-port notes remain the reference for future
+contributor head updates (#265, #278, and #284). This refresh revalidated the
+current stack, re-probed the remaining old-layout/non-ancestor PRs in an
+isolated worktree, and selectively ported one low-risk Gemma4 KV correctness
+survivor from PR #177 into the current `server/src/gemma4` layout: SWA cache
+writes now split when a prefill chunk wraps the ring buffer instead of creating
+an out-of-bounds cache view. Direct merge still conflicts for the remaining
+non-ancestor PRs, so the selective-port notes remain the reference for future
 work.
 
 ## Included in the current stack
@@ -32,6 +34,7 @@ work.
 | #265 | `feat-cpp-server-target-layer-split-prep` | `054af28` | included | Current head is an ancestor of the refreshed stack; tightens layer-split validation/cleanup across backend factory, layer-split backend, Qwen35 adapter, server main, and unit coverage. |
 | #152 | `main` | `cf735be` | included | Current head is an ancestor of the refreshed stack. |
 | #142 | `xabicasa/dflash-safetensors-draft-fp16` | `f2fbf62` | included | Current head is an ancestor of the refreshed stack. |
+| #177 | `split/gemma4-06-kv-correctness` | `0a95d4b` | selectively included | This refresh ported the low-risk current-layout survivor: Gemma4 SWA cache writes now split on ring-buffer wrap in `server/src/gemma4/gemma4_graph.cpp`; the old-layout loader/graph/test files still need deliberate mapping before the PR can be fully closed. |
 | #174 | `split/gemma4-14-small-vram-docs` | `8b1caba` | selectively included | The useful small-VRAM/VMM documentation is already ported into the current `server/README.md`; the remaining old Gemma4 split-chain commits are not ancestors. |
 | #94 | `feat/dflash-qwen36-swa-draft` | `d2f9c9d` | absorbed / selectively included | Current draft/common code already carries the safetensors SWA config parsing and causal-mask behavior; the old branch conflicts on moved/rewritten draft files. |
 | #62 | `fix/issue-55-stable-kv-pad` | `0ce6832` | absorbed / selectively included | Daemon reset regression coverage and reset fixes remain carried in the current server layout; the old branch still conflicts on legacy test paths. |
@@ -47,10 +50,10 @@ carried.
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| upstream sync | checked | In isolated worktree `/tmp/luce-auto-cron-20260528-051446`, `git merge --no-edit origin/main` reported `Already up to date.` |
+| upstream sync | checked | In isolated worktree `/tmp/luce-auto-cron-20260528-053512`, `git merge --no-edit origin/main` reported `Already up to date.` |
 | current integrated PRs | checked | Current heads for #284, #278, #276, #274, #273, #266, #265, #152, and #142 are ancestors of the refreshed stack. |
-| remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39. Every direct probe conflicted and was aborted in the isolated worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-051446.txt`. |
-| #183 delegated feasibility | attempted this run | Conflicted probe worktree `/tmp/luce-pr183-feas-20260528-051446` was inspected by Claude in tmux. The first run reached the turn limit without a useful report (`/tmp/pr183-claude-feasibility-20260528-051446.txt`); the narrowed rerun produced `/tmp/pr183-claude2-feasibility-20260528-051446.txt`, recommending selective ports for Gemma4 MTP/KV fixes rather than a direct merge. |
+| remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39. Every direct probe conflicted and was aborted in the isolated worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-053512.txt`. |
+| #177 selective port | partially integrated this run | Direct merge still conflicts because #177 targets the retired `dflash/` layout. Manual inspection found a portable KV correctness fix in its Gemma4 graph: split SWA K/V cache writes when a chunk wraps the ring buffer. Ported that into `server/src/gemma4/gemma4_graph.cpp`; two Claude feasibility attempts in tmux ended at turn limits without a useful report (`/tmp/pr177-claude-feasibility-20260528-053512.txt`, `/tmp/pr177-claude2-feasibility-20260528-053512.txt`), so the final change was manually inspected against `origin/pr/177:dflash/src/gemma4_target_graph.cpp`. |
 
 ## Prior probe results (retained)
 
@@ -68,7 +71,7 @@ carried.
 | #182 | `split/gemma4-10-mtp-loader-step-graph` | selective-port | Portable only as current-layout `server/src/gemma4` assistant loader/MTP graph work. Prior Codex report: `/tmp/pr182-feasibility-20260527-2039.txt`. |
 | #181 | `split/gemma4-09-dflash-draft-runtime` | likely superseded / selective-port | Overlaps current Gemma4 DFlash backend and should be mined only after the current Gemma4 MTP shape is chosen. |
 | #180 | `split/gemma4-08-draft-loader-quant` | likely superseded / selective-port | Overlaps current Gemma4 loader/backend code; not mechanically mergeable. |
-| #177 | `split/gemma4-06-kv-correctness` | selective-port / blocked-needs-human | Old-layout additions `dflash/include/gemma4.h`, `dflash/src/gemma4_target_graph.cpp`, `dflash/src/gemma4_target_loader.cpp`, and Gemma4 tests need deliberate mapping into current `server/` APIs. |
+| #177 | `split/gemma4-06-kv-correctness` | partially integrated / selective-port | This run ported PR #177's SWA ring-buffer wrap-safe K/V cache write into current `server/src/gemma4/gemma4_graph.cpp`. Direct merge still conflicts and the remaining old-layout `dflash/include/gemma4.h`, `dflash/src/gemma4_target_graph.cpp`, `dflash/src/gemma4_target_loader.cpp`, and Gemma4 tests need deliberate mapping into current `server/` APIs before #177 is fully integrated. |
 | #154 | `xabicasa/dflash-mtp-speculative-loop` | selective-port | Linear native MTP decode semantics are portable with moderate risk after a current-layout Qwen35 MTP design. Prior Codex report: `/tmp/pr154-feasibility-20260527-2039.txt`. |
 | #153 | `xabicasa/dflash-mtp-integrated` | blocked-needs-human / selective-port | Current-layout Qwen35 MTP port is feasible but requires loader/graph/cache/MoE design, not conflict-marker resolution. Prior Codex report: `/tmp/pr153-feasibility-20260527-2020.txt`. |
 | #137 | `xabicasa/dflash-build-cmake-sm89-bsa` | stale / suggested close | Edits only deleted legacy `dflash/CMakeLists.txt`; close or ask author to retarget current `server/CMakeLists.txt`. |
@@ -89,7 +92,7 @@ remains partially carried only as an integration dependency.
 
 This run performed:
 
-- `date -Is` -> 2026-05-28T05:14:46-04:00 during preflight.
+- `date -Is` -> 2026-05-28T05:43:22-04:00 during this refresh.
 - Primary checkout `git status --short` was clean before work began.
 - `git remote -v` verified `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
 - `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status` succeeded for account `easel`.
@@ -98,20 +101,20 @@ This run performed:
 - `git fetch --prune origin` and `git fetch --prune easel` completed; targeted fetches recreated current open non-draft PR refs.
 - `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ... --jq ...` enumerated all open PRs and showed #289, #286, #285, #275, #249, #193, and #75 as drafts/excluded.
 - `git merge-base --is-ancestor origin/pr/<n> easel/auto-integration` classification showed #284, #278, #276, #274, #273, #266, #265, #152, and #142 are current integrated non-draft heads.
-- Isolated reconciliation/probe worktree `/tmp/luce-auto-cron-20260528-051446`; `git merge --no-edit origin/main` reported already up to date.
-- Fresh direct merge probes for remaining non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all direct probes conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260528-051446.txt`.
-- Dedicated conflicted #183 probe worktree `/tmp/luce-pr183-feas-20260528-051446` was inspected by Claude in tmux. The first run hit the turn limit without producing a useful report; the narrowed rerun produced `/tmp/pr183-claude2-feasibility-20260528-051446.txt` and recommended selective ports rather than direct merge.
-- `git diff --check origin/main...HEAD` reported only pre-existing whitespace warnings in `luce-bench/src/lucebench/fixtures/forge_eval/scenarios/_model_quality.py` and `_stateful_model_quality.py`.
-- `git diff --check b08646b..HEAD` passed for this refresh's manifest-only change.
+- Isolated reconciliation/probe worktree `/tmp/luce-auto-cron-20260528-053512`; `git merge --no-edit origin/main` reported already up to date.
+- Fresh direct merge probes for remaining non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all direct probes conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260528-053512.txt`.
+- Dedicated conflicted #177 probe worktree `/tmp/luce-pr177-feas-20260528-053512` was inspected manually and with two Claude-in-tmux attempts. Both Claude attempts ended at turn limits without a useful report; manual inspection ported the SWA ring-buffer split-copy fix from `origin/pr/177:dflash/src/gemma4_target_graph.cpp` into current `server/src/gemma4/gemma4_graph.cpp`.
+- `git diff --check` passed for this refresh's code and manifest changes.
 - Search for exact merge conflict markers (`^(<<<<<<<|=======|>>>>>>>)`) under the reconciliation worktree returned no results.
-- `cmake -S server -B /tmp/luce-build-20260528-035325 -DLUCE_BUILD_TESTS=ON` was not rerun this cycle; the prior same-day result remains the current environment blocker: local WSL CUDA compiler identification selects unsupported `sm_52` (`ptxas fatal: Value 'sm_52' is not defined for option 'gpu-name'`).
+- `cmake -S server -B /tmp/luce-build-20260528-053512 -DLUCE_BUILD_TESTS=ON` was attempted and failed before project compilation due to the known local WSL CUDA compiler identification blocker: unsupported `sm_52` (`ptxas fatal: Value 'sm_52' is not defined for option 'gpu-name'`).
 
 ## Notes
 
-- Primary checkout `/home/erik/Projects/luce2` was clean at preflight and matched fetched `easel/auto-integration` (`b08646b`).
-- Retained worktree `/tmp/luce-auto-cron-20260528-051446` for direct-merge probe audit until the pushed branch is reviewed.
-- Retained direct-probe log `/tmp/luce-merge-probes-20260528-051446.txt`.
-- Retained conflicted #183 probe worktree `/tmp/luce-pr183-feas-20260528-051446` plus Claude reports `/tmp/pr183-claude-feasibility-20260528-051446.txt` and `/tmp/pr183-claude2-feasibility-20260528-051446.txt`.
+- Primary checkout `/home/erik/Projects/luce2` was clean at preflight and matched fetched `easel/auto-integration` (`6da5a0a`).
+- Retained worktree `/tmp/luce-auto-cron-20260528-053512` for direct-merge probe audit and final commit preparation until the pushed branch is reviewed.
+- Retained direct-probe log `/tmp/luce-merge-probes-20260528-053512.txt`.
+- Retained conflicted #177 probe worktree `/tmp/luce-pr177-feas-20260528-053512` plus Claude turn-limit reports `/tmp/pr177-claude-feasibility-20260528-053512.txt` and `/tmp/pr177-claude2-feasibility-20260528-053512.txt`.
+- Retained previous conflicted #183 probe worktree `/tmp/luce-pr183-feas-20260528-051446` plus Claude reports `/tmp/pr183-claude-feasibility-20260528-051446.txt` and `/tmp/pr183-claude2-feasibility-20260528-051446.txt`.
 - Retained previous conflicted #221 probe worktree `/tmp/luce-pr221-feas-20260528-043924` plus Claude reports `/tmp/pr221-claude-feasibility-20260528-043924.txt` and `/tmp/pr221-claude2-feasibility-20260528-043924.txt`.
-- Retained earlier worktrees `/tmp/luce-auto-cron-20260528-042532`, `/tmp/luce-auto-cron-20260528-035325`, `/tmp/luce-auto-cron-20260528-033958`, `/tmp/luce-auto-cron-20260528-032612`, and `/tmp/luce-auto-cron-20260528-031117`, direct-probe logs `/tmp/luce-merge-probes-20260528-042532.txt`, `/tmp/luce-merge-probes-20260528-035325.txt`, `/tmp/luce-merge-probes-20260528-033958.txt`, `/tmp/luce-merge-probes-20260528-032612.txt`, and `/tmp/luce-merge-probes-20260528-031117.txt`, and prior CMake configure directories for inspection.
+- Retained earlier worktrees `/tmp/luce-auto-cron-20260528-051446`, `/tmp/luce-auto-cron-20260528-042532`, `/tmp/luce-auto-cron-20260528-035325`, `/tmp/luce-auto-cron-20260528-033958`, `/tmp/luce-auto-cron-20260528-032612`, and `/tmp/luce-auto-cron-20260528-031117`, direct-probe logs `/tmp/luce-merge-probes-20260528-051446.txt`, `/tmp/luce-merge-probes-20260528-042532.txt`, `/tmp/luce-merge-probes-20260528-035325.txt`, `/tmp/luce-merge-probes-20260528-033958.txt`, `/tmp/luce-merge-probes-20260528-032612.txt`, and `/tmp/luce-merge-probes-20260528-031117.txt`, and prior CMake configure directories for inspection.
 - Prior retained conflicted worktrees and agent reports remain as listed in earlier manifest revisions; cleanup is separate maintenance.
