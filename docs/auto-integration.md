@@ -4,8 +4,8 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-27T21:02:57-04:00 through 2026-05-27T21:09:58-04:00
-Current stack tip before this metadata refresh: `cc007d1` (already aligned with `origin/main` `4f4d82e`; this run found no upstream-base advance and refreshed triage for two stale/conflicted PRs).
+Last refresh: 2026-05-27T21:22:54-04:00 through 2026-05-27T21:29:00-04:00
+Current stack tip before this metadata refresh: `d465a7e` (already aligned with `origin/main` `4f4d82e`; this run found no upstream-base advance and revalidated PR #237 with a fresh conflicted worktree plus tmux-driven Codex feasibility report).
 
 ## Included in the current stack
 
@@ -27,6 +27,7 @@ Current stack tip before this metadata refresh: `cc007d1` (already aligned with 
 
 | PR | Outcome | Notes |
 |---:|---|---|
+| #237 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr237-20260527-2124` produced broad conflicts across current `server/CMakeLists.txt`, common backend/MTP interfaces, Qwen35 loader/graph/backend files, tests, and deleted legacy `dflash/scripts/server.py` / `dflash/src/server/server_main.cpp`. tmux-driven Codex session `luce-pr237-codex-2124` wrote `/tmp/pr237-feasibility-20260527-2124.txt`: selective port is feasible, but a direct conflict-marker resolution is unsafe because the current native server CLI/config, Qwen35 MoE/remote-draft/thinking-budget behavior, and restore/prefix-cache semantics must be preserved with MTP off by default first. |
 | #177 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr177-20260527-2020` produced conflicts in deleted legacy `dflash/CMakeLists.txt`, moved Gemma4 header/source/test paths, `server/src/errors.cpp`, and `server/src/internal.h`. A tmux-driven Claude assessment session was launched (`luce-pr177-claude-2020`) but exited without producing a report; the raw conflict shape still confirms this older Gemma4 KV-correctness split is not mechanically mergeable into the current `server/src/gemma4` architecture. |
 | #153 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr153-20260527-2020` produced conflicts in legacy `dflash/CMakeLists.txt`, current `server/src/internal.h`, `server/src/qwen35/gguf_target_loader.cpp`, `server/src/qwen35/qwen35_target_graph.cpp`, and path-mapped MTP docs/tests. Codex tmux session `luce-pr153-codex-2020` wrote `/tmp/pr153-feasibility-20260527-2020.txt`: selective port is feasible, but not as conflict-marker resolution; current-layout loader/graph/token embedding/MoE/cache semantics need deliberate design. |
 | #39 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr39-20260527-2020` produced broad conflicts across deleted legacy `dflash/*` files plus current draft graph/safetensors loader and MoE smoke tests. A tmux-driven Claude assessment session was launched (`luce-pr39-claude-2020`) but exited without producing a report; the branch remains an older MoE/DDTree stack that needs a survivorship review against current qwen35moe support. |
@@ -44,7 +45,7 @@ Current stack tip before this metadata refresh: `cc007d1` (already aligned with 
 
 | PR | Head branch | State | Why held |
 |---:|---|---|---|
-| #237 | `feat/dflash-mtp-foundation` | blocked-needs-human / selective-port | Prior fresh worktree and Codex attempts found broad conflicts in server CMake/backend/MTP/Qwen35 graph/test code. Valuable, but needs a deliberate current-layout MTP foundation port rather than conflict-marker resolution. |
+| #237 | `feat/dflash-mtp-foundation` | attempted / blocked-needs-human / selective-port | Revalidated this run in `/tmp/luce-attempt-pr237-20260527-2124`; Codex report says selective current-layout MTP foundation port is feasible, but not by resolving the merge markers directly. First port current server MTP CLI/config with MTP off by default, preserve Qwen35 MoE/remote-draft/thinking-budget behavior, and defer or design restore/prefix-cache MTP warm semantics. |
 | #221 | `feat/mtp-prefix-warm-ghost` | blocked-needs-human / dependency | Prior direct + Codex attempts left many unmerged paths and legacy artifacts; depends on a coherent #237-style MTP foundation first. |
 | #183 | `split/gemma4-11a-target-mtp-integration` | blocked-needs-human / superseded-by-current-architecture | Revalidated in the previous run. Its direct `h_prev` assertion has no current target location until Gemma4 MTP runtime is reintroduced in the current `server/src/gemma4` architecture. |
 | #182 | `split/gemma4-10-mtp-loader-step-graph` | attempted / selective-port | Revalidated this run in `/tmp/luce-attempt-pr182-20260527-2039`; Codex report says the assistant loader/MTP graph are portable only as current-layout `server/src/gemma4` work. |
@@ -66,23 +67,28 @@ Draft PRs remain outside the primary contributor integration target: #289, #286,
 
 - #137: close or ask author to re-target current `server/CMakeLists.txt`.
 - #48: close as superseded by current CUDA architecture/Blackwell handling unless the author has a specific missing Blackwell case.
+- #237: keep open for a deliberate current-layout MTP foundation port; direct merge is unsafe, but the Codex report identifies a viable compile-first path with MTP disabled by default.
 - #183/#182/#181/#180/#177/#154/#153/#131/#39: do not close solely as conflicts yet; ask authors or maintainers to identify which current-layout Gemma4/MTP pieces are still intended after the newer `server/src/gemma4` architecture and #237 direction.
 
 ## Validation run
 
 This run performed:
 
-- `git merge --no-edit origin/main` check in the metadata worktree (no merge needed; `origin/main` was already an ancestor of `cc007d1`)
+- `git merge --no-edit origin/main` check in the metadata worktree (no merge needed; `origin/main` was already an ancestor of `d465a7e`)
 - `date -Is`
 - `git status --short`, `git remote -v`, branch and revision checks in the primary checkout
 - `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status`
 - `HOME=/home/erik /home/erik/.local/bin/claude auth status --text`
-- `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --version`
+- `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --help`
 - `git fetch --prune origin`
 - `git fetch --prune easel`
 - `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ... --jq ...`
 - Targeted fetches for all open non-draft PR refs (`origin/pr/<n>`)
 - `git cherry easel/auto-integration origin/pr/<n>` and `git merge-base --is-ancestor origin/pr/<n> easel/auto-integration` classification checks
+- Isolated metadata worktree `/tmp/luce-auto-cron-20260527-212401`
+- Fresh isolated PR #237 merge probe in `/tmp/luce-attempt-pr237-20260527-2124`
+- tmux-driven Codex assessment session `luce-pr237-codex-2124`, producing `/tmp/pr237-feasibility-20260527-2124.txt`
+- `git diff --check -- docs/auto-integration.md` before this metadata commit (clean)
 - Isolated metadata worktree `/tmp/luce-auto-cron-20260527-2020`
 - Fresh isolated PR #177 merge probe in `/tmp/luce-attempt-pr177-20260527-2020`
 - Fresh isolated PR #153 merge probe in `/tmp/luce-attempt-pr153-20260527-2020`
@@ -109,6 +115,9 @@ This run performed:
 ## Notes
 
 - Primary checkout `/home/erik/Projects/luce2` was clean at start and was not edited directly during reconciliation.
+- Retained worktree `/tmp/luce-auto-cron-20260527-212401` for this metadata refresh until pushed/verified.
+- Retained conflicted worktree `/tmp/luce-attempt-pr237-20260527-2124` for audit; it contains unmerged PR #237 probe state.
+- Retained prior metadata/conflicted worktrees from earlier runs as previously reported; cleanup would be separate maintenance.
 - Retained worktree `/tmp/luce-auto-cron-20260527-2105` for this metadata refresh until pushed/verified.
 - Retained conflicted worktree `/tmp/luce-attempt-pr137-20260527-2105` for audit; it contains unmerged PR #137 probe state.
 - Retained conflicted worktree `/tmp/luce-attempt-pr135-20260527-2105` for audit; it contains unmerged PR #135 probe state.
