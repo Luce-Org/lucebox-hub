@@ -4,17 +4,18 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T01:22:15-04:00
+Last refresh: 2026-05-28T01:36:00-04:00
 Current base: `origin/main` `4f4d82e`
-Current integration tip before this refresh: `easel/auto-integration` `db9e839`
+Current integration tip before this refresh: `easel/auto-integration` `2da4736`
 
 This branch is maintained as a reproducible patch stack over `origin/main`. The
 primary checkout was clean at the start of this unattended run. This refresh
 rechecked upstream/main and the open PR set, found no upstream-base advance and
 no newly mergeable non-draft PR head, and therefore made no source stack
-changes. It refreshed direct-merge probe evidence for every currently
-non-ancestor non-draft PR and preserves the prior manual/delegated feasibility
-reports for the large selective-port candidates.
+changes. New PR #289 is draft-only and was recorded for dependency awareness.
+The run refreshed direct-merge probe evidence for every currently non-ancestor
+non-draft PR and preserves the prior manual/delegated feasibility reports for
+the large selective-port candidates.
 
 ## Included in the current stack
 
@@ -41,8 +42,8 @@ carried.
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| upstream sync | checked | In isolated worktree `/tmp/luce-auto-cron-20260528-012215`, `git merge --no-edit origin/main` reported `Already up to date.` |
-| all non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated direct probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39. Every direct probe conflicted and was aborted in the isolated worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-012215.txt`. |
+| upstream sync | checked | In isolated worktree `/tmp/luce-auto-cron-20260528-013559`, `git merge --no-edit origin/main` reported `Already up to date.` |
+| all non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated direct probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39. Every direct probe conflicted and was aborted in the isolated worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-013559.txt`. |
 | #237 | prior delegated/manual feasibility retained | Prior conflicted probe worktree `/tmp/luce-pr237-feas-20260528-000006` remains the current evidence. Claude exited with only `Error: Reached max turns (12)` (`/tmp/pr237-claude-feasibility-20260528-000006.txt`), so no Claude conclusion is claimed. Codex completed (`/tmp/pr237-codex-feasibility-20260528-000006.txt`) and confirmed #237 is not mechanically mergeable: stale deleted `dflash/` server paths plus semantic conflicts in MTP source selection, qwen35/qwen35moe GGUF metadata, graph-builder hidden-state capture vs MoE router capture, remote-draft/PFlash coexistence, and CMake/test wiring. |
 | #221 | prior delegated/manual feasibility retained | Prior conflicted probe worktree `/tmp/luce-pr221-feas-20260528-002537` remains the current evidence. Claude exited with only `Error: Reached max turns (18)` (`/tmp/pr221-claude-feasibility-20260528-002537.txt`), so no Claude conclusion is claimed. Codex produced a large usable report (`/tmp/pr221-codex-feasibility-20260528-002537.txt`) confirming #221 should wait for #237/equivalent MTP foundation before selectively porting dual-dispatch and prefix-WARM behavior. |
 | #183 | prior delegated/manual feasibility retained | Prior conflicted probe worktree `/tmp/luce-pr183-feas-20260528-004611` remains the current evidence. Claude exited with only `Error: Reached max turns (18)` (`/tmp/pr183-claude-feasibility-20260528-004611.txt`), and Codex produced read-only inspection output without a final recommendation (`/tmp/pr183-codex-feasibility-20260528-004611.txt`). Manual inspection confirms #183's unique value is Gemma4 target-graph MTP integration, but current `server/src/gemma4/*` already has a different feature-complete backend/DFlash target shape. |
@@ -73,13 +74,15 @@ carried.
 
 Draft PRs remain outside the primary non-draft integration target except for
 dependency awareness: #289, #286, #285, #278, #275, #273, #265, #249, #193,
-and #75. #285 remains partially carried only as an integration dependency.
+and #75. New draft #289 (`feat(qwen35moe): pipelined hybrid MoE decode with
+GPU/CPU overlap`) is not attempted while draft. #285 remains partially carried
+only as an integration dependency.
 
 ## Validation run
 
 This run performed:
 
-- `date -Is` -> 2026-05-28T01:21:22-04:00 during preflight, 2026-05-28T01:22:15-04:00 for the reconciliation worktree name.
+- `date -Is` -> 2026-05-28T01:35:04-04:00 during preflight, 2026-05-28T01:36:00-04:00 inside the reconciliation worktree.
 - Primary checkout `git status --short` was clean before work began and remained clean while probing in worktrees.
 - `git remote -v` verified `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
 - `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status` succeeded for account `easel`.
@@ -89,8 +92,8 @@ This run performed:
 - `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ... --jq ...` enumerated all open PRs.
 - Targeted fetches for all open non-draft PR refs (`origin/pr/<n>`).
 - `git merge-base --is-ancestor origin/pr/<n> easel/auto-integration` classification checks: #284, #276, #274, #266, #152, and #142 are current ancestors; #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39 remain non-ancestor/selective-port candidates.
-- Isolated reconciliation/probe worktree `/tmp/luce-auto-cron-20260528-012215`; `git merge --no-edit origin/main` reported already up to date.
-- Fresh direct merge probes for all currently non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all direct probes conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260528-012215.txt`.
+- Isolated reconciliation/probe worktree `/tmp/luce-auto-cron-20260528-013559`; `git merge --no-edit origin/main` reported already up to date.
+- Fresh direct merge probes for all currently non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all direct probes conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260528-013559.txt`.
 - `git diff --check` on the metadata-only change passed.
 
 No source/build validation was rerun because this refresh changes only
@@ -102,6 +105,6 @@ Value 'sm_52' is not defined for option 'gpu-name'`).
 ## Notes
 
 - Primary checkout `/home/erik/Projects/luce2` stayed clean during probing and was modified only after the verified metadata commit was ready.
-- Retained worktree `/tmp/luce-auto-cron-20260528-012215` for this metadata refresh and direct-merge probe audit.
-- Retained direct-probe log `/tmp/luce-merge-probes-20260528-012215.txt`.
+- Retained worktree `/tmp/luce-auto-cron-20260528-013559` for this metadata refresh and direct-merge probe audit.
+- Retained direct-probe log `/tmp/luce-merge-probes-20260528-013559.txt`.
 - Prior retained conflicted worktrees and agent reports remain as listed in earlier manifest revisions; cleanup is separate maintenance.
