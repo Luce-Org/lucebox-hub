@@ -4,18 +4,18 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T07:50:11-04:00
+Last refresh: 2026-05-28T08:04:55-04:00
 Current base: `origin/main` `4f4d82e`
-Current integration tip before this refresh: `easel/auto-integration` `8033b09`
+Current integration tip before this refresh: `easel/auto-integration` `7991066`
 
 This branch is maintained as a reproducible patch stack over `origin/main`. The
 primary checkout was clean at the start of this unattended run. Upstream
-`origin/main` was already merged into the stack and no open non-draft contributor
-PR head had advanced beyond the currently carried stack. This run therefore made
-no code changes; it revalidated the ready/non-draft PR set and reran direct merge
-probes for the remaining old-layout/non-ancestor PRs. Those probes still conflict
-and remain selective-port or human-design work rather than safe mechanical
-merges.
+`origin/main` was already merged into the stack and every open non-draft
+contributor PR that can be mechanically carried remains present in the current
+stack. This run therefore made no code changes; it revalidated the ready/non-draft
+PR set and reran direct merge probes for the remaining old-layout/non-ancestor
+PRs. Those probes still conflict and remain selective-port or human-design work
+rather than safe mechanical merges.
 
 ## Included in the current stack
 
@@ -47,9 +47,9 @@ carried.
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| upstream sync | checked | In isolated worktree `/tmp/luce-auto-cron-20260528-074954`, `git merge --no-edit origin/main` reported `Already up to date.` |
-| current integrated PRs | checked | Current heads for #289, #284, #278, #276, #274, #273, #266, #265, #152, and #142 are included in `easel/auto-integration` `8033b09`; none advanced since the prior refresh. |
-| remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39. Every direct probe conflicted and was aborted in the isolated worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-074954.txt`. |
+| upstream sync | checked | In isolated worktree `/tmp/luce-auto-cron-20260528-080455`, `git merge --no-edit origin/main` reported `Already up to date.` |
+| current integrated PRs | checked | Current heads for #289, #284, #278, #276, #274, #273, #266, #265, #152, and #142 are included in `easel/auto-integration` `7991066`; none advanced beyond the carried stack. |
+| remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39. Every direct probe conflicted and was aborted in the isolated worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-080455.txt`. |
 
 ## Prior probe results (retained)
 
@@ -90,27 +90,28 @@ integration dependency.
 
 This run performed:
 
-- `date -Is` -> 2026-05-28T07:49:16-04:00 at preflight and 2026-05-28T07:50:11-04:00 at manifest refresh.
+- `date -Is` -> 2026-05-28T08:04:55-04:00 at preflight and manifest refresh.
 - Primary checkout `git status --short` was clean before work began.
 - `git remote -v` verified `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
 - `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status` succeeded for account `easel`.
 - `HOME=/home/erik /home/erik/.local/bin/claude auth status --text` succeeded for the Claude Team account.
-- Harmless `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --help` and `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --version` smoke checks succeeded (`codex-cli 0.130.0`).
+- Harmless `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --version` smoke check succeeded (`codex-cli 0.130.0`).
 - `git fetch --prune origin` and `git fetch --prune easel` completed; targeted fetches recreated current open non-draft PR refs.
 - `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ... --jq ...` enumerated all open PRs and showed #291, #290, #286, #285, #275, #249, #193, and #75 as drafts/excluded.
 - `git merge-base --is-ancestor origin/pr/<n> easel/auto-integration` showed #289, #284, #278, #276, #274, #273, #266, #265, #152, and #142 are current integrated non-draft heads.
-- Isolated reconciliation/probe worktree `/tmp/luce-auto-cron-20260528-074954`; `git merge --no-edit origin/main` reported already up to date.
-- Fresh direct merge probes for remaining non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all direct probes conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260528-074954.txt`.
+- Isolated reconciliation/probe worktree `/tmp/luce-auto-cron-20260528-080455`; `git merge --no-edit origin/main` reported already up to date.
+- Fresh direct merge probes for remaining non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all direct probes conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260528-080455.txt`.
 - `git diff --check` on this run's working-tree changes passed; full-stack `git diff --check origin/main...HEAD` still reports pre-existing trailing blank line warnings in `luce-bench/src/lucebench/fixtures/forge_eval/scenarios/_model_quality.py` and `_stateful_model_quality.py`.
 - Search for exact merge conflict markers (`^(<<<<<<<|=======|>>>>>>>)`) under the reconciliation worktree returned no results.
-- `cmake -S server -B /tmp/luce-build-20260528-074954 -DLUCE_BUILD_TESTS=ON` failed during CUDA compiler identification before project compilation with the known local nvcc/CMake `sm_52` toolchain issue (`ptxas fatal : Value 'sm_52' is not defined for option 'gpu-name'`).
+- `cmake -S server -B /tmp/luce-build-20260528-080455 -DLUCE_BUILD_TESTS=ON` failed during CUDA compiler identification before project compilation with the known local nvcc/CMake `sm_52` toolchain issue (`ptxas fatal : Value 'sm_52' is not defined for option 'gpu-name'`).
 
 ## Notes
 
-- Primary checkout `/home/erik/Projects/luce2` was clean at preflight and matched fetched `easel/auto-integration` (`8033b09`).
-- Retained worktree `/tmp/luce-auto-cron-20260528-074954` for direct-merge probe audit and final commit preparation until the pushed branch is reviewed.
-- Retained direct-probe log `/tmp/luce-merge-probes-20260528-074954.txt`.
-- Retained configure directory `/tmp/luce-build-20260528-074954` showing the local CUDA compiler-identification blocker.
+- Primary checkout `/home/erik/Projects/luce2` was clean at preflight and matched fetched `easel/auto-integration` (`7991066`).
+- Retained worktree `/tmp/luce-auto-cron-20260528-080455` for direct-merge probe audit and final commit preparation until the pushed branch is reviewed.
+- Retained direct-probe log `/tmp/luce-merge-probes-20260528-080455.txt`.
+- Retained configure directory `/tmp/luce-build-20260528-080455` showing the local CUDA compiler-identification blocker.
+- Prior retained worktree `/tmp/luce-auto-cron-20260528-074954`, direct-probe log `/tmp/luce-merge-probes-20260528-074954.txt`, and configure directory `/tmp/luce-build-20260528-074954` remain for the last no-code refresh audit.
 - Prior retained worktree `/tmp/luce-auto-cron-20260528-073442`, direct-probe log `/tmp/luce-merge-probes-20260528-073442.txt`, and configure directory `/tmp/luce-build-20260528-073442` remain for the #289 update audit.
 - Retained #180 probe worktree `/tmp/luce-pr180-feas-20260528-071342` plus reports `/tmp/pr180-claude-feasibility-20260528-071342.txt` (turn-limit only) and `/tmp/pr180-codex-feasibility-20260528-071342.txt` (completed feasibility).
 - Retained previous #181 probe worktree `/tmp/luce-pr181-feas-20260528-065539` plus reports `/tmp/pr181-claude-feasibility-20260528-065539.txt` (empty report) and `/tmp/pr181-codex-feasibility-20260528-065539.txt` (completed feasibility).
