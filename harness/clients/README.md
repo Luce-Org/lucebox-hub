@@ -8,10 +8,21 @@ These scripts run real clients against Lucebox (C++ server by default).
 cd /workspace/lucebox-hub-harness
 python3 -m harness.client_test_runner --condition C_bandit \
   --clients claude_code,hermes,opencode,codex,pi
+
+# Or run one compatibility launcher from the repo root:
+cd lucebox-hub
+harness/clients/run_codex.sh
 ```
 
 Each launcher starts `server/build/dflash_server`, runs the client, writes logs
-under `/workspace/lucebox-client-harness-runs`, then stops the server.
+under `.harness-work/runs`, then stops the server. Override `REPO_DIR`,
+`CLIENT_WORK_DIR`, or `RUN_DIR` for custom/shared locations.
+
+Install the real client CLIs before running the launchers:
+
+```bash
+python3 harness/client_test_runner.py install --clients codex,hermes,openwebui
+```
 
 The launcher will start `server/build/dflash_server` by default, or the path in
 `DFLASH_SERVER_BIN`. The default model paths are
