@@ -4,9 +4,9 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T13:17:57-04:00
+Last refresh: 2026-05-28T13:34:07-04:00
 Current base: `origin/main` `315a9bdb`
-Current integration tip before this refresh: `easel/auto-integration` `11f7424b`
+Current integration tip before this refresh: `easel/auto-integration` `90d4aac1`
 Refreshed stack tip prepared in this run: this commit
 
 This branch is maintained as a reproducible patch stack over `origin/main`.
@@ -46,11 +46,11 @@ libcurl development headers for the new server target in CI/Docker builds.
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| upstream sync | checked | `origin/main` advanced to `315a9bdb`; `easel/auto-integration` was at `161014ae` before this refresh, and the branch was merged forward in this run. |
-| current integrated PRs | checked | `git merge-base --is-ancestor origin/pr/<n> HEAD` shows #294, #292, #289, #284, #276, #274, #266, #152, and #142 are ancestors of the refreshed stack. #278 and #265 are included through `origin/main`. |
-| remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39 against current stack tip `575034db`. Every direct probe conflicted and was aborted in the isolated probe worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-123547.txt`. |
+| upstream sync | checked | `origin/main` remains `315a9bdb`; `easel/auto-integration` was at `90d4aac1` before this refresh, and the branch already contained the latest upstream merge plus the integration-only CI fixes. |
+| current integrated PRs | checked | `git merge-base --is-ancestor origin/pr/<n> HEAD` shows #294, #292, #289, #276, #274, #266, #152, and #142 are ancestors of the refreshed stack. #284, #278, and #265 are included through `origin/main`. |
+| remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39 against current stack tip `90d4aac1` in probe branch `auto-integration-probe-20260528-133529`. Every direct probe conflicted and was aborted in the isolated probe worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-133529.txt`. |
 | #237 manual/delegated status | still blocked-needs-human | No new #237 head since the prior deep manual/delegated recheck. This run's direct probe again showed broad conflicts across old `dflash/` paths, common MTP interfaces, Qwen35 graph/backend files, CMake, daemon/server wiring, and tests. Prior Claude/Codex tmux attempts did not produce a trusted ready-to-apply resolution, and the required next step remains a deliberate current-layout MTP port rather than conflict-marker resolution. |
-| integration-only CI fix | fixed | GitHub checks for the manifest-only push `9b7972a1` failed during CMake configure because several tests were registered twice in `server/CMakeLists.txt` and the new `dflash_server` target required libcurl development headers on the hosted runner. This refresh removes the duplicate target block and adds an explicit CI `apt-get install libcurl4-openssl-dev` step plus Docker builder headers. A follow-up attempt showed `Jimver/cuda-toolkit` suffixes `non-cuda-sub-packages`, so libcurl was moved out of that action's package list into the explicit apt step. |
+| integration-only CI fix | pending verification | The pushed stack contains the earlier duplicate-CMake-target and libcurl CI/Docker fixes. At this refresh, GitHub checks for PR #286 had a new run in progress (`Build (cmake + uv sync --extra megakernel)` and `uv workspace` pending); previous `cuda12` check for `3b27fc1e` was still pending when the newer run superseded it. |
 
 ## Pending / blocked-needs-human / selective-port candidates
 
@@ -84,7 +84,7 @@ as an integration dependency.
 
 This run performed:
 
-- `date -Is` -> 2026-05-28T12:34:53-04:00 at preflight.
+- `date -Is` -> 2026-05-28T13:32:10-04:00 at preflight.
 - Primary checkout `git status --short --branch` was clean before work began and reported `## auto-integration...easel/auto-integration`.
 - `git branch --show-current` reported `auto-integration` in the primary checkout.
 - `git remote -v` verified `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
@@ -92,16 +92,16 @@ This run performed:
 - `HOME=/home/erik /home/erik/.local/bin/claude auth status --text` succeeded for the Claude Team account.
 - `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --version` succeeded with `codex-cli 0.130.0`.
 - `git fetch --prune origin` and `git fetch --prune easel` completed; targeted fetches recreated current open non-draft contributor PR refs.
-- `origin/main`, `easel/auto-integration`, and local `HEAD` were checked as `6a6b0081`, `575034db`, and `575034db` respectively; `git rev-list --left-right --count HEAD...easel/auto-integration` returned `0 0`.
-- Isolated probe worktree `/tmp/luce-probe-20260528-123547` reran direct conflict probes for all remaining non-ancestor non-draft PRs.
-- Ancestor checks passed for included contributor PR refs #294, #292, #289, #284, #276, #274, #266, #152, and #142; #278 and #265 are included through upstream main.
-- `git diff --check` passed for this manifest refresh and the integration-only CI fix.
-- Targeted conflict-marker scan over `docs/auto-integration.md` found no merge markers.
-- GitHub checks on intermediate commit `9b7972a1` were inspected with `gh pr checks 286 --watch` and `gh run view 26588281995 --log-failed`; `uv workspace` passed, while CMake configure failed on duplicate test targets and missing CURL dev headers. Follow-up commit `c967d8e9` was inspected with `gh run view 26588595195 --log-failed`; it reached the CUDA setup action and failed because `Jimver/cuda-toolkit` transformed `libcurl4-openssl-dev` into a non-existent CUDA-suffixed package, so the final fix installs libcurl via a separate apt step.
-- Local `cmake -S server -B /tmp/luce-cmake-fix-124202 ...` could not reach project configure due to the known local WSL CUDA compiler-id blocker (`ptxas fatal: Value 'sm_52' is not defined`), so CI is the authoritative CMake verifier for this fix.
+- `origin/main`, `easel/auto-integration`, and local `HEAD` were checked as `315a9bdb`, `90d4aac1`, and `90d4aac1` respectively before this manifest-only refresh; `git rev-list --left-right --count HEAD...easel/auto-integration` returned `0 0`.
+- Isolated probe worktree `/tmp/luce-probe-20260528-133529` reran direct conflict probes for all remaining non-ancestor non-draft PRs.
+- Ancestor checks passed for included contributor PR refs #294, #292, #289, #276, #274, #266, #152, and #142; #284, #278, and #265 are included through upstream main.
+- `git diff --check` passed for this manifest-only refresh before commit.
+- Targeted conflict-marker scan over `docs/auto-integration.md` found no merge markers before this manifest refresh.
+- GitHub checks for PR #286 were inspected with `gh pr checks 286`; at the time of this refresh the new workflow run was still pending for `Build (cmake + uv sync --extra megakernel)` and `uv workspace`.
+- Local `cmake -S server -B /tmp/luce-cmake-fix-124202 ...` from the earlier CI-fix run could not reach project configure due to the known local WSL CUDA compiler-id blocker (`ptxas fatal: Value 'sm_52' is not defined`), so CI remains the authoritative CMake verifier for this fix.
 
 ## Notes
 
-- Primary checkout `/home/erik/Projects/luce2` was clean at preflight and matched fetched `easel/auto-integration` (`575034db`).
-- Retained probe worktree `/tmp/luce-probe-20260528-123547` plus direct-probe log `/tmp/luce-merge-probes-20260528-123547.txt`.
+- Primary checkout `/home/erik/Projects/luce2` was clean at preflight and matched fetched `easel/auto-integration` (`90d4aac1`) before this manifest-only refresh.
+- Retained probe worktree `/tmp/luce-probe-20260528-133529` plus direct-probe log `/tmp/luce-merge-probes-20260528-133529.txt`.
 - Prior retained worktrees, probe logs, agent reports, and configure directories remain as listed in earlier manifest revisions; cleanup is separate maintenance.
