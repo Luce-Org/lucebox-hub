@@ -4,31 +4,30 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T11:42:32-04:00
-Current base: `origin/main` `43457d8f`
-Current integration tip before this refresh: `easel/auto-integration` `3929bc88`
+Last refresh: 2026-05-28T11:55:49-04:00
+Current base: `origin/main` `fda8877b`
+Current integration tip before this refresh: `easel/auto-integration` `e8548491`
 Refreshed stack tip prepared in this run: this commit
 
 This branch is maintained as a reproducible patch stack over `origin/main`.
 The primary checkout was clean at the start of this unattended run. This refresh
-keeps the stack rebased on the unchanged upstream base, integrates the new
-non-draft contributor PR #293, reruns direct conflict probes for the remaining
-non-ancestor non-draft PRs, and records local validation status.
+rebases the existing stack over the latest upstream `origin/main`, preserves all
+currently integrated non-draft contributor PR refs, records fresh direct merge
+probes for the remaining non-ancestor PRs, and adds one integration-only include
+fix needed by the new upstream bounded feature-range restore path.
 
 ## Included in the current stack
 
 | PR | Head branch | Head | State | Notes |
 |---:|---|---:|---|---|
-| #293 | `fix/qwen3-think-prefill-jinja` | `2c19f66` | included / new this run | Completes the Qwen3 closed-`<think>` Jinja prefill fix by adding documentation and unit coverage that gates the suffix to Qwen3-family formats and prevents double-appending. The functional renderer change from the stack is already present; this merge adds the PR's remaining docs/tests. |
 | #292 | `feat-backend-ipc-payload-pipe-open` | `90bc52f` | included | Adds backend IPC payload-pipe support for remote draft feature/noise payloads, with integration-only pipe-drain hardening and shared feature-slice storage helper. |
-| #289 | `pipeline_moe` | `0ffab8a` | included | Latest pipelined hybrid Qwen35 MoE decode update is carried. The inaccessible submodule pointer from earlier PR history remains excluded. |
+| #289 | `pipeline_moe` | `0ffab8a` | included | Pipelined hybrid Qwen35 MoE decode update is carried. The inaccessible submodule pointer from earlier PR history remains excluded. |
 | #284 | `fix/draft-safetensors-rope-theta` | `63bba30` | included | Reads and validates `rope_theta` from draft safetensors `config.json`. |
 | #278 | `fix-pflash-drafter-backend-precision-submit` | `fdfcbda` | included | Adds legacy CUDA drafter precision fallback via shared backend precision policy while preserving current Q8_0 allocation behavior where present. |
 | #276 | `fix/qwen36-claude-code-tool-calling` | `0e3c79a` | included | Qwen3.6-27B tool-calling fix for Claude-code Anthropic path. |
-| #274 | `feat/pflash-drafter-ee7` | `9c9aee9` | included | Adaptive pFlash compression docs/config, transitive anchor default, backup-suffix ignores, EE7/drafter updates, and related server changes are carried. |
-| #273 | `feat-cpp-server-gemma4-layer-split-adapter` | `79abba9` | included | Gemma4 target-layer-split adapter and loader/graph support. |
+| #274 | `feat/pflash-drafter-ee7` | `2c19f66` | included | Adaptive pFlash compression docs/config, transitive anchor default, backup-suffix ignores, EE7/drafter updates, and the Qwen3 closed-`<think>` Jinja prefill docs/tests from the branch's latest head are carried. |
 | #266 | `feat/harness-typed-adapters` | `17525ea` | included | Typed harness adapters and format-aware session-inject proxy. |
-| #265 | `feat-cpp-server-target-layer-split-prep` | `054af28` | included through upstream | Upstream main contains this PR. |
+| #265 | `feat-cpp-server-target-layer-split-prep` | upstream | included through upstream | Upstream main contains this PR. |
 | #177 | `split/gemma4-06-kv-correctness` | `0a95d4b` | selectively included | Previously carried split-on-wrap SWA KV writes and larger SWA ring allocation for chunked long-context prefill in `server/src/gemma4/gemma4_loader.cpp`. Remaining TQ3/large-head KV alignment and tests still require manual design. |
 | #174 | `split/gemma4-14-small-vram-docs` | `8b1caba` | selectively included | Useful small-VRAM/VMM documentation is already ported into current `server/README.md`. |
 | #152 | `main` | `cf735be` | included | Gemma 4 RTX 4090 backend helpers already carried. |
@@ -43,11 +42,11 @@ non-ancestor non-draft PRs, and records local validation status.
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| upstream sync | checked | `origin/main` remained `43457d8f`; reconciliation worktree `/tmp/luce-auto-cron-20260528-114019` started from `easel/auto-integration` `3929bc88` and was already up to date with upstream. |
-| #293 | integrated | New non-draft PR `origin/pr/293` at `2c19f66` merged cleanly into the reconciliation worktree as merge commit `21ff26b8`. The stack already carried the functional Jinja renderer change, so the merge added the PR's remaining documentation and unit tests. |
-| current integrated PRs | checked | After the #293 refresh, `git merge-base --is-ancestor origin/pr/<n> HEAD` shows #293, #292, #289, #284, #278, #276, #274, #273, #266, #152, and #142 are ancestors of the refreshed stack. #265 is included through `origin/main`. |
-| remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39 against the post-#293 stack. Every direct probe conflicted and was aborted in the isolated probe worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-114019.txt`. |
-| #237 delegated review carry-forward | still applicable | Previous tmux-driven Claude/Codex attempts remain the latest substantial delegated feasibility work for the MTP-foundation blocker: Claude failed to produce a usable report; Codex reported that direct merge is unsafe due to the `dflash/src` to `server/src` relocation and recommended a deliberate current-layout MTP architecture port. |
+| upstream sync | integrated | `origin/main` advanced from `43457d8f` to `fda8877b`. Reconciliation worktree `/tmp/luce-auto-cron-20260528-115635` started from `easel/auto-integration` `e8548491` and merged upstream as `4da4424f`. |
+| integration-only fix | applied | Added missing `<fstream>` include in `server/src/common/dflash_draft_ipc_daemon.cpp`; the new upstream bounded `set_feature_range` restore path uses `std::ifstream`. |
+| current integrated PRs | checked | After upstream sync, `git merge-base --is-ancestor origin/pr/<n> HEAD` shows #292, #289, #284, #278, #276, #274, #266, #152, and #142 are ancestors of the refreshed stack. #265 is included through `origin/main`. |
+| remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39 against the post-upstream-sync stack. Every direct probe conflicted and was aborted in the isolated probe worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-115635.txt`. |
+| #237 delegated review carry-forward | still applicable | Prior tmux-driven Claude/Codex attempts remain the latest substantial delegated feasibility work for the MTP-foundation blocker: Claude failed to produce a usable report; Codex reported that direct merge is unsafe due to the `dflash/src` to `server/src` relocation and recommended a deliberate current-layout MTP architecture port. |
 
 ## Pending / blocked-needs-human / selective-port candidates
 
@@ -81,26 +80,25 @@ as an integration dependency.
 
 This run performed:
 
-- `date -Is` -> 2026-05-28T11:40:19-04:00 at preflight and 2026-05-28T11:42:32-04:00 at manifest refresh.
+- `date -Is` -> 2026-05-28T11:55:49-04:00 at preflight.
 - Primary checkout `git status --short` was clean before work began.
 - `git branch --show-current` reported `auto-integration` in the primary checkout.
 - `git remote -v` verified `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
 - `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status` succeeded for account `easel` with repo/workflow scopes.
 - `HOME=/home/erik /home/erik/.local/bin/claude auth status --text` succeeded for the Claude Team account.
-- `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --help` succeeded and confirmed the Codex CLI is available.
+- `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --version` succeeded (`codex-cli 0.130.0`).
 - `git fetch --prune origin` and `git fetch --prune easel` completed; targeted fetches recreated current open non-draft contributor PR refs.
-- Isolated reconciliation worktree `/tmp/luce-auto-cron-20260528-114019` merged latest `origin/main` and was already up to date.
-- `origin/pr/293` merged cleanly into the reconciliation worktree as merge commit `21ff26b8` before this manifest refresh.
-- Isolated probe worktree `/tmp/luce-probe-after293-20260528-114019` reran direct conflict probes for all remaining non-ancestor non-draft PRs.
-- `git diff --check` passed for the uncommitted manifest refresh plus #293 merge changes.
-- Targeted conflict-marker scan over files changed by `HEAD^1..HEAD` plus `docs/auto-integration.md` found no merge markers.
-- Ancestor checks passed for included contributor PR refs #293, #292, #289, #284, #278, #276, #274, #273, #266, #152, and #142.
-- `cmake -S server -B /tmp/luce-cmake-20260528-114019 -DDFLASH27B_GPU_BACKEND=cuda -DCMAKE_CUDA_ARCHITECTURES=89` failed during CUDA compiler identification because local `/usr/bin/nvcc`/CMake still selected unsupported `sm_52` (`ptxas fatal : Value 'sm_52' is not defined`), before project compilation.
-- Push outcome is recorded in the final cron report.
+- Isolated reconciliation worktree `/tmp/luce-auto-cron-20260528-115635` merged latest `origin/main` (`fda8877b`) into the stack as `4da4424f`.
+- Isolated probe worktree `/tmp/luce-probe-20260528-115635` reran direct conflict probes for all remaining non-ancestor non-draft PRs.
+- Ancestor checks passed for included contributor PR refs #292, #289, #284, #278, #276, #274, #266, #152, and #142.
+- `git diff --check` passed for the upstream-sync merge, integration-only include fix, and manifest refresh.
+- Targeted conflict-marker scan over `server/src/common/dflash_draft_ipc_daemon.cpp`, `server/src/common/layer_split_utils.cpp`, and `docs/auto-integration.md` found no merge markers.
+- A direct `g++ -fsyntax-only` probe for `server/src/common/dflash_draft_ipc_daemon.cpp` could not compile because the worktree's submodules are not initialized (`ggml.h` absent under `server/deps/llama.cpp`).
+- `cmake -S server -B /tmp/luce-cmake-20260528-115635 -DDFLASH27B_GPU_BACKEND=cuda -DCMAKE_CUDA_ARCHITECTURES=89` failed during CUDA compiler identification because local `/usr/bin/nvcc`/CMake still selected unsupported `sm_52` (`ptxas fatal : Value 'sm_52' is not defined`), before project compilation.
 
 ## Notes
 
-- Primary checkout `/home/erik/Projects/luce2` was clean at preflight and matched fetched `easel/auto-integration` (`3929bc88`).
-- Retained reconciliation worktree `/tmp/luce-auto-cron-20260528-114019` for audit/final push preparation.
-- Retained probe worktree `/tmp/luce-probe-after293-20260528-114019` plus direct-probe log `/tmp/luce-merge-probes-20260528-114019.txt`.
+- Primary checkout `/home/erik/Projects/luce2` was clean at preflight and matched fetched `easel/auto-integration` (`e8548491`).
+- Retained reconciliation worktree `/tmp/luce-auto-cron-20260528-115635` for audit/final push preparation.
+- Retained probe worktree `/tmp/luce-probe-20260528-115635` plus direct-probe log `/tmp/luce-merge-probes-20260528-115635.txt`.
 - Prior retained worktrees, probe logs, agent reports, and configure directories remain as listed in earlier manifest revisions; cleanup is separate maintenance.
