@@ -129,6 +129,10 @@ MAX_CTX=32768 BUDGET=22 VERIFY_MODE=ddtree \
 harness/clients/run_codex.sh
 ```
 
+For no-draft targets such as Gemma, set only `DFLASH_TARGET` or pass
+`DRAFT=none`; the harness will not attach the default Qwen draft to a custom
+target.
+
 ## Run the Server
 
 Default: Qwen 3.6-27B Q4_K_M target + Lucebox Q4_K_M DFlash drafter on RTX 3090. DDTree budget=22, TQ3_0 KV cache, sliding FA window 2048. OpenAI-compatible HTTP on `:8000`.
