@@ -6,8 +6,8 @@ Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
 Last refresh: 2026-05-28T13:17:57-04:00
 Current base: `origin/main` `315a9bdb`
-Current integration tip before this refresh: `easel/auto-integration` `161014ae`
-Refreshed stack tip prepared in this run: `11f7424b`
+Current integration tip before this refresh: `easel/auto-integration` `11f7424b`
+Refreshed stack tip prepared in this run: this commit
 
 This branch is maintained as a reproducible patch stack over `origin/main`.
 The primary checkout was clean at the start of this unattended run. Since the
@@ -46,7 +46,7 @@ libcurl development headers for the new server target in CI/Docker builds.
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| upstream sync | checked | `origin/main` remains `6a6b0081`; `easel/auto-integration` and the primary checkout both started at `575034db`, with no upstream-base merge needed in this run. |
+| upstream sync | checked | `origin/main` advanced to `315a9bdb`; `easel/auto-integration` was at `161014ae` before this refresh, and the branch was merged forward in this run. |
 | current integrated PRs | checked | `git merge-base --is-ancestor origin/pr/<n> HEAD` shows #294, #292, #289, #284, #276, #274, #266, #152, and #142 are ancestors of the refreshed stack. #278 and #265 are included through `origin/main`. |
 | remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39 against current stack tip `575034db`. Every direct probe conflicted and was aborted in the isolated probe worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-123547.txt`. |
 | #237 manual/delegated status | still blocked-needs-human | No new #237 head since the prior deep manual/delegated recheck. This run's direct probe again showed broad conflicts across old `dflash/` paths, common MTP interfaces, Qwen35 graph/backend files, CMake, daemon/server wiring, and tests. Prior Claude/Codex tmux attempts did not produce a trusted ready-to-apply resolution, and the required next step remains a deliberate current-layout MTP port rather than conflict-marker resolution. |
