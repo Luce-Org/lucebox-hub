@@ -43,6 +43,23 @@ bool create_laguna_target_cache(const LagunaTargetWeights & w,
                                  int max_ctx,
                                  ggml_backend_t backend,
                                  LagunaTargetCache & out) {
+    return create_laguna_target_cache_partial(
+        w, max_ctx, backend, /*layer_begin=*/0, /*layer_end=*/w.n_layer, out);
+}
+
+bool create_laguna_target_cache_partial(const LagunaTargetWeights & w,
+                                         int max_ctx,
+                                         ggml_backend_t backend,
+                                         int layer_begin,
+                                         int layer_end,
+                                         LagunaTargetCache & out) {
+    if (layer_begin < 0) layer_begin = 0;
+    if (layer_end < 0) layer_end = w.n_layer;
+    if (layer_begin > layer_end || layer_end > w.n_layer) {
+        set_last_error("laguna cache: invalid layer range");
+        return false;
+    }
+
     out.backend  = backend;
     out.max_ctx  = max_ctx;
     out.cur_pos  = 0;
@@ -66,6 +83,7 @@ bool create_laguna_target_cache(const LagunaTargetWeights & w,
     out.attn_k.resize(w.n_layer, nullptr);
     out.attn_v.resize(w.n_layer, nullptr);
     for (int il = 0; il < w.n_layer; ++il) {
+        if (il < layer_begin || il >= layer_end) continue;
         char nm[32];
         std::snprintf(nm, sizeof(nm), "k_l%d", il);
         ggml_tensor * k = ggml_new_tensor_3d(out.base_ctx, k_type, w.head_dim, max_ctx, w.n_head_kv);
@@ -89,6 +107,7 @@ bool create_laguna_target_cache(const LagunaTargetWeights & w,
     std::vector<uint8_t> zeros(std::min<size_t>(buf_sz, 64 * 1024 * 1024), 0);
     for (int il = 0; il < w.n_layer; ++il) {
         for (auto * t : { out.attn_k[il], out.attn_v[il] }) {
+            if (!t) continue;
             const size_t sz = ggml_nbytes(t);
             for (size_t off = 0; off < sz; off += zeros.size()) {
                 const size_t chunk = std::min(zeros.size(), sz - off);
@@ -119,6 +138,7 @@ bool laguna_snapshot_alloc(const LagunaTargetCache & cache,
     out.attn_k.assign((size_t)n_layer, nullptr);
     out.attn_v.assign((size_t)n_layer, nullptr);
     for (int il = 0; il < n_layer; ++il) {
+        if (!cache.attn_k[il] || !cache.attn_v[il]) continue;
         char nm[32];
         std::snprintf(nm, sizeof(nm), "snap_k_l%d", il);
         // Right-sized: [head_dim, snap_pos, n_head_kv]
@@ -179,6 +199,7 @@ bool laguna_snapshot_save(const LagunaTargetCache & cache,
         ggml_tensor * dk = snap.attn_k[il];
         ggml_tensor * sv = cache.attn_v[il];
         ggml_tensor * dv = snap.attn_v[il];
+        if (!sk || !dk || !sv || !dv) continue;
         const size_t k_strip = (size_t)snap_pos * sk->nb[1];
         const size_t v_strip = (size_t)snap_pos * sv->nb[1];
         for (int kh = 0; kh < n_head_kv; kh++) {
@@ -210,6 +231,7 @@ bool laguna_snapshot_restore(const LagunaCacheSnapshot & snap,
         ggml_tensor * dk = cache.attn_k[il];
         ggml_tensor * sv = snap.attn_v[il];
         ggml_tensor * dv = cache.attn_v[il];
+        if (!sk || !dk || !sv || !dv) continue;
         const size_t k_strip = (size_t)snap_pos * sk->nb[1];
         const size_t v_strip = (size_t)snap_pos * sv->nb[1];
         for (int kh = 0; kh < (int)sk->ne[2]; kh++) {
@@ -637,6 +659,150 @@ static ggml_tensor * build_laguna_layer(
                    : build_laguna_moe_block(ctx, cur, w, L);
 
     return ggml_add(ctx, cur, ffn_inp);
+}
+
+void laguna_layer_step_graph_free(LagunaLayerStepGraph & sg) {
+    if (sg.ctx) {
+        ggml_free(sg.ctx);
+        sg.ctx = nullptr;
+    }
+    sg.gf = nullptr;
+    sg.positions = nullptr;
+    sg.attn_mask = nullptr;
+    sg.attn_mask_swa = nullptr;
+}
+
+void laguna_layer_step_graph_destroy(LagunaLayerStepGraph & sg) {
+    if (sg.alloc) {
+        ggml_gallocr_free(sg.alloc);
+        sg.alloc = nullptr;
+    }
+    laguna_layer_step_graph_free(sg);
+}
+
+bool build_laguna_layer_step(
+    LagunaLayerStepGraph & sg,
+    const LagunaTargetWeights & w,
+    LagunaTargetCache & cache,
+    ggml_backend_t backend,
+    int layer_idx,
+    ggml_tensor * act_in,
+    ggml_tensor * act_out,
+    int chunk_start,
+    int n_tokens,
+    int kv_start) {
+    laguna_layer_step_graph_free(sg);
+    if (layer_idx < 0 || layer_idx >= w.n_layer) return false;
+    if (!cache.attn_k[layer_idx] || !cache.attn_v[layer_idx]) return false;
+
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() + 16 * 1024 * 1024;
+    ip.no_alloc = true;
+    sg.ctx = ggml_init(ip);
+    if (!sg.ctx) return false;
+    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+
+    ggml_tensor * inp = ggml_view_2d(
+        sg.ctx, act_in, w.n_embd, n_tokens,
+        act_in->nb[1], (size_t)chunk_start * act_in->nb[1]);
+    ggml_set_input(inp);
+
+    sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(sg.positions);
+
+    const int kv_len = kv_start + n_tokens;
+    sg.attn_mask = ggml_new_tensor_4d(sg.ctx, GGML_TYPE_F32, kv_len, n_tokens, 1, 1);
+    ggml_set_input(sg.attn_mask);
+    ggml_tensor * mask_full_f16 = ggml_cast(sg.ctx, sg.attn_mask, GGML_TYPE_F16);
+
+    sg.attn_mask_swa = ggml_new_tensor_4d(sg.ctx, GGML_TYPE_F32, kv_len, n_tokens, 1, 1);
+    ggml_set_input(sg.attn_mask_swa);
+    ggml_tensor * mask_swa_f16 = ggml_cast(sg.ctx, sg.attn_mask_swa, GGML_TYPE_F16);
+
+    ggml_tensor * layer_out = build_laguna_layer(
+        sg.ctx, sg.gf, w, cache, layer_idx, inp, sg.positions,
+        mask_full_f16, kv_start, n_tokens, mask_swa_f16);
+    if (!layer_out) return false;
+
+    ggml_tensor * out_view = ggml_view_2d(
+        sg.ctx, act_out, w.n_embd, n_tokens,
+        act_out->nb[1], (size_t)chunk_start * act_out->nb[1]);
+    ggml_build_forward_expand(sg.gf, ggml_cpy(sg.ctx, layer_out, out_view));
+
+    if (!sg.alloc) {
+        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
+}
+
+bool compute_laguna_split_projection(
+    ggml_backend_t backend,
+    const LagunaTargetWeights & w,
+    ggml_tensor * act,
+    int token_offset,
+    int n_tokens,
+    std::vector<int32_t> * out_argmax,
+    std::vector<float> * out_logits) {
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 64 + ggml_graph_overhead() + 1024 * 1024;
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return false;
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+
+    ggml_tensor * act_view = ggml_view_2d(
+        ctx, act, w.n_embd, n_tokens, act->nb[1],
+        (size_t)token_offset * act->nb[1]);
+    ggml_tensor * cur = laguna_rms_norm_mul(ctx, act_view, w.out_norm);
+    cur = ggml_mul_mat(ctx, w.output, cur);
+    ggml_tensor * logits = cur;
+    ggml_tensor * argmax = nullptr;
+    if (out_logits) {
+        ggml_set_output(logits);
+        ggml_build_forward_expand(gf, logits);
+    }
+    if (out_argmax) {
+        argmax = ggml_argmax(ctx, logits);
+        ggml_set_output(argmax);
+        ggml_build_forward_expand(gf, argmax);
+    }
+
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!alloc || !ggml_gallocr_alloc_graph(alloc, gf)) {
+        if (alloc) ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        return false;
+    }
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        return false;
+    }
+    if (out_argmax) {
+        out_argmax->resize((size_t)n_tokens);
+        ggml_backend_tensor_get(argmax, out_argmax->data(), 0,
+                                sizeof(int32_t) * (size_t)n_tokens);
+    }
+    if (out_logits) {
+        const int vocab = (int)w.embedder.n_vocab;
+        out_logits->resize((size_t)vocab * (size_t)n_tokens);
+        ggml_backend_tensor_get(logits, out_logits->data(), 0,
+                                sizeof(float) * (size_t)vocab * (size_t)n_tokens);
+    }
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    return true;
+}
+
+bool compute_laguna_split_argmax(
+    ggml_backend_t backend,
+    const LagunaTargetWeights & w,
+    ggml_tensor * act,
+    int token_offset,
+    int n_tokens,
+    std::vector<int32_t> & out_argmax) {
+    return compute_laguna_split_projection(
+        backend, w, act, token_offset, n_tokens, &out_argmax, nullptr);
 }
 
 LagunaGraphOutputs build_laguna_graph(
