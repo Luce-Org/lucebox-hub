@@ -350,7 +350,7 @@ static int run_target_layer_split_harness(
     (void)enable_layer_split_peer_access(target_gpus, peer_access);
     for (auto & shard : shards) {
         const TargetLoadPlan plan =
-            make_layer_split_load_plan(shard, &shard == &shards.back());
+            make_layer_split_load_plan<TargetLoadPlan>(shard, &shard == &shards.back());
         if (!load_target_gguf_partial(target_path, shard.backend, plan, shard.weights)) {
             std::fprintf(stderr, "target-split load gpu=%d: %s\n",
                          shard.gpu, dflash27b_last_error());

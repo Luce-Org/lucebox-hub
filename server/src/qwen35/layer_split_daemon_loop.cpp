@@ -49,7 +49,7 @@ int run_layer_split_daemon(const LayerSplitDaemonConfig & cfg) {
     // Load partial target weights + caches.
     for (auto & shard : shards) {
         const TargetLoadPlan plan =
-            make_layer_split_load_plan(shard, &shard == &shards.back());
+            make_layer_split_load_plan<TargetLoadPlan>(shard, &shard == &shards.back());
         if (!load_target_gguf_partial(cfg.target_path, shard.backend, plan, shard.weights) ||
             !create_target_cache_partial(shard.weights, cfg.max_ctx, cfg.max_verify_tokens,
                                          shard.backend, shard.cache,

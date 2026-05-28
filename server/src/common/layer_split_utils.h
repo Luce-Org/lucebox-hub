@@ -26,10 +26,11 @@ struct LayerSplitShardMeta {
     ggml_backend_t backend = nullptr;
 };
 
-inline TargetLoadPlan make_layer_split_load_plan(
+template <typename LoadPlan>
+inline LoadPlan make_layer_split_load_plan(
         const LayerSplitShardMeta & shard,
         bool is_last_shard) {
-    TargetLoadPlan plan;
+    LoadPlan plan;
     plan.layer_begin = shard.layer_begin;
     plan.layer_end = shard.layer_end;
     plan.load_output = is_last_shard;

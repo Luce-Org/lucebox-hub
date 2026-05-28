@@ -62,7 +62,7 @@ bool Qwen35LayerSplitAdapter::init() {
 
     for (auto & shard : shards_) {
         const TargetLoadPlan plan =
-            make_layer_split_load_plan(shard, &shard == &shards_.back());
+            make_layer_split_load_plan<TargetLoadPlan>(shard, &shard == &shards_.back());
         if (!load_target_gguf_partial(cfg_.target_path, shard.backend, plan,
                                       shard.weights) ||
             !create_target_cache_partial(shard.weights, cfg_.device.max_ctx,

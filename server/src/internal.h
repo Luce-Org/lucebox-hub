@@ -23,7 +23,6 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
-#include "common/layer_split_utils.h"
 #include "dflash27b.h"
 
 namespace dflash::common {
