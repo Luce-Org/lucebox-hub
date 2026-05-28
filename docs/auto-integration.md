@@ -18,7 +18,10 @@ upstream `origin/main` (which now includes PR #296), then integrated the updated
 non-draft PR #295 head. #295 conflicted only with the stack's previous
 integration of the same feature in the target layer-split prefill-logit capture
 calls; the resolution preserves #295's required always-capture behavior so
-sampling and prefix snapshots can restore prefill logits correctly.
+sampling and prefix snapshots can restore prefill logits correctly. After the
+first push, CI exposed duplicate CMake test target registrations inherited from
+the long-running stack; this refresh also removes the repeated registration block
+so the CMake configure step can progress past CMP0002 target-name errors.
 
 ## Included in the current stack
 
@@ -51,6 +54,7 @@ sampling and prefix snapshots can restore prefill logits correctly.
 |---:|---|---|
 | upstream sync | integrated | `origin/main` advanced from `315a9bdb` to `3ba525e0`; merged cleanly in the worktree. |
 | #295 | integrated after manual conflict resolution | Direct merge conflicted in `server/src/gemma4/gemma4_layer_split_adapter.cpp` and `server/src/qwen35/qwen35_layer_split_adapter.cpp` where the stack had conditional prefill-logit capture. The final resolution uses #295's `&prefill_last_logits_` path so sampled target layer split and snapshot restore both retain logits. |
+| integration-only CI fix | applied | After push `c8da5c5b`, PR #286 CI failed in both CMake and Docker CUDA configure with duplicate `test_drafter_*` / `test_anchor_transitive` target and test registrations in `server/CMakeLists.txt`. This run removed the second duplicate block and verified no duplicate `add_executable` / `add_test(NAME ...)` entries remain. |
 | current integrated PRs | checked | Ancestor checks passed for #295, #294, #292, #289, #276, #274, #266, #152, and #142 at stack tip `98da34f0`; #296, #284, #278, and #265 are included through `origin/main`. |
 | remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #154, #153, #137, #135, #94, and #48 against stack tip `98da34f0` in probe branch `auto-integration-probe-20260528-142207`. Every direct probe conflicted and was aborted in the isolated probe worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-142207.txt`. |
 | #237 manual/delegated status | still blocked-needs-human | No new #237 head since the prior deep manual/delegated recheck. This run's direct probe again showed broad conflicts across old `dflash/` paths, common MTP interfaces, Qwen35 graph/backend files, CMake, daemon/server wiring, and tests. Prior Claude/Codex tmux attempts did not produce a trusted ready-to-apply resolution, and the required next step remains a deliberate current-layout MTP port rather than conflict-marker resolution. |
@@ -88,6 +92,8 @@ This run performed:
 - `git fetch --prune origin` and `git fetch --prune easel` completed separately; targeted fetches recreated current open non-draft contributor PR refs.
 - `origin/main`, `easel/auto-integration`, local primary `HEAD`, and prepared worktree `HEAD` were checked as `3ba525e0`, `6a9e50cd`, `f13a7459`, and `98da34f0` respectively before this manifest commit. The primary local branch was behind fetched `easel/auto-integration`, so it was not used for reconciliation.
 - Worktree `/tmp/luce-auto-cron-20260528-142207` merged `origin/main` cleanly and merged #295 after resolving two content conflicts in layer-split adapter prefill-logit capture.
+- After the first push (`c8da5c5b`), `gh pr checks 286 --watch` reported `uv workspace` passed, while `Build (cmake + uv sync --extra megakernel)` and `cuda12` failed during CMake configure with duplicate target/test names in `server/CMakeLists.txt`.
+- The duplicate CMake block was removed, and a local static check over `server/CMakeLists.txt` reported `target duplicates []` and `test duplicates []`.
 - Isolated probe worktree `/tmp/luce-probe-20260528-142207` reran direct conflict probes for all remaining non-ancestor non-draft PRs.
 - Ancestor checks passed for included contributor PR refs #295, #294, #292, #289, #276, #274, #266, #152, and #142; #296, #284, #278, and #265 are included through upstream main.
 - `git diff --check` passed before this manifest refresh.
