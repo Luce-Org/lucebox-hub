@@ -26,6 +26,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          lfs: true
           token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
 
       - uses: Jimver/cuda-toolkit@v0.2.35
@@ -55,7 +56,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target \
             test_dflash test_generate test_flash_attn_sparse \
-            dflash_server test_server_unit \
+            dflash_server test_server_unit spike_no_gpu_http_server \
             -j$(nproc)
 
       - name: Run C++ server unit tests
@@ -69,6 +70,19 @@ jobs:
         # [tool.uv.sources]) and pflash drags in setuptools. Megakernel is
         # in the optional `megakernel` extra so its build does NOT run yet.
         run: uv sync --frozen
+
+      - name: Run CPU integration tests (stub backend, no GPU)
+        # End-to-end exercise of HttpServer + render_chat_template +
+        # SseEmitter with a deterministic stub model backend. No GPU
+        # required: the spike driver runs under CUDA_VISIBLE_DEVICES=""
+        # and the tokenizer fixture is a stripped Qwen3.6 GGUF (metadata
+        # only). Covers the regression class from PR #308 end-to-end —
+        # streaming and non-streaming, OpenAI and Anthropic formats.
+        env:
+          CUDA_VISIBLE_DEVICES: ""
+        run: |
+          uv run --frozen --with pytest --with requests \
+            pytest -v server/test/test_stub_integration.py
 
       - name: Build megakernel via uv sync (sm_75)
         env:
