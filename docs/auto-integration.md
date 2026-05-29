@@ -29,7 +29,7 @@ was made.
 | #299 | `feat/draft-swa-flag` | upstream | included through upstream | Draft SWA env/flag support remains in upstream. |
 | #298 | `fix/gemma4-destructor-link` | upstream | included through upstream | Gemma4 destructor-link fix remains in upstream. |
 | #292 | `feat-backend-ipc-payload-pipe-open` | upstream / `90bc52f` | included through upstream and stack | `origin/main` carries backend IPC payload-pipe support; the stack already contained the same PR head before it landed upstream. |
-| #297 | `feat-server-laguna-layer-split-adapter-v2` | `53dd1686` | included | Laguna target-layer-split adapter remains carried in the easel stack. The GitHub PR is non-draft again and its current head is an ancestor of the integration tip. |
+| #297 | `feat-server-laguna-layer-split-adapter-v2` | `53dd1686` | included / draft at final check | Laguna target-layer-split adapter remains carried in the easel stack. It appeared non-draft during the initial enumeration and was already an ancestor of the integration tip; the post-push recheck showed it draft again, so it is excluded from the current non-draft target but retained as an already-carried dependency. |
 | #295 | `fix-layer-split-sampling` | `a9aedf7d` | included | Target layer-split sampling support remains an ancestor of the stack. |
 | #294 | `feat/server-passthrough-proxy` | `0883c2ef` | included | Server passthrough proxy wiring, piecewise keep-ratio curve, query survival checks, and unit coverage are carried. |
 | #289 | `pipeline_moe` | `0ffab8a1` | included | Pipelined hybrid Qwen35 MoE decode update remains an ancestor of the stack. |
@@ -51,7 +51,7 @@ This run performed:
 - Open PR enumeration used `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json number,title,author,isDraft,headRefName,headRepositoryOwner,headRepository,baseRefName,updatedAt,mergeable,url --jq ...`.
 - Fetched open non-draft PR refs explicitly: #295, #294, #289, #276, #274, #266, #237, #221, #154, #153, #152, #142, #137, #135, #94, #48, and #297.
 - `git rev-list --left-right --count origin/main...HEAD` reports `0` behind and `368` ahead before the manifest commit.
-- `git merge-base --is-ancestor` checks pass for carried open non-draft PR refs: #297, #295, #294, #289, #276, #274, #266, #152, and #142.
+- `git merge-base --is-ancestor` checks pass for carried open non-draft PR refs: #295, #294, #289, #276, #274, #266, #152, and #142. #297 also passed during the initial enumeration when it appeared non-draft; the post-push recheck showed #297 draft again.
 - Repeated direct merge probes from `easel/auto-integration` in `/tmp/luce-auto-cron-20260528-220855/` for #237, #221, #154, #153, #137, #135, #94, and #48. All still conflict.
 - Delegation for #237: Claude Code was run through tmux but reached `--max-turns` without a usable report (`/tmp/luce237claude220908-report.txt`). Codex was then run through tmux on the same conflicted worktree and produced a read-only feasibility report (`/tmp/luce237codex221133-report.txt`) recommending staged selective port rather than direct merge resolution.
 
@@ -71,10 +71,11 @@ This run performed:
 ## Draft / excluded
 
 Draft PRs remain outside the primary non-draft integration target except for
-ongoing dependency awareness: #304, #291, #290, #286, #285, #275, #249, and
-#193. #286 is the draft PR for the current auto-integration snapshot. #304 is a
+ongoing dependency awareness: #304, #297, #291, #290, #286, #285, #275, #249,
+and #193. #286 is the draft PR for the current auto-integration snapshot. #304 is a
 draft LLM auto context compaction PR observed in this run and excluded because
-it is draft. #297 is no longer draft and is included above.
+it is draft. #297 was briefly observed as open during the initial enumeration
+but was draft again on the required post-push recheck.
 
 ## Retained worktrees / logs
 
@@ -99,6 +100,7 @@ Agent reports/logs retained:
 
 This run produced a manifest-only refresh on top of `a98ffb79`; no source stack
 rewrite was needed because `origin/main`, `easel/auto-integration`, and all
-carried mergeable non-draft PR heads were already current. The only non-draft
-state change relevant to inclusion is #297 returning from draft to open; its
-head `53dd1686` was already carried.
+carried mergeable non-draft PR heads were already current. #297 briefly appeared
+non-draft during the initial enumeration and was confirmed carried, but the
+post-push recheck showed it draft again; its head `53dd1686` remains retained as
+an already-carried draft dependency.
