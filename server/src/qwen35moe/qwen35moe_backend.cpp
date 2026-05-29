@@ -570,15 +570,33 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                 }
             }
 
-            // Batched hybrid FFN for this chunk
-            std::vector<float> ffn_batch_out;
-            if (!eval_qwen35moe_hybrid_ffn_batched(
-                    target_backend(), cpu_be, target_weights(), L, storage,
-                    chunk_post.data(), chunk_selected.data(), chunk_weights.data(),
-                    chunk_len, ffn_batch_out, &result.error)) {
-                step_graph_destroy(prefill_sg);
-                cleanup_graphs();
-                return result;
+            // Batched hybrid FFN for this chunk.
+            // The routed-expert mul_mat_id MMQ kernel writes out of bounds on
+            // Ampere when the per-call token count exceeds ~8: the expert token
+            // distribution overshoots the destination tiles on the
+            // need_check=false write path, silently corrupting neighbouring GPU
+            // allocations during prefill and crashing with an illegal memory
+            // access at a later decode sync (~4th request under the server).
+            // Sub-batch the FFN to a safe width so the attention prefill can
+            // stay at the full chunk size.
+            std::vector<float> ffn_batch_out((size_t)chunk_len * (size_t)hidden);
+            constexpr int kFfnSafeBatch = 8;
+            for (int fb = 0; fb < chunk_len; fb += kFfnSafeBatch) {
+                const int fl = std::min(kFfnSafeBatch, chunk_len - fb);
+                std::vector<float> sub_out;
+                if (!eval_qwen35moe_hybrid_ffn_batched(
+                        target_backend(), cpu_be, target_weights(), L, storage,
+                        chunk_post.data()     + (size_t)fb * (size_t)hidden,
+                        chunk_selected.data() + (size_t)fb * (size_t)n_expert_used,
+                        chunk_weights.data()  + (size_t)fb * (size_t)n_expert_used,
+                        fl, sub_out, &result.error)) {
+                    step_graph_destroy(prefill_sg);
+                    cleanup_graphs();
+                    return result;
+                }
+                std::memcpy(ffn_batch_out.data() + (size_t)fb * (size_t)hidden,
+                            sub_out.data(),
+                            (size_t)fl * (size_t)hidden * sizeof(float));
             }
 
             // Combine FFN output + residual → embed_all for next layer
