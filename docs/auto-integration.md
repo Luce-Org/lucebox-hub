@@ -4,18 +4,19 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-29T01:24:38-04:00
+Last refresh: 2026-05-29T01:28:45-04:00
 Current base: `origin/main` `8782d07a`
-Current integration tip before this refresh: `easel/auto-integration` `d318694b`
-Refreshed stack merge commit prepared in this run: none; stack already current
+Current integration tip before this refresh: `easel/auto-integration` `d318694b`; intermediate manifest-only push `f167e85d`
+Refreshed stack merge commit prepared in this run: PR #285 was resolved and merged after it changed from draft to open during final re-enumeration
 Final manifest commit prepared after stack/probe refresh: this commit
 
 This branch is maintained as a reproducible patch stack over `origin/main`.
 At this run's start `easel/auto-integration` was already based on current
-`origin/main` (`0` behind / `380` ahead), and every currently mergeable
-non-draft contributor PR head was either already an ancestor of the stack or
-was re-probed as a selective-port/superseded conflict. No source stack rewrite
-was made in this run.
+`origin/main` (`0` behind / `380` ahead). Initial enumeration had PR #285 as
+draft, but the mandatory post-push re-enumeration showed #285 had become open;
+it was fetched, resolved in a worktree, verified with Python checks, and merged.
+The remaining non-draft contributor PRs are either already ancestors of the stack
+or were re-probed as selective-port/superseded conflicts.
 
 ## Included in the current stack
 
@@ -37,23 +38,25 @@ was made in this run.
 | #266 | `feat/harness-typed-adapters` | `17525eae` | included | Typed harness adapters and format-aware session-inject proxy are carried. |
 | #152 | `main` | `cf735bee` | included | Gemma 4 RTX 4090 backend helpers are carried. |
 | #142 | `xabicasa/dflash-safetensors-draft-fp16` | `f2fbf62f` | included | FP16 safetensors drafter support is carried. |
-| #285 | `feat/lucebox-docker` | draft | partial draft dependency | Draft PR, outside the primary non-draft target, but earlier Docker/CLI/bench integration dependency remains partially carried. The draft head has moved and is not fully an ancestor. |
+| #285 | `feat/lucebox-docker` | `a73d4820` | included | Docker stack, `lucebox` CLI, bench/profile tooling, harness clients, and `luce-bench` are now carried. It changed from draft to open during this run's post-push re-enumeration and was resolved by taking the refreshed PR head for conflicted feature files plus preserving the current server include needed by the existing stack. |
 
 ## Validation run
 
 This run performed:
 
-- `date -Is` -> 2026-05-29T01:18:51-04:00 for preflight and 2026-05-29T01:24:38-04:00 for the manifest refresh timestamp.
+- `date -Is` -> 2026-05-29T01:18:51-04:00 for preflight and 2026-05-29T01:28:45-04:00 for the final manifest refresh timestamp.
 - Primary checkout preflight: `git status --short` was clean; branch was `auto-integration`; remotes were `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
 - Auth/tooling checks with real user credentials succeeded: `gh auth status`, `claude auth status --text`, and a harmless `codex --version` smoke check.
 - `git fetch --prune origin` and `git fetch --prune easel` completed successfully.
 - Open PR enumeration used `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json number,title,author,isDraft,headRefName,headRepositoryOwner,headRepository,baseRefName,updatedAt,mergeable,url --jq ...`.
-- Fetched open non-draft PR refs explicitly: #295, #294, #289, #276, #274, #266, #237, #221, #154, #153, #152, #142, #137, #135, #94, and #48.
+- Fetched open non-draft PR refs explicitly: #295, #294, #289, #276, #274, #266, #237, #221, #154, #153, #152, #142, #137, #135, #94, and #48; after post-push re-enumeration showed #285 had become open, fetched #285 at `a73d4820` as well.
 - `git rev-list --left-right --count origin/main...easel/auto-integration` reported `0` behind and `380` ahead before this manifest commit.
-- `git merge-base --is-ancestor` checks pass for carried open non-draft PR refs: #295, #294, #289, #276, #274, #266, #152, and #142.
+- `git merge-base --is-ancestor` checks pass for carried open non-draft PR refs: #295, #294, #289, #276, #274, #266, #152, #142, and, after the final merge, #285.
 - Reconciliation worktree `/tmp/luce-auto-cron-20260529-011930/reconcile` was created from `easel/auto-integration`; `origin/main` is already an ancestor and no base merge was required.
 - Repeated direct merge probes from `easel/auto-integration` in `/tmp/luce-auto-cron-20260529-011930/` for #237, #221, #154, #153, #137, #135, #94, and #48. All still conflict in the conflict classes recorded below.
 - Fresh delegation for #237: Claude Code ran in tmux session `luce237-luce-auto-cron-20260529-011930-claude` and exited with `Error: Reached max turns (8)` without a usable report; Codex then ran in tmux session `luce237-luce-auto-cron-20260529-011930-codex` and produced `/tmp/luce237-luce-auto-cron-20260529-011930-codex-report.txt`. Codex confirmed direct merge is unsafe and a selective current-layout MTP foundation port is required.
+- PR #285 changed from draft to open after the first manifest-only push. Probe worktree `/tmp/luce-auto-cron-20260529-011930/pr-285-probe` resolved the refreshed Docker/lucebox/luce-bench stack by taking the PR head for conflicted feature files and preserving `<algorithm>` in `server/src/server/server_main.cpp` for the existing auto-integration stack.
+- PR #285 validation in the resolved worktree: `git diff --check` passed; `python3 -m compileall -q lucebox/src lucebox/tests luce-bench/src luce-bench/tests harness/src` passed; plain `python3 -m pytest ...` and `uv run python -m pytest ...` could not run because pytest was not installed in those environments; `uv run --with pytest python -m pytest lucebox/tests luce-bench/tests/test_report.py luce-bench/tests/test_smoke_area.py luce-bench/tests/test_runner.py -q` passed with `151 passed in 14.41s`.
 - `git diff --check -- docs/auto-integration.md` passed after this manifest update.
 
 ## Pending / blocked-needs-human / selective-port candidates
@@ -72,11 +75,12 @@ This run performed:
 ## Draft / excluded
 
 Draft PRs remain outside the primary non-draft integration target except for
-ongoing dependency awareness: #304, #297, #291, #290, #286, #285, #275, #249,
+ongoing dependency awareness: #304, #297, #291, #290, #286, #275, #249,
 and #193. #286 is the draft PR for the current auto-integration snapshot. #304
 is a draft LLM auto context compaction PR and excluded because it is draft. #297
 is draft at this run's enumeration and remains carried as an already-integrated
-draft dependency.
+draft dependency. #285 was draft during initial enumeration but became open
+before final reporting, so it is now included above.
 
 ## Retained worktrees / logs
 
@@ -93,7 +97,8 @@ because safe cleanup would require resolving or discarding conflicted indexes:
 - `/tmp/luce-auto-cron-20260529-011930/pr-48-probe`
 
 The clean reconciliation worktree `/tmp/luce-auto-cron-20260529-011930/reconcile`
-was also left in place to avoid worktree force-deletion in an unattended run.
+and resolved PR #285 integration worktree `/tmp/luce-auto-cron-20260529-011930/pr-285-probe`
+were also left in place to avoid worktree force-deletion in an unattended run.
 
 Agent reports/logs retained:
 
@@ -110,13 +115,13 @@ Agent reports/logs retained:
 
 ## Notes
 
-This run produced a manifest-only refresh on top of `d318694b`; no source stack
-rewrite was needed because `origin/main`, `easel/auto-integration`, and all
-carried mergeable non-draft PR heads were already current. The next useful work
-remains a human-reviewed selective port of #237's MTP foundation into the current
-`server/` layout. After that, mine #221's WARM-cache/dispatcher behavior and
-#153/#154's native/integrated MTP semantics. #135 remains confirmed by Codex as
-a selective current-layout port focused on the qwen35 daemon scheduler and
-batched target-step API. #137 and #48 look like old `dflash/CMakeLists.txt`
-changes that should be closed or retargeted, and #94 appears largely superseded
-by current draft/SWA support.
+This run first produced a manifest-only refresh on top of `d318694b`, then
+post-push re-enumeration showed #285 had become non-draft. The final pushed stack
+therefore also merges #285 at `a73d4820` with conflict resolution and targeted
+Python validation. The next useful work remains a human-reviewed selective port
+of #237's MTP foundation into the current `server/` layout. After that, mine
+#221's WARM-cache/dispatcher behavior and #153/#154's native/integrated MTP
+semantics. #135 remains confirmed by Codex as a selective current-layout port
+focused on the qwen35 daemon scheduler and batched target-step API. #137 and #48
+look like old `dflash/CMakeLists.txt` changes that should be closed or
+retargeted, and #94 appears largely superseded by current draft/SWA support.

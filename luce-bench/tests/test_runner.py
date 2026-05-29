@@ -213,9 +213,11 @@ def test_run_case_hits_v1_chat_completions_endpoint():
 
 
 def test_run_case_normalizes_response_into_row():
+    # Non-streaming path: caller opts out, single-shot POST returns a full
+    # OpenAI response dict. Streaming has its own coverage below.
     case = {"id": "x", "source": "test", "kind": "integer", "question": "1+1?"}
     with patch("urllib.request.urlopen", return_value=_mock_urlopen(_chat_response(content="2"))):
-        row = run_case(url="http://localhost:8080", case=case)
+        row = run_case(url="http://localhost:8080", case=case, stream=False)
     assert row["case_id"] == "x"
     assert row["source"] == "test"
     assert row["content"] == "2"
@@ -224,6 +226,9 @@ def test_run_case_normalizes_response_into_row():
     assert row["completion_tokens"] == 5
     assert row["http_status"] == 200
     assert row["wall_seconds"] is not None
+    # Non-streaming rows still carry the new schema fields with None / False.
+    assert row["ttft_seconds"] is None
+    assert row["streaming"] is False
 
 
 def test_run_case_surfaces_timings_when_server_emits_them():
@@ -240,8 +245,153 @@ def test_run_case_surfaces_timings_when_server_emits_them():
         }
     )
     with patch("urllib.request.urlopen", return_value=_mock_urlopen(resp)):
-        row = run_case(url="http://localhost:8080", case=case)
+        row = run_case(url="http://localhost:8080", case=case, stream=False)
     assert row["timings"]["decode_tokens_per_sec"] == 109.4
+
+
+# ────────────────────────────────────────────────────────────────────
+# Streaming path — SSE parsing, TTFT capture, schema additions
+# ────────────────────────────────────────────────────────────────────
+
+
+def _mock_sse_response(frames: list[dict | str], status: int = 200):
+    """Return a context-manager mock that yields an iterable of SSE byte lines.
+
+    `frames` is a list of either:
+      * dict → wrapped as `data: <json>\\n\\n` and split into 2 lines
+        (data line + blank terminator)
+      * str  → wrapped as `data: <str>\\n\\n` verbatim (use for [DONE]
+        or malformed payloads)
+    """
+    lines: list[bytes] = []
+    for frame in frames:
+        if isinstance(frame, dict):
+            lines.append(("data: " + json.dumps(frame) + "\n").encode())
+        else:
+            lines.append(("data: " + frame + "\n").encode())
+        lines.append(b"\n")  # blank line = frame terminator
+
+    resp = MagicMock()
+    resp.__iter__ = lambda self: iter(lines)
+    resp.status = status
+    resp.headers = {"Content-Type": "text/event-stream"}
+    ctx = MagicMock()
+    ctx.__enter__.return_value = resp
+    ctx.__exit__.return_value = False
+    return ctx
+
+
+def test_run_case_streaming_captures_ttft_and_concatenates_content():
+    """A streamed response with 3 content deltas should:
+      * stamp ttft on the first delta with non-empty content
+      * concatenate all deltas into row["content"]
+      * pick up usage from the final chunk
+      * mark streaming=True
+    """
+    case = {"id": "x", "source": "test", "kind": "integer", "question": "1+1?"}
+    frames = [
+        # Role-only opener — must NOT stamp ttft (no real text yet).
+        {
+            "model": "mock",
+            "choices": [{"delta": {"role": "assistant"}, "finish_reason": None}],
+        },
+        # First text delta — ttft stamps here.
+        {"model": "mock", "choices": [{"delta": {"content": "The "}, "finish_reason": None}]},
+        {"model": "mock", "choices": [{"delta": {"content": "answer is "}, "finish_reason": None}]},
+        {"model": "mock", "choices": [{"delta": {"content": "42."}, "finish_reason": "stop"}]},
+        # Usage-only final chunk (OpenAI shape with include_usage=true).
+        {
+            "model": "mock",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 7,
+                "timings": {
+                    "prefill_ms": 45.0,
+                    "decode_ms": 120.0,
+                    "decode_tokens_per_sec": 58.3,
+                },
+            },
+        },
+        "[DONE]",
+    ]
+    with patch("urllib.request.urlopen", return_value=_mock_sse_response(frames)):
+        row = run_case(url="http://localhost:8080", case=case)
+    assert row["streaming"] is True
+    assert row["content"] == "The answer is 42."
+    assert row["finish_reason"] == "stop"
+    assert row["prompt_tokens"] == 12
+    assert row["completion_tokens"] == 7
+    assert row["timings"]["decode_tokens_per_sec"] == 58.3
+    # TTFT must be set (non-None) and bounded — wall_seconds is an upper bound.
+    assert isinstance(row["ttft_seconds"], float)
+    assert row["ttft_seconds"] >= 0
+    assert row["ttft_seconds"] <= row["wall_seconds"] + 0.01
+
+
+def test_run_case_streaming_request_sets_stream_true_and_include_usage():
+    """The wire body must carry stream=true and stream_options.include_usage."""
+    case = {"id": "x", "kind": "integer", "question": "1+1?"}
+    sent: dict = {}
+
+    def fake_urlopen(req, timeout=None):
+        sent["body"] = json.loads(req.data)
+        sent["headers"] = dict(req.header_items())
+        return _mock_sse_response(
+            [
+                {"model": "m", "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]},
+                "[DONE]",
+            ]
+        )
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        run_case(url="http://localhost:8080", case=case)
+    assert sent["body"]["stream"] is True
+    assert sent["body"]["stream_options"] == {"include_usage": True}
+    # Accept: text/event-stream is what gateways inspect for SSE routing.
+    accept = sent["headers"].get("Accept") or sent["headers"].get("accept")
+    assert accept == "text/event-stream"
+
+
+def test_run_case_streaming_captures_reasoning_content_for_ttft():
+    """A reasoning-content delta (no visible content yet) should still
+    stamp TTFT — that's "first useful token" from the user's POV."""
+    case = {"id": "x", "kind": "integer", "question": "1+1?"}
+    frames = [
+        # Role-only opener.
+        {"model": "m", "choices": [{"delta": {"role": "assistant"}, "finish_reason": None}]},
+        # Reasoning-only chunk — TTFT must stamp here.
+        {
+            "model": "m",
+            "choices": [{"delta": {"reasoning_content": "thinking..."}, "finish_reason": None}],
+        },
+        # Visible content arrives later.
+        {"model": "m", "choices": [{"delta": {"content": "2"}, "finish_reason": "stop"}]},
+        "[DONE]",
+    ]
+    with patch("urllib.request.urlopen", return_value=_mock_sse_response(frames)):
+        row = run_case(url="http://localhost:8080", case=case)
+    assert row["reasoning_content"] == "thinking..."
+    assert row["content"] == "2"
+    assert row["ttft_seconds"] is not None
+
+
+def test_run_case_stream_false_omits_include_usage_and_uses_application_json():
+    case = {"id": "x", "kind": "integer", "question": "1+1?"}
+    sent: dict = {}
+
+    def fake_urlopen(req, timeout=None):
+        sent["body"] = json.loads(req.data)
+        sent["headers"] = dict(req.header_items())
+        return _mock_urlopen(_chat_response())
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        run_case(url="http://localhost:8080", case=case, stream=False)
+    assert sent["body"]["stream"] is False
+    assert "stream_options" not in sent["body"]
+    accept = sent["headers"].get("Accept") or sent["headers"].get("accept")
+    # Non-streaming runs don't override Accept — urllib defaults to */*.
+    assert accept != "text/event-stream"
 
 
 def test_run_case_returns_error_row_on_network_failure():

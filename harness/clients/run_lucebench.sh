@@ -14,8 +14,8 @@
 #
 # Knobs (env var or default):
 #   LUCEBENCH_AREA      single area: code | longctx | agent | ds4-eval | forge
-#                       (default: empty → --sweep, all 4 stdlib areas; forge
-#                       requires the [forge] extra installed)
+#                       (default: empty → `--areas all`, every stdlib area;
+#                       forge requires the [forge] extra installed)
 #   LUCEBENCH_THINK     1 → --think, 0 → --no-think, empty → server default
 #                       (default: 0; nothink is ~4× faster on gemma-4-26b
 #                       per the 2026-05-26 think/nothink comparison)
@@ -48,16 +48,19 @@ source "$SCRIPT_DIR/common.sh"
 
 CLIENT_OUT="$LOG_DIR/lucebench.out"
 
-# Build the luce-bench argv. Sweep mode (no --area) writes per-area JSONs +
-# `_summary.{json,md}` into $LOG_DIR; single-area mode writes one JSON.
+# Build the luce-bench argv. With no LUCEBENCH_AREA, we run `--areas all`
+# (writes per-area JSONs + `_summary.{json,md}` under $LOG_DIR/lucebench-sweep/).
+# With LUCEBENCH_AREA=X, we run a single area to $LOG_DIR/lucebench-X.json.
+# `--areas` is the canonical flag since luce-bench v0.2.5; the older
+# `--sweep` is still accepted but emits a deprecation note.
 lucebench_args=(--base-url "$BASE_URL" --model "$MODEL_ID" \
                 --timeout "$LUCEBENCH_TIMEOUT" --parallel "$LUCEBENCH_PARALLEL")
 
 if [[ -n "$LUCEBENCH_AREA" ]]; then
-  lucebench_args+=(--area "$LUCEBENCH_AREA" \
+  lucebench_args+=(--areas "$LUCEBENCH_AREA" \
                    --json-out "$LOG_DIR/lucebench-$LUCEBENCH_AREA.json")
 else
-  lucebench_args+=(--sweep --out-dir "$LOG_DIR" --name lucebench-sweep)
+  lucebench_args+=(--areas all --out-dir "$LOG_DIR" --name lucebench-sweep)
 fi
 
 # --think / --no-think only applies when explicitly set. Leaving the flag

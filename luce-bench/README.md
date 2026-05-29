@@ -79,9 +79,13 @@ payload + timings (when surfaced by the server).
 |------|-------|--------|--------|
 | `smoke` | 3 (arithmetic, capital, sequence) | case-insensitive substring | own — default sanity check |
 | `ds4-eval` | 92 (GPQA Diamond, SuperGPQA, AIME2025, COMPSEC) | strict `Answer: X` extract | [antirez/ds4](https://github.com/antirez/ds4) (MIT) |
+| `gsm8k` | 100 (test split sample, seed 42) | `#### N` marker, last-number fallback | [openai/gsm8k](https://huggingface.co/datasets/openai/gsm8k) (MIT) |
+| `truthfulqa-mc1` | 100 (validation split sample, seed 42) | MC letter extract (2–13 choices) | [truthful_qa](https://huggingface.co/datasets/truthful_qa) (Apache-2.0) |
+| `hellaswag` | 100 (validation split sample, seed 42) | MC letter extract (A–D endings) | [Rowan/hellaswag](https://huggingface.co/datasets/Rowan/hellaswag) (MIT) |
 | `code` | 10 (mid-function completion) | `ast.parse(prompt + completion)` | [openai/human-eval](https://github.com/openai/human-eval) (MIT) port |
 | `longctx` | 6 frontiers (2k → 64k tokens) | `^Risk:` prefix check | own ports |
 | `agent` | N codex-style prompts paired with coding tasks | code-fence / json-tool / apply_patch detect | own ports |
+| `agent_recorded` | 25 prompts mined from real local Claude Code + Codex sessions | three-bin tool-schema-coverage (expected tools + files named in reply) | own — mined via `scripts/extract-agentic-fixture.py` |
 | `forge` | 7+ tool-calling scenarios | error_type == None | [antoinezambelli/forge](https://github.com/antoinezambelli/forge) 0.7.1 (MIT) |
 
 Each row in the result carries:
@@ -121,6 +125,9 @@ This project redistributes evaluation fixtures from upstream MIT-
 licensed projects. See `NOTICE` for full attribution; in short:
 
 - ds4-eval cases — `antirez/ds4`, MIT
+- GSM8K cases — `openai/gsm8k`, MIT
+- TruthfulQA MC1 cases — `truthful_qa`, Apache-2.0
+- HellaSwag cases — `Rowan/hellaswag`, MIT
 - HumanEval prompts — `openai/human-eval`, MIT
 - forge eval scenarios — `antoinezambelli/forge`, MIT
 

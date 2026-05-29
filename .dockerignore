@@ -6,7 +6,6 @@
 # Build artefacts.
 **/build/
 **/build-*/
-.docker-build/
 dflash/build/
 
 # Model weights — bind-mount at runtime instead of baking into the image.

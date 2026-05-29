@@ -106,6 +106,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Capture build identity
+        id: identity
+        # /props.build identity baked into the image. GIT_SHA is the full
+        # commit sha (matches `${{ github.sha }}` — short-form is fine, we
+        # use the full 40-char form for "exactly which weights are running"
+        # forensics). BUILD_TIME is ISO 8601 UTC. IMAGE_TAG is filled in
+        # after the metadata-action step below picks the headline tag.
+        run: |
+          echo "git_sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Derive image metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -139,6 +150,17 @@ jobs:
 
       - name: Build and push
         uses: docker/bake-action@v5
+        env:
+          # Wire identity into docker-bake.hcl's GIT_SHA / IMAGE_TAG /
+          # BUILD_TIME variables. IMAGE_TAG is `${{ steps.meta.outputs.
+          # version }}` — the headline tag metadata-action picked
+          # (e.g. `cuda12` on main, `0.3.0-cuda12` on a release tag).
+          # The image's /props.build will surface these so a curl can
+          # pin down "what binary is this exactly" without inspecting
+          # the registry.
+          GIT_SHA: ${{ steps.identity.outputs.git_sha }}
+          IMAGE_TAG: ${{ steps.meta.outputs.version }}
+          BUILD_TIME: ${{ steps.identity.outputs.build_time }}
         with:
           files: |
             docker-bake.hcl

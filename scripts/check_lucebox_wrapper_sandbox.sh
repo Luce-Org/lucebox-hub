@@ -174,7 +174,10 @@ fi
 
 if [ "$RUN_CONTAINER_CLI" = "1" ]; then
     run_logged_capture "$ROOT/check.out" lucebox check
-    run_logged_capture "$ROOT/configure.out" lucebox configure --overwrite
+    # Sparse persistence: `config set` creates config.toml with only the
+    # named key. Replaces the old `configure --overwrite` path.
+    run_logged_capture "$ROOT/config-image.out" lucebox config set "image=$IMAGE"
+    run_logged_capture "$ROOT/config-variant.out" lucebox config set "variant=$VARIANT"
     assert_file "$LUCEBOX_HOME/config.toml"
     [ "$(stat -c '%u' "$LUCEBOX_HOME/config.toml")" = "$(id -u)" ] \
         || die "config.toml is not owned by the invoking user"

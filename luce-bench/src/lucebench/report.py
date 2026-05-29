@@ -1,8 +1,8 @@
-"""`luce-bench-report` — summarize and compare snapshot directories.
+"""``luce-bench report`` — summarize and compare snapshot directories.
 
-A snapshot dir is what `luce-bench --sweep` writes: per-area JSON
-files (ds4-eval.json, code.json, …) plus `_summary.json`. This tool
-aggregates one or many such dirs into:
+A snapshot dir is what ``luce-bench --areas all`` (or the ``snapshot``
+subcommand) writes: per-area JSON files (ds4-eval.json, code.json, …)
+plus ``_summary.json``. This tool aggregates one or many such dirs into:
 
   * a single-snapshot summary table (--summary), or
   * a multi-snapshot comparison matrix (--compare).
@@ -16,6 +16,19 @@ lucebench installs.
 The compare mode also runs against single-area JSON files (not just
 full sweep dirs) — useful for one-off ad-hoc comparisons of two ds4
 runs without rebuilding into the sweep layout.
+
+Host-identity (schema v2+) routing
+----------------------------------
+``load_snapshot`` now routes every per-area JSON through
+``normalize.normalize_result`` so the ``host`` block reaches the
+comparison table. The compare path surfaces a ``Host`` column with
+``host.wsl_version`` / ``host.kernel`` / ``host.gpus[0].name`` (+ "+N"
+when N>1) and prints a confounder warning above the table when rows
+differ on the WSL version, primary GPU name, or primary GPU power
+limit. Timestamps (``host.collected_at`` first, falling back to
+``started_at``) ride along the row identity since the same config can
+land in multiple snapshots and the user has explicitly asked for
+side-by-side cross-host comparison with explicit labelling.
 """
 
 from __future__ import annotations
@@ -28,10 +41,20 @@ from pathlib import Path
 from typing import Any
 
 from lucebench import __version__
+from lucebench.normalize import normalize_result
+from lucebench.schema import CanonicalResult, HostInfo
 
 
-def _row_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate per-case rows into a per-area stat block."""
+def _row_stats(canon: CanonicalResult) -> dict[str, Any]:
+    """Aggregate per-case rows on a CanonicalResult into a per-area stat block.
+
+    Reads from CanonicalRow (case_id/content/wall_seconds/graded shape)
+    so legacy and current result.json layouts collapse onto the same
+    output. Pass-rate is computed straight from rows (graded.pass /
+    graded.strict_pass), bypassing the writer's possibly-wrong-unit
+    aggregate.
+    """
+    rows = canon.rows
     if not rows:
         return {
             "n": 0,
@@ -41,11 +64,16 @@ def _row_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "wall_median": 0.0,
             "tok_per_s": 0.0,
             "comp_median": 0,
+            "decode_tps_median": 0,
         }
-    passes = sum(1 for r in rows if r.get("pass") or r.get("graded_pass"))
-    walls = [r.get("wall_seconds") or r.get("wall_s") or 0 for r in rows]
-    comp = [r.get("completion_tokens") or 0 for r in rows]
-    decode_tps = [(r.get("timings") or {}).get("decode_tokens_per_sec") or 0 for r in rows]
+    passes = sum(
+        1
+        for r in rows
+        if r.graded.get("pass") or r.graded.get("strict_pass")
+    )
+    walls = [r.wall_seconds or 0 for r in rows]
+    comp = [r.completion_tokens or 0 for r in rows]
+    decode_tps = [r.decode_tokens_per_sec or 0 for r in rows]
     decode_tps = [t for t in decode_tps if t > 0]
     return {
         "n": len(rows),
@@ -62,32 +90,176 @@ def _row_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def load_snapshot(path: Path) -> dict[str, dict[str, Any]]:
-    """Load a snapshot dir or a single-area JSON file.
+def _host_short(host: HostInfo | None) -> str:
+    """Compact one-cell host descriptor for the comparison table.
 
-    Returns ``{area_name: row_stats_dict}``. For a single JSON file,
-    the area name comes from the file's `area` field (or stem).
+    Format: ``"<wsl|host-os> · <gpu names joined by +>"``. Every GPU is
+    rendered so a ``5090+3090`` mixed rig is visibly different from
+    ``5090+5090`` — material when comparing benchmark rows across rigs.
+    Empty when nothing is known about the host (pre-v2 result with no
+    host block).
+    """
+    if host is None:
+        return "—"
+    parts: list[str] = []
+    tag = host.wsl_version or (host.kernel.split("-")[0] if host.kernel else None)
+    if not tag and host.os_pretty:
+        tag = host.os_pretty.split()[0]
+    if tag:
+        parts.append(tag)
+    if host.gpus:
+        # Trim "NVIDIA GeForce " / "NVIDIA " prefixes for readability;
+        # join every GPU with "+" so multi-GPU rigs are visibly distinct.
+        short_names = [
+            (g.name or "?").replace("NVIDIA GeForce ", "").replace("NVIDIA ", "")
+            for g in host.gpus
+        ]
+        parts.append("+".join(short_names))
+    if not parts:
+        # Fall back to the provenance label so an "unknown" row still
+        # carries the source it came from.
+        return host.source or "—"
+    return " · ".join(parts)
+
+
+def _host_confounders(snapshots: list[tuple[str, dict[str, dict[str, Any]], HostInfo | None]]) -> list[str]:
+    """Return a list of confounder-warning lines for the compare header.
+
+    Empty when all rows agree on wsl_version, full GPU lineup (every
+    name + power limit, in index order), and CUDA_VISIBLE_DEVICES.
+    Comparing the full lineup catches the case where a 5090+3090 rig
+    and a 5090+5090 rig would otherwise look identical via gpus[0]
+    alone. We deliberately don't refuse to render — the user has
+    explicitly said cross-host comparison is allowed with explicit
+    labelling.
+    """
+    wsl_versions: set[str | None] = set()
+    # The "lineup" is the ordered tuple of (name, power_limit_w) for
+    # every GPU. Sets of tuples compare structurally — `(a, b) == (a, b)`
+    # but `(a, b) != (b, a)` (index order matters; CUDA_VISIBLE_DEVICES
+    # references indices).
+    gpu_lineups: set[tuple[tuple[str | None, int | None], ...]] = set()
+    cuda_visible: set[str | None] = set()
+    for _name, _snap, host in snapshots:
+        if host is None:
+            continue
+        wsl_versions.add(host.wsl_version)
+        if host.gpus:
+            lineup = tuple((g.name, g.power_limit_w) for g in host.gpus)
+        else:
+            lineup = ()
+        gpu_lineups.add(lineup)
+        cuda_visible.add(host.cuda_visible_devices)
+    warnings: list[str] = []
+    if len(wsl_versions) > 1:
+        warnings.append(
+            "⚠ confounder: hosts differ on host.wsl_version "
+            f"(values: {sorted(str(v) for v in wsl_versions)})"
+        )
+    if len(gpu_lineups) > 1:
+        # Render each lineup compactly: "5090@175W+3090@250W". This
+        # surfaces both the GPU mix AND the power limit difference in
+        # a single warning rather than splitting into two.
+        def _fmt(lineup: tuple[tuple[str | None, int | None], ...]) -> str:
+            if not lineup:
+                return "—"
+            return "+".join(
+                f"{(name or '?')}@{plw}W" if plw is not None else (name or "?")
+                for name, plw in lineup
+            )
+        warnings.append(
+            "⚠ confounder: hosts differ on host.gpus lineup "
+            f"(values: {sorted(_fmt(lineup) for lineup in gpu_lineups)})"
+        )
+    if len(cuda_visible) > 1:
+        warnings.append(
+            "⚠ confounder: hosts differ on host.cuda_visible_devices "
+            f"(values: {sorted(repr(v) for v in cuda_visible)})"
+        )
+    return warnings
+
+
+def _row_identity(name: str, host: HostInfo | None) -> str:
+    """Render the per-row identity used in the compare header.
+
+    Includes the snapshot name and its collected_at timestamp. The user
+    explicitly called out that multiple copies of "the same" snapshot
+    can land in the baselines repo — so the timestamp is part of the
+    key. Empty timestamp falls back to just the name.
+    """
+    if host is None or not host.collected_at:
+        return name
+    return f"{name}@{host.collected_at}"
+
+
+def load_snapshot(path: Path) -> tuple[dict[str, dict[str, Any]], HostInfo | None]:
+    """Load a snapshot dir (or single-area JSON) into per-area stats + host.
+
+    Returns ``({area_name: row_stats}, host)``. The host block is
+    pulled from the first per-area file (they all carry the same block
+    because the snapshot writes it into each), or from ``host.json`` as
+    a fallback. For a single-file input we read the host directly off
+    that file's normalized result.
     """
     out: dict[str, dict[str, Any]] = {}
+    host: HostInfo | None = None
     if path.is_dir():
         for f in sorted(path.glob("*.json")):
             if f.name.startswith("_"):
                 continue  # skip _summary.json
-            data = json.loads(f.read_text())
-            rows = data.get("rows") or data.get("results") or []
-            area = data.get("area") or f.stem
-            out[area] = _row_stats(rows)
-        return out
-    # Single file
-    data = json.loads(path.read_text())
-    rows = data.get("rows") or data.get("results") or []
-    area = data.get("area") or path.stem
-    out[area] = _row_stats(rows)
-    return out
+            if f.name in {"host.json", "props.json", "config.json"}:
+                continue
+            try:
+                data = json.loads(f.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            canon = normalize_result(data, source_path=f)
+            area = canon.area or f.stem
+            out[area] = _row_stats(canon)
+            if host is None and canon.host is not None:
+                # Only take a non-"unknown" host as authoritative — an
+                # explicit unknown means the JSON had no host context, so
+                # keep looking through siblings.
+                if canon.host.source and canon.host.source != "unknown":
+                    host = canon.host
+                elif host is None:
+                    host = canon.host
+        # Fall back to host.json if nothing in the area files spoke up.
+        if host is None or host.source == "unknown":
+            host_json_path = path / "host.json"
+            if host_json_path.is_file():
+                try:
+                    raw = json.loads(host_json_path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    raw = None
+                if isinstance(raw, dict):
+                    from lucebench.schema import host_from_dict
+
+                    candidate = host_from_dict(raw)
+                    if candidate is not None and candidate.source != "unknown":
+                        host = candidate
+        return out, host
+    # Single file path.
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return out, None
+    if not isinstance(data, dict):
+        return out, None
+    canon = normalize_result(data, source_path=path)
+    area = canon.area or path.stem
+    out[area] = _row_stats(canon)
+    host = canon.host
+    return out, host
 
 
-def fmt_summary_md(name: str, snapshot: dict[str, dict[str, Any]]) -> str:
-    lines = [f"# {name}", ""]
+def fmt_summary_md(name: str, snapshot: dict[str, dict[str, Any]], host: HostInfo | None = None) -> str:
+    lines = [f"# {name}"]
+    if host is not None:
+        lines.append(f"_host:_ {_host_short(host)} (source={host.source or 'unknown'})")
+    lines.append("")
     lines += [
         "| area | n | pass | rate | wall_total | wall_median | tok/s | decode_tps (median) |",
         "|---|---|---|---|---|---|---|---|",
@@ -102,38 +274,57 @@ def fmt_summary_md(name: str, snapshot: dict[str, dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def fmt_compare_md(snapshots: list[tuple[str, dict[str, dict[str, Any]]]]) -> str:
-    """One row per (snapshot, area), grouped by area for easy scanning."""
+def fmt_compare_md(
+    snapshots: list[tuple[str, dict[str, dict[str, Any]], HostInfo | None]],
+) -> str:
+    """One row per (snapshot, area), grouped by area for easy scanning.
+
+    Adds a ``Host`` column with the compact host descriptor. Confounder
+    warnings (host.wsl_version / primary-GPU name / primary-GPU power
+    limit drift) print above the table — informational, never an exit.
+    """
     all_areas: set[str] = set()
-    for _name, snap in snapshots:
+    for _name, snap, _h in snapshots:
         all_areas.update(snap.keys())
     lines = ["# luce-bench compare", ""]
-    lines += [f"- {len(snapshots)} snapshots: " + ", ".join(n for n, _ in snapshots), ""]
+    lines += [
+        f"- {len(snapshots)} snapshots: "
+        + ", ".join(_row_identity(n, h) for n, _s, h in snapshots),
+        "",
+    ]
+    warns = _host_confounders(snapshots)
+    if warns:
+        lines += warns
+        lines.append("")
     for area in sorted(all_areas):
         lines += [
             "",
             f"## {area}",
             "",
-            "| snapshot | n | pass | rate | wall_total | wall_median | "
+            "| snapshot | host | n | pass | rate | wall_total | wall_median | "
             "tok/s | decode_tps (median) |",
-            "|---|---|---|---|---|---|---|---|",
+            "|---|---|---|---|---|---|---|---|---|",
         ]
-        for name, snap in snapshots:
+        for name, snap, host in snapshots:
+            host_label = _host_short(host)
+            row_id = _row_identity(name, host)
             s = snap.get(area)
             if not s:
-                lines.append(f"| {name} | — | — | — | — | — | — | — |")
+                lines.append(
+                    f"| {row_id} | {host_label} | — | — | — | — | — | — | — |"
+                )
                 continue
             lines.append(
-                f"| {name} | {s['n']} | {s['pass']} | {s['rate']:.1f}% | "
+                f"| {row_id} | {host_label} | {s['n']} | {s['pass']} | {s['rate']:.1f}% | "
                 f"{s['wall_total']:.0f}s | {s['wall_median']:.1f}s | "
                 f"{s['tok_per_s']:.1f} | {s['decode_tps_median']:.1f} |"
             )
     return "\n".join(lines)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        prog="luce-bench-report",
+        prog="luce-bench report",
         description=(
             "Summarize and compare luce-bench snapshot directories. "
             "Pass one path for a summary table; multiple for a side-by-side "
@@ -148,25 +339,26 @@ def main() -> int:
     ap.add_argument(
         "--out", type=Path, default=None, help="Write the markdown to this file instead of stdout."
     )
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
-    loaded = []
+    loaded: list[tuple[str, dict[str, dict[str, Any]], HostInfo | None]] = []
     for p in args.paths:
         if not p.exists():
-            print(f"luce-bench-report: {p} does not exist", file=sys.stderr)
+            print(f"luce-bench report: {p} does not exist", file=sys.stderr)
             return 2
-        snap = load_snapshot(p)
-        loaded.append((p.name or str(p), snap))
+        snap, host = load_snapshot(p)
+        loaded.append((p.name or str(p), snap, host))
 
     if len(loaded) == 1:
-        text = fmt_summary_md(loaded[0][0], loaded[0][1])
+        name, snap, host = loaded[0]
+        text = fmt_summary_md(name, snap, host)
     else:
         text = fmt_compare_md(loaded)
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(text + "\n")
-        print(f"luce-bench-report: wrote {args.out}", file=sys.stderr)
+        print(f"luce-bench report: wrote {args.out}", file=sys.stderr)
     else:
         print(text)
     return 0

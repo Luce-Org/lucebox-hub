@@ -51,4 +51,14 @@ export VERSION
 export REGISTRY="${REGISTRY:-}"
 export DFLASH_CUDA_ARCHES="${DFLASH_CUDA_ARCHES:-75;80;86;89;90;120}"
 
+# /props.build identity (baked into /opt/lucebox-hub/IMAGE_INFO and surfaced
+# at /props.build). All best-effort for local builds:
+#   * GIT_SHA   — `git rev-parse HEAD` (full sha; empty on a non-git tree)
+#   * BUILD_TIME — UTC ISO 8601 timestamp
+#   * IMAGE_TAG  — falls back to "cuda12" (the moving tag) unless caller
+#     pre-exported one. CI replaces this with the metadata-action version.
+export GIT_SHA="${GIT_SHA:-$(git rev-parse HEAD 2>/dev/null || true)}"
+export BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+export IMAGE_TAG="${IMAGE_TAG:-${VERSION:+${VERSION}-}cuda12}"
+
 exec docker buildx bake cuda12-local "$@"

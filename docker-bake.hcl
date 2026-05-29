@@ -4,9 +4,7 @@
 # intentionally omitted.
 #
 #   scripts/build_image.sh            # version-derived local build (preferred)
-#   scripts/docker_build_env.sh       # mounted-worktree dev build env + build
 #   docker buildx bake cuda12-local   # raw local build; tagged lucebox-hub:cuda12
-#   docker buildx bake build-env-local # local mounted-worktree build env
 #   docker buildx bake cuda12         # CI target; tags come from metadata-action
 #                                 # Arches: sm_75;80;86;89;90;120
 #
@@ -46,6 +44,16 @@ variable "TAG"      { default = "" }
 # multiple arches.
 variable "DFLASH_CUDA_ARCHES" { default = "75;80;86;89;90;120" }
 
+# Image identity stamped into /opt/lucebox-hub/IMAGE_INFO at build time and
+# surfaced under /props.build at runtime (git_sha, image_tag, build_time).
+# CI sets all three from the workflow context; local builds get a best-
+# effort `git rev-parse` for GIT_SHA + empty IMAGE_TAG/BUILD_TIME (those
+# come from CI metadata-action and the workflow timestamp, neither of
+# which is available offline). Empty values turn into JSON null at /props.
+variable "GIT_SHA"    { default = "" }
+variable "IMAGE_TAG"  { default = "" }
+variable "BUILD_TIME" { default = "" }
+
 # Image tag list. Default (no VERSION / no TAG) emits just the moving
 # `lucebox-hub:cuda12`. With VERSION set we also emit a pinned
 # `lucebox-hub:<version>-cuda12`. Both point at the same image so users
@@ -77,6 +85,12 @@ target "_cuda12-base" {
         CUDA_VERSION        = "12.8.1"
         UBUNTU_VERSION      = "22.04"
         DFLASH_CUDA_ARCHES  = DFLASH_CUDA_ARCHES
+        # /props.build identity. CI passes these as env vars from the
+        # workflow context; local builds rely on the variables' defaults
+        # (empty strings → JSON null at /props.build.*).
+        GIT_SHA             = GIT_SHA
+        IMAGE_TAG           = IMAGE_TAG
+        BUILD_TIME          = BUILD_TIME
     }
 }
 
@@ -87,10 +101,4 @@ target "cuda12" {
 target "cuda12-local" {
     inherits = ["_cuda12-base"]
     tags = image_tags("cuda12")
-}
-
-target "build-env-local" {
-    inherits = ["_cuda12-base"]
-    target = "build-env"
-    tags = image_tags("build-env")
 }

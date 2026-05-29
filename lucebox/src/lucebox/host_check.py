@@ -5,6 +5,7 @@ socket. Prints a status report and returns an aggregate severity.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Literal
 
@@ -129,7 +130,7 @@ def _check_systemd(host: HostFacts) -> CheckResult:
             "systemd",
             "warn",
             "user systemd not available",
-            "WSL: enable systemd in /etc/wsl.conf; otherwise 'lucebox.sh serve' "
+            "WSL: enable systemd in /etc/wsl.conf; otherwise 'lucebox serve' "
             "still works in the foreground",
         )
     return CheckResult("systemd", "ok", "user systemd available")
@@ -165,6 +166,8 @@ def render(console: Console, host: HostFacts, results: list[CheckResult]) -> Sev
         if r.hint:
             console.print(f"  {'':<22} {'':<8} [dim]{r.hint}[/dim]")
 
+    render_host_facts(console)
+
     worst = aggregate(results)
     console.print()
     if worst == "ok":
@@ -173,6 +176,57 @@ def render(console: Console, host: HostFacts, results: list[CheckResult]) -> Sev
         console.print("[yellow]Checks passed with warnings.[/yellow]")
     else:
         console.print(
-            "[red]Critical checks failed — fix the issues above before 'lucebox.sh start'.[/red]"
+            "[red]Critical checks failed — fix the issues above before 'lucebox start'.[/red]"
         )
     return worst
+
+
+def render_host_facts(console: Console) -> None:
+    """Print a pretty 'Host facts' section sourced from LUCEBOX_HOST_*.
+
+    Same data that ends up in /opt/lucebox-hub/HOST_INFO inside the
+    container — printed here so the operator can sanity-check the
+    rig classification BEFORE starting a long bench run, and so the
+    CI exit-code gate (the pass/fail checks above) stays orthogonal
+    to the informational host facts.
+
+    Reads from the same LUCEBOX_HOST_* env the host wrapper exports
+    (see lucebox.sh::probe_host). Quiet — emits the section header
+    even when most facts are unset, since "no host facts probed at
+    all" is itself a useful signal.
+    """
+    console.print()
+    console.print("[bold]Host facts[/bold] (LUCEBOX_HOST_*, surfaced as /props.host)")
+    facts = [
+        ("os", os.environ.get("LUCEBOX_HOST_OS_PRETTY", "")),
+        ("kernel", os.environ.get("LUCEBOX_HOST_KERNEL", "")),
+        ("wsl_version", os.environ.get("LUCEBOX_HOST_WSL_VERSION", "")),
+        ("docker", os.environ.get("LUCEBOX_HOST_DOCKER_VERSION", "")),
+        ("nvidia_driver", os.environ.get("LUCEBOX_HOST_DRIVER_VERSION", "")),
+        ("nvidia_ctk", os.environ.get("LUCEBOX_HOST_NVIDIA_CTK_VERSION", "")),
+        ("cpu", os.environ.get("LUCEBOX_HOST_CPU_MODEL", "")),
+        ("cuda_visible_devices", os.environ.get("LUCEBOX_HOST_CUDA_VISIBLE_DEVICES", "")),
+    ]
+    for key, value in facts:
+        display = value if value else "[dim](unset)[/dim]"
+        console.print(f"  {key:<22} {display}")
+
+    # Multi-GPU table — one line per device. LUCEBOX_HOST_GPU_LIST_CSV
+    # carries the verbatim nvidia-smi CSV the host wrapper probed.
+    csv = os.environ.get("LUCEBOX_HOST_GPU_LIST_CSV", "")
+    if csv:
+        console.print("  gpus:")
+        for line in csv.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = [c.strip() for c in line.split(",")]
+            if len(parts) >= 7:
+                idx, _uuid, _pci, name, sm, mem, plimit = parts[:7]
+                console.print(
+                    f"    [{idx}] {name} (sm_{sm}, {mem}, {plimit})"
+                )
+            else:
+                console.print(f"    {line}")
+    else:
+        console.print("  gpus                  [dim](none — nvidia-smi unavailable)[/dim]")

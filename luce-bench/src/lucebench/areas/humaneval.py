@@ -25,6 +25,9 @@ import json
 from pathlib import Path
 from typing import Any
 
+# See lucebench.areas.ds4_eval.GRADER_VERSION for the bump policy.
+GRADER_VERSION = 1
+
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 FIXTURE_PATH = SCRIPT_DIR / "fixtures" / "humaneval" / "cases.json"
 

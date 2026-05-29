@@ -92,11 +92,17 @@ def run_bench(
         else:
             resolved_json_out = (out_dir or Path.cwd()) / f"lucebench-{area}.json"
         resolved_json_out.parent.mkdir(parents=True, exist_ok=True)
-        argv += ["--area", area, "--json-out", str(resolved_json_out)]
+        # --areas (canonical in v0.2.5+) accepts a single name too, so we
+        # use it everywhere instead of the back-compat --area form.
+        argv += ["--areas", area, "--json-out", str(resolved_json_out)]
     else:
         assert out_dir is not None and name is not None  # narrowed by check above
         out_dir.mkdir(parents=True, exist_ok=True)
-        argv += ["--sweep", "--out-dir", str(out_dir), "--name", name]
+        # `--areas all` is the v0.2.5+ replacement for `--sweep`. Same
+        # output shape: per-area JSONs + _summary.{json,md} under
+        # out_dir/name/. Pre-v0.2.5 luce-bench still accepts --sweep
+        # with a deprecation warning, but new callers use --areas.
+        argv += ["--areas", "all", "--out-dir", str(out_dir), "--name", name]
         resolved_json_out = out_dir / name / "_summary.json"
 
     if think is True:

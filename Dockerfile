@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-# ─── Stage 1: shared CUDA build toolchain ────────────────────────────────────
+# ─── Stage 1: builder ───────────────────────────────────────────────────────
 # CUDA_VERSION / UBUNTU_VERSION / DFLASH_CUDA_ARCHES are build args so the
 # same Dockerfile can be repinned later. The prebuilt image is the
 # CUDA 12.8 path:
@@ -8,53 +8,9 @@
 # See docker-bake.hcl for the canonical invocation.
 ARG CUDA_VERSION=12.8.1
 ARG UBUNTU_VERSION=22.04
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS build-base
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-        ca-certificates \
-        cmake \
-        curl \
-        git \
-        git-lfs \
-        libcurl4-openssl-dev \
-        ninja-build \
-        pkg-config \
-        python3 \
-    && rm -rf /var/lib/apt/lists/*
-
-# CUDA driver stub. nvidia/cuda:*-devel images ship the driver stub at
-# /usr/local/cuda/lib64/stubs/libcuda.so but not as libcuda.so.1. ld follows
-# the NEEDED reference inside libggml-cuda.so by SONAME (libcuda.so.1) when
-# linking executables, so without this symlink + ld.so.conf entry the
-# test_dflash link step fails with `undefined reference to cuMem*`.
-# At runtime the host driver provides the real libcuda.so.1 via
-# --gpus all; the stub is only for build-time symbol resolution.
-RUN ln -sf libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 \
-    && echo "/usr/local/cuda/lib64/stubs" > /etc/ld.so.conf.d/cuda-stubs.conf \
-    && ldconfig
-
-# Mounted-worktree development/build image. This intentionally derives from the
-# exact same CUDA/toolchain layer as the production builder, but does not COPY
-# source into the image; scripts/docker_build_env.sh bind-mounts the checkout at
-# /workspace so repeated integration builds exercise the same compiler stack
-# without invalidating Docker layers on every source edit.
-FROM build-base AS build-env
-ARG DFLASH_CUDA_ARCHES="75;80;86;89;90;120"
-ENV DFLASH_CUDA_ARCHES="${DFLASH_CUDA_ARCHES}" \
-    UV_PYTHON_INSTALL_DIR=/opt/uv/python \
-    UV_TOOL_DIR=/opt/uv/tools \
-    UV_LINK_MODE=hardlink
-RUN curl -LsSf https://astral.sh/uv/install.sh \
-        | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 INSTALLER_NO_MODIFY_PATH=1 sh \
-    && mkdir -p /workspace /work
-WORKDIR /workspace
-CMD ["bash"]
-
-# ─── Stage 2: production builder ────────────────────────────────────────────
-FROM build-base AS builder
 
 # Fat-binary CUDA arch list, semicolon-separated. Defaults cover the CUDA 12.8
 # image. dflash-supported arches in this image:
@@ -70,6 +26,29 @@ FROM build-base AS builder
 # of fat-binary kernel code and ~3-5 min of nvcc time per .cu translation
 # unit.
 ARG DFLASH_CUDA_ARCHES="75;80;86;89;90;120"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        curl \
+        git \
+        git-lfs \
+        ninja-build \
+        pkg-config \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# CUDA driver stub. nvidia/cuda:*-devel images ship the driver stub at
+# /usr/local/cuda/lib64/stubs/libcuda.so but not as libcuda.so.1. ld follows
+# the NEEDED reference inside libggml-cuda.so by SONAME (libcuda.so.1) when
+# linking executables, so without this symlink + ld.so.conf entry the
+# test_dflash link step fails with `undefined reference to cuMem*`.
+# At runtime the host driver provides the real libcuda.so.1 via
+# --gpus all; the stub is only for build-time symbol resolution.
+RUN ln -sf libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 \
+    && echo "/usr/local/cuda/lib64/stubs" > /etc/ld.so.conf.d/cuda-stubs.conf \
+    && ldconfig
 
 WORKDIR /src
 
@@ -142,13 +121,23 @@ COPY harness /src/harness
 COPY optimizations/pflash /src/optimizations/pflash
 COPY optimizations/megakernel /src/optimizations/megakernel
 
-# ─── Stage 3: runtime ───────────────────────────────────────────────────────
+# ─── Stage 2: runtime ───────────────────────────────────────────────────────
 # Runtime image: ships nvidia driver libs but no nvcc / dev headers. Matches
 # the builder's CUDA version so the test_dflash binary's libcudart SONAME
 # resolves at runtime against the same major.minor.
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime
 
 ARG DEBIAN_FRONTEND=noninteractive
+
+# Image identity baked in at build time and read by dflash_server at startup
+# to populate /props.build (git_sha / image_tag / build_time). All three are
+# wired from docker-bake.hcl, which sources them from CI metadata or local
+# `git`. Missing args leave the corresponding fields empty in IMAGE_INFO,
+# which dflash_server surfaces as JSON null at /props.build.* — that's the
+# expected behavior on a `docker build` run without bake.
+ARG GIT_SHA=""
+ARG IMAGE_TAG=""
+ARG BUILD_TIME=""
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -222,6 +211,14 @@ RUN test -x /opt/lucebox-hub/server/build/test_dflash \
     && test -f /opt/lucebox-hub/server/share/model_cards/qwen3.6-27b.json \
     && chmod +x /opt/lucebox-hub/server/scripts/entrypoint.sh
 
+# Image identity for /props.build. dflash_server reads this file at startup
+# (path: /opt/lucebox-hub/IMAGE_INFO, three lines: git_sha, image_tag,
+# build_time). Override the path with $DFLASH_IMAGE_INFO_PATH for tests.
+# All three args may be empty in non-bake builds — the empty lines that
+# results in are detected at read time and surface as JSON null in /props.
+RUN printf '%s\n%s\n%s\n' "$GIT_SHA" "$IMAGE_TAG" "$BUILD_TIME" \
+        > /opt/lucebox-hub/IMAGE_INFO
+
 # Register the ggml lib dir with ld.so so libggml-cpu.so (loaded transitively
 # by libggml.so) resolves. CMakeLists.txt sets a `$ORIGIN/deps/...` RUNPATH
 # uniformly across all linked artefacts — correct for test_dflash in
@@ -242,8 +239,15 @@ RUN printf '%s\n%s\n' \
 # cache is gone by the time the layer commits, so we don't double-pay.
 ENV UV_LINK_MODE=hardlink \
     UV_NO_CACHE=1
-RUN uv sync --no-dev --frozen 2>/dev/null \
-    || uv sync --no-dev
+# --no-editable: install workspace members (luce-bench, lucebox, harness,
+# pflash, lucebox-hub) as proper wheels rather than source-linked editable
+# installs. Without this, hatch-vcs's build hook re-fires at runtime when
+# `uv run` re-checks env consistency and tries to write `_version.py` into
+# the root-owned workspace source dirs, which fails as a non-root user.
+# With non-editable wheels the venv is self-contained and the build hook
+# only runs once, here, with root.
+RUN uv sync --no-dev --frozen --no-editable 2>/dev/null \
+    || uv sync --no-dev --no-editable
 
 # Host wrapper CLI containers run as the invoking host uid so bind-mounted
 # config/profile files are not left root-owned. Keep the uv-managed

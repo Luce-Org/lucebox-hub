@@ -47,8 +47,11 @@ luce-bench = "lucebench.cli:main"
 lucebench = "lucebench.cli:main"
 luce-bench-probe = "lucebench.probe:main"
 lucebench-probe = "lucebench.probe:main"
-luce-bench-report = "lucebench.report:main"
-lucebench-report = "lucebench.report:main"
+# `luce-bench regrade` is also exposed as a subcommand of `luce-bench`,
+# but the standalone entry-point lets shell completion and `uvx luce-
+# bench-regrade --glob '...'` work without the verb wrapper.
+luce-bench-regrade = "lucebench.regrade:main"
+lucebench-regrade = "lucebench.regrade:main"
 
 [project.urls]
 Homepage = "https://github.com/easel/luce-bench"

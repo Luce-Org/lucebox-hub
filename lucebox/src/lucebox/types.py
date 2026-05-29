@@ -7,14 +7,29 @@ mistakes (e.g. mutating a config after autotune wrote it) fail loudly.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 Variant = str
 CtkStatus = Literal["runtime", "cdi", "installed-unwired", "none"]
+
+
+def default_models_dir() -> Path:
+    """Resolve the default models directory under the XDG Base Directory spec.
+
+    $XDG_DATA_HOME (default ~/.local/share) is the conventional location for
+    user-specific data files on Linux + macOS. Lucebox nests its model store
+    under that so downloads live alongside other per-user app data instead
+    of cluttering $HOME directly. The host wrapper bind-mounts this path
+    into the container so paths line up in and out of the image.
+    """
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base) / "lucebox" / "models"
+
+
 GpuVendor = Literal["nvidia", "amd", "none"]
-AutotuneSource = Literal["heuristic", "benchmark"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +56,14 @@ class HostFacts:
 @dataclass(frozen=True, slots=True)
 class DflashRuntime:
     """The DFLASH_* knobs as typed values. Serialized under [dflash] in TOML
-    and emitted as -e DFLASH_FOO=bar args to docker run."""
+    and emitted as -e DFLASH_FOO=bar args to docker run.
+
+    The 11 fields below (budget through prefill_drafter) form the strict
+    allowlist mirrored by lucebench's snapshot config.json — keep both
+    in lockstep. ``think_max`` is a separate phase-1 thinking cap that
+    isn't part of the runtime snapshot allowlist (it's per-request, not
+    per-server).
+    """
 
     budget: int = 22
     max_ctx: int = 16384
@@ -61,27 +83,24 @@ class DflashRuntime:
 
 
 @dataclass(frozen=True, slots=True)
-class AutotuneMeta:
-    source: AutotuneSource = "heuristic"
-    timestamp: str = ""  # ISO-8601
+class ModelMeta:
+    """Which preset the operator picked at configure/download time.
 
+    Persisted under ``[model]`` in config.toml so `lucebox serve` can
+    pass ``DFLASH_TARGET=/opt/lucebox-hub/server/models/<file>`` and
+    ``DFLASH_DRAFT`` for the draft GGUF (when one is published for the
+    preset). The entrypoint's "multiple candidate GGUFs" branch never
+    has to guess which one to load.
 
-@dataclass(frozen=True, slots=True)
-class BenchmarkMeta:
-    """Filled in by the optimizer; absent until the user runs `benchmark`."""
+    ``target_file`` and ``draft_file`` are advanced overrides — when set
+    they win over the preset's registry default. Empty strings mean
+    "fall back to the registry value for [model] preset, then to the
+    entrypoint's autodetect".
+    """
 
-    ran_at: str = ""
-    profile: str = ""  # e.g. "he-decode"
-    winner_budget: int | None = None
-    winner_max_ctx: int | None = None
-    winner_lazy: bool | None = None
-    winner_prefix_cache_slots: int | None = None
-    winner_prefill_cache_slots: int | None = None
-    winner_cache_type_k: str = ""
-    winner_cache_type_v: str = ""
-    winner_prefill_mode: str = ""
-    mean_tps: float | None = None
-    report_path: str = ""  # relative to config dir
+    preset: str = ""
+    target_file: str = ""
+    draft_file: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,8 +111,7 @@ class Config:
     image: str = "ghcr.io/luce-org/lucebox-hub"
     container_name: str = "lucebox"
     port: int = 8080
-    models_dir: Path = Path.home() / "models"
+    models_dir: Path = field(default_factory=default_models_dir)
     dflash: DflashRuntime = field(default_factory=DflashRuntime)
     host: HostFacts = field(default_factory=HostFacts)
-    autotune: AutotuneMeta = field(default_factory=AutotuneMeta)
-    benchmark: BenchmarkMeta | None = None
+    model: ModelMeta = field(default_factory=ModelMeta)

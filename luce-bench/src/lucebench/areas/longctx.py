@@ -31,6 +31,9 @@ from __future__ import annotations
 import re
 from typing import Any
 
+# See lucebench.areas.ds4_eval.GRADER_VERSION for the bump policy.
+GRADER_VERSION = 1
+
 # Reuse the corpus blocks from the upstream frontier probe so prompts
 # remain bit-identical when comparing autotune-shelled output against
 # the unified-harness output.

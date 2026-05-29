@@ -213,3 +213,128 @@ def test_forge_available_returns_two_tuple():
         assert reason is None
     else:
         assert isinstance(reason, str) and "anthropic" in reason.lower()
+
+
+# ────────────────────────────────────────────────────────────────────
+# _preflight /props display — pinned against the lucebox /props schema
+# (see ../../docs/specs/props-endpoint.md). Tests stub urlopen so they
+# don't need a live server.
+# ────────────────────────────────────────────────────────────────────
+
+
+def _stub_preflight_urlopen(monkeypatch, models_payload, props_payload):
+    """Wire `urllib.request.urlopen` to return models then props bodies."""
+    import io
+    import json as _json
+    import urllib.request
+    from contextlib import contextmanager
+
+    queue = [models_payload, props_payload]
+
+    @contextmanager
+    def fake_urlopen(req, timeout=0):
+        # Each call pops the next body. The preflight calls /v1/models
+        # first, then /props — order matters.
+        body = queue.pop(0)
+        yield io.BytesIO(_json.dumps(body).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+
+def test_preflight_props_schema3_image_and_target_displayed(monkeypatch):
+    """Schema 3 server: preflight surfaces image=<tag>@<sha7> and target=<basename>."""
+    from lucebench.cli import _preflight
+
+    models = {"data": [{"id": "dflash"}]}
+    props = {
+        "build": {
+            "server_name": "luce-dflash",
+            "server_version": "0.0.0+cpp",
+            "props_schema": 3,
+            "git_sha": "6d12378abcdef01234567890abcdef0123456789",
+            "image_tag": "cuda12",
+            "image_digest": None,
+            "build_time": "2026-05-28T13:43:57Z",
+        },
+        "model": {
+            "arch": "qwen35",
+            "alias": "dflash",
+            "target": {
+                "path": "/opt/models/Qwen3.6-27B-Q4_K_M.gguf",
+                "size_bytes": 17134510080,
+                "sha256": "a" * 64,
+                "gguf": {"general.architecture": "qwen35"},
+            },
+            "draft": None,
+        },
+        "budget_envelope": {
+            "model_card_source": "share/model_cards/qwen3.6-27b.json",
+            "hard_limit_reply_budget": 4096,
+        },
+    }
+    _stub_preflight_urlopen(monkeypatch, models, props)
+    ok, lines, _server_honors = _preflight("http://localhost:8080")
+    assert ok is True
+    # Find the /props line.
+    props_line = next(line for line in lines if "/props" in line)
+    # Image identity: `image=cuda12@6d12378`.
+    assert "image=cuda12@6d12378" in props_line, props_line
+    # Target basename, .gguf-stripped.
+    assert "target=Qwen3.6-27B-Q4_K_M" in props_line, props_line
+    # Existing budget_envelope hits still surfaced.
+    assert "model_card=share/model_cards/qwen3.6-27b.json" in props_line
+    assert "reply_budget=4096" in props_line
+
+
+def test_preflight_props_schema2_falls_back(monkeypatch):
+    """Pre-schema-3 server: no `build` / `model.target` → fallback display."""
+    from lucebench.cli import _preflight
+
+    models = {"data": [{"id": "dflash"}]}
+    props = {
+        # No `build` block — schema 2.
+        "model": {"arch": "qwen35"},
+        "budget_envelope": {
+            "model_card_source": "share/model_cards/qwen3.6-27b.json",
+            "hard_limit_reply_budget": 4096,
+        },
+    }
+    _stub_preflight_urlopen(monkeypatch, models, props)
+    ok, lines, _server_honors = _preflight("http://localhost:8080")
+    assert ok is True
+    props_line = next(line for line in lines if "/props" in line)
+    # No image=/target= bits when those fields are absent.
+    assert "image=" not in props_line
+    assert "target=" not in props_line
+    # Schema-2 bits still present.
+    assert "model_card=share/model_cards/qwen3.6-27b.json" in props_line
+    assert "reply_budget=4096" in props_line
+
+
+def test_preflight_props_build_image_fields_null(monkeypatch):
+    """Bare-metal build: `build` block present but image_* are null.
+
+    The preflight line should NOT carry an `image=` token in that case —
+    showing `image=None@None` would be worse than just hiding the bit.
+    """
+    from lucebench.cli import _preflight
+
+    models = {"data": [{"id": "dflash"}]}
+    props = {
+        "build": {
+            "server_name": "luce-dflash",
+            "server_version": "0.0.0+cpp",
+            "props_schema": 3,
+            "git_sha": None,
+            "image_tag": None,
+            "image_digest": None,
+            "build_time": None,
+        },
+        "model": {"arch": "qwen35"},
+        "budget_envelope": {},
+    }
+    _stub_preflight_urlopen(monkeypatch, models, props)
+    ok, lines, _server_honors = _preflight("http://localhost:8080")
+    assert ok is True
+    props_line = next(line for line in lines if "/props" in line)
+    assert "image=" not in props_line

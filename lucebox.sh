@@ -8,8 +8,7 @@
 #      dispatch into the in-container Python CLI via `docker run`. The
 #      Python CLI lives at /opt/lucebox-hub/lucebox/ inside the image and is
 #      the single source of truth for orchestration logic — TOML config,
-#      autotune rules, server bring-up, benchmark sweeps, smoke tests, model
-#      downloads.
+#      autotune rules + sweep, server bring-up, smoke tests, model downloads.
 #
 #   2) Manage a user-level systemd unit (~/.config/systemd/user/lucebox.service)
 #      so the server can run as a long-lived service without keeping a shell
@@ -17,8 +16,12 @@
 #      delegate to systemctl --user / journalctl --user.
 #
 # Install:
-#   curl -fsSL https://raw.githubusercontent.com/Luce-Org/lucebox-hub/main/lucebox.sh \
-#        -o ~/.local/bin/lucebox && chmod +x ~/.local/bin/lucebox
+#   curl -fsSL https://raw.githubusercontent.com/Luce-Org/lucebox-hub/main/install.sh | bash
+#
+# The installer bakes the source URL into the installed copy as
+# `LUCEBOX_INSTALLED_FROM=`, so `lucebox update` later re-pulls from the
+# same channel (canonical, dev fork, branch — whatever you originally
+# installed from).
 #
 # Then: lucebox check && lucebox install && lucebox start
 #
@@ -35,15 +38,168 @@ SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo
 SCRIPT_NAME="$(basename "$SCRIPT_PATH")"
 
 # ── tunables / env overrides ───────────────────────────────────────────────
-IMAGE_BASE="${LUCEBOX_IMAGE:-ghcr.io/luce-org/lucebox-hub}"
-CONTAINER_NAME="${LUCEBOX_CONTAINER:-lucebox}"
-DEFAULT_PORT="${LUCEBOX_PORT:-8080}"
+# Host-side scalars (image registry+variant, port, container name, models
+# dir). Resolution order, applied uniformly via _lucebox_resolve below:
+#   1. $LUCEBOX_<NAME>            per-invocation env override
+#   2. config.toml <section>.<key>  persisted user choice (system of record)
+#   3. derived / canonical default
+# This keeps the wrapper and the in-container Python CLI agreeing on
+# effective values — config.toml is the single source of truth, both
+# sides read it.
 UNIT_NAME="lucebox.service"
 UNIT_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$UNIT_NAME"
 
 # CUDA driver floor for the prebuilt CUDA 12 image.
 # shellcheck disable=SC2034
 MIN_DRIVER_CUDA12=525
+
+# Canonical source of `lucebox.sh`. The bootstrap installer (`install.sh`)
+# rewrites this line at install time to record which URL the user actually
+# installed from — `lucebox update` then re-pulls from the same channel
+# without losing track of forks. Falls back to the Luce-Org main branch
+# when nothing was baked in (e.g. someone curl'd the script directly).
+LUCEBOX_INSTALLED_FROM="${LUCEBOX_INSTALLED_FROM:-https://raw.githubusercontent.com/Luce-Org/lucebox-hub/main/lucebox.sh}"
+
+# Path to the persisted config.toml. Mirrors
+# lucebox.config.default_config_path: $LUCEBOX_HOME/config.toml if set,
+# else $HOME/.lucebox/config.toml. Read-only from this wrapper — the
+# Python CLI is the writer.
+_lucebox_config_path() {
+    if [ -n "${LUCEBOX_HOME:-}" ]; then
+        printf '%s/config.toml' "$LUCEBOX_HOME"
+        return
+    fi
+    printf '%s/.lucebox/config.toml' "$HOME"
+}
+
+# Read a `<section>.<key>` value from config.toml. Returns empty if the
+# file is missing, the section/key is absent, or the value is empty.
+# Handles the subset of TOML that lucebox writes:
+#   [section]
+#   key = "string"      # surrounding double-quotes are stripped
+#   key = 8080          # bare scalars passed through verbatim
+#   key = true          # same
+# Inline `# comment` is honored. Arrays / inline tables / multi-line
+# strings aren't written by the Python persister, so we don't parse them.
+_lucebox_config_get() {
+    local dotted="$1" cfg
+    cfg="$(_lucebox_config_path)"
+    [ -f "$cfg" ] || return 0
+    local section="${dotted%.*}"
+    local key="${dotted##*.}"
+    [ "$section" = "$dotted" ] && section=""
+    awk -v want_section="$section" -v want_key="$key" '
+        BEGIN { current = "" }
+        /^[[:space:]]*\[/ {
+            t = $0
+            sub(/^[[:space:]]*\[[[:space:]]*/, "", t)
+            sub(/[[:space:]]*\][[:space:]]*$/, "", t)
+            current = t
+            next
+        }
+        /^[[:space:]]*#/ { next }
+        /=/ {
+            if (current != want_section) next
+            line = $0
+            sub(/#.*$/, "", line)
+            eq = index(line, "=")
+            if (eq == 0) next
+            k = substr(line, 1, eq - 1)
+            v = substr(line, eq + 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+            if (k != want_key) next
+            if (length(v) >= 2 && substr(v, 1, 1) == "\"" && substr(v, length(v), 1) == "\"")
+                v = substr(v, 2, length(v) - 2)
+            print v
+            exit
+        }
+    ' "$cfg"
+}
+
+# Resolve a scalar through the precedence ladder. env_value comes from
+# the caller (typically `"${LUCEBOX_FOO:-}"` — the `:-` matters under
+# `set -u`).
+_lucebox_resolve() {
+    local env_value="$1" toml_key="$2" default="$3" v
+    if [ -n "$env_value" ]; then
+        printf '%s' "$env_value"
+        return
+    fi
+    v="$(_lucebox_config_get "$toml_key")"
+    if [ -n "$v" ]; then
+        printf '%s' "$v"
+        return
+    fi
+    printf '%s' "$default"
+}
+
+# Derive the default image URL from the install source so a fork install
+# (e.g. easel/lucebox-hub) gets the fork's GHCR image automatically when
+# config.toml hasn't pinned one yet. Pattern:
+#   https://raw.githubusercontent.com/<org>/<repo>/<ref>/lucebox.sh
+#   → ghcr.io/<org-lowercase>/<repo>
+# GHCR rejects mixed-case org paths so the org segment is lowercased; the
+# repo name is preserved as-is. Falls back to the canonical Luce-Org image
+# when the URL doesn't match the raw.githubusercontent.com pattern.
+_lucebox_derive_image() {
+    # The ref segment can contain slashes (e.g. `feat/lucebox-docker`), so
+    # the middle `.+` greedily eats everything up to the trailing
+    # `/lucebox.sh`. The first two `[^/]+` capture org + repo, which are
+    # never slash-containing on GitHub.
+    local url="$1" org repo
+    if [[ "$url" =~ ^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/.+/lucebox\.sh$ ]]; then
+        org=$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')
+        repo="${BASH_REMATCH[2]}"
+        printf 'ghcr.io/%s/%s' "$org" "$repo"
+        return
+    fi
+    printf 'ghcr.io/luce-org/lucebox-hub'
+}
+
+# Effective scalars, env > config.toml > default.
+CONTAINER_NAME=$(_lucebox_resolve "${LUCEBOX_CONTAINER:-}" runtime.container_name "lucebox")
+DEFAULT_PORT=$(_lucebox_resolve "${LUCEBOX_PORT:-}" runtime.port "8080")
+DEFAULT_MODELS_DIR=$(_lucebox_resolve "${LUCEBOX_MODELS:-}" paths.models "${XDG_DATA_HOME:-$HOME/.local/share}/lucebox/models")
+IMAGE_BASE=$(_lucebox_resolve "${LUCEBOX_IMAGE:-}" image.registry "$(_lucebox_derive_image "$LUCEBOX_INSTALLED_FROM")")
+
+# ── LUCEBOX_HOST_* safe defaults (belt-and-suspenders) ────────────────────
+# `set -u` makes any unbound LUCEBOX_HOST_* read fatal. Historically this has
+# been the #1 source of regressions in this wrapper: someone adds a code path
+# that touches a LUCEBOX_HOST_* var before probe_host has run, the call sites
+# that DO pre-probe still work, and the bug ships. To make the bug literally
+# unrepresentable we seed every LUCEBOX_HOST_* with an explicit safe default
+# at script-load time (these mirror probe_host's "nothing detected" state).
+# probe_host then overwrites them with real values. Any future read — pre- or
+# post-probe — is now well-defined.
+: "${LUCEBOX_HOST_NPROC:=1}"
+: "${LUCEBOX_HOST_RAM_GB:=0}"
+: "${LUCEBOX_HOST_GPU_VENDOR:=none}"
+: "${LUCEBOX_HOST_GPU_NAME:=}"
+: "${LUCEBOX_HOST_GPU_COUNT:=0}"
+: "${LUCEBOX_HOST_VRAM_GB:=0}"
+: "${LUCEBOX_HOST_GPU_SM:=}"
+: "${LUCEBOX_HOST_DRIVER_VERSION:=}"
+: "${LUCEBOX_HOST_DRIVER_MAJOR:=0}"
+: "${LUCEBOX_HOST_HAS_SYSTEMD:=0}"
+: "${LUCEBOX_HOST_IS_WSL:=0}"
+: "${LUCEBOX_HOST_HAS_DOCKER:=0}"
+: "${LUCEBOX_HOST_DOCKER_VERSION:=}"
+: "${LUCEBOX_HOST_HAS_CTK:=none}"
+# Host-identity facts (item 1 — host-identity capture). These ride along
+# the existing LUCEBOX_HOST_* convoy into the container so /opt/lucebox-hub/
+# HOST_INFO can be written without re-probing inside the container (where
+# /proc and nvidia-smi see the container's view, not the rig's).
+: "${LUCEBOX_HOST_OS_PRETTY:=}"
+: "${LUCEBOX_HOST_KERNEL:=}"
+: "${LUCEBOX_HOST_WSL_VERSION:=}"
+: "${LUCEBOX_HOST_NVIDIA_CTK_VERSION:=}"
+: "${LUCEBOX_HOST_CPU_MODEL:=}"
+: "${LUCEBOX_HOST_GPU_LIST_CSV:=}"
+: "${LUCEBOX_HOST_CUDA_VISIBLE_DEVICES:=}"
+# Tracks whether probe_host has actually run; pieces of the code that need
+# fresh host facts (e.g. cmd_check, cmd_serve) gate on this. Default 0.
+: "${_LUCEBOX_HOST_PROBED:=0}"
 
 # ── output helpers ────────────────────────────────────────────────────────
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -67,7 +223,14 @@ die()   { err "$*"; exit 1; }
 
 probe_host() {
     LUCEBOX_HOST_NPROC=$(nproc 2>/dev/null || echo 1)
-    LUCEBOX_HOST_RAM_GB=$(awk '/MemTotal/{printf "%.0f", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)
+    # RAM: try Linux /proc/meminfo first, then macOS/BSD sysctl, else 0.
+    LUCEBOX_HOST_RAM_GB=0
+    if [ -r /proc/meminfo ]; then
+        LUCEBOX_HOST_RAM_GB=$(awk '/MemTotal/{printf "%.0f", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)
+    elif command -v sysctl &>/dev/null; then
+        mem_bytes=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+        LUCEBOX_HOST_RAM_GB=$(( mem_bytes / 1024 / 1024 / 1024 ))
+    fi
     LUCEBOX_HOST_GPU_VENDOR="none"
     LUCEBOX_HOST_GPU_NAME=""
     LUCEBOX_HOST_GPU_COUNT=0
@@ -92,6 +255,45 @@ probe_host() {
             LUCEBOX_HOST_GPU_SM="${cc//./}"
             LUCEBOX_HOST_GPU_COUNT=$(printf '%s\n' "$q" | wc -l)
         fi
+        # Multi-GPU enumeration for /props.host. The single-GPU vars
+        # above (GPU_NAME / GPU_SM / VRAM_GB / DRIVER_VERSION) keep
+        # describing GPU 0 for back-compat with cmd_check + autotune;
+        # the full per-GPU CSV rides along separately so HOST_INFO can
+        # emit the whole array.
+        LUCEBOX_HOST_GPU_LIST_CSV=$(nvidia-smi \
+            --query-gpu=index,uuid,pci.bus_id,name,compute_cap,memory.total,power.limit \
+            --format=csv,noheader 2>/dev/null || echo "")
+    fi
+    # CUDA_VISIBLE_DEVICES from the caller's env (empty default = "all GPUs").
+    LUCEBOX_HOST_CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
+
+    # OS / kernel identity. /etc/os-release is the freedesktop spec for
+    # "what distro is this?" and we keep PRETTY_NAME verbatim (it already
+    # includes the version, e.g. "Ubuntu 22.04.3 LTS").
+    LUCEBOX_HOST_OS_PRETTY=""
+    if [ -r /etc/os-release ]; then
+        # shellcheck source=/dev/null
+        LUCEBOX_HOST_OS_PRETTY=$(. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-}")
+    fi
+    LUCEBOX_HOST_KERNEL=$(uname -r 2>/dev/null || echo "")
+
+    # WSL version detection. "wsl2" matches the kernel-side string the
+    # MS-shipped WSL2 kernel embeds; "wsl1" is what the legacy translation
+    # layer writes. Anything else stays empty (= not WSL).
+    LUCEBOX_HOST_WSL_VERSION=""
+    if [ -r /proc/version ]; then
+        if grep -q "microsoft-standard-WSL2" /proc/version 2>/dev/null; then
+            LUCEBOX_HOST_WSL_VERSION="wsl2"
+        elif grep -qi "Microsoft" /proc/version 2>/dev/null; then
+            LUCEBOX_HOST_WSL_VERSION="wsl1"
+        fi
+    fi
+
+    # CPU model — first "model name" hit in /proc/cpuinfo. Cheaper than
+    # lscpu and keeps the bash side dep-free.
+    LUCEBOX_HOST_CPU_MODEL=""
+    if [ -r /proc/cpuinfo ]; then
+        LUCEBOX_HOST_CPU_MODEL=$(awk -F': ' '/^model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null || echo "")
     fi
 
     LUCEBOX_HOST_HAS_SYSTEMD=0
@@ -124,17 +326,41 @@ probe_host() {
         fi
     fi
 
+    # NVIDIA Container Toolkit version (best-effort; empty when nvidia-ctk
+    # is not installed). nvidia-ctk --version prints "NVIDIA Container
+    # Toolkit CLI version 1.16.2" on a single line — extract the trailing
+    # token so the host-info JSON carries just the version, not the banner.
+    LUCEBOX_HOST_NVIDIA_CTK_VERSION=""
+    if command -v nvidia-ctk &>/dev/null; then
+        LUCEBOX_HOST_NVIDIA_CTK_VERSION=$(nvidia-ctk --version 2>/dev/null \
+            | awk '/version/{print $NF; exit}' \
+            || echo "")
+    fi
+
     export LUCEBOX_HOST_NPROC LUCEBOX_HOST_RAM_GB LUCEBOX_HOST_GPU_VENDOR
     export LUCEBOX_HOST_GPU_NAME LUCEBOX_HOST_GPU_COUNT LUCEBOX_HOST_VRAM_GB
     export LUCEBOX_HOST_GPU_SM LUCEBOX_HOST_DRIVER_VERSION LUCEBOX_HOST_DRIVER_MAJOR
     export LUCEBOX_HOST_HAS_SYSTEMD LUCEBOX_HOST_IS_WSL
     export LUCEBOX_HOST_HAS_DOCKER LUCEBOX_HOST_DOCKER_VERSION
     export LUCEBOX_HOST_HAS_CTK
+    export LUCEBOX_HOST_OS_PRETTY LUCEBOX_HOST_KERNEL LUCEBOX_HOST_WSL_VERSION
+    export LUCEBOX_HOST_NVIDIA_CTK_VERSION LUCEBOX_HOST_CPU_MODEL
+    export LUCEBOX_HOST_GPU_LIST_CSV LUCEBOX_HOST_CUDA_VISIBLE_DEVICES
+    _LUCEBOX_HOST_PROBED=1
+}
+
+# Cheap idempotency wrapper. Anything that needs real host facts (vs the safe
+# defaults seeded at script-load) calls this. Subcommands that go straight to
+# `systemctl`/`journalctl` no longer need to remember to call probe_host.
+ensure_probed() {
+    [ "$_LUCEBOX_HOST_PROBED" = "1" ] || probe_host
 }
 
 pick_variant() {
-    # CUDA 12.8 is the supported image for this branch.
-    echo "${LUCEBOX_VARIANT:-cuda12}"
+    # CUDA 12.8 is the supported image variant for this branch. Effective
+    # value goes through the same env > config.toml > default ladder as
+    # everything else so `config set image.variant=...` propagates.
+    _lucebox_resolve "${LUCEBOX_VARIANT:-}" image.variant "cuda12"
 }
 
 # ── prereq checks (host-only) ─────────────────────────────────────────────
@@ -184,6 +410,14 @@ require_ctk() {
 }
 
 require_systemd() {
+    # Earlier versions of this wrapper had `start`/`stop`/`logs`/etc. drop
+    # straight into cmd_systemctl_passthrough without probing first, which
+    # tripped `set -u` on the reference below. Two layers of defence now:
+    #   1) top-of-script seeds LUCEBOX_HOST_HAS_SYSTEMD=0 unconditionally, so
+    #      no read can be unbound even if probe_host is bypassed entirely.
+    #   2) ensure_probed runs probe_host on first call so we still get the
+    #      real answer for the require_systemd error path.
+    ensure_probed
     if [ "$LUCEBOX_HOST_HAS_SYSTEMD" != "1" ]; then
         err "user systemd is not available — required for $1"
         hint "On WSL: set 'systemd=true' under [boot] in /etc/wsl.conf, then 'wsl --shutdown'."
@@ -223,6 +457,12 @@ build_orchestrator_argv() {
     fi
     argv+=(-v "$DOCKER_SOCK_PATH:/var/run/docker.sock")
     argv+=(-v "$HOME:$HOME")
+    # Bind-mount the XDG models dir explicitly (host = container path) so
+    # paths line up in/out. The $HOME mount above already covers it when
+    # XDG_DATA_HOME is unset, but an explicit -v is required when the user
+    # points XDG_DATA_HOME outside $HOME.
+    mkdir -p "$DEFAULT_MODELS_DIR"
+    argv+=(-v "$DEFAULT_MODELS_DIR:$DEFAULT_MODELS_DIR")
     argv+=(-w "$PWD")
     argv+=(-e "HOME=$HOME")
     # Host facts — Python side reads these instead of reprobing.
@@ -235,7 +475,10 @@ build_orchestrator_argv() {
     argv+=(-e "LUCEBOX_VARIANT=$variant")
     argv+=(-e "LUCEBOX_PORT=$DEFAULT_PORT")
     argv+=(-e "LUCEBOX_CONTAINER=$CONTAINER_NAME")
-    [ -n "${LUCEBOX_MODELS:-}" ] && argv+=(-e "LUCEBOX_MODELS=$LUCEBOX_MODELS")
+    # Always export the resolved models dir so the in-container CLI sees
+    # the same path the wrapper mounts (don't gate on `LUCEBOX_MODELS` being
+    # set — the XDG default needs to flow through too).
+    argv+=(-e "LUCEBOX_MODELS=$DEFAULT_MODELS_DIR")
     [ -n "${HF_TOKEN:-}" ] && argv+=(-e "HF_TOKEN=$HF_TOKEN")
 
     argv+=("${IMAGE_BASE}:${variant}")
@@ -260,10 +503,56 @@ cmd_serve() {
     # conservative docker run — the container's own VRAM-tiered autotune
     # picks reasonable defaults from there.
     require_host_prereqs
-    probe_host
+    ensure_probed
     require_ctk
     local variant
     variant=$(pick_variant)
+
+    # Pre-flight: refuse to stomp on something that's already serving this
+    # slot. Three states to distinguish, because silently `docker rm -f`-ing
+    # whatever is there hides real bugs (e.g. the user forgot they had a
+    # systemd unit up, and we'd happily race two servers on the same port):
+    #
+    #   1. systemd unit active           → refuse, redirect to `logs`/`stop`
+    #   2. container running (no systemd)→ refuse, redirect to `docker logs`
+    #   3. container present but stopped → orphan from a SIGKILLed previous
+    #      run (docker run --rm only cleans up on clean exit). Remove it,
+    #      but TELL the user — they need to know their last run died dirty.
+    # CRITICAL: when systemd invokes US as the unit's ExecStart, is-active
+    # returns true *because of us* — refusing here would deadlock the unit
+    # in a restart loop (and historically did — commit a30dbe5 shipped this
+    # bug). systemd sets $INVOCATION_ID in every service exec, so its
+    # presence is the unambiguous "I am running as the systemd ExecStart"
+    # signal. Skip the unit-active check in that case; the container-state
+    # check below still catches a stale container holding the slot.
+    if [ -z "${INVOCATION_ID:-}" ] \
+       && systemctl --user is-active --quiet "$UNIT_NAME" 2>/dev/null; then
+        err "${UNIT_NAME} is already running under systemd."
+        hint "  $SCRIPT_NAME logs            # follow the journal"
+        hint "  $SCRIPT_NAME restart         # bounce the service"
+        hint "  $SCRIPT_NAME stop            # stop the service"
+        exit 1
+    fi
+    local container_state
+    container_state=$(docker inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo absent)
+    case "$container_state" in
+        absent)
+            ;;
+        running|restarting)
+            err "Container '$CONTAINER_NAME' is already running (outside systemd)."
+            hint "  docker logs -f $CONTAINER_NAME    # follow output"
+            hint "  $SCRIPT_NAME stop                # stop it"
+            exit 1
+            ;;
+        exited|created|paused|dead)
+            info "Removing stale '$CONTAINER_NAME' container (state=$container_state, likely from a previous unclean exit)"
+            docker rm -f "$CONTAINER_NAME" >/dev/null
+            ;;
+        *)
+            warn "Container '$CONTAINER_NAME' is in unexpected state '$container_state' — removing"
+            docker rm -f "$CONTAINER_NAME" >/dev/null
+            ;;
+    esac
 
     local orch_argv server_argv
     mapfile -t orch_argv < <(build_orchestrator_argv "$variant" print-serve-argv)
@@ -272,29 +561,85 @@ cmd_serve() {
        && [ "${#server_argv[@]}" -gt 0 ] \
        && [ "${server_argv[0]}" = "docker" ]; then
         info "Starting lucebox server (variant=$variant, from config.toml)"
-        exec "${server_argv[@]}"
+        _serve_and_track "${server_argv[@]}"
+        return $?
     fi
 
     warn "Couldn't fetch server argv from container (image not pulled?) — using fallback"
     info "Starting lucebox server (variant=$variant, port=$DEFAULT_PORT, defaults only)"
-    local fallback_models="${LUCEBOX_MODELS:-$HOME/models}"
-    exec docker run --rm \
-        --name "$CONTAINER_NAME" \
-        --gpus all \
-        -p "$DEFAULT_PORT:8080" \
-        -v "$HOME:$HOME" \
-        -v "$fallback_models:/opt/lucebox-hub/server/models" \
-        "${IMAGE_BASE}:${variant}"
+    local fallback_models="$DEFAULT_MODELS_DIR"
+    mkdir -p "$fallback_models"
+    # Forward host facts even on the fallback path so the in-container
+    # entrypoint can still write /opt/lucebox-hub/HOST_INFO from the host's
+    # view of the rig. Matches the orchestrator path (see
+    # build_orchestrator_argv) — without it, HOST_INFO would be written
+    # with "source: unknown" any time print-serve-argv fails.
+    local fallback_argv=(docker run --rm
+        --name "$CONTAINER_NAME"
+        --gpus all
+        -p "$DEFAULT_PORT:8080"
+        -v "$HOME:$HOME"
+        -v "$fallback_models:/opt/lucebox-hub/server/models")
+    local var
+    for var in $(compgen -e | grep '^LUCEBOX_HOST_' || true); do
+        fallback_argv+=(-e "$var=${!var}")
+    done
+    fallback_argv+=("${IMAGE_BASE}:${variant}")
+    _serve_and_track "${fallback_argv[@]}"
+}
+
+# Foreground server runner with controlling-process lifetime semantics:
+# the docker daemon owns containers independently of the CLI, so a bare
+# `exec docker run` leaves the container alive after the wrapper's parent
+# (a terminal, a systemd unit, anything) goes away. `docker run --rm` only
+# cleans up on the container's own clean exit, not on our death.
+#
+# Fix: run docker as a child, install signal traps that issue `docker stop`
+# before exiting. Now `lucebox serve` behaves like a normal foreground
+# program — close the terminal, kill the wrapper, send SIGTERM from
+# systemd, the container goes down with it.
+#
+# Stops also from EXIT so even a `set -e` propagation cleans up.
+_serve_and_track() {
+    "$@" &
+    local docker_pid=$!
+    # shellcheck disable=SC2317  # called via trap, not "unreachable"
+    _serve_stop() {
+        trap - HUP INT TERM EXIT
+        # Best-effort: container may already be exiting / never started.
+        # `docker stop` blocks up to -t seconds for graceful shutdown
+        # (server handles SIGTERM), then SIGKILLs. 10s is enough for the
+        # in-flight request to finish on a typical decode.
+        docker stop -t 10 "$CONTAINER_NAME" >/dev/null 2>&1 || true
+        wait "$docker_pid" 2>/dev/null || true
+    }
+    trap _serve_stop HUP INT TERM EXIT
+    wait "$docker_pid"
+    local rc=$?
+    trap - HUP INT TERM EXIT
+    return $rc
 }
 
 cmd_systemd_install() {
     require_host_prereqs
-    probe_host
+    ensure_probed
     require_systemd "service install"
     local docker_bin
     docker_bin=$(command -v docker)
 
     mkdir -p "$(dirname "$UNIT_PATH")"
+    # Capture the user's resolved env at install time so the unit launches
+    # with the same image/variant/port/models the user expected when they
+    # ran `lucebox install`. Systemd's user-session env is sparse — without
+    # this block, the wrapper inside the unit would fall back to the
+    # in-script defaults and silently pick a different image or models
+    # directory than the user's interactive session uses.
+    #
+    # ExecStartPre cleans up any orphaned container with the target name
+    # left behind by a previous crash (docker's `--rm` only fires on clean
+    # exit — a SIGKILL or daemon restart leaves the name claimed, and the
+    # next ExecStart would die with "name already in use" while systemd
+    # reports a useless "exit code 125").
     cat > "$UNIT_PATH" <<EOF
 [Unit]
 Description=Lucebox hub LLM inference server
@@ -306,6 +651,13 @@ Wants=network-online.target docker.service
 Type=exec
 Restart=on-failure
 RestartSec=10
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=LUCEBOX_IMAGE=$IMAGE_BASE
+Environment=LUCEBOX_VARIANT=$(pick_variant)
+Environment=LUCEBOX_PORT=$DEFAULT_PORT
+Environment=LUCEBOX_CONTAINER=$CONTAINER_NAME
+Environment=LUCEBOX_MODELS=$DEFAULT_MODELS_DIR
+ExecStartPre=-$docker_bin rm -f $CONTAINER_NAME
 ExecStart=$SCRIPT_PATH serve
 ExecStop=$docker_bin stop -t 30 $CONTAINER_NAME
 TimeoutStopSec=45
@@ -358,7 +710,69 @@ cmd_systemctl_passthrough() {
         exit 1
     fi
     case "$action" in
-        start|stop|restart|enable|disable)
+        start|restart)
+            # `systemctl start` is fire-and-forget for Type=exec: it returns
+            # success as soon as execve() completes, even if the wrapper
+            # exits 1 a millisecond later. That gave us the worst possible
+            # UX — `lucebox start` reports no error but no container ever
+            # binds port 8080. Poll is-active for a few seconds and dump
+            # status + recent journal lines so the user sees the real cause.
+            local current
+            current=$(systemctl --user is-active "$UNIT_NAME" 2>/dev/null || true)
+            # `start` against an already-active unit: systemctl returns 0
+            # silently. That's polite for scripts but confusing for humans
+            # — say so explicitly. For `restart` always run through.
+            if [ "$action" = "start" ] && [ "$current" = "active" ]; then
+                ok "$UNIT_NAME is already active"
+                hint "logs:    $SCRIPT_NAME logs"
+                hint "smoke:   curl -s http://localhost:$DEFAULT_PORT/v1/models"
+                hint "(use \`$SCRIPT_NAME restart\` to bounce, \`$SCRIPT_NAME stop\` to halt)"
+                return 0
+            fi
+            # `start` against a unit stuck in restart-loop ("activating") is
+            # the symptom of a broken ExecStart — calling start would just
+            # block waiting for active that never comes. Surface this
+            # specifically so the user goes to `lucebox logs` to find the
+            # exit reason rather than waiting for the poll to give up.
+            if [ "$action" = "start" ] && [ "$current" = "activating" ]; then
+                err "$UNIT_NAME is in restart-loop (state=activating)"
+                hint "the unit is failing and being auto-restarted by systemd"
+                hint "  $SCRIPT_NAME stop          # halt the loop first"
+                hint "  $SCRIPT_NAME logs          # find the exit reason"
+                exit 1
+            fi
+            info "$action $UNIT_NAME"
+            if ! systemctl --user "$action" "$UNIT_NAME"; then
+                err "systemctl --user $action $UNIT_NAME failed"
+                systemctl --user status "$UNIT_NAME" --no-pager -n 30 || true
+                exit 1
+            fi
+            local i state
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+                state=$(systemctl --user is-active "$UNIT_NAME" 2>/dev/null || true)
+                case "$state" in
+                    active|activating) ;;
+                    *) break ;;
+                esac
+                sleep 1
+            done
+            state=$(systemctl --user is-active "$UNIT_NAME" 2>/dev/null || true)
+            if [ "$state" != "active" ]; then
+                err "$UNIT_NAME did not reach active state (current: ${state:-unknown})"
+                if [ "$state" = "activating" ]; then
+                    hint "the unit is in a restart loop — \`$SCRIPT_NAME stop\` to halt it"
+                fi
+                hint "status:"
+                systemctl --user status "$UNIT_NAME" --no-pager -n 30 || true
+                hint "recent journal:"
+                journalctl --user -u "$UNIT_NAME" -n 30 --no-pager || true
+                exit 1
+            fi
+            ok "$UNIT_NAME is active"
+            hint "logs:    $SCRIPT_NAME logs"
+            hint "smoke:   curl -s http://localhost:$DEFAULT_PORT/v1/models"
+            ;;
+        stop|enable|disable)
             exec systemctl --user "$action" "$UNIT_NAME" ;;
         status)
             exec systemctl --user status "$UNIT_NAME" --no-pager ;;
@@ -388,12 +802,142 @@ cmd_pull() {
     exec docker pull "${IMAGE_BASE}:${variant}"
 }
 
+cmd_update() {
+    # Re-run the bootstrap installer against the channel we were installed
+    # from. The installer is the source of truth for "how do you install
+    # lucebox correctly" — chmod, atomic mv, validation, baking the source
+    # URL back into the new copy so the channel is preserved across
+    # upgrades. Keeping the logic in install.sh means it can evolve
+    # independently (sha verify, signature check, etc.) and the installed
+    # `lucebox update` picks those changes up on the next run.
+    #
+    # The installer URL is derived from LUCEBOX_INSTALLED_FROM by swapping
+    # `lucebox.sh` → `install.sh` in the same directory, so forks don't
+    # need a separate registration. Override the source channel via
+    # $LUCEBOX_INSTALL_URL (e.g. to switch from canonical to a dev fork).
+    local source_url installer_url target
+    source_url="${LUCEBOX_INSTALL_URL:-$LUCEBOX_INSTALLED_FROM}"
+    if [[ "$source_url" != */lucebox.sh ]]; then
+        die "LUCEBOX_INSTALLED_FROM doesn't end in /lucebox.sh: $source_url"
+    fi
+    installer_url="${source_url%/lucebox.sh}/install.sh"
+    target=$(realpath "$SCRIPT_PATH")
+
+    info "Updating lucebox via $installer_url"
+    info "  source: $source_url"
+    info "  target: $target"
+
+    # Pass the URLs through to install.sh via env. The installer reads
+    # $LUCEBOX_INSTALL_URL (which we set to source_url) and
+    # $LUCEBOX_INSTALL_DEST (the realpath of *this* file, so a symlinked
+    # install replaces the actual file behind the link).
+    LUCEBOX_INSTALL_URL="$source_url" \
+    LUCEBOX_INSTALL_DEST="$target" \
+        bash -c "$(curl -fsSL "$installer_url")" \
+            || die "update failed (installer exited non-zero)"
+}
+
+cmd_completion() {
+    # Print shell completion script for bash / zsh / fish. Usage:
+    #
+    #   # bash  (in ~/.bashrc):
+    #   source <(lucebox completion bash)
+    #
+    #   # zsh  (in ~/.zshrc, before `compinit`):
+    #   source <(lucebox completion zsh)
+    #
+    #   # fish:
+    #   lucebox completion fish | source
+    #
+    # Keep this in sync with the dispatch table in main() and the sub-app
+    # verbs (config get/set/unset, models list/download). Adding a new
+    # top-level command means adding it here too.
+    local shell="${1:-}"
+    case "$shell" in
+        bash)
+            cat <<'BASH'
+# lucebox bash completion. Source from ~/.bashrc:
+#   source <(lucebox completion bash)
+_lucebox_complete() {
+    local cur prev cmds config_verbs models_verbs completion_shells
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    cmds="install uninstall start stop restart enable disable status logs \
+          serve pull update check completion config models autotune \
+          profile smoke print-run help version"
+    config_verbs="get set unset"
+    models_verbs="list download"
+    completion_shells="bash zsh fish"
+
+    # Sub-app verbs / shell args.
+    case "$prev" in
+        config)     COMPREPLY=( $(compgen -W "$config_verbs"     -- "$cur") ); return ;;
+        models)     COMPREPLY=( $(compgen -W "$models_verbs"     -- "$cur") ); return ;;
+        completion) COMPREPLY=( $(compgen -W "$completion_shells" -- "$cur") ); return ;;
+    esac
+
+    # Top-level command.
+    if [ "$COMP_CWORD" = 1 ]; then
+        COMPREPLY=( $(compgen -W "$cmds" -- "$cur") )
+        return
+    fi
+}
+complete -F _lucebox_complete lucebox lucebox.sh
+BASH
+            ;;
+        zsh)
+            # Bash-compat shim: zsh sources our bash completion through
+            # bashcompinit. Users who prefer native zsh _arguments-style
+            # completion can write their own; this gets `<TAB>` working
+            # in two lines for free.
+            cat <<'ZSH'
+# lucebox zsh completion. Source from ~/.zshrc (after compinit):
+#   source <(lucebox completion zsh)
+autoload -Uz compinit bashcompinit
+compinit
+bashcompinit
+ZSH
+            cmd_completion bash
+            ;;
+        fish)
+            cat <<'FISH'
+# lucebox fish completion. Source from ~/.config/fish/config.fish:
+#   lucebox completion fish | source
+complete -c lucebox -f
+set -l __lucebox_cmds install uninstall start stop restart enable disable \
+    status logs serve pull update check completion config models autotune \
+    profile smoke print-run help version
+for cmd in $__lucebox_cmds
+    complete -c lucebox -n "not __fish_seen_subcommand_from $__lucebox_cmds" -a $cmd
+end
+complete -c lucebox -n "__fish_seen_subcommand_from config" -a "get set unset"
+complete -c lucebox -n "__fish_seen_subcommand_from models" -a "list download"
+complete -c lucebox -n "__fish_seen_subcommand_from completion" -a "bash zsh fish"
+FISH
+            ;;
+        ""|--help|-h)
+            cat <<EOF
+$SCRIPT_NAME completion {bash|zsh|fish}
+
+Emits a shell completion script. Source it from your shell's rc file:
+
+  bash:  source <($SCRIPT_NAME completion bash)
+  zsh:   source <($SCRIPT_NAME completion zsh)
+  fish:  $SCRIPT_NAME completion fish | source
+EOF
+            ;;
+        *)
+            die "unknown shell: $shell — want bash, zsh, or fish" ;;
+    esac
+}
+
 cmd_check() {
     # Host-only readiness report. Pure shell — never enters the container,
     # since the point is to verify the host can run the container in the
     # first place. Reuses probe_host (LUCEBOX_HOST_* env vars) for the
     # actual detection so the formatting is the only thing here.
-    probe_host
+    ensure_probed
 
     local variant
     variant=$(pick_variant)
@@ -402,9 +946,13 @@ cmd_check() {
     # style of the lucebench preflight output.
     local mark detail
     _row() {
-        if [ "$1" = "1" ]; then mark="$C_OK✓$C_RST"
-        elif [ "$1" = "warn" ]; then mark="$C_WARN!$C_RST"
-        else mark="$C_ERR✗$C_RST"; fi
+        # Brace every var ref so multi-byte glyphs (✓ ✗) don't get parsed
+        # as part of the identifier — some bash builds with permissive
+        # locales count them as identifier characters and `set -u` then
+        # errors out on the resulting "C_OK✓" / "C_ERR✗" names.
+        if [ "$1" = "1" ]; then mark="${C_OK}✓${C_RST}"
+        elif [ "$1" = "warn" ]; then mark="${C_WARN}!${C_RST}"
+        else mark="${C_ERR}✗${C_RST}"; fi
         printf '  %-22s %b  %s\n' "$2" "$mark" "$3"
     }
 
@@ -460,8 +1008,17 @@ cmd_check() {
         _row warn "user systemd" "not available — '$SCRIPT_NAME install' (service unit) won't work; '$SCRIPT_NAME serve' (foreground) will"
     fi
 
-    # image we'd pull
-    _row 1 "image" "${IMAGE_BASE}:${variant}"
+    # image we'd pull — marked ✗ when the host clearly can't run cuda12
+    # (no nvidia driver, or no CTK wired into docker). It's still useful
+    # to print the line so the user knows what would be pulled, but a
+    # green ✓ would be misleading.
+    if [ "$LUCEBOX_HOST_GPU_VENDOR" != "nvidia" ]; then
+        _row 0 "image" "${IMAGE_BASE}:${variant} — requires NVIDIA driver"
+    elif [ "$LUCEBOX_HOST_HAS_CTK" = "none" ] || [ "$LUCEBOX_HOST_HAS_CTK" = "installed-unwired" ]; then
+        _row 0 "image" "${IMAGE_BASE}:${variant} — needs NVIDIA Container Toolkit wired into docker"
+    else
+        _row 1 "image" "${IMAGE_BASE}:${variant}"
+    fi
     # RAM / cores (informational)
     _row 1 "host" "${LUCEBOX_HOST_NPROC} cpus, ${LUCEBOX_HOST_RAM_GB} GB RAM"
 }
@@ -470,9 +1027,10 @@ cmd_in_container() {
     # Generic dispatcher: anything that isn't a systemd action goes here.
     # Runs the in-container Python CLI with the supplied argv.
     require_host_prereqs
-    probe_host
-    # CTK isn't strictly required for every subcommand (e.g. `configure`
-    # only writes a TOML file), but the server-spawning subcommands need it.
+    ensure_probed
+    # CTK isn't strictly required for every subcommand (e.g. `config get`
+    # or `autotune` only touch local files), but the server-spawning
+    # subcommands need it.
     # Letting docker error its own way is fine for the no-CTK case.
     local variant
     variant=$(pick_variant)
@@ -498,12 +1056,15 @@ Direct server invocation (foreground, no systemd):
 
 Provisioning + workloads (delegated to the in-container Python CLI):
   check                 host + docker readiness report
-  configure             write .lucebox/config.toml (heuristic)
   pull                  docker pull the cuda12 image
-  download-models       fetch target GGUF + DFlash draft (via the container)
+  update                re-run the bootstrap installer to upgrade this script
+  completion <shell>    print shell completion script (bash / zsh / fish)
+  models                list / download / activate model presets
+  config                read / write keys in .lucebox/config.toml
+  autotune              compute (and optionally apply) VRAM-tier DFLASH_* defaults
+                        — `autotune --sweep` empirically picks a per-tier winner
   smoke                 hit /v1/chat/completions on a running server
-  benchmark             sweep DFLASH_* knobs inside the container, write tuned config
-  profile               update profile evidence; use --export-snapshot to export
+  profile               run luce-bench snapshot via the running container
   print-run             print the docker-run command for the server
 
 Misc:
@@ -515,8 +1076,8 @@ Environment overrides:
   LUCEBOX_VARIANT       image tag to pull/run (default: cuda12)
   LUCEBOX_PORT          host port for the server (default: 8080)
   LUCEBOX_CONTAINER     server container name (default: lucebox)
-  LUCEBOX_MODELS        host model directory (default: ~/models)
-  HF_TOKEN              propagated to download-models for gated HF repos
+  LUCEBOX_MODELS        host model directory (default: \$XDG_DATA_HOME/lucebox/models
+  HF_TOKEN              propagated to `models download` for gated HF repos
 EOF
 }
 
@@ -537,8 +1098,17 @@ main() {
         serve)            cmd_serve "$@" ;;
         pull)             cmd_pull "$@" ;;
 
+        # Self-update — re-runs the bootstrap installer against the channel
+        # this script was installed from (LUCEBOX_INSTALLED_FROM).
+        update)           cmd_update "$@" ;;
+
         # Host-only readiness check — pure shell, never enters the container.
         check)            cmd_check "$@" ;;
+
+        # Shell completion — print a script the user sources into their rc
+        # file. Bash and zsh share the bash-style emitter (zsh users add a
+        # `bashcompinit; complete` shim); fish is native.
+        completion)       cmd_completion "$@" ;;
 
         # Help / version
         help|--help|-h)   usage ;;

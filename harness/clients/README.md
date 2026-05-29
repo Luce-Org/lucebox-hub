@@ -1,15 +1,12 @@
 # Client Launchers
 
-These scripts run real clients against Lucebox (C++ server by default).
+These scripts run real clients against Lucebox. They are useful when you want to
+use Lucebox from a specific tool, and when you want to check that a server
+change did not break that tool.
 
-## Headless bandit (5 clients, structured CSV)
+Run from the repo on the GPU machine:
 
 ```bash
-cd /workspace/lucebox-hub-harness
-python3 -m harness.client_test_runner --condition C_bandit \
-  --clients claude_code,hermes,opencode,codex,pi
-
-# Or run one compatibility launcher from the repo root:
 cd lucebox-hub
 harness/clients/run_codex.sh
 ```
@@ -58,21 +55,10 @@ these launchers and probes: OpenAI Chat Completions, streaming chunks, tool
 metadata, OpenAI Responses for Codex, Anthropic Messages for Claude Code, and
 Open WebUI model metadata.
 
-Dry-run (preflight only, no server needed):
+## Defaults
 
-```bash
-python3 -m harness.client_test_runner --condition C_bandit \
-  --clients claude_code,hermes,opencode,codex,pi --dry-run
-```
-
-Output columns: `client, preflight_ok, session_id_captured, accept_rate, wall_s, exit_code`
-
-When `codex` or `pi` binary is missing you will see:
-```
-PREFLIGHT ERROR: 'codex' not found on PATH.  Hint: run 'asdf reshim' or install it …
-```
-
-## Single-client bash launchers (kept for compatibility)
+The defaults below are the current RTX 3090 starting points for
+`Qwen3.6-27B-Q4_K_M` plus the Lucebox DFlash draft.
 
 | Client | Launcher | Default profile |
 | --- | --- | --- |
@@ -90,19 +76,32 @@ Override any setting inline:
 
 ```bash
 MAX_CTX=32768 harness/clients/run_claude_code.sh
+PROMPT='Explain the repo and end with lucebox-client-ok' harness/clients/run_opencode.sh
+PROMPT_FILE=harness/clients/prompts/repo_inspection.txt harness/clients/run_hermes.sh
 ```
 
-## Environment overrides (applies to all launchers)
+Claude Code uses the real Anthropic Messages client path. Lucebox trims
+Claude-specific prompt boilerplate by default for local-model reliability. To
+test the raw prompt, set:
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `LUCEBOX_SERVER_BACKEND` | `cpp` | Native C++ server backend |
-| `DFLASH_SERVER_BIN` | `$REPO_DIR/server/build/dflash_server` | C++ server binary |
-| `MAX_CTX` | per-client | KV cache context size |
-| `BUDGET` | 22 | Speculative decode budget |
-| `PROMPT` | per-client | One-shot prompt |
-| `PROMPT_FILE` | `` | Override prompt from file |
-| `PFLASH_SESSION_ID` | `` | Session ID injected via proxy |
+```bash
+DFLASH_ANTHROPIC_RAW_SYSTEM=1 DFLASH_ANTHROPIC_RAW_USER=1 \
+  harness/clients/run_claude_code.sh
+```
+
+## Compare Backends
+
+Use `run_backend_pair.sh` to run the same client once with llama.cpp and once
+with Lucebox:
+
+```bash
+CLIENT=opencode PROMPT_FILE=harness/clients/prompts/repo_inspection.txt \
+  harness/clients/run_backend_pair.sh
+```
+
+OpenAI Chat Completions clients can call llama.cpp directly. Claude Code and
+Codex use `llamacpp_compat_proxy.py` so their real Anthropic Messages and
+Responses requests can be compared too.
 
 ## luce-bench
 
@@ -129,7 +128,8 @@ LUCEBENCH_AREA=ds4-eval LUCEBENCH_THINK=1 harness/clients/run_lucebench.sh
 
 ## Notes
 
-- `common.sh` contains the shared server lifecycle (`start_lucebox_server`, `preflight_require_bin`).
-- C++ server default: `LUCEBOX_SERVER_BACKEND=cpp` is set before sourcing `common.sh` in every launcher.
-- `run_openwebui_tools.sh` supports `OPENWEBUI_FUNCTION_CALLING=default` and `OPENWEBUI_FUNCTION_CALLING=native`.
-- Every launcher redirects stdin from `/dev/null`.
+- `common.sh` contains the shared server startup logic.
+- `run_openwebui_tools.sh` supports `OPENWEBUI_FUNCTION_CALLING=default` and
+  `OPENWEBUI_FUNCTION_CALLING=native`.
+- Every launcher redirects stdin from `/dev/null`; this prevents SSH input from
+  being accidentally treated as a user prompt by interactive clients.

@@ -47,6 +47,89 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_sse_from_completion(self, payload: dict) -> None:
+        """Emit a streaming SSE response synthesized from a non-streaming
+        OpenAI completion dict.
+
+        Split the assistant content into 3 deltas so tests can observe a
+        meaningful TTFT (first chunk arrives before the rest). The final
+        chunk carries the usage block (matches OpenAI's behavior when
+        stream_options.include_usage is true).
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+
+        choices = payload.get("choices") or []
+        choice0 = choices[0] if choices else {}
+        msg = choice0.get("message", {}) if isinstance(choice0, dict) else {}
+        content = msg.get("content") or ""
+        reasoning = msg.get("reasoning_content") or ""
+        finish_reason = choice0.get("finish_reason") or "stop"
+        model = payload.get("model") or "mock-model"
+
+        def _send(frame: dict) -> None:
+            line = "data: " + json.dumps(frame) + "\n\n"
+            self.wfile.write(line.encode())
+            self.wfile.flush()
+
+        # Chunk 0: role-only opener (no content yet). TTFT should NOT
+        # stamp here — the runner only stamps on chunks with real text.
+        _send(
+            {
+                "id": "chatcmpl-mock",
+                "object": "chat.completion.chunk",
+                "model": model,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            }
+        )
+
+        # Split content into 3 roughly-equal pieces; reasoning into 1.
+        if reasoning:
+            _send(
+                {
+                    "id": "chatcmpl-mock",
+                    "object": "chat.completion.chunk",
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"reasoning_content": reasoning},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+        if content:
+            n = max(1, len(content) // 3)
+            pieces = [content[i : i + n] for i in range(0, len(content), n)]
+            for p in pieces:
+                _send(
+                    {
+                        "id": "chatcmpl-mock",
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [
+                            {"index": 0, "delta": {"content": p}, "finish_reason": None}
+                        ],
+                    }
+                )
+
+        # Final chunk with finish_reason + usage (when client asked).
+        final: dict[str, Any] = {
+            "id": "chatcmpl-mock",
+            "object": "chat.completion.chunk",
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+        }
+        if isinstance(payload.get("usage"), dict):
+            final["usage"] = payload["usage"]
+        _send(final)
+        # Terminator.
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/v1/models":
             self._send_json({"object": "list", "data": [{"id": "mock-model", "object": "model"}]})
@@ -67,7 +150,13 @@ class _Handler(BaseHTTPRequestHandler):
         }
         type(self).captured.append(record)
         if self.path == "/v1/chat/completions":
-            self._send_json(type(self).response_for(body))
+            payload = type(self).response_for(body)
+            # Honor the request's stream flag — when the runner asks for
+            # SSE we synthesize chunks from the same canned completion.
+            if body.get("stream"):
+                self._send_sse_from_completion(payload)
+            else:
+                self._send_json(payload)
             return
         self._send_json({"error": {"message": "not found"}}, status=404)
 

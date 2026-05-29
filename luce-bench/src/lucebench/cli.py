@@ -19,8 +19,35 @@ from pathlib import Path
 from typing import Any
 
 from lucebench import __version__
-from lucebench.areas import agent, ds4_eval, humaneval, longctx, smoke
+from lucebench._thinking import verify_thinking_control
+from lucebench.areas import (
+    agent,
+    agent_recorded,
+    ds4_eval,
+    gsm8k,
+    hellaswag,
+    humaneval,
+    longctx,
+    smoke,
+    truthfulqa_mc1,
+)
 from lucebench.runner import run_case
+
+
+def _summarize_injection(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Roll the per-row ``_thinking_injection`` echoes into a single block.
+
+    The runner stamps the same injection dict on every row (the resolution
+    is identical across a run), so we just pick the first non-empty one
+    and surface it at the top level. Returns the canonical inactive block
+    when no row carries the field — e.g. a run with control_flag='off',
+    or a sweep area that ran before the feature shipped.
+    """
+    for r in rows:
+        info = r.get("_thinking_injection")
+        if isinstance(info, dict):
+            return info
+    return {"active": False, "token": None, "source": "none"}
 
 # Threshold below which we'll auto-pick the first model and surface the
 # full list. Gateways with hundreds of models still need an explicit
@@ -105,6 +132,25 @@ AREAS = {
         "default_max_tokens": ds4_eval.DS4_EVAL_MAX_TOKENS,
         "default_thinking": True,
     },
+    "gsm8k": {
+        "load": gsm8k.load_gsm8k_cases,
+        "grade": gsm8k.grade_gsm8k_case,
+        "default_max_tokens": gsm8k.GSM8K_MAX_TOKENS,
+        # 0-shot, raw model behavior. Users who want CoT pass --think.
+        "default_thinking": False,
+    },
+    "truthfulqa-mc1": {
+        "load": truthfulqa_mc1.load_truthfulqa_mc1_cases,
+        "grade": truthfulqa_mc1.grade_truthfulqa_mc1_case,
+        "default_max_tokens": truthfulqa_mc1.TRUTHFULQA_MC1_MAX_TOKENS,
+        "default_thinking": False,
+    },
+    "hellaswag": {
+        "load": hellaswag.load_hellaswag_cases,
+        "grade": hellaswag.grade_hellaswag_case,
+        "default_max_tokens": hellaswag.HELLASWAG_MAX_TOKENS,
+        "default_thinking": False,
+    },
     "code": {
         "load": humaneval.load_humaneval_cases,
         "grade": humaneval.grade_humaneval_case,
@@ -120,6 +166,12 @@ AREAS = {
     "agent": {
         "load": agent.load_agent_cases,
         "grade": agent.grade_agent_case,
+        "default_max_tokens": 4096,
+        "default_thinking": False,
+    },
+    "agent_recorded": {
+        "load": agent_recorded.load_agent_recorded_cases,
+        "grade": agent_recorded.grade_agent_recorded_case,
         "default_max_tokens": 4096,
         "default_thinking": False,
     },
@@ -163,14 +215,38 @@ def format_row(idx: int, row: dict, graded: dict) -> str:
     # clock estimate so OpenRouter / vLLM (which don't surface decode_tps)
     # don't always read "0tps". The fallback rolls prefill into the rate,
     # so mark it with a trailing `*` to keep the distinction visible.
+    #
+    # Two display refinements that prevent the noisy-but-useless "0tps*"
+    # case (e.g. OpenRouter, smoke prompts emitting only 2 tokens — the
+    # rate is then dominated by routing/first-token latency, not decode):
+    #   1) When the fallback completion count is below 8 tokens, skip the
+    #      rate entirely and show `out=N` only — the math measures
+    #      router overhead, not decode.
+    #   2) Sub-10tps values render with one decimal so 0.3 doesn't round
+    #      down to 0.
+    def _fmt_tps(v: float) -> str:
+        if v < 10:
+            return f"{v:.1f}"
+        return f"{v:.0f}"
+
     tps_val = timings.get("decode_tokens_per_sec")
     completion_tokens = row.get("completion_tokens")
+    _FALLBACK_MIN_TOKENS = 8
     if tps_val:
-        tps_str = f"{tps_val:.0f}tps"
-    elif completion_tokens and wall and wall > 0:
-        tps_str = f"{completion_tokens / wall:.0f}tps*"
+        tps_str = f"{_fmt_tps(tps_val)}tps"
+    elif (
+        completion_tokens
+        and isinstance(completion_tokens, int)
+        and completion_tokens >= _FALLBACK_MIN_TOKENS
+        and wall
+        and wall > 0
+    ):
+        tps_str = f"{_fmt_tps(completion_tokens / wall)}tps*"
     else:
-        tps_str = "?tps"
+        # Either no usable count or too few tokens to be meaningful — leave
+        # the rate column off rather than print a number dominated by
+        # prefill/router latency.
+        tps_str = ""
 
     # ── Prefill / decode split. lucebox-server surfaces both in
     # `usage.timings` (prefill_ms + decode_ms); OpenRouter / vLLM
@@ -185,12 +261,26 @@ def format_row(idx: int, row: dict, graded: dict) -> str:
             return f"{ms:.0f}ms"
         return f"{ms / 1000:.1f}s"
 
+    # ── Time-to-first-token. Server-reported `prefill_ms` is the gold
+    # standard (no network RTT, no SSE framing overhead). Streaming runs
+    # also capture a wall-clock TTFT — useful for OpenRouter / vLLM where
+    # the server doesn't ship prefill_ms. When both are present prefer
+    # the server value and drop the wall-clock duplicate; when only the
+    # streaming measurement is available mark it with `*` (same convention
+    # as the tps fallback above).
+    ttft_seconds = row.get("ttft_seconds")
+    ttft_ms: float | None = ttft_seconds * 1000 if isinstance(ttft_seconds, int | float) else None
+
     time_parts: list[str] = []
     if prefill_ms is not None and decode_ms is not None:
         time_parts.append(f"prefill={_fmt_ms(prefill_ms)}")
         time_parts.append(f"decode={_fmt_ms(decode_ms)}")
     elif prefill_ms is not None:
         time_parts.append(f"prefill={_fmt_ms(prefill_ms)} wall={wall:.2f}s")
+    elif ttft_ms is not None and decode_ms is not None:
+        time_parts.append(f"ttft={_fmt_ms(ttft_ms)}* decode={_fmt_ms(decode_ms)}")
+    elif ttft_ms is not None:
+        time_parts.append(f"ttft={_fmt_ms(ttft_ms)}* wall={wall:.2f}s")
     elif decode_ms is not None:
         time_parts.append(f"decode={_fmt_ms(decode_ms)} wall={wall:.2f}s")
     else:
@@ -216,11 +306,14 @@ def format_row(idx: int, row: dict, graded: dict) -> str:
         tok_bits.append(f"out={completion_tokens}")
     tok_str = " ".join(tok_bits)
 
+    tail_bits = [time_str]
+    if tps_str:
+        tail_bits.append(tps_str)
+    if tok_str:
+        tail_bits.append(tok_str)
     return (
         f"  {idx:3d} {verdict} {src:14s} {cid:24s} "
-        f"given={given:20s} correct={correct:20s} "
-        f"{time_str} {tps_str}"
-        + (f" {tok_str}" if tok_str else "")
+        f"given={given:20s} correct={correct:20s} " + " ".join(tail_bits)
     )
 
 
@@ -291,15 +384,19 @@ def _preflight(
     auth_header: str = "",
     timeout_s: int = 5,
     requested_model: str | None = None,
-) -> tuple[bool, list[str]]:
+) -> tuple[bool, list[str], bool]:
     """Probe the server's liveness + OpenAI shape + lucebox /props endpoint.
 
-    Returns ``(ok, lines)`` where ``lines`` is the printed grid (already
-    formatted, one check per line) and ``ok`` is False iff a HARD check
-    failed — which is "liveness" or "/v1/models doesn't return a data
-    list". The /props check is lucebox-specific: missing/404 prints a
-    warning line but does NOT fail (OpenRouter, vLLM, stock ds4_server
-    don't expose /props).
+    Returns ``(ok, lines, server_honors_api_flags)`` where ``lines`` is
+    the printed grid (already formatted, one check per line), ``ok`` is
+    False iff a HARD check failed — which is "liveness" or "/v1/models
+    doesn't return a data list" — and ``server_honors_api_flags`` is True
+    iff the server's /props response surfaces ``model_card_source`` (the
+    marker that this is a lucebox stack which enforces thinking control
+    server-side). The /props check is lucebox-specific: missing/404 prints
+    a warning line but does NOT fail (OpenRouter, vLLM, stock ds4_server
+    don't expose /props), and in those cases ``server_honors_api_flags``
+    defaults to False so the client-side injection can take over.
 
     Designed to run before any case fires so a typo'd --url surfaces in
     ~50ms instead of after 92 timeouts. The CLI gates this behind
@@ -337,14 +434,16 @@ def _preflight(
             models_payload = None
     except urllib.error.URLError as e:
         reason = getattr(e, "reason", e)
-        liveness_detail = f"connection refused ({reason})" if "refused" in str(reason).lower() else str(reason)
+        liveness_detail = (
+            f"connection refused ({reason})" if "refused" in str(reason).lower() else str(reason)
+        )
     except OSError as e:
         liveness_detail = f"{type(e).__name__}: {e}"
     except Exception as e:  # last-resort guard so preflight never raises
         liveness_detail = f"{type(e).__name__}: {e}"
     lines.append(_line("liveness", liveness_ok, liveness_detail))
     if not liveness_ok:
-        return False, lines
+        return False, lines, False
 
     # 2. /v1/models shape — OpenAI-compat servers return {"data": [...]}.
     models_ok = False
@@ -352,7 +451,9 @@ def _preflight(
     if isinstance(models_payload, dict):
         data = models_payload.get("data")
         if isinstance(data, list):
-            ids = [m.get("id") for m in data if isinstance(m, dict) and isinstance(m.get("id"), str)]
+            ids = [
+                m.get("id") for m in data if isinstance(m, dict) and isinstance(m.get("id"), str)
+            ]
             if not ids:
                 models_detail = "0 models exposed"
             else:
@@ -370,10 +471,13 @@ def _preflight(
         models_detail = "response was not JSON"
     lines.append(_line("/v1/models", models_ok, models_detail))
     if not models_ok:
-        return False, lines
+        return False, lines, False
 
     # 3. /props — lucebox-specific. Soft check: warn if absent, surface
-    # model_card_source + hard_limit_reply_budget if present.
+    # the image identity + target GGUF basename + model_card_source when
+    # the server is new enough to expose them (props_schema >= 3); fall
+    # back to the schema-2 model_card + reply_budget display on older
+    # servers.
     props_req = urllib.request.Request(base + "/props", headers={"Accept": "application/json"})
     if auth_header:
         props_req.add_header("Authorization", auth_header)
@@ -382,22 +486,66 @@ def _preflight(
             props = json.loads(resp.read())
     except Exception:
         # Not a hard failure — OpenRouter, vLLM, ds4_server don't expose this.
+        # ``server_honors_api_flags=False`` here is what flips the auto-mode
+        # client-side thinking injection on by default for these stacks.
         lines.append(_line("/props", True, "absent (non-lucebox server) — skipped"))
-        return True, lines
+        return True, lines, False
 
-    # Pull from budget_envelope first (lucebox canonical), fall back to top-level.
+    bits: list[str] = []
+
+    # `build` (schema 3+): image_tag + short git_sha → "image=<tag>@<sha7>"
+    # so an operator scanning a bench log can pin the exact prebuilt image.
+    # Fall back gracefully when the server is pre-schema-3 (no `build`
+    # block) or when the fields are null (bare-metal / non-Docker builds).
+    if isinstance(props, dict):
+        build = props.get("build")
+        if isinstance(build, dict):
+            tag = build.get("image_tag")
+            git_sha = build.get("git_sha")
+            short_sha = git_sha[:7] if isinstance(git_sha, str) and git_sha else None
+            if tag and short_sha:
+                bits.append(f"image={tag}@{short_sha}")
+            elif tag:
+                bits.append(f"image={tag}")
+            elif short_sha:
+                bits.append(f"image=@{short_sha}")
+
+        # `model.target` (schema 3+): GGUF basename + quant tag. Strips
+        # the `.gguf` suffix so the line stays narrow.
+        model = props.get("model")
+        if isinstance(model, dict):
+            target = model.get("target")
+            if isinstance(target, dict):
+                path = target.get("path")
+                if isinstance(path, str) and path:
+                    stem = path.rsplit("/", 1)[-1]
+                    if stem.endswith(".gguf"):
+                        stem = stem[: -len(".gguf")]
+                    bits.append(f"target={stem}")
+
+    # `budget_envelope` (schema 2+): card lookup hit + reply budget. Kept
+    # in the line even when the schema-3 fields are present — operators
+    # debugging budget-envelope bugs find this faster than digging through
+    # the full `/props` body.
     env = props.get("budget_envelope") if isinstance(props, dict) else None
     env = env if isinstance(env, dict) else {}
-    card = env.get("model_card_source") or (props.get("model_card_source") if isinstance(props, dict) else None)
+    card = env.get("model_card_source") or (
+        props.get("model_card_source") if isinstance(props, dict) else None
+    )
     reply = env.get("hard_limit_reply_budget")
-    bits = []
     if card:
         bits.append(f"model_card={card}")
     if reply is not None:
         bits.append(f"reply_budget={reply}")
+
     detail = "  ".join(bits) if bits else "present (no envelope fields)"
     lines.append(_line("/props", True, detail))
-    return True, lines
+    # ``model_card_source`` is the lucebox-stack tell: a server that surfaces
+    # which sidecar card it loaded is enforcing thinking control + reply
+    # budget server-side via the chat template, so the auto-mode client-side
+    # injection should stand down.
+    server_honors = bool(card)
+    return True, lines, server_honors
 
 
 def _forge_available() -> tuple[bool, str | None]:
@@ -413,6 +561,250 @@ def _forge_available() -> tuple[bool, str | None]:
         return True, None
     except ImportError:
         return False, "anthropic SDK not installed — `pip install 'luce-bench[forge]'`"
+
+
+def _run_forge_area_to_dir(
+    *,
+    out_root: Path,
+    url: str,
+    model: str,
+    auth_header: str,
+    timeout: int,
+    max_tokens: int | None,
+    questions: int | None,
+) -> dict[str, Any] | None:
+    """Drive the forge area + write ``<out_root>/forge.json``.
+
+    Returns the per-area summary row (the dict appended to
+    ``summary_areas``) or ``None`` if the forge runner raised
+    ``SystemExit`` (e.g. no anthropic SDK installed).
+    """
+    from lucebench.areas.forge import run_forge_area
+
+    max_tokens_forge = max_tokens if max_tokens is not None else 4096
+    print(
+        f"\n[lucebench] === area=forge max_tokens={max_tokens_forge} ===",
+        flush=True,
+    )
+    try:
+        forge_rows, forge_summary = run_forge_area(
+            url=url,
+            model=model,
+            max_tokens=max_tokens_forge,
+            timeout_s=timeout,
+            auth_header=auth_header,
+            questions=questions,
+        )
+    except SystemExit as exc:
+        print(f"[lucebench] forge: {exc}", file=sys.stderr, flush=True)
+        return None
+    (out_root / "forge.json").write_text(
+        json.dumps(
+            {
+                "lucebench_version": __version__,
+                "area": "forge",
+                "url": url,
+                "model": model,
+                **forge_summary,
+                "rows": forge_rows,
+            },
+            indent=2,
+            default=str,
+        )
+    )
+    print(
+        f"[lucebench] area=forge pass_rate={forge_summary.get('pass_rate', 0):.2f}% "
+        f"({forge_summary.get('n_pass', 0)}/{forge_summary.get('n_scenarios', 0)})",
+        flush=True,
+    )
+    return {
+        "area": "forge",
+        "n": forge_summary.get("n_scenarios", 0),
+        "pass": forge_summary.get("n_pass", 0),
+        "rate": forge_summary.get("pass_rate", 0.0),
+        "wall_total": sum(r.get("wall_seconds") or 0 for r in forge_rows),
+        "wall_median": (
+            statistics.median([r.get("wall_seconds") or 0 for r in forge_rows])
+            if forge_rows
+            else 0
+        ),
+    }
+
+
+def _run_standard_area_to_dir(
+    area: str,
+    *,
+    out_root: Path,
+    url: str,
+    model: str,
+    auth_header: str,
+    timeout: int,
+    max_tokens: int | None,
+    think: bool | None,
+    temperature: float | None,
+    top_p: float | None,
+    top_k: int | None,
+    questions: int | None,
+    no_fail_fast: bool,
+    prompt_thinking_control: str,
+    server_honors_api_flags: bool,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Drive a single stdlib area into ``<out_root>/<area>.json``.
+
+    Returns ``(summary_row, aborted)`` where ``aborted`` is ``True`` when
+    the fail-fast guard tripped on the first case (server unreachable).
+    """
+    cfg = AREAS[area]
+    cases = cfg["load"]()
+    cases = select_cases(cases, questions=questions)
+    chosen_max_tokens = max_tokens if max_tokens is not None else cfg["default_max_tokens"]
+    chosen_think = think if think is not None else cfg["default_thinking"]
+    print(
+        f"\n[lucebench] === area={area} cases={len(cases)} think={chosen_think} "
+        f"max_tokens={chosen_max_tokens} ===",
+        flush=True,
+    )
+
+    rows: list[dict[str, Any]] = []
+    for idx, case in enumerate(cases, start=1):
+        row = run_case(
+            url=url,
+            case=case,
+            timeout_s=timeout,
+            max_tokens=chosen_max_tokens,
+            think=chosen_think,
+            model=model,
+            auth_header=auth_header,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            thinking_control_flag=prompt_thinking_control,
+            server_honors_api_flags=server_honors_api_flags,
+        )
+        graded = cfg["grade"](case, row)
+        row["pass"] = graded.get("pass", False)
+        row["graded"] = graded
+        rows.append(row)
+        print(format_row(idx, row, graded), flush=True)
+        if idx == 1 and not no_fail_fast and _row_is_unreachable(row):
+            print(
+                f"\n[lucebench] sweep aborted — server at {url} appears "
+                f"unreachable (case 1 raised {row.get('error')!r}). "
+                "Pass --no-fail-fast to keep going anyway.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None, True
+
+    pass_n = sum(1 for r in rows if r["pass"])
+    rate = 100 * pass_n / len(rows) if rows else 0
+    walls = [r.get("wall_seconds") or 0 for r in rows]
+    wall_total = sum(walls)
+    wall_median = statistics.median(walls) if walls else 0
+    print(
+        f"[lucebench] area={area} pass_rate={rate:.2f}% "
+        f"({pass_n}/{len(rows)}) wall_total={wall_total:.0f}s",
+        flush=True,
+    )
+
+    requested_mode = "think" if chosen_think else "nothink"
+    honored, contradicting = verify_thinking_control(rows, requested_mode)
+    injection_summary = _summarize_injection(rows)
+    if not honored:
+        host = url.split("://", 1)[1].split("/", 1)[0] if "://" in url else url
+        print(
+            f"[lucebench] WARNING: thinking control not honored at {host} — "
+            f"{contradicting}/{len(rows)} rows in {requested_mode} mode have "
+            f"non-empty reasoning. Consider --prompt-thinking-control=on or "
+            f"pick a model card with an explicit thinking_control block.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    terse = [
+        {k: v for k, v in r.items() if k not in {"_response", "_thinking_injection"}}
+        for r in rows
+    ]
+    (out_root / f"{area}.json").write_text(
+        json.dumps(
+            {
+                "lucebench_version": __version__,
+                "area": area,
+                "url": url,
+                "model": model,
+                "think": chosen_think,
+                "max_tokens": chosen_max_tokens,
+                "n": len(rows),
+                "pass": pass_n,
+                "pass_rate": rate,
+                "wall_total": wall_total,
+                "wall_median": wall_median,
+                "thinking_control_requested": requested_mode,
+                "thinking_control_honored": honored,
+                "contradicting_rows": contradicting,
+                "thinking_control_injection": injection_summary,
+                "rows": terse,
+            },
+            indent=2,
+        )
+    )
+    return (
+        {
+            "area": area,
+            "n": len(rows),
+            "pass": pass_n,
+            "rate": rate,
+            "wall_total": wall_total,
+            "wall_median": wall_median,
+        },
+        False,
+    )
+
+
+def write_sweep_summary(
+    out_root: Path,
+    *,
+    name: str,
+    url: str,
+    model: str,
+    summary_areas: list[dict[str, Any]],
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Write ``_summary.json`` + ``_summary.md`` to ``out_root`` and return the JSON payload.
+
+    ``extra`` is shallow-merged into the JSON payload — used by the
+    snapshot subcommand to record ``level`` next to the area roll-up so
+    downstream tools (``submit-baseline``) can validate the snapshot
+    against the requested tier.
+    """
+    summary: dict[str, Any] = {
+        "lucebench_version": __version__,
+        "name": name,
+        "url": url,
+        "model": model,
+        "areas": summary_areas,
+    }
+    if extra:
+        summary.update(extra)
+    (out_root / "_summary.json").write_text(json.dumps(summary, indent=2))
+
+    md_lines = [
+        f"# luce-bench sweep — {name}",
+        "",
+        f"- url:   `{url}`",
+        f"- model: `{model}`",
+        f"- lucebench v{__version__}",
+        "",
+        "| area | n | pass | rate | wall_total | wall_median |",
+        "|------|---|------|------|------------|-------------|",
+    ]
+    for a in summary_areas:
+        md_lines.append(
+            f"| {a['area']} | {a['n']} | {a['pass']} | "
+            f"{a['rate']:.1f}% | {a['wall_total']:.0f}s | {a['wall_median']:.1f}s |"
+        )
+    (out_root / "_summary.md").write_text("\n".join(md_lines) + "\n")
+    return summary
 
 
 def _run_sweep(args) -> int:
@@ -435,7 +827,7 @@ def _run_sweep(args) -> int:
     out_root.mkdir(parents=True, exist_ok=True)
 
     # The set of areas to run is supplied by main() in args.areas_list
-    # (computed from --areas, with back-compat for --area / --sweep).
+    # (computed from --areas, with back-compat for --area).
     sweep_areas = list(args.areas_list)
     forge_ok, forge_reason = _forge_available()
     auth_header = ""
@@ -464,186 +856,80 @@ def _run_sweep(args) -> int:
     summary_areas: list[dict[str, Any]] = []
     for area in sweep_areas:
         if area == "forge":
-            # Forge has its own runner (recording AnthropicClient), so dispatch
-            # separately. Still emit per-area JSON for symmetry with the others.
-            from lucebench.areas.forge import run_forge_area
-
-            max_tokens_forge = args.max_tokens if args.max_tokens is not None else 4096
-            print(
-                f"\n[lucebench] === area=forge max_tokens={max_tokens_forge} ===",
-                flush=True,
-            )
-            try:
-                forge_rows, forge_summary = run_forge_area(
-                    url=args.url,
-                    model=args.model,
-                    max_tokens=max_tokens_forge,
-                    timeout_s=args.timeout,
-                    auth_header=auth_header,
-                    questions=args.questions,
-                )
-            except SystemExit as exc:
-                print(f"[lucebench] forge: {exc}", file=sys.stderr, flush=True)
-                continue
-            (out_root / "forge.json").write_text(
-                json.dumps(
-                    {
-                        "lucebench_version": __version__,
-                        "area": "forge",
-                        "url": args.url,
-                        "model": args.model,
-                        **forge_summary,
-                        "rows": forge_rows,
-                    },
-                    indent=2,
-                    default=str,
-                )
-            )
-            summary_areas.append(
-                {
-                    "area": "forge",
-                    "n": forge_summary.get("n_scenarios", 0),
-                    "pass": forge_summary.get("n_pass", 0),
-                    "rate": forge_summary.get("pass_rate", 0.0),
-                    "wall_total": sum(r.get("wall_seconds") or 0 for r in forge_rows),
-                    "wall_median": (
-                        statistics.median([r.get("wall_seconds") or 0 for r in forge_rows])
-                        if forge_rows
-                        else 0
-                    ),
-                }
-            )
-            print(
-                f"[lucebench] area=forge pass_rate={forge_summary.get('pass_rate', 0):.2f}% "
-                f"({forge_summary.get('n_pass', 0)}/{forge_summary.get('n_scenarios', 0)})",
-                flush=True,
-            )
-            continue
-
-        cfg = AREAS[area]
-        cases = cfg["load"]()
-        cases = select_cases(cases, questions=args.questions)
-        max_tokens = args.max_tokens if args.max_tokens is not None else cfg["default_max_tokens"]
-        think = args.think if args.think is not None else cfg["default_thinking"]
-        print(
-            f"\n[lucebench] === area={area} cases={len(cases)} think={think} "
-            f"max_tokens={max_tokens} ===",
-            flush=True,
-        )
-
-        rows: list[dict[str, Any]] = []
-        aborted = False
-        for idx, case in enumerate(cases, start=1):
-            row = run_case(
+            row = _run_forge_area_to_dir(
+                out_root=out_root,
                 url=args.url,
-                case=case,
-                timeout_s=args.timeout,
-                max_tokens=max_tokens,
-                think=think,
                 model=args.model,
                 auth_header=auth_header,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                top_k=args.top_k,
+                timeout=args.timeout,
+                max_tokens=args.max_tokens,
+                questions=args.questions,
             )
-            graded = cfg["grade"](case, row)
-            row["pass"] = graded.get("pass", False)
-            row["graded"] = graded
-            rows.append(row)
-            print(format_row(idx, row, graded), flush=True)
-            # Fail-fast: if the very first case looks like the server is
-            # unreachable, abort the sweep rather than wasting timeouts
-            # on the remaining ~91 cases per area * 4 areas. Skip the
-            # guard when --no-fail-fast is set (CI / chaos tests).
-            if idx == 1 and not args.no_fail_fast and _row_is_unreachable(row):
-                print(
-                    f"\n[lucebench] sweep aborted — server at {args.url} appears "
-                    f"unreachable (case 1 raised {row.get('error')!r}). "
-                    "Pass --no-fail-fast to keep going anyway.",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                aborted = True
-                break
+            if row is not None:
+                summary_areas.append(row)
+            continue
+
+        row, aborted = _run_standard_area_to_dir(
+            area,
+            out_root=out_root,
+            url=args.url,
+            model=args.model,
+            auth_header=auth_header,
+            timeout=args.timeout,
+            max_tokens=args.max_tokens,
+            think=args.think,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            questions=args.questions,
+            no_fail_fast=args.no_fail_fast,
+            prompt_thinking_control=getattr(args, "prompt_thinking_control", "off"),
+            server_honors_api_flags=getattr(args, "server_honors_api_flags", False),
+        )
         if aborted:
             return 3
+        if row is not None:
+            summary_areas.append(row)
 
-        pass_n = sum(1 for r in rows if r["pass"])
-        rate = 100 * pass_n / len(rows) if rows else 0
-        walls = [r.get("wall_seconds") or 0 for r in rows]
-        wall_total = sum(walls)
-        wall_median = statistics.median(walls) if walls else 0
-        print(
-            f"[lucebench] area={area} pass_rate={rate:.2f}% "
-            f"({pass_n}/{len(rows)}) wall_total={wall_total:.0f}s",
-            flush=True,
-        )
+    summary = write_sweep_summary(
+        out_root,
+        name=name,
+        url=args.url,
+        model=args.model,
+        summary_areas=summary_areas,
+    )
 
-        # Per-area JSON
-        terse = [{k: v for k, v in r.items() if k != "_response"} for r in rows]
-        (out_root / f"{area}.json").write_text(
-            json.dumps(
-                {
-                    "lucebench_version": __version__,
-                    "area": area,
-                    "url": args.url,
-                    "model": args.model,
-                    "think": think,
-                    "max_tokens": max_tokens,
-                    "n": len(rows),
-                    "pass": pass_n,
-                    "pass_rate": rate,
-                    "wall_total": wall_total,
-                    "wall_median": wall_median,
-                    "rows": terse,
-                },
-                indent=2,
-            )
-        )
-        summary_areas.append(
-            {
-                "area": area,
-                "n": len(rows),
-                "pass": pass_n,
-                "rate": rate,
-                "wall_total": wall_total,
-                "wall_median": wall_median,
-            }
-        )
-
-    # Combined summary
-    summary = {
-        "lucebench_version": __version__,
-        "name": name,
-        "url": args.url,
-        "model": args.model,
-        "areas": summary_areas,
-    }
-    (out_root / "_summary.json").write_text(json.dumps(summary, indent=2))
-
-    md_lines = [
-        f"# luce-bench sweep — {name}",
-        "",
-        f"- url:   `{args.url}`",
-        f"- model: `{args.model}`",
-        f"- lucebench v{__version__}",
-        "",
-        "| area | n | pass | rate | wall_total | wall_median |",
-        "|------|---|------|------|------------|-------------|",
-    ]
-    for a in summary_areas:
-        md_lines.append(
-            f"| {a['area']} | {a['n']} | {a['pass']} | "
-            f"{a['rate']:.1f}% | {a['wall_total']:.0f}s | {a['wall_median']:.1f}s |"
-        )
-    (out_root / "_summary.md").write_text("\n".join(md_lines) + "\n")
-
+    md_text = (out_root / "_summary.md").read_text()
     print(f"\n[lucebench] sweep complete → {out_root}", flush=True)
-    print("\n".join(md_lines), flush=True)
+    print(md_text.rstrip(), flush=True)
+    del summary  # silence "assigned but never used" for the JSON payload
     return 0
 
 
 def main() -> int:
+    # ── Subcommand short-circuit. ``lucebench regrade ...`` and friends
+    # (``snapshot``, ``report``, ``submit-baseline``) have their own
+    # argparse trees; intercept the verb BEFORE the main bench-args
+    # parser inspects sys.argv so the subcommand flags don't clash with
+    # the bench parser's positional / option semantics. Keeps full
+    # back-compat for plain ``lucebench --area X`` invocations.
+    if len(sys.argv) >= 2 and sys.argv[1] == "regrade":
+        from lucebench.regrade import main as regrade_main
+
+        return regrade_main(sys.argv[2:])
+    if len(sys.argv) >= 2 and sys.argv[1] == "snapshot":
+        from lucebench.snapshot import main as snapshot_main
+
+        return snapshot_main(sys.argv[2:])
+    if len(sys.argv) >= 2 and sys.argv[1] == "report":
+        from lucebench.report import main as report_main
+
+        return report_main(sys.argv[2:])
+    if len(sys.argv) >= 2 and sys.argv[1] == "submit-baseline":
+        from lucebench.submit_baseline import main as submit_baseline_main
+
+        return submit_baseline_main(sys.argv[2:])
+
     ap = argparse.ArgumentParser(
         prog="lucebench",
         description="Capability benchmarks for chat-completion endpoints.",
@@ -688,17 +974,20 @@ def main() -> int:
         help="DEPRECATED (v0.2.5): use --areas <name>. Still accepted.",
     )
     ap.add_argument(
-        "--sweep",
-        action="store_true",
-        help="DEPRECATED (v0.2.5): use --areas all. Still accepted.",
-    )
-    ap.add_argument(
         "--no-preflight",
         action="store_true",
         help="Skip the pre-run liveness / /v1/models / /props checks. "
         "Use when running against a deliberately-degraded endpoint "
         "(chaos tests, CI fixtures) where the preflight would "
         "false-fail.",
+    )
+    ap.add_argument(
+        "--list-models",
+        action="store_true",
+        help="Print the model ids exposed by --base-url/v1/models (one "
+        "per line) and exit. Skips preflight, area validation, and the "
+        "version banner — output is machine-readable so it can be piped "
+        "to grep/head/fzf.",
     )
     ap.add_argument(
         "--name",
@@ -738,6 +1027,22 @@ def main() -> int:
     )
     ap.add_argument("--think", dest="think", action="store_true", default=None)
     ap.add_argument("--no-think", dest="think", action="store_false")
+    ap.add_argument(
+        "--prompt-thinking-control",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Client-side prompt-level thinking-control fallback. "
+        "API-side flags (chat_template_kwargs.enable_thinking, "
+        "thinking, reasoning_effort) keep firing regardless; this "
+        "knob adds an in-band token (e.g. '/no_think' for Qwen3.x) "
+        "to the last user turn as belt+suspenders against providers "
+        "that strip the API flags. "
+        "'auto' (default) injects only when the preflight cannot "
+        "confirm a lucebox stack via /props; 'on' forces injection "
+        "regardless; 'off' restores pre-feature behavior. Family "
+        "tokens are picked from the model id (longest-prefix match) "
+        "or from a model-card sidecar's thinking_control block.",
+    )
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--top-p", type=float, default=None)
     ap.add_argument("--top-k", type=int, default=None)
@@ -757,9 +1062,10 @@ def main() -> int:
     ap.add_argument(
         "--no-fail-fast",
         action="store_true",
-        help="In --sweep mode, keep going even when the first case can't reach "
-        "the server. Default behavior aborts on connection-refused-style "
-        "errors to avoid burning ~92 timeouts per area on a typo'd URL.",
+        help="When running multiple areas (--areas all or a comma list), "
+        "keep going even when the first case can't reach the server. "
+        "Default behavior aborts on connection-refused-style errors to "
+        "avoid burning ~92 timeouts per area on a typo'd URL.",
     )
     ap.add_argument(
         "--parallel",
@@ -770,35 +1076,59 @@ def main() -> int:
         "gateways (OpenRouter); leave at 1 for single-GPU "
         "local servers since concurrent requests just queue.",
     )
+
     args = ap.parse_args()
+
     if args.parallel < 1:
         ap.error("--parallel must be >= 1")
 
-    # ── Resolve --areas (canonical) + back-compat with --area / --sweep.
-    # Exactly one of {--areas, --area, --sweep} can be supplied; if
-    # nothing is set we default to the smoke area (the new "is the
-    # server alive?" sanity check). All three forms collapse to a
-    # single list of area names in args.areas_list.
-    if args.areas is not None and (args.area or args.sweep):
-        ap.error("--areas cannot be combined with --area or --sweep — use --areas")
-    if args.area and args.sweep:
-        ap.error("--area and --sweep are mutually exclusive — pick one (or use --areas)")
+    # ── --list-models: machine-readable id dump + exit. Skips area
+    # validation, the version banner, and preflight so the output is
+    # safe to pipe (`lucebench --list-models | head -5`). Exits 0 when
+    # one or more ids came back, 1 when /v1/models was empty / malformed.
+    if args.list_models:
+        auth_header = ""
+        if args.auth_env:
+            token = os.environ.get(args.auth_env, "")
+            if token:
+                auth_header = f"Bearer {token}"
+        _chosen, models = list_models(args.url, auth_header=auth_header)
+        if not models:
+            print(
+                f"no models exposed at {args.url.rstrip('/')}/v1/models",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
+        for mid in models:
+            print(mid)
+        return 0
 
-    all_areas = ["smoke", "ds4-eval", "code", "longctx", "agent", "forge"]
+    # ── Resolve --areas (canonical) + back-compat with --area.
+    # Exactly one of {--areas, --area} can be supplied; if nothing is set
+    # we default to the smoke area (the "is the server alive?" sanity
+    # check). Both forms collapse to a single list of area names in
+    # args.areas_list. --sweep was removed in v0.2.6 — use `--areas all`
+    # (or the `snapshot` subcommand) for the equivalent multi-area run.
+    if args.areas is not None and args.area:
+        ap.error("--areas cannot be combined with --area — use --areas")
 
-    if args.sweep:
+    all_areas = [
+        "smoke",
+        "ds4-eval",
+        "gsm8k",
+        "truthfulqa-mc1",
+        "hellaswag",
+        "code",
+        "longctx",
+        "agent",
+        "agent_recorded",
+        "forge",
+    ]
+
+    if args.area:
         print(
-            "[lucebench] note: --sweep is deprecated in v0.2.5; use --areas all instead.",
-            file=sys.stderr,
-            flush=True,
-        )
-        # Old sweep behavior: every stdlib area except smoke + forge-if-available.
-        # New "all" matches the spec (every stdlib area). Keep them in sync.
-        args.areas_list = list(all_areas)
-    elif args.area:
-        print(
-            f"[lucebench] note: --area is deprecated in v0.2.5; "
-            f"use --areas {args.area} instead.",
+            f"[lucebench] note: --area is deprecated in v0.2.5; use --areas {args.area} instead.",
             file=sys.stderr,
             flush=True,
         )
@@ -814,9 +1144,7 @@ def main() -> int:
             valid = set(AREAS) | {"forge"}
             bad = [a for a in wanted if a not in valid]
             if bad:
-                ap.error(
-                    f"--areas: unknown area(s) {bad!r}. Valid: {sorted(valid)}"
-                )
+                ap.error(f"--areas: unknown area(s) {bad!r}. Valid: {sorted(valid)}")
             args.areas_list = wanted
 
     # First line out: which version of lucebench is actually running.
@@ -836,8 +1164,9 @@ def main() -> int:
         if token:
             auth_for_probe = f"Bearer {token}"
 
+    server_honors_api_flags = False
     if not args.no_preflight:
-        ok, lines = _preflight(
+        ok, lines, server_honors_api_flags = _preflight(
             args.url,
             auth_header=auth_for_probe,
             timeout_s=5,
@@ -853,6 +1182,7 @@ def main() -> int:
                 flush=True,
             )
             return 4
+    args.server_honors_api_flags = server_honors_api_flags
 
     # /v1/models auto-resolution. Only fires when the user left --model
     # at the literal default; an explicit value (even if wrong) is
@@ -990,6 +1320,8 @@ def main() -> int:
             temperature=args.temperature,
             top_p=args.top_p,
             top_k=args.top_k,
+            thinking_control_flag=getattr(args, "prompt_thinking_control", "off"),
+            server_honors_api_flags=getattr(args, "server_honors_api_flags", False),
         )
         graded = cfg["grade"](case, row)
         row["pass"] = graded.get("pass", False)
@@ -1029,9 +1361,39 @@ def main() -> int:
         flush=True,
     )
 
+    # ── Post-run thinking-control verification. Counts rows whose
+    # reasoning_tokens / reasoning_content contradict the requested
+    # mode; flips honored=False when contradicting/n exceeds the 5%
+    # slack. The block is written into the result JSON (canonical
+    # schema fields) AND surfaced as a stderr warning so an operator
+    # running `--no-think` against OpenRouter sees the failure at the
+    # bottom of the bench output, not buried inside the result file.
+    requested_mode = "think" if think else "nothink"
+    honored, contradicting = verify_thinking_control(rows, requested_mode)
+    injection_summary = _summarize_injection(rows)
+    if not honored:
+        host = (
+            args.url.split("://", 1)[1].split("/", 1)[0]
+            if "://" in args.url
+            else args.url
+        )
+        print(
+            f"[lucebench] WARNING: thinking control not honored at {host} — "
+            f"{contradicting}/{len(rows)} rows in {requested_mode} mode have "
+            f"non-empty reasoning. Consider --prompt-thinking-control=on or "
+            f"pick a model card with an explicit thinking_control block.",
+            file=sys.stderr,
+            flush=True,
+        )
+
     if args.json_out:
-        # Drop the raw _response blob from JSON-out by default to keep file size sane.
-        terse = [{k: v for k, v in r.items() if k != "_response"} for r in rows]
+        # Drop the raw _response blob + the per-row _thinking_injection
+        # echo (it's the same on every row; the top-level summary is what
+        # consumers read) from JSON-out by default to keep file size sane.
+        terse = [
+            {k: v for k, v in r.items() if k not in {"_response", "_thinking_injection"}}
+            for r in rows
+        ]
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(
             json.dumps(
@@ -1045,6 +1407,10 @@ def main() -> int:
                     "n": len(rows),
                     "pass": pass_n,
                     "pass_rate": rate,
+                    "thinking_control_requested": requested_mode,
+                    "thinking_control_honored": honored,
+                    "contradicting_rows": contradicting,
+                    "thinking_control_injection": injection_summary,
                     "rows": terse,
                 },
                 indent=2,

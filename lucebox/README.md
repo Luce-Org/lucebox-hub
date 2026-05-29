@@ -8,7 +8,7 @@ and is invoked from the host via the [`lucebox.sh`](../lucebox.sh) wrapper:
     lucebox.sh print-run
 
 The wrapper is the only thing that runs on the host; everything else (host
-checks, TOML config, docker daemon calls, benchmark orchestration, smoke
+checks, TOML config, docker daemon calls, autotune + sweep, smoke
 tests, model download) is Python in the container. Host facts (driver,
 GPU, RAM, VRAM, systemd availability) are passed in via `LUCEBOX_HOST_*`
 environment variables so the Python side doesn't reprobe.

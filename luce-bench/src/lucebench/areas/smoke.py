@@ -21,6 +21,9 @@ from __future__ import annotations
 
 from typing import Any
 
+# See lucebench.areas.ds4_eval.GRADER_VERSION for the bump policy.
+GRADER_VERSION = 1
+
 # Three tiny, deterministic prompts. Each pairs the user-visible question
 # with the substring the model's reply must contain. Two rules for picking
 # expected substrings:

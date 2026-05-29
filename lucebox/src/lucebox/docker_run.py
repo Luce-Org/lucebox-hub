@@ -1,5 +1,4 @@
-"""Build and execute `docker run` argv for the server, benchmark, and
-download containers.
+"""Build and execute `docker run` argv for the server and download containers.
 
 We shell out to the `docker` CLI rather than using the docker SDK because
 (a) the CLI is the user-visible contract — errors look the same whether
@@ -10,6 +9,7 @@ SDK later is a single-file change.
 
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
 import sys
@@ -17,6 +17,50 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from lucebox.types import Config
+
+
+def _host_facts_env() -> list[tuple[str, str]]:
+    """Forward LUCEBOX_HOST_* from the orchestrator's env into the server.
+
+    lucebox.sh's probe_host() exports every host-identity fact (OS,
+    kernel, GPU list CSV, CTK version, …) before invoking ``docker run``
+    on the orchestrator. The orchestrator inherits them and we pass
+    them through verbatim so the server entrypoint can write
+    /opt/lucebox-hub/HOST_INFO without re-probing inside the container
+    (where /proc and nvidia-smi see the container's view, not the
+    rig's). See entrypoint.sh::write_host_info and http_server.cpp's
+    /props.host block.
+    """
+    out: list[tuple[str, str]] = []
+    for key, value in sorted(os.environ.items()):
+        if key.startswith("LUCEBOX_HOST_"):
+            out.append((key, value))
+    return out
+
+
+def _resolve_model_files(cfg: Config) -> tuple[str, str]:
+    """Return (target_file, draft_file) bare filenames for DFLASH_TARGET / DFLASH_DRAFT.
+
+    Resolution order — first non-empty wins per field:
+        1. cfg.model.target_file / draft_file (explicit override in config.toml)
+        2. PRESETS[cfg.model.preset].target_file / draft_file (registry)
+        3. "" (entrypoint autodetect path runs unchanged).
+
+    Imported lazily to avoid the lucebox.types ↔ lucebox.download circular
+    import that surfaces when this module is imported from ``__init__``.
+    """
+    target = cfg.model.target_file
+    draft = cfg.model.draft_file
+    if (not target or not draft) and cfg.model.preset:
+        from lucebox.download import PRESETS
+
+        pres = PRESETS.get(cfg.model.preset)
+        if pres is not None:
+            if not target:
+                target = pres.target_file
+            if not draft and pres.has_draft and pres.draft_file:
+                draft = pres.draft_file
+    return target, draft
 
 
 def _runtime_volumes(cfg: Config) -> tuple[tuple[str, str], ...]:
@@ -100,7 +144,10 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
     """Long-running OpenAI-compatible server. Foreground (systemd manages
     lifecycle), --gpus all, models bind-mounted, DFLASH_* propagated.
     """
-    env: list[tuple[str, str]] = [
+    # LUCEBOX_HOST_* first so they ride out front in the rendered argv,
+    # making it obvious in `print-run` output what host facts get forwarded.
+    env: list[tuple[str, str]] = list(_host_facts_env())
+    env += [
         ("DFLASH_BUDGET", str(cfg.dflash.budget)),
         ("DFLASH_MAX_CTX", str(cfg.dflash.max_ctx)),
         ("DFLASH_PREFIX_CACHE_SLOTS", str(cfg.dflash.prefix_cache_slots)),
@@ -108,6 +155,17 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
         ("DFLASH_THINK_MAX", str(cfg.dflash.think_max)),
         ("DFLASH_PORT", "8080"),
     ]
+    # Resolve target/draft GGUFs in priority order:
+    #   1. cfg.model.target_file / draft_file (explicit override in config.toml)
+    #   2. PRESETS[cfg.model.preset].target_file / draft_file (registry default)
+    #   3. unset — entrypoint's autodetect path runs unchanged.
+    # Container view of the models dir is /opt/lucebox-hub/server/models
+    # (see _runtime_volumes); the entrypoint reads DFLASH_TARGET / DFLASH_DRAFT.
+    target_file, draft_file = _resolve_model_files(cfg)
+    if target_file:
+        env.append(("DFLASH_TARGET", f"/opt/lucebox-hub/server/models/{target_file}"))
+    if draft_file:
+        env.append(("DFLASH_DRAFT", f"/opt/lucebox-hub/server/models/draft/{draft_file}"))
     if cfg.dflash.lazy:
         env.append(("DFLASH_LAZY", "1"))
     if cfg.dflash.cache_type_k:
@@ -132,48 +190,6 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
         port_publish=(cfg.port, 8080),
         volumes=_runtime_volumes(cfg),
         env=tuple(env),
-    )
-
-
-def benchmark_run_spec(cfg: Config, args: tuple[str, ...] = ()) -> DockerRunSpec:
-    """One-shot optimizer container.
-
-    The benchmark entrypoint is still a Python harness while the serving
-    container now runs the native dflash_server binary. It writes its report
-    under the bind-mounted models directory and exits; the host CLI reads that
-    report back and updates config.toml.
-    """
-    env: list[tuple[str, str]] = [
-        ("DFLASH_BUDGET", str(cfg.dflash.budget)),
-        ("DFLASH_MAX_CTX", str(cfg.dflash.max_ctx)),
-        ("DFLASH_PREFIX_CACHE_SLOTS", str(cfg.dflash.prefix_cache_slots)),
-        ("DFLASH_PREFILL_CACHE_SLOTS", str(cfg.dflash.prefill_cache_slots)),
-        ("DFLASH_THINK_MAX", str(cfg.dflash.think_max)),
-    ]
-    if cfg.dflash.lazy:
-        env.append(("DFLASH_LAZY", "1"))
-    if cfg.dflash.cache_type_k:
-        env.append(("DFLASH_CACHE_TYPE_K", cfg.dflash.cache_type_k))
-    if cfg.dflash.cache_type_v:
-        env.append(("DFLASH_CACHE_TYPE_V", cfg.dflash.cache_type_v))
-    if cfg.dflash.prefill_mode != "off":
-        env += [
-            ("DFLASH_PREFILL_MODE", cfg.dflash.prefill_mode),
-            ("DFLASH_PREFILL_KEEP", str(cfg.dflash.prefill_keep_ratio)),
-            ("DFLASH_PREFILL_THRESHOLD", str(cfg.dflash.prefill_threshold)),
-        ]
-        if cfg.dflash.prefill_drafter:
-            env.append(("DFLASH_PREFILL_DRAFTER", cfg.dflash.prefill_drafter))
-
-    return DockerRunSpec(
-        image=f"{cfg.image}:{cfg.variant}",
-        name=f"{cfg.container_name}-bench",
-        gpus=True,
-        remove=True,
-        detach=False,
-        volumes=_runtime_volumes(cfg),
-        env=tuple(env),
-        entrypoint_args=("benchmark", *args),
     )
 
 

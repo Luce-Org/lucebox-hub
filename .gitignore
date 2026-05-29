@@ -33,7 +33,6 @@ MANIFEST
 *.cubin
 *.fatbin
 *.ncu-rep
-.docker-build/
 
 # virtualenvs
 venv/
@@ -60,8 +59,6 @@ env/
 bench-out/
 dflash/bench/results/
 profile-out/
-context-gemma4-*.json
-verify-gemma4-*.json
 
 # Model weights and caches (pull fresh from HF)
 weights/
@@ -97,7 +94,3 @@ dflash/docs/tuning-snapshots/
 # luce-bench --sweep default output dir (per-host bench runs); reference
 # baselines live in github.com/easel/luce-bench-baselines.
 luce-bench/snapshots/
-
-# Workdir editor backup suffixes
-*.git-head
-*.pre-pflash-rename

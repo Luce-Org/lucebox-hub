@@ -1,327 +1,159 @@
-import json
-import sys
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
+"""Tests for the collapsed ``lucebox profile`` wrapper.
 
-from lucebox.types import Config, DflashRuntime, HostFacts
+The profile module is now a thin shim over ``luce-bench snapshot``: it
+probes host facts, picks an output dir, and exec's ``docker exec``. The
+tests below pin the wrapper contract — no behavior tests of the bench
+itself (those live in luce-bench's own test suite).
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import pytest
+from lucebox.types import Config, HostFacts
 
 from lucebox import profile
 
 
-class StubProfileInfoProvider:
-    def __init__(self, *, dirty: bool = False, nvidia_smi_csv: str | None = None):
-        self.dirty = dirty
-        self.nvidia_smi_csv = nvidia_smi_csv
-
-    def git_info(self):
-        return {
-            "repo_head": "abc123",
-            "repo_head_subject": "test commit",
-            "repo_branch": "test",
-            "repo_dirty": self.dirty,
-            "repo_dirty_staged": self.dirty,
-            "repo_dirty_unstaged": False,
-            "repo_untracked_count": 2 if self.dirty else 0,
-        }
-
-    def live_host_info(self):
-        return {
-            "hostname": "host-a",
-            "kernel": "Linux host-a",
-            "os_pretty_name": "Test Linux",
-            "cpu_model": "Test CPU",
-            "nproc": "8",
-            "mem_total_kib": "123456",
-            "nvidia_smi_csv": self.nvidia_smi_csv or "0, Test GPU, 24564, 1024, 999.1, 8.6",
-            "nvidia_smi_full": "GPU test dump",
-        }
-
-    def docker_info(self):
-        return {
-            "docker_client_version": "1",
-            "docker_server_version": "1",
-            "docker_default_runtime": "runc",
-            "docker_has_nvidia_runtime": False,
-        }
-
-    def image_info(self, _cfg):
-        return {
-            "image": "example/lucebox:cuda12",
-            "image_id": "sha256:test",
-            "image_created": "today",
-        }
-
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/health":
-            payload = {"status": "ok"}
-        elif self.path == "/props":
-            payload = {
-                "server": {"name": "luce-dflash", "version": "0.1.0", "props_schema": 1},
-                "build_info": "luce-dflash v0.1.0 props_schema=1",
-                "model_alias": "luce-dflash",
-                "model_path": "/models/target.gguf",
-                "model": {"draft_path": "/models/draft.gguf"},
-                "runtime": {"backend": "cuda", "kv_cache_k": "q4_0", "kv_cache_v": "q4_0"},
-                "default_generation_settings": {"n_ctx": 4096},
-                "speculative_mode": "dflash",
-            }
-        else:
-            self.send_response(404)
-            self.end_headers()
-            return
-        data = json.dumps(payload).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def log_message(self, *_args):
-        return
-
-
-def _server():
-    srv = HTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=srv.serve_forever, daemon=True)
-    thread.start()
-    return srv, f"http://127.0.0.1:{srv.server_address[1]}"
-
-
 def _cfg(tmp_path: Path) -> Config:
+    """Build a Config with a deterministic models_dir + sentinel host facts."""
     return Config(
-        image="example/lucebox",
-        port=1236,
-        models_dir=tmp_path,
-        dflash=DflashRuntime(max_ctx=4096, budget=8),
-        host=HostFacts(gpu_vendor="nvidia", gpu_name="Test GPU", vram_gb=24),
+        models_dir=tmp_path / "models",
+        host=HostFacts(
+            gpu_vendor="nvidia",
+            gpu_name="Test GPU 5090",
+            vram_gb=32,
+            nproc=16,
+            ram_gb=64,
+            driver_version="595.71.05",
+            gpu_sm="12.0",
+            gpu_count=1,
+        ),
     )
 
 
-def test_profile_keeps_versioned_results_and_exports_audited_snapshot(tmp_path):
-    srv, url = _server()
-    try:
-        cfg = _cfg(tmp_path)
-        provider = StubProfileInfoProvider()
-
-        first = profile.run_profile(
-            cfg,
-            base_url=url,
-            step_filter="health.props",
-            force_refresh=True,
-            provider=provider,
-        )
-        reused = profile.run_profile(
-            cfg,
-            base_url=url,
-            step_filter="health.props",
-            provider=provider,
-        )
-        second = profile.run_profile(
-            cfg,
-            base_url=url,
-            step_filter="health.props",
-            force_refresh=True,
-            provider=provider,
-        )
-
-        assert first[0]["status"] == "passed"
-        assert reused[0]["ran"] is False
-        assert reused[0]["freshness_status"] == "fresh"
-        assert second[0]["status"] == "passed"
-        result_files = list(
-            (tmp_path / ".lucebox" / "profile" / "results" / "health.props").glob("*/*.json")
-        )
-        assert len(result_files) == 2
-
-        out = tmp_path / "snapshot.txt"
-        written = profile.export_snapshot(cfg, out, base_url=url, provider=provider)
-
-        assert written == out
-        text = out.read_text()
-        assert "[profile.step.1]" in text
-        assert "step_id=health.props" in text
-        assert "status=fresh" in text
-        snapshot_json = json.loads((tmp_path / "snapshot.json").read_text())
-        assert any(s["section"] == "profile.step.1" for s in snapshot_json["sections"])
-    finally:
-        srv.shutdown()
-
-
-def test_profile_dry_run_reports_missing_without_running(tmp_path):
+def test_server_base_urls_includes_docker_host_route(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
-    rows = profile.run_profile(
-        cfg,
-        base_url="http://127.0.0.1:1",
-        step_filter="health.props",
-        dry_run=True,
-        provider=StubProfileInfoProvider(),
-    )
-
-    assert rows[0]["step_id"] == "health.props"
-    assert rows[0]["ran"] is False
-    assert rows[0]["status"] == "skipped_unavailable"
+    urls = profile._server_base_urls(cfg)
+    assert urls[0] == f"http://127.0.0.1:{cfg.port}"
+    assert any("host.docker.internal" in u for u in urls)
+    assert any("172.17.0.1" in u for u in urls)
 
 
-def test_luce_bench_argv_shape_for_each_area(tmp_path):
-    """Each bench-running StepDefinition builds a luce-bench argv with the
-    right area, base-url, model, and per-step knobs (think mode, max_tokens,
-    timeout). Catches regressions in the argv builder shape — the framework
-    later writes the produced JSON back through the hash/dedup pipeline."""
-    srv, url = _server()
-    try:
-        cfg = _cfg(tmp_path)
-        ctx = profile.build_context(cfg, base_url=url, provider=StubProfileInfoProvider())
-        # Steps that drive luce-bench (4 of the 7 in the current registry).
-        expected_areas = {
-            "benchmark.code": ("code", None),
-            "benchmark.longctx": ("longctx", None),
-            "benchmark.agent": ("agent", "4096"),
-            "quality.ds4_eval": ("ds4-eval", "16000"),
-        }
-        for step in profile.registry():
-            if step.id not in expected_areas:
-                continue
-            area, max_tokens = expected_areas[step.id]
-            assert step.argv is not None
-            argv = step.argv(ctx, tmp_path)
-            # Every luce-bench step delegates to `python -m harness.bench`,
-            # which composes the lucebench argv internally. Single source
-            # of truth for "run a bench against a Lucebox server".
-            assert argv[1] == "-m"
-            assert argv[2] == "harness.bench"
-            # Area + base-url + model are mandatory.
-            assert "--area" in argv
-            assert argv[argv.index("--area") + 1] == area
-            assert argv[argv.index("--base-url") + 1] == url
-            assert argv[argv.index("--model") + 1] == "default"
-            # JSON output lands in the step's owned dest dir.
-            json_out = argv[argv.index("--json-out") + 1]
-            assert str(tmp_path) in json_out
-            # max_tokens only set when the step asked for it (agent, ds4_eval).
-            if max_tokens is None:
-                assert "--max-tokens" not in argv
-            else:
-                assert argv[argv.index("--max-tokens") + 1] == max_tokens
-        # quality.ds4_eval is the slow score-only step; verify its specific knobs.
-        ds4 = next(s for s in profile.registry() if s.id == "quality.ds4_eval")
-        argv = ds4.argv(ctx, tmp_path)
-        assert "--think" in argv  # ds4-eval runs with thinking enabled
-        assert ds4.timeout_s == 86400  # 24h ceiling for the full 92-case run
-        assert "--timeout" in argv  # per-case timeout (1800s)
-        assert argv[argv.index("--timeout") + 1] == "1800"
-    finally:
-        srv.shutdown()
+def test_server_base_urls_honors_override(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    assert profile._server_base_urls(cfg, "http://example/") == ["http://example"]
 
 
-def test_profile_hash_ignores_volatile_machine_and_dirty_state(tmp_path):
-    srv, url = _server()
-    try:
-        cfg = _cfg(tmp_path)
-        clean = profile.build_context(
-            cfg,
-            base_url=url,
-            provider=StubProfileInfoProvider(
-                dirty=False,
-                nvidia_smi_csv=(
-                    "0, Test GPU, 24564, 1024, 999.1, 8.6, 0000:01:00.0, 70, 450, 3, 41, 1500, 9500"
-                ),
-            ),
-        )
-        busy = profile.build_context(
-            cfg,
-            base_url=url,
-            provider=StubProfileInfoProvider(
-                dirty=True,
-                nvidia_smi_csv=(
-                    "0, Test GPU, 24564, 20000, 999.1, 8.6, 0000:01:00.0, "
-                    "390, 450, 99, 76, 1800, 10500"
-                ),
-            ),
-        )
-
-        step = next(s for s in profile.registry() if s.id == "benchmark.autotune_latest")
-
-        assert profile.select_step(step, clean).hash == profile.select_step(step, busy).hash
-        assert clean.git["repo_dirty"] is False
-        assert busy.git["repo_dirty"] is True
-        assert clean.machine["nvidia_smi_csv"] != busy.machine["nvidia_smi_csv"]
-    finally:
-        srv.shutdown()
+def test_host_info_payload_carries_canonical_keys(tmp_path: Path) -> None:
+    """The payload handed to luce-bench matches the bench's expected schema."""
+    cfg = _cfg(tmp_path)
+    payload = profile._host_info_payload(cfg)
+    expected = {
+        "cpu_model",
+        "nproc",
+        "ram_gb",
+        "gpu_name",
+        "gpu_count",
+        "vram_gb",
+        "gpu_sm",
+        "gpu_power_limit_w",
+        "driver_version",
+        "cuda_runtime_version",
+        "nvidia_smi_csv",
+        "lucebox_host_facts",
+    }
+    assert expected.issubset(payload.keys())
+    assert payload["gpu_name"] == "Test GPU 5090"
+    assert payload["vram_gb"] == 32
 
 
-def test_command_step_keeps_append_only_artifacts_and_fingerprint(tmp_path):
-    srv, url = _server()
-    try:
-        cfg = _cfg(tmp_path)
-        ctx = profile.build_context(cfg, base_url=url, provider=StubProfileInfoProvider())
-        code = (
-            "import json, pathlib, sys; "
-            "pathlib.Path(sys.argv[1]).write_text(json.dumps({'ok': True}) + '\\n')"
-        )
-
-        def argv(_ctx, dest):
-            return [sys.executable, "-c", code, str(dest / "report.json")]
-
-        step = profile.StepDefinition(
-            id="test.command_artifacts",
-            version=1,
-            description="command artifact append-only test",
-            timeout_s=10,
-            max_age_hours=24,
-            requires_live_server=False,
-            argv=argv,
-            report_name="report.json",
-        )
-        selection = profile.select_step(step, ctx, force_refresh=True)
-
-        first = profile._command_step(step, ctx, selection.hash, True, selection.fingerprint)
-        second = profile._command_step(step, ctx, selection.hash, True, selection.fingerprint)
-
-        assert first["status"] == "passed"
-        assert second["status"] == "passed"
-        assert first["report_path"] != second["report_path"]
-        assert first["fingerprint"] == selection.fingerprint
-        result_dir = tmp_path / ".lucebox" / "profile" / "results" / step.id / selection.hash
-        assert (result_dir / first["report_path"]).exists()
-        assert (result_dir / second["report_path"]).exists()
-        assert len(list(result_dir.glob("*.json"))) == 2
-    finally:
-        srv.shutdown()
+def test_run_profile_rejects_unknown_level(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _cfg(tmp_path)
+    rc = profile.run_profile(cfg, level="level42")
+    assert rc == 2
 
 
-def test_hardware_dump_redaction_removes_device_identifiers():
-    redacted = profile._redact_hardware_dump(
-        "Serial Number                                      : 12345\n"
-        "GPU UUID                                           : GPU-secret\n"
-        "GPU PDI                                            : secret-pdi\n"
-        "Product Name                                       : Test GPU\n"
-    )
-
-    assert "12345" not in redacted
-    assert "GPU-secret" not in redacted
-    assert "secret-pdi" not in redacted
-    assert "Product Name                                       : Test GPU" in redacted
+def test_run_profile_errors_when_container_not_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clear error when there's no container — the wrapper must NOT try to boot one."""
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(profile, "_container_running", lambda name: False)
+    rc = profile.run_profile(cfg, level="level1")
+    assert rc == 2
 
 
-def test_snapshot_canonicalizes_legacy_autotune_profile_names():
-    assert profile._canonical_autotune_profile("quick") == "level1"
-    assert profile._canonical_autotune_profile("full") == "level2"
-    assert profile._canonical_autotune_profile("stress") == "level3"
-    assert profile._canonical_autotune_profile("level2") == "level2"
+def test_run_profile_exec_docker_exec_with_expected_args(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Happy path: builds the docker exec argv and writes a host-info file."""
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(profile, "_container_running", lambda name: True)
+    monkeypatch.setattr(profile, "_json_get", lambda url, timeout_s=5.0: {})
+    # Pin the output dir under tmp_path so the test is hermetic.
+    monkeypatch.setattr(profile, "_profile_out_dir", lambda: tmp_path / "snaps")
+
+    invocations: list[list[str]] = []
+
+    def fake_run(cmd: list[str], check: bool = False) -> subprocess.CompletedProcess[Any]:
+        invocations.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    rc = profile.run_profile(cfg, level="level1", url="http://127.0.0.1:8080")
+    assert rc == 0
+    assert len(invocations) == 1
+    cmd = invocations[0]
+    assert cmd[:3] == ["docker", "exec", cfg.container_name]
+    assert "luce-bench" in cmd
+    assert "snapshot" in cmd
+    assert "--level" in cmd
+    i = cmd.index("--level")
+    assert cmd[i + 1] == "level1"
+    # host-info file was written.
+    host_info_path = tmp_path / "snaps" / "_host-info.json"
+    assert host_info_path.exists()
+    payload = json.loads(host_info_path.read_text())
+    assert payload["gpu_name"] == "Test GPU 5090"
 
 
-def test_missing_binary_status_does_not_mark_unknown_repo_dirty():
-    assert profile._cmd_status(["/definitely/missing/lucebox-test-git"]) == 127
+def test_run_profile_passes_url_override_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(profile, "_container_running", lambda name: True)
+    monkeypatch.setattr(profile, "_profile_out_dir", lambda: tmp_path / "snaps")
+    captured: list[list[str]] = []
 
-    provider = profile.LiveProfileInfoProvider()
-    info = provider.git_info()
+    def fake_run(cmd: list[str], check: bool = False) -> subprocess.CompletedProcess[Any]:
+        captured.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    if info["repo_head"]:
-        assert isinstance(info["repo_dirty"], bool)
-    else:
-        assert info["repo_dirty"] is False
-        assert info["repo_dirty_staged"] is False
-        assert info["repo_dirty_unstaged"] is False
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    rc = profile.run_profile(cfg, level="level2", url="http://example:9000")
+    assert rc == 0
+    cmd = captured[0]
+    i = cmd.index("--url")
+    assert cmd[i + 1] == "http://example:9000"
+
+
+def test_run_profile_returns_subprocess_rc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(profile, "_container_running", lambda name: True)
+    monkeypatch.setattr(profile, "_profile_out_dir", lambda: tmp_path / "snaps")
+
+    def fake_run(cmd: list[str], check: bool = False) -> subprocess.CompletedProcess[Any]:
+        return subprocess.CompletedProcess(cmd, 7, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    rc = profile.run_profile(cfg, level="level0", url="http://x")
+    assert rc == 7

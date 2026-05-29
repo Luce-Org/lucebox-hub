@@ -42,6 +42,16 @@ FIXTURE_DIR = Path(__file__).resolve().parent.parent / "fixtures"
 DS4_EVAL_CASES_PATH = FIXTURE_DIR / "ds4_eval_cases.json"
 DS4_SOURCES = {"GPQA Diamond", "SuperGPQA", "AIME2025", "COMPSEC"}
 
+# Bump this when ``grade_case`` semantics change in a way that would
+# move scores: extractor regex tweaks, semantic-hint definition shifts,
+# strict-pass tightening, COMPSEC line-spec collation rules, etc. The
+# ``luce-bench regrade`` CLI refuses to put runs with different
+# ``GRADER_VERSION``s in the same comparison row (a re-grade is the
+# only way to make them comparable). Pure data fixes (typos in
+# ds4_eval_cases.json) DO NOT bump this — those don't change grading
+# logic, only the gold answers.
+GRADER_VERSION = 1
+
 # Combined cap from antirez/ds4 ds4_eval.c (`.max_tokens = 16000`). The
 # bench sends this as the standard OpenAI `max_tokens`; each server applies
 # its own configured thinking-budget split internally (`--think-max-tokens`
@@ -277,6 +287,16 @@ def grade_case(case: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
 
     Returns a dict with at least {pass, given, correct, status, format_pass,
     semantic_hint}.
+
+    NOTE: this grader deliberately does NOT emit ``semantic_passed`` /
+    ``semantic_pass_rate``. There's no semantic judge plumbed today —
+    older result.json files carry those fields but they're always 0.0
+    and have caused real misreads ("strict_pass_rate dropped to 0!").
+    The ``normalize`` loader drops them on load. If you wire a real
+    judge in the future, emit it under
+    ``metrics["semantic_judge"][<judge_id>]["pass_rate"]`` so the
+    re-grade CLI can carry it as a properly-namespaced metric — do NOT
+    re-introduce the top-level ``semantic_pass_rate`` field.
     """
     content = row.get("content") or ""
     reasoning = row.get("reasoning_content")
