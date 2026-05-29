@@ -272,7 +272,8 @@ bool Qwen35MoeBackend::ensure_pipe_state(int kv_start) {
     if (pipe_state_ && pipe_state_->valid()) return true;
     pipe_state_ = std::make_unique<PipelinedDecodeState>();
     if (!init_pipelined_decode_state(*pipe_state_, target_backend(), target_weights(),
-                                     target_cache(), kv_start, cfg_.kq_stride_pad)) {
+                                     target_cache(), *target_weights().moe_hybrid,
+                                     kv_start, cfg_.kq_stride_pad)) {
         pipe_state_.reset();
         return false;
     }
@@ -310,7 +311,9 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
                 return false;
             }
         }
-        ggml_backend_tensor_set(logits_sg.hidden_input, act_cur.data(), 0, sizeof(float) * (size_t)hidden);
+        // GPU→GPU: pipe act_cur directly into logits graph (no host bounce)
+        ggml_backend_tensor_copy_async(target_backend(), target_backend(),
+                                        pipe_state_->gpu_state.act_cur, logits_sg.hidden_input);
         auto st = ggml_backend_graph_compute(target_backend(), logits_sg.gf);
         if (st != GGML_STATUS_SUCCESS) return false;
         ggml_backend_tensor_get(logits_sg.logits, logits_buf.data(), 0, sizeof(float) * (size_t)vocab);
@@ -346,8 +349,8 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
         if (!target_weights().embedder.embed(&tok, 1, act_cur.data())) {
             return false;
         }
-        ggml_backend_tensor_set(pipe_state_->gpu_state.act_cur, act_cur.data(), 0,
-                                sizeof(float) * (size_t)hidden);
+        ggml_backend_tensor_set_async(target_backend(), pipe_state_->gpu_state.act_cur,
+                                       act_cur.data(), 0, sizeof(float) * (size_t)hidden);
 
         if (!pipelined_decode_one_token(*pipe_state_, target_backend(), target_weights(),
                                         target_cache(), *target_weights().moe_hybrid,
@@ -355,8 +358,7 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
             return false;
         }
 
-        ggml_backend_tensor_get(pipe_state_->gpu_state.act_cur, act_cur.data(), 0,
-                                sizeof(float) * (size_t)hidden);
+        // act_cur stays on GPU — project_logits reads it via GPU→GPU copy
         if (!project_logits()) {
             step_graph_destroy(logits_sg);
             return false;
@@ -439,7 +441,7 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
     };
 
     // Helper: compute logits from act_cur (persistent graph, built once)
-    auto compute_logits = [&]() -> bool {
+    auto compute_logits = [&](ggml_tensor* gpu_src = nullptr) -> bool {
         if (!logits_sg.ctx) {
             // First call: build the logits graph
             ggml_init_params ip{};
@@ -462,7 +464,13 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                 return false;
             }
         }
-        ggml_backend_tensor_set(logits_sg.hidden_input, act_cur.data(), 0, sizeof(float) * (size_t)hidden);
+        if (gpu_src) {
+            // GPU→GPU: pipe act_cur directly without host bounce
+            ggml_backend_tensor_copy_async(target_backend(), target_backend(),
+                                            gpu_src, logits_sg.hidden_input);
+        } else {
+            ggml_backend_tensor_set(logits_sg.hidden_input, act_cur.data(), 0, sizeof(float) * (size_t)hidden);
+        }
         auto st = ggml_backend_graph_compute(target_backend(), logits_sg.gf);
         if (st != GGML_STATUS_SUCCESS) return false;
         ggml_backend_tensor_get(logits_sg.logits, logits_buf.data(), 0, sizeof(float) * (size_t)vocab);
@@ -741,8 +749,9 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                         cleanup_graphs();
                         return result;
                     }
-                    ggml_backend_tensor_set(pipe_state_->gpu_state.act_cur, act_cur.data(), 0,
-                                            sizeof(float) * (size_t)hidden);
+                    // Upload embedding async on compute stream
+                    ggml_backend_tensor_set_async(target_backend(), pipe_state_->gpu_state.act_cur,
+                                                  act_cur.data(), 0, sizeof(float) * (size_t)hidden);
 
                     PipelinedDecodeTelemetry tel;
                     if (!pipelined_decode_one_token(*pipe_state_, target_backend(), target_weights(),
@@ -761,14 +770,23 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                         decode_tel_accum.ffn_us += tel.ffn_us;
                         decode_tel_accum.ffn_allhot_us += tel.ffn_allhot_us;
                         decode_tel_accum.ffn_mixed_us += tel.ffn_mixed_us;
+                        decode_tel_accum.gpu_idle_us += tel.gpu_idle_us;
+                        decode_tel_accum.tensor_io_us += tel.tensor_io_us;
+                        decode_tel_accum.combine_overhead_us += tel.combine_overhead_us;
+                        decode_tel_accum.cold_cpu_us += tel.cold_cpu_us;
+                        decode_tel_accum.cold_compute_us += tel.cold_compute_us;
+                        decode_tel_accum.hot_graph_build_us += tel.hot_graph_build_us;
+                        decode_tel_accum.ffn_post_get_us += tel.ffn_post_get_us;
+                        decode_tel_accum.sync_wait_us += tel.sync_wait_us;
                         decode_tel_accum.allhot_layers += tel.allhot_layers;
                         decode_tel_accum.mixed_layers += tel.mixed_layers;
                         decode_tel_accum.total_layers += tel.total_layers;
+                        decode_tel_accum.hot_graph_rebuilds += tel.hot_graph_rebuilds;
+                        decode_tel_accum.routed_ffn_layers += tel.routed_ffn_layers;
                     }
 
-                    ggml_backend_tensor_get(pipe_state_->gpu_state.act_cur, act_cur.data(), 0,
-                                            sizeof(float) * (size_t)hidden);
-                    if (!compute_logits()) {
+                    // act_cur stays on GPU — compute_logits reads it via GPU→GPU copy
+                    if (!compute_logits(pipe_state_->gpu_state.act_cur)) {
                         result.error = "decode_logits";
                         cleanup_graphs();
                         return result;
@@ -805,12 +823,32 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                                 decode_tel_accum.ffn_mixed_us / 1000.0,
                                 decode_tel_accum.allhot_layers,
                                 decode_tel_accum.mixed_layers);
-                    if (n_dec > 0) {
+                    std::printf("  GPU IDLE: tensor_io=%.1fms combine=%.1fms sync_wait=%.1fms\n",
+                                decode_tel_accum.tensor_io_us / 1000.0,
+                                decode_tel_accum.combine_overhead_us / 1000.0,
+                                decode_tel_accum.sync_wait_us / 1000.0);
+                    std::printf("  CPU TIME: cold_total=%.1fms cold_compute=%.1fms hot_graph_build=%.1fms ffn_post_get=%.1fms\n",
+                                decode_tel_accum.cold_cpu_us / 1000.0,
+                                decode_tel_accum.cold_compute_us / 1000.0,
+                                decode_tel_accum.hot_graph_build_us / 1000.0,
+                                decode_tel_accum.ffn_post_get_us / 1000.0);
+                    std::printf("  hot_graph_rebuilds=%d routed_ffn_layers=%d\n",
+                                decode_tel_accum.hot_graph_rebuilds,
+                                decode_tel_accum.routed_ffn_layers);
+                    if (n_dec > 0 && decode_tel_accum.total_us > 0) {
+                        const double gpu_compute_us = (double)(decode_tel_accum.prefn_compute_us + decode_tel_accum.ffn_us - decode_tel_accum.cold_cpu_us);
+                        const double gpu_util_pct = 100.0 * gpu_compute_us / (double)decode_tel_accum.total_us;
                         std::printf("  per-token avg: prefn_build=%.2fms prefn_compute=%.2fms readback=%.2fms ffn=%.2fms\n",
                                     decode_tel_accum.prefn_graph_build_us / 1000.0 / n_dec,
                                     decode_tel_accum.prefn_compute_us / 1000.0 / n_dec,
                                     decode_tel_accum.routing_readback_us / 1000.0 / n_dec,
                                     decode_tel_accum.ffn_us / 1000.0 / n_dec);
+                        std::printf("  per-token avg: tensor_io=%.2fms combine=%.2fms cold_cpu=%.2fms cold_compute=%.2fms\n",
+                                    decode_tel_accum.tensor_io_us / 1000.0 / n_dec,
+                                    decode_tel_accum.combine_overhead_us / 1000.0 / n_dec,
+                                    decode_tel_accum.cold_cpu_us / 1000.0 / n_dec,
+                                    decode_tel_accum.cold_compute_us / 1000.0 / n_dec);
+                        std::printf("  estimated GPU utilization: %.1f%%\n", gpu_util_pct);
                     }
                     std::fflush(stdout);
                 }
@@ -883,8 +921,8 @@ bool Qwen35MoeBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
     // Ensure pipelined state
     if (!ensure_pipe_state(kv_pos)) return false;
 
-    // Upload to GPU-resident act_cur
-    ggml_backend_tensor_set(pipe_state_->gpu_state.act_cur, act_cur.data(), 0,
+    // Upload to GPU-resident act_cur (async — compute stream ordering guarantees correctness)
+    ggml_backend_tensor_set_async(target_backend(), pipe_state_->gpu_state.act_cur, act_cur.data(), 0,
                             sizeof(float) * (size_t)hidden);
 
     // Run pipelined decode (all 40 layers with cached DeltaNet + hot/cold FFN)
