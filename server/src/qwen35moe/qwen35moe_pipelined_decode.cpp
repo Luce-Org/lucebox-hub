@@ -33,6 +33,7 @@ void CachedPrefnGraph::free() {
     moe_weights = nullptr;
 }
 
+
 // Build a cached pre-FFN graph for a DeltaNet layer.
 // DeltaNet layers have no kv_start-dependent views — the graph structure is
 // identical across tokens. We build once and reuse by updating inp_embed data.
@@ -98,6 +99,8 @@ static bool build_cached_deltanet_prefn(
 void PipelinedDecodeState::destroy() {
     for (auto & cpg : cached_prefn) cpg.free();
     cached_prefn.clear();
+    for (auto & rff : cached_routed_ffn) rff.free();
+    cached_routed_ffn.clear();
     gpu_state.destroy();
     routing_ids_buf.clear();
     routing_weights_buf.clear();
@@ -111,6 +114,7 @@ bool init_pipelined_decode_state(
     ggml_backend_t backend,
     const TargetWeights & w,
     TargetCache & cache,
+    MoeHybridStorage & hybrid,
     int kv_start,
     int kq_stride_pad) {
 
@@ -131,27 +135,54 @@ bool init_pipelined_decode_state(
     out.routing_weights_buf.resize((size_t)w.n_expert_used);
     out.ffn_post_host_buf.resize((size_t)w.n_embd);
 
-    // Build cached pre-FFN graphs for DeltaNet layers
+    // Check if routed FFN pipeline is disabled
+    const bool routed_disabled = (std::getenv("DFLASH_QWEN35MOE_NO_ROUTED") != nullptr);
+
+    // Build cached pre-FFN graphs for all DeltaNet layers.
     out.cached_prefn.resize((size_t)w.n_layer);
-    int cached_count = 0;
+    int cached_prefn_count = 0;
     for (int il = 0; il < w.n_layer; ++il) {
         const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
         if (!is_attn) {
-            // DeltaNet layer: cache the graph
             if (!build_cached_deltanet_prefn(
                     out.cached_prefn[(size_t)il], backend, w, cache, il, kv_start, kq_stride_pad)) {
                 std::fprintf(stderr, "[pipelined] failed to cache DeltaNet prefn for layer %d\n", il);
-                // Non-fatal: will fall back to dynamic build for this layer
             } else {
-                cached_count++;
+                cached_prefn_count++;
             }
         }
-        // Attention layers: cached_prefn[il] remains invalid (rebuilt per-token)
     }
 
-    out.cold_in_zeroed = true;
-    // cold_in was already zeroed in init_gpu_resident_state
+    // Build cached routed FFN graphs for DeltaNet layers (StreamMoE-inspired pipeline).
+    // Reuses the same build_cached_hot_graph as the split path but with n_expert_used
+    // slots (cold entries get weight=0 at runtime, contributing nothing to output).
+    out.cached_routed_ffn.resize((size_t)w.n_layer);
+    int routed_count = 0;
+    if (!routed_disabled) {
+        for (int il = 0; il < w.n_layer; ++il) {
+            const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
+            if (is_attn) continue;
+            if ((size_t)il >= hybrid.layers.size()) continue;
 
+            auto & storage = hybrid.layers[(size_t)il];
+            const TargetLayer & L = w.layers[(size_t)il];
+
+            if (!build_cached_hot_graph(
+                    out.cached_routed_ffn[(size_t)il], backend,
+                    storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
+                    L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
+                    make_moe_layer_desc(L), w.n_embd, w.n_ff_exp, w.n_expert_used)) {
+                // Non-fatal: fall back to split path for this layer
+            } else {
+                routed_count++;
+            }
+        }
+    }
+
+    std::fprintf(stderr, "[pipelined] cached %d prefn + %d routed FFN graphs\n",
+                 cached_prefn_count, routed_count);
+
+    out.cold_in_zeroed = true;
     return true;
 }
 
@@ -180,9 +211,15 @@ bool pipelined_decode_one_token(
         tel->ffn_us = 0;
         tel->ffn_allhot_us = 0;
         tel->ffn_mixed_us = 0;
+        tel->gpu_idle_us = 0;
+        tel->tensor_io_us = 0;
+        tel->combine_overhead_us = 0;
+        tel->cold_cpu_us = 0;
+        tel->sync_wait_us = 0;
         tel->allhot_layers = 0;
         tel->mixed_layers = 0;
         tel->total_layers = 0;
+        tel->routed_ffn_layers = 0;
     }
 
     const auto tok_t0 = PipelineClock::now();
@@ -191,6 +228,104 @@ bool pipelined_decode_one_token(
     for (int il = 0; il < n_layer; ++il) {
         const bool is_attn = (((il + 1) % state.full_attention_interval) == 0);
         const auto prefn_build_t0 = PipelineClock::now();
+
+        // ══════════════════════════════════════════════════════════════════════
+        // ROUTED FFN FAST PATH (StreamMoE-inspired async pipeline):
+        // prefn(async) → copy routing → routed_ffn(async) → combine(async)
+        // Zero CPU sync between stages — GPU stream ordering guarantees correctness.
+        // ══════════════════════════════════════════════════════════════════════
+        if (!is_attn
+            && state.cached_prefn[(size_t)il].valid()
+            && state.cached_routed_ffn[(size_t)il].valid()) {
+
+            auto & cpg = state.cached_prefn[(size_t)il];
+            auto & rffn = state.cached_routed_ffn[(size_t)il];
+
+            // 1. Copy act_cur → prefn input (GPU→GPU async)
+            ggml_backend_tensor_copy_async(backend, backend, state.gpu_state.act_cur, cpg.inp_embed);
+
+            if (tel) tel->prefn_graph_build_us += pipe_elapsed_us(prefn_build_t0, PipelineClock::now());
+
+            // 2. Run prefn graph (DeltaNet + router)
+            const auto prefn_compute_t0 = PipelineClock::now();
+            ggml_backend_graph_compute_async(backend, cpg.gf);
+
+            // 3. Sync to read routing decisions from prefn output
+            ggml_backend_synchronize(backend);
+
+            // Read routing decisions from GPU
+            int32_t global_ids[8];
+            float   router_weights[8];
+            ggml_backend_tensor_get(cpg.moe_selected, global_ids, 0,
+                                    sizeof(int32_t) * (size_t)n_expert_used);
+            ggml_backend_tensor_get(cpg.moe_weights, router_weights, 0,
+                                    sizeof(float) * (size_t)n_expert_used);
+
+            // CPU-side local ID mapping + cold masking (trivial: 8 lookups + 8 mults)
+            auto & storage = hybrid.layers[(size_t)il];
+            int32_t local_ids[8];
+            float   masked_weights[8];
+            for (int i = 0; i < n_expert_used; ++i) {
+                int32_t gid = global_ids[i];
+                int32_t lid = (gid >= 0 && gid < (int)storage.hot_local_by_global.size())
+                              ? storage.hot_local_by_global[(size_t)gid] : -1;
+                if (lid >= 0) {
+                    local_ids[i] = lid;
+                    masked_weights[i] = router_weights[i];
+                } else {
+                    local_ids[i] = 0;       // safe: maps to expert 0 (result zeroed by weight)
+                    masked_weights[i] = 0.0f; // cold expert contributes nothing
+                }
+            }
+
+            // Upload pre-computed inputs to rffn graph (H→D async on compute stream)
+            ggml_backend_tensor_set_async(backend, rffn.ids, local_ids, 0,
+                                          sizeof(int32_t) * (size_t)n_expert_used);
+            ggml_backend_tensor_set_async(backend, rffn.weights, masked_weights, 0,
+                                          sizeof(float) * (size_t)n_expert_used);
+            // Copy ffn_post from prefn output → rffn input (GPU→GPU, already synced)
+            ggml_backend_tensor_copy_async(backend, backend, cpg.ffn_post, rffn.inp);
+
+            // 4. Copy residual to combine input (async)
+            ggml_backend_tensor_copy_async(backend, backend, cpg.ffn_residual, state.gpu_state.combine.residual_in);
+
+            // 5. Run routed FFN graph (async — mul_mat_id + shared expert)
+            ggml_backend_graph_compute_async(backend, rffn.gf);
+
+            // 6. Copy FFN output → combine.hot_in (async, ordered after FFN)
+            ggml_backend_tensor_copy_async(backend, backend, rffn.output, state.gpu_state.combine.hot_in);
+
+            // 7. Ensure cold_in is zero (skip if already zeroed)
+            if (!state.cold_in_zeroed) {
+                static float zeros[8192] = {};
+                ggml_backend_tensor_set_async(backend, state.gpu_state.combine.cold_in, zeros, 0,
+                                               sizeof(float) * (size_t)n_embd);
+                state.cold_in_zeroed = true;
+            }
+
+            // 8. Run combine graph (async — adds residual + hot + cold)
+            ggml_backend_graph_compute_async(backend, state.gpu_state.combine.gf);
+
+            // 9. Copy combine output → act_cur for next layer (async)
+            ggml_backend_tensor_copy_async(backend, backend, state.gpu_state.combine.output, state.gpu_state.act_cur);
+
+            if (tel) {
+                tel->prefn_compute_us += pipe_elapsed_us(prefn_compute_t0, PipelineClock::now());
+                tel->allhot_layers++;
+                tel->total_layers++;
+                tel->routed_ffn_layers++;
+            }
+            continue;
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // SPLIT PATH: separate prefn + routing readback + FFN (original logic)
+        // Used for attention layers or layers without routed FFN graph.
+        // ══════════════════════════════════════════════════════════════════════
+
+        // Sync any pending async work before entering the split path
+        // (split path needs synchronous access to GPU data)
+        ggml_backend_synchronize(backend);
 
         ggml_tensor * ffn_post_gpu = nullptr;
         ggml_tensor * ffn_residual_gpu = nullptr;
@@ -205,11 +340,11 @@ bool pipelined_decode_one_token(
                 step_graph_destroy(dyn_sg);
                 return false;
             }
-            // Copy act_cur to graph input (GPU→GPU)
-            ggml_backend_tensor_copy(state.gpu_state.act_cur, dyn_sg.inp_embed);
+            // Copy act_cur to graph input (GPU→GPU) — async on compute stream
+            ggml_backend_tensor_copy_async(backend, backend, state.gpu_state.act_cur, dyn_sg.inp_embed);
             if (dyn_sg.positions) {
                 int32_t pos4[4] = {kv_pos, kv_pos, kv_pos, 0};
-                ggml_backend_tensor_set(dyn_sg.positions, pos4, 0, sizeof(pos4));
+                ggml_backend_tensor_set_async(backend, dyn_sg.positions, pos4, 0, sizeof(pos4));
             }
 
             if (tel) tel->prefn_graph_build_us += pipe_elapsed_us(prefn_build_t0, PipelineClock::now());
@@ -230,7 +365,8 @@ bool pipelined_decode_one_token(
         } else {
             // DeltaNet layer: reuse cached graph, just update input
             auto & cpg = state.cached_prefn[(size_t)il];
-            ggml_backend_tensor_copy(state.gpu_state.act_cur, cpg.inp_embed);
+            // Async copy on compute stream — ordered before next graph_compute
+            ggml_backend_tensor_copy_async(backend, backend, state.gpu_state.act_cur, cpg.inp_embed);
 
             if (tel) tel->prefn_graph_build_us += pipe_elapsed_us(prefn_build_t0, PipelineClock::now());
 
@@ -246,12 +382,15 @@ bool pipelined_decode_one_token(
         }
 
         // ── Read routing decisions (tiny: 32 + 32 bytes) ──
+        // Use get_async + single sync instead of 2 separate sync tensor_gets.
+        // After graph_compute (SYNC) above, data is ready — just need D2H copy.
         const auto routing_t0 = PipelineClock::now();
         if (!moe_selected_tensor || !moe_weights_tensor) return false;
-        ggml_backend_tensor_get(moe_selected_tensor, state.routing_ids_buf.data(), 0,
+        ggml_backend_tensor_get_async(backend, moe_selected_tensor, state.routing_ids_buf.data(), 0,
                                 sizeof(int32_t) * (size_t)n_expert_used);
-        ggml_backend_tensor_get(moe_weights_tensor, state.routing_weights_buf.data(), 0,
+        ggml_backend_tensor_get_async(backend, moe_weights_tensor, state.routing_weights_buf.data(), 0,
                                 sizeof(float) * (size_t)n_expert_used);
+        ggml_backend_synchronize(backend);
         if (tel) tel->routing_readback_us += pipe_elapsed_us(routing_t0, PipelineClock::now());
 
         // ── FFN: hot/cold partition + compute ──
@@ -289,40 +428,48 @@ bool pipelined_decode_one_token(
         // ── Read ffn_post to CPU NOW (before hot launch) ──
         // The routing readback above already synced the GPU stream, so ffn_post
         // is guaranteed ready. Reading it here avoids a sync AFTER hot launch.
+        const auto tensor_io_t0 = PipelineClock::now();
         if (has_cold) {
             ggml_backend_tensor_get(ffn_post_gpu, state.ffn_post_host_buf.data(), 0,
                                     sizeof(float) * (size_t)n_embd);
         }
+        if (tel) tel->ffn_post_get_us += pipe_elapsed_us(tensor_io_t0, PipelineClock::now());
 
-        // ── GPU→GPU: copy residual to combine input ──
-        ggml_backend_tensor_copy(ffn_residual_gpu, state.gpu_state.combine.residual_in);
+
+        // ── GPU→GPU: copy residual to combine input (async on compute stream) ──
+        ggml_backend_tensor_copy_async(backend, backend, ffn_residual_gpu, state.gpu_state.combine.residual_in);
 
         // ── Prepare + launch hot graph (async — returns immediately) ──
         bool hot_async_launched = false;
         if (has_hot || has_shared) {
             if (!storage.hot_graph.valid() || storage.hot_graph.n_hot != n_hot) {
+                const auto hbuild_t0 = PipelineClock::now();
                 build_cached_hot_graph(storage.hot_graph, backend,
                                        storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
                                        L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
                                        make_moe_layer_desc(L), n_embd, w.n_ff_exp, n_hot);
+                if (tel) { tel->hot_graph_build_us += pipe_elapsed_us(hbuild_t0, PipelineClock::now()); tel->hot_graph_rebuilds++; }
             }
             if (storage.hot_graph.valid() && storage.hot_graph.n_hot == n_hot) {
-                ggml_backend_tensor_copy(ffn_post_gpu, storage.hot_graph.inp);
+                // All setup on compute stream — no per-op cudaStreamSynchronize
+                ggml_backend_tensor_copy_async(backend, backend, ffn_post_gpu, storage.hot_graph.inp);
                 if (storage.hot_graph.ids && has_hot) {
-                    ggml_backend_tensor_set(storage.hot_graph.ids, hot_ids, 0,
-                                            sizeof(int32_t) * (size_t)n_hot);
+                    ggml_backend_tensor_set_async(backend, storage.hot_graph.ids, hot_ids, 0,
+                                                  sizeof(int32_t) * (size_t)n_hot);
                 }
                 if (storage.hot_graph.weights && has_hot) {
-                    ggml_backend_tensor_set(storage.hot_graph.weights, hot_weights, 0,
-                                            sizeof(float) * (size_t)n_hot);
+                    ggml_backend_tensor_set_async(backend, storage.hot_graph.weights, hot_weights, 0,
+                                                  sizeof(float) * (size_t)n_hot);
                 }
-                // Launch hot GPU async — no sync until combine
+                // Launch hot GPU async — queued after copies on same stream
                 ggml_backend_graph_compute_async(backend, storage.hot_graph.gf);
                 hot_async_launched = true;
             }
         }
+        if (tel) tel->tensor_io_us += pipe_elapsed_us(tensor_io_t0, PipelineClock::now());
 
         // ── Cold path: runs on CPU IN PARALLEL with hot GPU ──
+        const auto cold_t0 = PipelineClock::now();
         if (has_cold) {
             // ffn_post already read above (before hot launch) — no GPU sync here!
             if (!storage.cold_graph.valid() || storage.cold_graph.n_hot != n_cold) {
@@ -339,7 +486,9 @@ bool pipelined_decode_one_token(
                 ggml_backend_tensor_set(storage.cold_graph.weights, cold_weights, 0,
                                         sizeof(float) * (size_t)n_cold);
                 // CPU cold compute — hot GPU runs concurrently on its stream
+                const auto cold_compute_t0 = PipelineClock::now();
                 auto cst = ggml_backend_graph_compute(cpu_be, storage.cold_graph.gf);
+                if (tel) tel->cold_compute_us += pipe_elapsed_us(cold_compute_t0, PipelineClock::now());
                 if (cst != GGML_STATUS_SUCCESS) {
                     if (hot_async_launched) ggml_backend_synchronize(backend);
                     return false;
@@ -349,39 +498,37 @@ bool pipelined_decode_one_token(
                 return false;
             }
         }
+        if (tel) tel->cold_cpu_us += pipe_elapsed_us(cold_t0, PipelineClock::now());
 
-        // ── Sync hot GPU (only now — after cold CPU finished) ──
+        // ── Combine: queue on compute stream (no explicit sync needed) ──
+        const auto combine_t0 = PipelineClock::now();
         if (hot_async_launched) {
-            ggml_backend_synchronize(backend);
-            ggml_backend_tensor_copy(storage.hot_graph.output, state.gpu_state.combine.hot_in);
+            ggml_backend_tensor_copy_async(backend, backend, storage.hot_graph.output, state.gpu_state.combine.hot_in);
         } else {
             float zeros[8192];
             std::memset(zeros, 0, sizeof(float) * (size_t)n_embd);
-            ggml_backend_tensor_set(state.gpu_state.combine.hot_in, zeros, 0,
-                                    sizeof(float) * (size_t)n_embd);
+            ggml_backend_tensor_set_async(backend, state.gpu_state.combine.hot_in, zeros, 0,
+                                           sizeof(float) * (size_t)n_embd);
         }
 
-        // ── Upload cold result (or keep zeros) ──
         if (has_cold) {
             ggml_backend_tensor_get(storage.cold_graph.output, state.ffn_post_host_buf.data(), 0,
                                     sizeof(float) * (size_t)n_embd);
-            ggml_backend_tensor_set(state.gpu_state.combine.cold_in, state.ffn_post_host_buf.data(), 0,
-                                    sizeof(float) * (size_t)n_embd);
+            ggml_backend_tensor_set_async(backend, state.gpu_state.combine.cold_in, state.ffn_post_host_buf.data(), 0,
+                                           sizeof(float) * (size_t)n_embd);
             state.cold_in_zeroed = false;
         } else if (!state.cold_in_zeroed) {
             float zeros[8192];
             std::memset(zeros, 0, sizeof(float) * (size_t)n_embd);
-            ggml_backend_tensor_set(state.gpu_state.combine.cold_in, zeros, 0,
-                                    sizeof(float) * (size_t)n_embd);
+            ggml_backend_tensor_set_async(backend, state.gpu_state.combine.cold_in, zeros, 0,
+                                           sizeof(float) * (size_t)n_embd);
             state.cold_in_zeroed = true;
         }
 
-        // ── Combine: output = residual + hot + cold ──
-        auto cst = ggml_backend_graph_compute(backend, state.gpu_state.combine.gf);
-        if (cst != GGML_STATUS_SUCCESS) return false;
+        ggml_backend_graph_compute_async(backend, state.gpu_state.combine.gf);
 
-        // ── Copy combine output to persistent act_cur ──
-        ggml_backend_tensor_copy(state.gpu_state.combine.output, state.gpu_state.act_cur);
+        ggml_backend_tensor_copy_async(backend, backend, state.gpu_state.combine.output, state.gpu_state.act_cur);
+        if (tel) tel->combine_overhead_us += pipe_elapsed_us(combine_t0, PipelineClock::now());
 
         const auto ffn_t1 = PipelineClock::now();
         if (tel) {
@@ -400,8 +547,15 @@ bool pipelined_decode_one_token(
 
     step_graph_destroy(dyn_sg);
 
+    // Sync the compute stream before returning — caller needs act_cur on CPU.
+    // All async ops (combine + copy) from the last layer must complete.
+    ggml_backend_synchronize(backend);
+
     if (tel) {
         tel->total_us = pipe_elapsed_us(tok_t0, PipelineClock::now());
+        // GPU idle = time in tensor I/O + routing readback + combine overhead
+        // (these are all periods where GPU compute stream is idle)
+        tel->gpu_idle_us = tel->tensor_io_us + tel->routing_readback_us + tel->combine_overhead_us;
     }
     return true;
 }

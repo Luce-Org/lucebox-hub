@@ -65,9 +65,20 @@ struct PipelinedDecodeTelemetry {
     uint64_t ffn_us = 0;
     uint64_t ffn_allhot_us = 0;
     uint64_t ffn_mixed_us = 0;
+    // GPU utilization diagnosis: time the GPU is idle waiting for CPU
+    uint64_t gpu_idle_us = 0;       // total GPU idle (tensor_io + combine_overhead + sync_wait)
+    uint64_t tensor_io_us = 0;      // hot path setup: D2H readback + GPU copies + kernel launch
+    uint64_t combine_overhead_us = 0; // combine graph dispatch + copy
+    uint64_t cold_cpu_us = 0;       // cold path total (graph build + ggml CPU compute)
+    uint64_t cold_compute_us = 0;   // just ggml_backend_graph_compute(cpu_be) time
+    uint64_t hot_graph_build_us = 0; // hot graph rebuild (only when n_hot changes)
+    uint64_t ffn_post_get_us = 0;   // D2H readback of ffn_post for cold path
+    uint64_t sync_wait_us = 0;      // time in ggml_backend_synchronize (waiting for GPU)
     int allhot_layers = 0;
     int mixed_layers = 0;
     int total_layers = 0;
+    int hot_graph_rebuilds = 0;     // count of hot graph rebuilds
+    int routed_ffn_layers = 0;      // layers handled by routed FFN (async pipeline)
 };
 
 // State for pipelined decode: holds cached DeltaNet pre-FFN graphs +
@@ -78,6 +89,10 @@ struct PipelinedDecodeState {
     // Cached pre-FFN graphs for DeltaNet layers (layer index → graph)
     // Attention layers (every full_attention_interval-th) are nullptr (rebuilt each token)
     std::vector<CachedPrefnGraph> cached_prefn;
+
+    // Cached routed FFN graphs for DeltaNet layers (layer index → graph)
+    // StreamMoE-inspired: reads routing from GPU, eliminates CPU sync.
+    std::vector<CachedFfnGraph> cached_routed_ffn;
 
     // Persistent host buffers (avoid per-layer allocation)
     std::vector<int32_t> routing_ids_buf;
@@ -100,6 +115,7 @@ struct PipelinedDecodeState {
     PipelinedDecodeState(PipelinedDecodeState && o) noexcept
         : gpu_state(std::move(o.gpu_state)),
           cached_prefn(std::move(o.cached_prefn)),
+          cached_routed_ffn(std::move(o.cached_routed_ffn)),
           routing_ids_buf(std::move(o.routing_ids_buf)),
           routing_weights_buf(std::move(o.routing_weights_buf)),
           ffn_post_host_buf(std::move(o.ffn_post_host_buf)),
@@ -114,6 +130,7 @@ struct PipelinedDecodeState {
             destroy();
             gpu_state = std::move(o.gpu_state);
             cached_prefn = std::move(o.cached_prefn);
+            cached_routed_ffn = std::move(o.cached_routed_ffn);
             routing_ids_buf = std::move(o.routing_ids_buf);
             routing_weights_buf = std::move(o.routing_weights_buf);
             ffn_post_host_buf = std::move(o.ffn_post_host_buf);
@@ -136,6 +153,7 @@ bool init_pipelined_decode_state(
     ggml_backend_t backend,
     const TargetWeights & w,
     TargetCache & cache,
+    MoeHybridStorage & hybrid,
     int kv_start,           // initial KV position for graph caching
     int kq_stride_pad);
 
