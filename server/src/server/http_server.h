@@ -200,6 +200,12 @@ struct ParsedRequest {
     std::vector<std::string>  stop_sequences;
     // Bandit: per-session adaptive keep_ratio opt-in
     std::string               session_id;
+    // Set by the chat-template renderer when the rendered prompt suffix
+    // pre-opens a `<think>` block (Qwen3.6 / Laguna enable_thinking path).
+    // Drives the SseEmitter's initial mode so reasoning tokens emitted
+    // before any explicit `<think>` opener route to reasoning_content
+    // instead of leaking into content.
+    bool                      started_in_thinking = false;
 };
 
 // Build the /props response body. Exposed (non-static) so unit tests
