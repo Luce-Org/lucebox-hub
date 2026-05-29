@@ -13,7 +13,7 @@
 // called. CUDA_VISIBLE_DEVICES="" is the supported test configuration.
 //
 // Usage:
-//   CUDA_VISIBLE_DEVICES="" ./spike_no_gpu_http_server \
+//   CUDA_VISIBLE_DEVICES="" ./replay_http_server \
 //       <vocab.gguf> --scenarios <dir> [--port 9999]
 //
 // See server/test/scenarios/*.json for the scenario file schema.

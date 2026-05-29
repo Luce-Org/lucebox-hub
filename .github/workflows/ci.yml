@@ -56,7 +56,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target \
             test_dflash test_generate test_flash_attn_sparse \
-            dflash_server test_server_unit spike_no_gpu_http_server \
+            dflash_server test_server_unit replay_http_server \
             -j$(nproc)
 
       - name: Run C++ server unit tests

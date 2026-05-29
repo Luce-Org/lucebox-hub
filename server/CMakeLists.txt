@@ -769,35 +769,36 @@ if(DFLASH27B_TESTS)
         endif()
     endif()
 
-    # ─── Spike: HttpServer with stub backend, no GPU bound ──────────────
-    # Validates that the server constructs and serves /health without a
-    # GPU — the foundation for a CPU-only integration test driver. Links
-    # dflash_common (which includes CUDA-compiled TUs) but never calls
-    # into any real ModelBackend; running under CUDA_VISIBLE_DEVICES=""
-    # is the supported configuration.
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/spike_no_gpu_http_server.cpp")
-        add_executable(spike_no_gpu_http_server
-            test/spike_no_gpu_http_server.cpp
+    # ─── replay_http_server: CPU-only HttpServer test driver ────────────
+    # Wires Tokenizer + ScenarioStore + StubModelBackend + HttpServer to
+    # serve real HTTP requests on the wire, replaying scripted token
+    # streams from JSON scenario files. Links dflash_common (which
+    # includes CUDA-compiled TUs) but never instantiates a real
+    # ModelBackend, so CUDA_VISIBLE_DEVICES="" is supported. Driven by
+    # test_stub_integration.py.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/replay_http_server.cpp")
+        add_executable(replay_http_server
+            test/replay_http_server.cpp
             test/scenario_store.cpp
             test/stub_model_backend.cpp
             src/server/http_server.cpp
             src/server/model_card.cpp)
-        target_include_directories(spike_no_gpu_http_server PRIVATE
+        target_include_directories(replay_http_server PRIVATE
             ${DFLASH27B_SRC_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/test)
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
-            target_compile_definitions(spike_no_gpu_http_server PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+            target_compile_definitions(replay_http_server PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
         else()
-            target_compile_definitions(spike_no_gpu_http_server PRIVATE
+            target_compile_definitions(replay_http_server PRIVATE
                 DFLASH27B_BACKEND_CUDA=1
                 DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
         endif()
-        target_link_libraries(spike_no_gpu_http_server PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread)
+        target_link_libraries(replay_http_server PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread)
         if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             find_package(CUDAToolkit REQUIRED)
-            target_link_libraries(spike_no_gpu_http_server PRIVATE CUDA::cudart)
+            target_link_libraries(replay_http_server PRIVATE CUDA::cudart)
         else()
-            target_link_libraries(spike_no_gpu_http_server PRIVATE hip::host)
+            target_link_libraries(replay_http_server PRIVATE hip::host)
         endif()
     endif()
 

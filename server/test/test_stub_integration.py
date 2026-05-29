@@ -1,7 +1,7 @@
 """End-to-end integration test for the dflash HttpServer, driven by a
 deterministic stub backend (no GPU, no model weights).
 
-Runs the spike_no_gpu_http_server binary with:
+Runs the replay_http_server binary with:
   - the tokenizer-only Qwen3.6 GGUF fixture under server/test/fixtures/
   - the JSON scenario files under server/test/scenarios/
 
@@ -13,7 +13,7 @@ that broke in the original Qwen3.6 think-channel bug — but on a CPU-only
 runner with no model file.
 
 Run locally:
-  ./server/build/spike_no_gpu_http_server (built by cmake)
+  ./server/build/replay_http_server (built by cmake)
   uv run pytest server/test/test_stub_integration.py -v
 
 The test starts and stops the driver itself; no separate server required.
@@ -34,7 +34,7 @@ import requests
 
 REPO_ROOT     = Path(__file__).resolve().parents[2]
 BUILD_DIR     = REPO_ROOT / "server" / "build"
-DRIVER_BIN    = BUILD_DIR / "spike_no_gpu_http_server"
+DRIVER_BIN    = BUILD_DIR / "replay_http_server"
 TOKENIZER_GGUF = REPO_ROOT / "server" / "test" / "fixtures" / "qwen3.6-tokenizer.gguf"
 SCENARIOS_DIR = REPO_ROOT / "server" / "test" / "scenarios"
 
@@ -50,7 +50,7 @@ def stub_server():
     """Spawn the stub-driven HttpServer for the duration of this module."""
     assert DRIVER_BIN.is_file(), (
         f"driver binary missing: {DRIVER_BIN} — "
-        "build target spike_no_gpu_http_server first")
+        "build target replay_http_server first")
     assert TOKENIZER_GGUF.is_file(), (
         f"tokenizer fixture missing: {TOKENIZER_GGUF} — "
         "is git-lfs configured for *.gguf?")
