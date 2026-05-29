@@ -9,11 +9,16 @@
 #include "model_backend.h"
 #include "laguna_internal.h"
 #include "qwen3_drafter.h"
+#include "../common/moe_hybrid_ffn_eval.h"
+#include "../common/moe_hybrid_storage.h"
+#include "../common/moe_hybrid_routing_stats.h"
+#include "../common/moe_hybrid_swap_manager.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
 
 #include <array>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -75,7 +80,23 @@ private:
     DrafterContext                              drafter_ctx_{};
     bool                                       drafter_loaded_ = false;
 
+    // ── Hybrid MoE mode (hot/cold expert split) ──
+    bool                                       hybrid_mode_ = false;
+    std::shared_ptr<MoeHybridStorage>          moe_hybrid_;
+    std::shared_ptr<MoeHybridRoutingStats>     routing_stats_;
+    std::string                                routing_stats_out_path_;
+    MoeHybridSwapPolicy                        swap_policy_;
+    bool                                       hybrid_telemetry_ = false;
+
     bool ensure_slot(int slot);
+
+    // Hybrid mode helpers
+    bool init_hybrid_mode();
+    GenerateResult generate_hybrid(const GenerateRequest & req, const DaemonIO & io);
+    bool hybrid_forward_one_token(int32_t tok, int kv_pos,
+                                  std::vector<float> & act_cur,
+                                  int32_t & argmax_out);
+    void maybe_post_request_swap();
 };
 
 }  // namespace dflash::common

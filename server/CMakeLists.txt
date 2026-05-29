@@ -250,12 +250,13 @@ add_library(dflash_common STATIC
     src/qwen35moe/qwen35moe_ffn.cpp
     src/qwen35moe/qwen35moe_backend.cpp
     src/qwen35moe/qwen35moe_daemon.cpp
-    src/qwen35moe/qwen35moe_routing_stats.cpp
-    src/qwen35moe/qwen35moe_expert_placement.cpp
-    src/qwen35moe/qwen35moe_hybrid_storage.cpp
-    src/qwen35moe/qwen35moe_hybrid_ffn_eval.cpp
     src/qwen35moe/qwen35moe_pipelined_decode.cpp
-    src/qwen35moe/qwen35moe_swap_manager.cpp
+    # ── Common MoE hybrid infrastructure ──
+    src/common/moe_hybrid_placement.cpp
+    src/common/moe_hybrid_routing_stats.cpp
+    src/common/moe_hybrid_storage.cpp
+    src/common/moe_hybrid_ffn_eval.cpp
+    src/common/moe_hybrid_swap_manager.cpp
     src/qwen35/layer_split_forward.cpp
     src/qwen35/layer_split_daemon.cpp
     src/qwen35/qwen35_backend.cpp

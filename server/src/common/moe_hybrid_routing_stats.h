@@ -1,8 +1,11 @@
-// Reusable qwen35moe routing-statistics scaffold for Phase 2 expert placement.
+// Common MoE routing statistics for expert placement decisions.
 
 #pragma once
 
-#include "internal.h"
+#include "moe_hybrid_types.h"
+
+#include "ggml.h"
+#include "ggml-backend.h"
 
 #include <cstdint>
 #include <string>
@@ -10,7 +13,7 @@
 
 namespace dflash::common {
 
-struct Qwen35MoeRoutingStats {
+struct MoeHybridRoutingStats {
     int n_layer       = 0;
     int n_expert      = 0;
     int n_expert_used = 0;
@@ -19,8 +22,10 @@ struct Qwen35MoeRoutingStats {
     std::vector<uint64_t> counts;
     std::vector<uint64_t> layer_totals;
 
-    bool init_from_weights(const TargetWeights & w);
-    bool matches(const TargetWeights & w) const;
+    bool init(int n_layer, int n_expert, int n_expert_used);
+    bool init(const MoeHybridConfig & cfg);
+    bool matches(int n_layer, int n_expert, int n_expert_used) const;
+    bool matches(const MoeHybridConfig & cfg) const;
     bool empty() const;
 
     uint64_t count(int layer_idx, int expert_idx) const;
@@ -35,7 +40,7 @@ struct Qwen35MoeRoutingStats {
 
     bool save_csv(const std::string & path, std::string * err = nullptr) const;
     static bool load_csv(const std::string & path,
-                         Qwen35MoeRoutingStats & out,
+                         MoeHybridRoutingStats & out,
                          std::string * err = nullptr);
 
 private:

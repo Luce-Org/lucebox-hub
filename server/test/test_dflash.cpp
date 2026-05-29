@@ -28,9 +28,11 @@
                             // qwen35 + DFlash + DDTree pipeline below.
 #include "qwen35_daemon.h"   // arch dispatch - single-GPU qwen35 daemon mode
 #include "qwen35moe_daemon.h"
-#include "qwen35moe_hybrid_ffn_eval.h"
-#include "qwen35moe_hybrid_storage.h"
-#include "qwen35moe_expert_placement.h"
+#include "../src/common/moe_hybrid_ffn_eval.h"
+#include "../src/common/moe_hybrid_storage.h"
+#include "../src/common/moe_hybrid_placement.h"
+#include "../src/common/moe_hybrid_routing_stats.h"
+#include "../src/common/moe_hybrid_types_impl.h"
 #include "qwen35moe_pipelined_decode.h"
 #include "qwen35_layer_split.h" // multi-GPU layer-split daemon args
 #include "layer_split_daemon_loop.h" // extracted layer-split daemon loop
@@ -1575,7 +1577,7 @@ int main(int argc, char ** argv) {
             // Build placement stats that mark the router's default picks as COLD
             // by giving them zero count (so they're placed cold), while giving
             // all other experts count=1 (so the hottest N are picked as hot).
-            Qwen35MoeRoutingStats biased_stats;
+            MoeHybridRoutingStats biased_stats;
             biased_stats.n_layer = w.n_layer;
             biased_stats.n_expert = w.n_expert;
             biased_stats.n_expert_used = w.n_expert_used;
@@ -1592,9 +1594,9 @@ int main(int argc, char ** argv) {
             }
             std::printf("  forced %d default-route experts to cold for worst-case bench\n", forced_cold_count);
 
-            Qwen35MoeExpertPlacement placement;
+            MoeHybridPlacement placement;
             std::string place_err;
-            if (!Qwen35MoeExpertPlacement::build_from_stats(
+            if (!MoeHybridPlacement::build_from_stats(
                     biased_stats, total_hot_budget,
                     /*min_hot_per_layer=*/std::min(w.n_expert_used, w.n_expert),
                     placement, &place_err)) {
@@ -1651,10 +1653,15 @@ int main(int argc, char ** argv) {
                             layer_file_data[(size_t)il].gate_up_exps = find_tensor_data("ffn_gate_up_exps");
                         }
 
-                        auto hybrid = std::make_shared<Qwen35MoeHybridStorage>();
+                        auto hybrid = std::make_shared<MoeHybridStorage>();
                         std::string hybrid_err;
-                        if (!build_qwen35moe_hybrid_storage_from_file(
-                                w, backend, placement, layer_file_data, *hybrid, &hybrid_err)) {
+                        MoeHybridConfig hybrid_cfg = make_moe_hybrid_config(w);
+                        std::vector<MoeLayerDesc> hybrid_descs((size_t)w.n_layer);
+                        for (int il = 0; il < w.n_layer; ++il) {
+                            hybrid_descs[(size_t)il] = make_moe_layer_desc(w.layers[(size_t)il]);
+                        }
+                        if (!build_moe_hybrid_storage_from_file(
+                                hybrid_cfg, backend, placement, hybrid_descs, layer_file_data, *hybrid, &hybrid_err)) {
                             std::fprintf(stderr, "[time-breakdown] hybrid storage build failed: %s\n",
                                          hybrid_err.c_str());
                         } else {
@@ -1712,8 +1719,8 @@ int main(int argc, char ** argv) {
                                                                     sizeof(int32_t) * selected.size());
                                             ggml_backend_tensor_get(layer_sg.moe_weights, weights_buf.data(), 0,
                                                                     sizeof(float) * weights_buf.size());
-                                            eval_qwen35moe_hybrid_ffn_gpu_resident(
-                                                backend, w, w.layers[(size_t)il],
+                                            eval_moe_hybrid_ffn_gpu_resident(
+                                                backend, make_moe_hybrid_config(w), make_moe_layer_desc(w.layers[(size_t)il]),
                                                 hybrid->layers[(size_t)il], cpu_be,
                                                 layer_sg.ffn_post, layer_sg.ffn_residual,
                                                 gpu_state,
@@ -1750,8 +1757,8 @@ int main(int argc, char ** argv) {
                                         ggml_backend_tensor_get(layer_sg.moe_weights, weights_buf.data(), 0,
                                                                 sizeof(float) * weights_buf.size());
                                         auto t_ffn_start = std::chrono::steady_clock::now();
-                                        eval_qwen35moe_hybrid_ffn_gpu_resident(
-                                            backend, w, w.layers[(size_t)il],
+                                        eval_moe_hybrid_ffn_gpu_resident(
+                                            backend, make_moe_hybrid_config(w), make_moe_layer_desc(w.layers[(size_t)il]),
                                             hybrid->layers[(size_t)il], cpu_be,
                                             layer_sg.ffn_post, layer_sg.ffn_residual,
                                             gpu_state,
@@ -1882,24 +1889,24 @@ int main(int argc, char ** argv) {
                             std::printf("\n[time-breakdown] === PIPELINED realistic placement (uniform hot/cold) ===\n");
                             {
                                 // Build uniform placement: hottest N experts per layer based on uniform counts
-                                Qwen35MoeRoutingStats uniform_stats;
+                                MoeHybridRoutingStats uniform_stats;
                                 uniform_stats.n_layer = w.n_layer;
                                 uniform_stats.n_expert = w.n_expert;
                                 uniform_stats.n_expert_used = w.n_expert_used;
                                 uniform_stats.counts.assign((size_t)w.n_layer * (size_t)w.n_expert, 1);
                                 uniform_stats.layer_totals.assign((size_t)w.n_layer, (uint64_t)w.n_expert);
 
-                                Qwen35MoeExpertPlacement uniform_placement;
+                                MoeHybridPlacement uniform_placement;
                                 std::string up_err;
-                                if (Qwen35MoeExpertPlacement::build_from_stats(
+                                if (MoeHybridPlacement::build_from_stats(
                                         uniform_stats, total_hot_budget,
                                         std::min(w.n_expert_used, w.n_expert),
                                         uniform_placement, &up_err)) {
 
                                     // Rebuild hybrid storage with uniform placement
-                                    auto hybrid_realistic = std::make_shared<Qwen35MoeHybridStorage>();
-                                    if (build_qwen35moe_hybrid_storage_from_file(
-                                            w, backend, uniform_placement, layer_file_data,
+                                    auto hybrid_realistic = std::make_shared<MoeHybridStorage>();
+                                    if (build_moe_hybrid_storage_from_file(
+                                            hybrid_cfg, backend, uniform_placement, hybrid_descs, layer_file_data,
                                             *hybrid_realistic, &up_err)) {
                                         std::printf("  uniform placement: hot=%d cold=%d — expect ~60%% all-hot layers\n",
                                                     uniform_placement.total_hot,

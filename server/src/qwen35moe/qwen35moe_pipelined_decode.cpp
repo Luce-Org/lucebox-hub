@@ -3,6 +3,8 @@
 
 #include "qwen35moe_pipelined_decode.h"
 
+#include "../common/moe_hybrid_types_impl.h"
+
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
@@ -160,7 +162,7 @@ bool pipelined_decode_one_token(
     ggml_backend_t backend,
     const TargetWeights & w,
     TargetCache & cache,
-    Qwen35MoeHybridStorage & hybrid,
+    MoeHybridStorage & hybrid,
     int kv_pos,
     int kq_stride_pad,
     PipelinedDecodeTelemetry * tel) {
@@ -302,7 +304,7 @@ bool pipelined_decode_one_token(
                 build_cached_hot_graph(storage.hot_graph, backend,
                                        storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
                                        L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
-                                       L, n_embd, w.n_ff_exp, n_hot);
+                                       make_moe_layer_desc(L), n_embd, w.n_ff_exp, n_hot);
             }
             if (storage.hot_graph.valid() && storage.hot_graph.n_hot == n_hot) {
                 ggml_backend_tensor_copy(ffn_post_gpu, storage.hot_graph.inp);

@@ -1,5 +1,8 @@
 #include "qwen35moe_backend.h"
 
+#include "../common/moe_hybrid_placement.h"
+#include "../common/moe_hybrid_types.h"
+#include "../common/moe_hybrid_types_impl.h"
 #include "common/sampler.h"
 #include "common/dflash_spec_decode.h"
 #include "dflash_draft_graph.h"
@@ -44,8 +47,8 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
     }
 
     if (const char * stats_path = std::getenv("DFLASH_QWEN35MOE_RUNTIME_STATS_OUT")) {
-        routing_stats_ = std::make_shared<Qwen35MoeRoutingStats>();
-        if (!routing_stats_->init_from_weights(out)) {
+        routing_stats_ = std::make_shared<MoeHybridRoutingStats>();
+        if (!routing_stats_->init(out.n_layer, out.n_expert, out.n_expert_used)) {
             set_last_error("qwen35moe runtime stats init failed");
             return false;
         }
@@ -54,7 +57,7 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
 
     // Phase 2: Compute dynamic placement based on VRAM budget.
     // Expert tensor metadata (ne/nb) is valid even without GPU allocation.
-    Qwen35MoeExpertPlacement placement;
+    MoeHybridPlacement placement;
     std::string placement_source;
     std::string err;
 
@@ -139,8 +142,13 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
             layer_file_data[(size_t)il].gate_up_exps = find_tensor_data("ffn_gate_up_exps");
         }
 
-        auto hybrid = std::make_shared<Qwen35MoeHybridStorage>();
-        if (!build_qwen35moe_hybrid_storage_from_file(out, backend, placement, layer_file_data, *hybrid, &err)) {
+        auto hybrid = std::make_shared<MoeHybridStorage>();
+        MoeHybridConfig hybrid_cfg = make_moe_hybrid_config(out);
+        std::vector<MoeLayerDesc> layer_descs((size_t)out.n_layer);
+        for (int il = 0; il < out.n_layer; ++il) {
+            layer_descs[(size_t)il] = make_moe_layer_desc(out.layers[(size_t)il]);
+        }
+        if (!build_moe_hybrid_storage_from_file(hybrid_cfg, backend, placement, layer_descs, layer_file_data, *hybrid, &err)) {
             ::munmap(mmap_addr, file_size);
             gguf_free(gctx);
             set_last_error(std::string("qwen35moe hybrid storage build failed: ") + err);
@@ -218,24 +226,29 @@ void Qwen35MoeBackend::maybe_post_request_swap() {
 
     if (!target_weights().moe_hybrid || swap_policy_.max_swaps_total <= 0) return;
 
-    Qwen35MoeSwapPlan plan;
+    MoeHybridSwapPlan plan;
     std::string err;
-    if (!build_qwen35moe_swap_plan(target_weights().moe_hybrid->placement, *routing_stats_,
+    if (!build_moe_hybrid_swap_plan(target_weights().moe_hybrid->placement, *routing_stats_,
                                    swap_policy_, plan, &err)) {
         std::fprintf(stderr, "[qwen35moe] swap plan failed: %s\n", err.c_str());
         return;
     }
     if (plan.actions.empty()) return;
 
-    auto rebuilt = std::make_shared<Qwen35MoeHybridStorage>();
-    if (!build_qwen35moe_hybrid_storage(target_weights(), target_backend(),
-                                        plan.next_placement, *rebuilt, &err)) {
+    auto rebuilt = std::make_shared<MoeHybridStorage>();
+    MoeHybridConfig swap_cfg = make_moe_hybrid_config(target_weights());
+    std::vector<MoeLayerDesc> swap_descs((size_t)target_weights().n_layer);
+    for (int il = 0; il < target_weights().n_layer; ++il) {
+        swap_descs[(size_t)il] = make_moe_layer_desc(target_weights().layers[(size_t)il]);
+    }
+    if (!build_moe_hybrid_storage(swap_cfg, target_backend(),
+                                        plan.next_placement, swap_descs, *rebuilt, &err)) {
         std::fprintf(stderr, "[qwen35moe] swap rebuild failed: %s\n", err.c_str());
         return;
     }
     target_weights().moe_hybrid = std::move(rebuilt);
     if (!placement_out_path_.empty()) {
-        if (!plan.next_placement.save_json(placement_out_path_, &err)) {
+        if (!plan.next_placement.save_json(placement_out_path_, "qwen35moe", &err)) {
             std::fprintf(stderr, "[qwen35moe] failed to save next placement: %s\n", err.c_str());
         }
     }
@@ -417,7 +430,7 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
 
     const int n_layer = target_weights().n_layer;
     uint64_t build_us_total = 0, compute_us_total = 0, readback_us_total = 0, ffn_us_total = 0;
-    Qwen35MoeHybridFfnTelemetry ffn_tel_accum{};
+    MoeHybridFfnTelemetry ffn_tel_accum{};
 
     StepGraph logits_sg;  // Persistent logits graph (used by spec-decode branch)
 
@@ -476,7 +489,6 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
     // Process layer by layer, chunked within each layer
     for (int il = 0; il < n_layer; ++il) {
         auto & storage = target_weights().moe_hybrid->layers[(size_t)il];
-        const auto & L = target_weights().layers[(size_t)il];
 
         for (int chunk_start = 0; chunk_start < prompt_len; chunk_start += prefill_chunk) {
             const int chunk_len = std::min(prefill_chunk, prompt_len - chunk_start);
@@ -579,13 +591,15 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
             // access at a later decode sync (~4th request under the server).
             // Sub-batch the FFN to a safe width so the attention prefill can
             // stay at the full chunk size.
+            MoeHybridConfig chunk_cfg = make_moe_hybrid_config(target_weights());
+            MoeLayerDesc chunk_desc = make_moe_layer_desc(target_weights().layers[(size_t)il]);
             std::vector<float> ffn_batch_out((size_t)chunk_len * (size_t)hidden);
             constexpr int kFfnSafeBatch = 8;
             for (int fb = 0; fb < chunk_len; fb += kFfnSafeBatch) {
                 const int fl = std::min(kFfnSafeBatch, chunk_len - fb);
                 std::vector<float> sub_out;
-                if (!eval_qwen35moe_hybrid_ffn_batched(
-                        target_backend(), cpu_be, target_weights(), L, storage,
+                if (!eval_moe_hybrid_ffn_batched(
+                        target_backend(), cpu_be, chunk_cfg, chunk_desc, storage,
                         chunk_post.data()     + (size_t)fb * (size_t)hidden,
                         chunk_selected.data() + (size_t)fb * (size_t)n_expert_used,
                         chunk_weights.data()  + (size_t)fb * (size_t)n_expert_used,
@@ -1155,12 +1169,12 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
 bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
                                                ggml_backend_t backend,
                                                const TargetWeights & w,
-                                               Qwen35MoeExpertPlacement & out,
+                                               MoeHybridPlacement & out,
                                                std::string * err) {
     // Load hotness table or assume uniform hotness
-    Qwen35MoeRoutingStats hotness;
+    MoeHybridRoutingStats hotness;
     if (hotness_path && hotness_path[0]) {
-        if (!Qwen35MoeRoutingStats::load_csv(std::string(hotness_path), hotness, err)) {
+        if (!MoeHybridRoutingStats::load_csv(std::string(hotness_path), hotness, err)) {
             return false;
         }
         if (hotness.n_layer != w.n_layer || hotness.n_expert != w.n_expert) {
@@ -1275,7 +1289,7 @@ bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
     }
 
     // Build placement using greedy knapsack with byte budget
-    if (!Qwen35MoeExpertPlacement::build_from_stats_with_layer_bytes(
+    if (!MoeHybridPlacement::build_from_stats_with_layer_bytes(
             hotness, layer_expert_bytes, expert_budget,
             /*min_hot_per_layer=*/std::min(w.n_expert_used, w.n_expert),
             out, err)) {

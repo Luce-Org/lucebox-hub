@@ -1,4 +1,4 @@
-#include "qwen35moe_hybrid_storage.h"
+#include "moe_hybrid_storage.h"
 
 #include "ggml-cpu.h"
 
@@ -41,7 +41,6 @@ static bool read_expert_slices(ggml_backend_t backend,
     return true;
 }
 
-// Read expert slices from raw memory (e.g. mmap) instead of a GPU tensor.
 static bool read_expert_slices_from_mem(const uint8_t * tensor_data,
                                         size_t tensor_size,
                                         const std::vector<int32_t> & expert_ids,
@@ -90,7 +89,7 @@ static ggml_tensor * new_like_with_expert_count(ggml_context * ctx, ggml_tensor 
 
 } // namespace
 
-Qwen35MoeHybridStorage::~Qwen35MoeHybridStorage() {
+MoeHybridStorage::~MoeHybridStorage() {
     for (auto & layer : layers) {
         layer.hot_graph.free();
         layer.cold_graph.free();
@@ -125,67 +124,67 @@ Qwen35MoeHybridStorage::~Qwen35MoeHybridStorage() {
     }
 }
 
-bool Qwen35MoeHybridStorage::matches(const TargetWeights & w) const {
-    return placement.matches(w) && (int)layers.size() == w.n_layer;
+bool MoeHybridStorage::matches(const MoeHybridConfig & cfg) const {
+    return placement.matches(cfg) && (int)layers.size() == cfg.n_layer;
 }
 
-bool Qwen35MoeHybridStorage::empty() const {
+bool MoeHybridStorage::empty() const {
     return layers.empty();
 }
 
-bool build_qwen35moe_hybrid_storage(const TargetWeights & w,
-                                    ggml_backend_t backend,
-                                    const Qwen35MoeExpertPlacement & placement,
-                                    Qwen35MoeHybridStorage & out,
-                                    std::string * err) {
-    if (!placement.matches(w)) {
-        if (err) *err = "placement does not match model";
+bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
+                              ggml_backend_t gpu_backend,
+                              const MoeHybridPlacement & placement,
+                              const std::vector<MoeLayerDesc> & layer_descs,
+                              MoeHybridStorage & out,
+                              std::string * err) {
+    if (!placement.matches(cfg)) {
+        if (err) *err = "placement does not match config";
         return false;
     }
-    if (!w.is_moe) {
-        if (err) *err = "target is not qwen35moe";
+    if ((int)layer_descs.size() != cfg.n_layer) {
+        if (err) *err = "layer_descs size does not match n_layer";
         return false;
     }
 
-    
     out.placement = placement;
-    out.layers.resize((size_t)w.n_layer);
+    out.layers.resize((size_t)cfg.n_layer);
     out.cpu_backend = ggml_backend_cpu_init();
     if (!out.cpu_backend) {
         if (err) *err = "failed to init cpu backend";
         return false;
     }
-    ggml_backend_cpu_set_n_threads(out.cpu_backend, std::max(1, std::min(w.n_expert_used, 8)));
+    ggml_backend_cpu_set_n_threads(out.cpu_backend, std::max(1, std::min(cfg.n_expert_used, 8)));
 
-    for (int il = 0; il < w.n_layer; ++il) {
-        const TargetLayer & L = w.layers[(size_t)il];
-        Qwen35MoeHybridLayerStorage & dst = out.layers[(size_t)il];
+    for (int il = 0; il < cfg.n_layer; ++il) {
+        const MoeLayerDesc & desc = layer_descs[(size_t)il];
+        MoeHybridLayerStorage & dst = out.layers[(size_t)il];
         dst.hot_expert_ids = placement.hot_expert_ids[(size_t)il];
-        dst.hot_local_by_global.assign((size_t)w.n_expert, -1);
-        dst.cold_local_by_global.assign((size_t)w.n_expert, -1);
+        dst.hot_local_by_global.assign((size_t)cfg.n_expert, -1);
+        dst.cold_local_by_global.assign((size_t)cfg.n_expert, -1);
 
-        std::vector<uint8_t> is_hot((size_t)w.n_expert, 0);
+        std::vector<uint8_t> is_hot((size_t)cfg.n_expert, 0);
         for (size_t i = 0; i < dst.hot_expert_ids.size(); ++i) {
             const int32_t expert = dst.hot_expert_ids[i];
-            if (expert < 0 || expert >= w.n_expert) {
+            if (expert < 0 || expert >= cfg.n_expert) {
                 if (err) *err = "hot expert id out of range";
                 return false;
             }
             dst.hot_local_by_global[(size_t)expert] = (int32_t)i;
             is_hot[(size_t)expert] = 1;
         }
-        for (int expert = 0; expert < w.n_expert; ++expert) {
+        for (int expert = 0; expert < cfg.n_expert; ++expert) {
             if (!is_hot[(size_t)expert]) {
                 dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
                 dst.cold_expert_ids.push_back((int32_t)expert);
             }
         }
 
-        dst.fused_gate_up = (L.ffn_gate_up_exps != nullptr);
-        if (!validate_expert_tensor(L.ffn_gate_exps, w.n_expert, &dst.gate_expert_bytes, err) ||
-            !validate_expert_tensor(L.ffn_up_exps, w.n_expert, &dst.up_expert_bytes, err) ||
-            !validate_expert_tensor(L.ffn_down_exps, w.n_expert, &dst.down_expert_bytes, err) ||
-            !validate_expert_tensor(L.ffn_gate_up_exps, w.n_expert, &dst.gate_up_expert_bytes, err)) {
+        dst.fused_gate_up = desc.has_fused_gate_up();
+        if (!validate_expert_tensor(desc.ffn_gate_exps, cfg.n_expert, &dst.gate_expert_bytes, err) ||
+            !validate_expert_tensor(desc.ffn_up_exps, cfg.n_expert, &dst.up_expert_bytes, err) ||
+            !validate_expert_tensor(desc.ffn_down_exps, cfg.n_expert, &dst.down_expert_bytes, err) ||
+            !validate_expert_tensor(desc.ffn_gate_up_exps, cfg.n_expert, &dst.gate_up_expert_bytes, err)) {
             return false;
         }
 
@@ -204,47 +203,41 @@ bool build_qwen35moe_hybrid_storage(const TargetWeights & w,
                 return false;
             }
             if (dst.fused_gate_up) {
-                dst.gate_up_hot = new_like_with_expert_count(dst.hot_ctx, L.ffn_gate_up_exps, hot_count);
-                dst.down_hot    = new_like_with_expert_count(dst.hot_ctx, L.ffn_down_exps, hot_count);
+                dst.gate_up_hot = new_like_with_expert_count(dst.hot_ctx, desc.ffn_gate_up_exps, hot_count);
+                dst.down_hot    = new_like_with_expert_count(dst.hot_ctx, desc.ffn_down_exps, hot_count);
             } else {
-                dst.gate_hot = new_like_with_expert_count(dst.hot_ctx, L.ffn_gate_exps, hot_count);
-                dst.up_hot   = new_like_with_expert_count(dst.hot_ctx, L.ffn_up_exps, hot_count);
-                dst.down_hot = new_like_with_expert_count(dst.hot_ctx, L.ffn_down_exps, hot_count);
+                dst.gate_hot = new_like_with_expert_count(dst.hot_ctx, desc.ffn_gate_exps, hot_count);
+                dst.up_hot   = new_like_with_expert_count(dst.hot_ctx, desc.ffn_up_exps, hot_count);
+                dst.down_hot = new_like_with_expert_count(dst.hot_ctx, desc.ffn_down_exps, hot_count);
             }
-            dst.hot_buf = ggml_backend_alloc_ctx_tensors(dst.hot_ctx, backend);
+            dst.hot_buf = ggml_backend_alloc_ctx_tensors(dst.hot_ctx, gpu_backend);
             if (!dst.hot_buf) {
                 if (err) *err = "failed to allocate hot expert buffer";
                 return false;
             }
 
-            // Copy hot expert slices from full GPU tensors to hot_buf
             std::vector<uint8_t> hot_bytes;
             if (dst.fused_gate_up) {
-                if (!read_expert_slices(backend, L.ffn_gate_up_exps, dst.hot_expert_ids,
-                                        dst.gate_up_expert_bytes, hot_bytes, err)) {
+                if (!read_expert_slices(gpu_backend, desc.ffn_gate_up_exps, dst.hot_expert_ids,
+                                        dst.gate_up_expert_bytes, hot_bytes, err))
                     return false;
-                }
                 ggml_backend_tensor_set(dst.gate_up_hot, hot_bytes.data(), 0, hot_bytes.size());
-                if (!read_expert_slices(backend, L.ffn_down_exps, dst.hot_expert_ids,
-                                        dst.down_expert_bytes, hot_bytes, err)) {
+                if (!read_expert_slices(gpu_backend, desc.ffn_down_exps, dst.hot_expert_ids,
+                                        dst.down_expert_bytes, hot_bytes, err))
                     return false;
-                }
                 ggml_backend_tensor_set(dst.down_hot, hot_bytes.data(), 0, hot_bytes.size());
             } else {
-                if (!read_expert_slices(backend, L.ffn_gate_exps, dst.hot_expert_ids,
-                                        dst.gate_expert_bytes, hot_bytes, err)) {
+                if (!read_expert_slices(gpu_backend, desc.ffn_gate_exps, dst.hot_expert_ids,
+                                        dst.gate_expert_bytes, hot_bytes, err))
                     return false;
-                }
                 ggml_backend_tensor_set(dst.gate_hot, hot_bytes.data(), 0, hot_bytes.size());
-                if (!read_expert_slices(backend, L.ffn_up_exps, dst.hot_expert_ids,
-                                        dst.up_expert_bytes, hot_bytes, err)) {
+                if (!read_expert_slices(gpu_backend, desc.ffn_up_exps, dst.hot_expert_ids,
+                                        dst.up_expert_bytes, hot_bytes, err))
                     return false;
-                }
                 ggml_backend_tensor_set(dst.up_hot, hot_bytes.data(), 0, hot_bytes.size());
-                if (!read_expert_slices(backend, L.ffn_down_exps, dst.hot_expert_ids,
-                                        dst.down_expert_bytes, hot_bytes, err)) {
+                if (!read_expert_slices(gpu_backend, desc.ffn_down_exps, dst.hot_expert_ids,
+                                        dst.down_expert_bytes, hot_bytes, err))
                     return false;
-                }
                 ggml_backend_tensor_set(dst.down_hot, hot_bytes.data(), 0, hot_bytes.size());
             }
         }
@@ -261,64 +254,42 @@ bool build_qwen35moe_hybrid_storage(const TargetWeights & w,
                 return false;
             }
             if (dst.fused_gate_up) {
-                dst.gate_up_cold = new_like_with_expert_count(dst.cold_ctx, L.ffn_gate_up_exps, cold_count);
-                dst.down_cold    = new_like_with_expert_count(dst.cold_ctx, L.ffn_down_exps, cold_count);
+                dst.gate_up_cold = new_like_with_expert_count(dst.cold_ctx, desc.ffn_gate_up_exps, cold_count);
+                dst.down_cold    = new_like_with_expert_count(dst.cold_ctx, desc.ffn_down_exps, cold_count);
             } else {
-                dst.gate_cold = new_like_with_expert_count(dst.cold_ctx, L.ffn_gate_exps, cold_count);
-                dst.up_cold   = new_like_with_expert_count(dst.cold_ctx, L.ffn_up_exps, cold_count);
-                dst.down_cold = new_like_with_expert_count(dst.cold_ctx, L.ffn_down_exps, cold_count);
+                dst.gate_cold = new_like_with_expert_count(dst.cold_ctx, desc.ffn_gate_exps, cold_count);
+                dst.up_cold   = new_like_with_expert_count(dst.cold_ctx, desc.ffn_up_exps, cold_count);
+                dst.down_cold = new_like_with_expert_count(dst.cold_ctx, desc.ffn_down_exps, cold_count);
             }
             dst.cold_buf = ggml_backend_alloc_ctx_tensors(dst.cold_ctx, out.cpu_backend);
             if (!dst.cold_buf) {
                 if (err) *err = "failed to allocate cold expert buffer";
                 return false;
             }
-        }
 
-        if (dst.fused_gate_up) {
-            if (!read_expert_slices(backend, L.ffn_gate_up_exps, dst.cold_expert_ids,
-                                    dst.gate_up_expert_bytes, dst.gate_up_cold_bytes, err)) {
-                return false;
-            }
-        } else {
-            if (!read_expert_slices(backend, L.ffn_gate_exps, dst.cold_expert_ids,
-                                    dst.gate_expert_bytes, dst.gate_cold_bytes, err) ||
-                !read_expert_slices(backend, L.ffn_up_exps, dst.cold_expert_ids,
-                                    dst.up_expert_bytes, dst.up_cold_bytes, err)) {
-                return false;
-            }
-        }
-        if (!read_expert_slices(backend, L.ffn_down_exps, dst.cold_expert_ids,
-                                dst.down_expert_bytes, dst.down_cold_bytes, err)) {
-            return false;
-        }
-
-        if (dst.fused_gate_up) {
-            if (dst.gate_up_cold && !dst.gate_up_cold_bytes.empty()) {
-                ggml_backend_tensor_set(dst.gate_up_cold, dst.gate_up_cold_bytes.data(), 0, dst.gate_up_cold_bytes.size());
-                dst.gate_up_cold_bytes.clear();
-                dst.gate_up_cold_bytes.shrink_to_fit();
-            }
-            if (dst.down_cold && !dst.down_cold_bytes.empty()) {
-                ggml_backend_tensor_set(dst.down_cold, dst.down_cold_bytes.data(), 0, dst.down_cold_bytes.size());
-                dst.down_cold_bytes.clear();
-                dst.down_cold_bytes.shrink_to_fit();
-            }
-        } else {
-            if (dst.gate_cold && !dst.gate_cold_bytes.empty()) {
-                ggml_backend_tensor_set(dst.gate_cold, dst.gate_cold_bytes.data(), 0, dst.gate_cold_bytes.size());
-                dst.gate_cold_bytes.clear();
-                dst.gate_cold_bytes.shrink_to_fit();
-            }
-            if (dst.up_cold && !dst.up_cold_bytes.empty()) {
-                ggml_backend_tensor_set(dst.up_cold, dst.up_cold_bytes.data(), 0, dst.up_cold_bytes.size());
-                dst.up_cold_bytes.clear();
-                dst.up_cold_bytes.shrink_to_fit();
-            }
-            if (dst.down_cold && !dst.down_cold_bytes.empty()) {
-                ggml_backend_tensor_set(dst.down_cold, dst.down_cold_bytes.data(), 0, dst.down_cold_bytes.size());
-                dst.down_cold_bytes.clear();
-                dst.down_cold_bytes.shrink_to_fit();
+            std::vector<uint8_t> cold_bytes;
+            if (dst.fused_gate_up) {
+                if (!read_expert_slices(gpu_backend, desc.ffn_gate_up_exps, dst.cold_expert_ids,
+                                        dst.gate_up_expert_bytes, cold_bytes, err))
+                    return false;
+                ggml_backend_tensor_set(dst.gate_up_cold, cold_bytes.data(), 0, cold_bytes.size());
+                if (!read_expert_slices(gpu_backend, desc.ffn_down_exps, dst.cold_expert_ids,
+                                        dst.down_expert_bytes, cold_bytes, err))
+                    return false;
+                ggml_backend_tensor_set(dst.down_cold, cold_bytes.data(), 0, cold_bytes.size());
+            } else {
+                if (!read_expert_slices(gpu_backend, desc.ffn_gate_exps, dst.cold_expert_ids,
+                                        dst.gate_expert_bytes, cold_bytes, err))
+                    return false;
+                ggml_backend_tensor_set(dst.gate_cold, cold_bytes.data(), 0, cold_bytes.size());
+                if (!read_expert_slices(gpu_backend, desc.ffn_up_exps, dst.cold_expert_ids,
+                                        dst.up_expert_bytes, cold_bytes, err))
+                    return false;
+                ggml_backend_tensor_set(dst.up_cold, cold_bytes.data(), 0, cold_bytes.size());
+                if (!read_expert_slices(gpu_backend, desc.ffn_down_exps, dst.cold_expert_ids,
+                                        dst.down_expert_bytes, cold_bytes, err))
+                    return false;
+                ggml_backend_tensor_set(dst.down_cold, cold_bytes.data(), 0, cold_bytes.size());
             }
         }
     }
@@ -326,67 +297,63 @@ bool build_qwen35moe_hybrid_storage(const TargetWeights & w,
     return true;
 }
 
-bool build_qwen35moe_hybrid_storage_from_file(
-    const TargetWeights & w,
+bool build_moe_hybrid_storage_from_file(
+    const MoeHybridConfig & cfg,
     ggml_backend_t gpu_backend,
-    const Qwen35MoeExpertPlacement & placement,
+    const MoeHybridPlacement & placement,
+    const std::vector<MoeLayerDesc> & layer_descs,
     const std::vector<LayerExpertFileData> & file_data,
-    Qwen35MoeHybridStorage & out,
+    MoeHybridStorage & out,
     std::string * err) {
 
-    if (!placement.matches(w)) {
-        if (err) *err = "placement does not match model";
+    if (!placement.matches(cfg)) {
+        if (err) *err = "placement does not match config";
         return false;
     }
-    if (!w.is_moe) {
-        if (err) *err = "target is not qwen35moe";
-        return false;
-    }
-    if ((int)file_data.size() != w.n_layer) {
-        if (err) *err = "file_data size does not match n_layer";
+    if ((int)layer_descs.size() != cfg.n_layer || (int)file_data.size() != cfg.n_layer) {
+        if (err) *err = "layer_descs/file_data size does not match n_layer";
         return false;
     }
 
-    
     out.placement = placement;
-    out.layers.resize((size_t)w.n_layer);
+    out.layers.resize((size_t)cfg.n_layer);
     out.cpu_backend = ggml_backend_cpu_init();
     if (!out.cpu_backend) {
         if (err) *err = "failed to init cpu backend";
         return false;
     }
-    ggml_backend_cpu_set_n_threads(out.cpu_backend, std::max(1, std::min(w.n_expert_used, 8)));
+    ggml_backend_cpu_set_n_threads(out.cpu_backend, std::max(1, std::min(cfg.n_expert_used, 8)));
 
-    for (int il = 0; il < w.n_layer; ++il) {
-        const TargetLayer & L = w.layers[(size_t)il];
+    for (int il = 0; il < cfg.n_layer; ++il) {
+        const MoeLayerDesc & desc = layer_descs[(size_t)il];
         const LayerExpertFileData & fd = file_data[(size_t)il];
-        Qwen35MoeHybridLayerStorage & dst = out.layers[(size_t)il];
+        MoeHybridLayerStorage & dst = out.layers[(size_t)il];
         dst.hot_expert_ids = placement.hot_expert_ids[(size_t)il];
-        dst.hot_local_by_global.assign((size_t)w.n_expert, -1);
-        dst.cold_local_by_global.assign((size_t)w.n_expert, -1);
+        dst.hot_local_by_global.assign((size_t)cfg.n_expert, -1);
+        dst.cold_local_by_global.assign((size_t)cfg.n_expert, -1);
 
-        std::vector<uint8_t> is_hot((size_t)w.n_expert, 0);
+        std::vector<uint8_t> is_hot((size_t)cfg.n_expert, 0);
         for (size_t i = 0; i < dst.hot_expert_ids.size(); ++i) {
             const int32_t expert = dst.hot_expert_ids[i];
-            if (expert < 0 || expert >= w.n_expert) {
+            if (expert < 0 || expert >= cfg.n_expert) {
                 if (err) *err = "hot expert id out of range";
                 return false;
             }
             dst.hot_local_by_global[(size_t)expert] = (int32_t)i;
             is_hot[(size_t)expert] = 1;
         }
-        for (int expert = 0; expert < w.n_expert; ++expert) {
+        for (int expert = 0; expert < cfg.n_expert; ++expert) {
             if (!is_hot[(size_t)expert]) {
                 dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
                 dst.cold_expert_ids.push_back((int32_t)expert);
             }
         }
 
-        dst.fused_gate_up = (L.ffn_gate_up_exps != nullptr);
-        if (!validate_expert_tensor(L.ffn_gate_exps, w.n_expert, &dst.gate_expert_bytes, err) ||
-            !validate_expert_tensor(L.ffn_up_exps, w.n_expert, &dst.up_expert_bytes, err) ||
-            !validate_expert_tensor(L.ffn_down_exps, w.n_expert, &dst.down_expert_bytes, err) ||
-            !validate_expert_tensor(L.ffn_gate_up_exps, w.n_expert, &dst.gate_up_expert_bytes, err)) {
+        dst.fused_gate_up = desc.has_fused_gate_up();
+        if (!validate_expert_tensor(desc.ffn_gate_exps, cfg.n_expert, &dst.gate_expert_bytes, err) ||
+            !validate_expert_tensor(desc.ffn_up_exps, cfg.n_expert, &dst.up_expert_bytes, err) ||
+            !validate_expert_tensor(desc.ffn_down_exps, cfg.n_expert, &dst.down_expert_bytes, err) ||
+            !validate_expert_tensor(desc.ffn_gate_up_exps, cfg.n_expert, &dst.gate_up_expert_bytes, err)) {
             return false;
         }
 
@@ -405,12 +372,12 @@ bool build_qwen35moe_hybrid_storage_from_file(
                 return false;
             }
             if (dst.fused_gate_up) {
-                dst.gate_up_hot = new_like_with_expert_count(dst.hot_ctx, L.ffn_gate_up_exps, hot_count);
-                dst.down_hot    = new_like_with_expert_count(dst.hot_ctx, L.ffn_down_exps, hot_count);
+                dst.gate_up_hot = new_like_with_expert_count(dst.hot_ctx, desc.ffn_gate_up_exps, hot_count);
+                dst.down_hot    = new_like_with_expert_count(dst.hot_ctx, desc.ffn_down_exps, hot_count);
             } else {
-                dst.gate_hot = new_like_with_expert_count(dst.hot_ctx, L.ffn_gate_exps, hot_count);
-                dst.up_hot   = new_like_with_expert_count(dst.hot_ctx, L.ffn_up_exps, hot_count);
-                dst.down_hot = new_like_with_expert_count(dst.hot_ctx, L.ffn_down_exps, hot_count);
+                dst.gate_hot = new_like_with_expert_count(dst.hot_ctx, desc.ffn_gate_exps, hot_count);
+                dst.up_hot   = new_like_with_expert_count(dst.hot_ctx, desc.ffn_up_exps, hot_count);
+                dst.down_hot = new_like_with_expert_count(dst.hot_ctx, desc.ffn_down_exps, hot_count);
             }
             dst.hot_buf = ggml_backend_alloc_ctx_tensors(dst.hot_ctx, gpu_backend);
             if (!dst.hot_buf) {
@@ -418,7 +385,6 @@ bool build_qwen35moe_hybrid_storage_from_file(
                 return false;
             }
 
-            // Load hot expert slices from file
             std::vector<uint8_t> slice_buf;
             if (dst.fused_gate_up) {
                 if (!read_expert_slices_from_mem(fd.gate_up_exps.data, fd.gate_up_exps.size,
@@ -457,12 +423,12 @@ bool build_qwen35moe_hybrid_storage_from_file(
                 return false;
             }
             if (dst.fused_gate_up) {
-                dst.gate_up_cold = new_like_with_expert_count(dst.cold_ctx, L.ffn_gate_up_exps, cold_count);
-                dst.down_cold    = new_like_with_expert_count(dst.cold_ctx, L.ffn_down_exps, cold_count);
+                dst.gate_up_cold = new_like_with_expert_count(dst.cold_ctx, desc.ffn_gate_up_exps, cold_count);
+                dst.down_cold    = new_like_with_expert_count(dst.cold_ctx, desc.ffn_down_exps, cold_count);
             } else {
-                dst.gate_cold = new_like_with_expert_count(dst.cold_ctx, L.ffn_gate_exps, cold_count);
-                dst.up_cold   = new_like_with_expert_count(dst.cold_ctx, L.ffn_up_exps, cold_count);
-                dst.down_cold = new_like_with_expert_count(dst.cold_ctx, L.ffn_down_exps, cold_count);
+                dst.gate_cold = new_like_with_expert_count(dst.cold_ctx, desc.ffn_gate_exps, cold_count);
+                dst.up_cold   = new_like_with_expert_count(dst.cold_ctx, desc.ffn_up_exps, cold_count);
+                dst.down_cold = new_like_with_expert_count(dst.cold_ctx, desc.ffn_down_exps, cold_count);
             }
             dst.cold_buf = ggml_backend_alloc_ctx_tensors(dst.cold_ctx, out.cpu_backend);
             if (!dst.cold_buf) {
@@ -470,7 +436,6 @@ bool build_qwen35moe_hybrid_storage_from_file(
                 return false;
             }
 
-            // Load cold expert slices from file directly to CPU tensors
             std::vector<uint8_t> slice_buf;
             if (dst.fused_gate_up) {
                 if (!read_expert_slices_from_mem(fd.gate_up_exps.data, fd.gate_up_exps.size,

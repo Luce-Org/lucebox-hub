@@ -1,4 +1,4 @@
-#include "qwen35moe_routing_stats.h"
+#include "../src/common/moe_hybrid_routing_stats.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -16,15 +16,9 @@ static void expect(bool cond, const char * msg) {
 }
 
 int main() {
-    TargetWeights w;
-    w.is_moe = true;
-    w.n_layer = 2;
-    w.n_expert = 4;
-    w.n_expert_used = 2;
-
-    Qwen35MoeRoutingStats stats;
-    expect(stats.init_from_weights(w), "init_from_weights");
-    expect(stats.matches(w), "matches after init");
+    MoeHybridRoutingStats stats;
+    expect(stats.init(2, 4, 2), "init");
+    expect(stats.matches(2, 4, 2), "matches after init");
 
     const int32_t layer0_a[] = {2, 1};
     const int32_t layer0_b[] = {2, 3};
@@ -49,13 +43,13 @@ int main() {
     expect(hot0.size() == 2, "hot size");
     expect(hot0[0] == 2, "hot leader");
 
-    const auto tmp = std::filesystem::temp_directory_path() / "qwen35moe-routing-stats-test.csv";
+    const auto tmp = std::filesystem::temp_directory_path() / "moe-hybrid-routing-stats-test.csv";
     std::string err;
     expect(stats.save_csv(tmp.string(), &err), err.c_str());
 
-    Qwen35MoeRoutingStats loaded;
-    expect(Qwen35MoeRoutingStats::load_csv(tmp.string(), loaded, &err), err.c_str());
-    expect(loaded.matches(w), "loaded matches weights");
+    MoeHybridRoutingStats loaded;
+    expect(MoeHybridRoutingStats::load_csv(tmp.string(), loaded, &err), err.c_str());
+    expect(loaded.matches(2, 4, 2), "loaded matches dims");
     expect(loaded.count(0, 2) == 2, "loaded count");
     expect(loaded.layer_totals[1] == 2, "loaded total");
 

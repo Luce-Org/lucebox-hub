@@ -10,8 +10,8 @@
 #pragma once
 
 #include "internal.h"
-#include "qwen35moe_hybrid_ffn_eval.h"
-#include "qwen35moe_hybrid_storage.h"
+#include "../common/moe_hybrid_ffn_eval.h"
+#include "../common/moe_hybrid_storage.h"
 #include "graph_builders.h"
 
 #include "ggml-backend.h"
@@ -147,7 +147,7 @@ bool pipelined_decode_one_token(
     ggml_backend_t backend,
     const TargetWeights & w,
     TargetCache & cache,
-    Qwen35MoeHybridStorage & hybrid,
+    MoeHybridStorage & hybrid,
     int kv_pos,              // current KV position
     int kq_stride_pad,
     PipelinedDecodeTelemetry * telemetry = nullptr);

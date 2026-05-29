@@ -1,4 +1,5 @@
-#include "qwen35moe_expert_placement.h"
+#include "moe_hybrid_placement.h"
+#include "moe_hybrid_routing_stats.h"
 
 #include <nlohmann/json.hpp>
 
@@ -8,20 +9,23 @@
 
 namespace dflash::common {
 
-bool Qwen35MoeExpertPlacement::matches(const TargetWeights & w) const {
-    return w.is_moe &&
-           n_layer == w.n_layer &&
-           n_expert == w.n_expert &&
-           n_expert_used == w.n_expert_used &&
+bool MoeHybridPlacement::matches(int n_layer_, int n_expert_, int n_expert_used_) const {
+    return n_layer == n_layer_ &&
+           n_expert == n_expert_ &&
+           n_expert_used == n_expert_used_ &&
            (int)hot_counts.size() == n_layer &&
            (int)hot_expert_ids.size() == n_layer;
 }
 
-bool Qwen35MoeExpertPlacement::empty() const {
+bool MoeHybridPlacement::matches(const MoeHybridConfig & cfg) const {
+    return matches(cfg.n_layer, cfg.n_expert, cfg.n_expert_used);
+}
+
+bool MoeHybridPlacement::empty() const {
     return hot_counts.empty();
 }
 
-bool Qwen35MoeExpertPlacement::is_hot(int layer_idx, int expert_idx) const {
+bool MoeHybridPlacement::is_hot(int layer_idx, int expert_idx) const {
     if (layer_idx < 0 || layer_idx >= n_layer || expert_idx < 0 || expert_idx >= n_expert) {
         return false;
     }
@@ -29,7 +33,8 @@ bool Qwen35MoeExpertPlacement::is_hot(int layer_idx, int expert_idx) const {
     return std::find(hot.begin(), hot.end(), expert_idx) != hot.end();
 }
 
-bool Qwen35MoeExpertPlacement::save_json(const std::string & path, std::string * err) const {
+bool MoeHybridPlacement::save_json(const std::string & path, const std::string & arch_name,
+                                   std::string * err) const {
     if (n_layer <= 0 || n_expert <= 0 || (int)hot_counts.size() != n_layer ||
         (int)hot_expert_ids.size() != n_layer) {
         if (err) *err = "placement not initialized";
@@ -37,7 +42,7 @@ bool Qwen35MoeExpertPlacement::save_json(const std::string & path, std::string *
     }
 
     nlohmann::json j;
-    j["arch"] = "qwen35moe";
+    j["arch"] = arch_name;
     j["version"] = 1;
     j["n_layer"] = n_layer;
     j["n_expert"] = n_expert;
@@ -59,9 +64,9 @@ bool Qwen35MoeExpertPlacement::save_json(const std::string & path, std::string *
     return true;
 }
 
-bool Qwen35MoeExpertPlacement::load_json(const std::string & path,
-                                         Qwen35MoeExpertPlacement & out,
-                                         std::string * err) {
+bool MoeHybridPlacement::load_json(const std::string & path,
+                                   MoeHybridPlacement & out,
+                                   std::string * err) {
     std::ifstream f(path);
     if (!f) {
         if (err) *err = "failed to open input file";
@@ -76,12 +81,10 @@ bool Qwen35MoeExpertPlacement::load_json(const std::string & path,
         return false;
     }
 
-    if (j.value("arch", std::string()) != "qwen35moe") {
-        if (err) *err = "unexpected arch";
-        return false;
-    }
+    // Accept both legacy "qwen35moe" and new "moe_hybrid" / any arch string.
+    // We don't reject based on arch — the caller validates dimensions.
 
-    Qwen35MoeExpertPlacement tmp;
+    MoeHybridPlacement tmp;
     try {
         tmp.n_layer = j.value("n_layer", 0);
         tmp.n_expert = j.value("n_expert", 0);
@@ -105,11 +108,11 @@ bool Qwen35MoeExpertPlacement::load_json(const std::string & path,
     return true;
 }
 
-bool Qwen35MoeExpertPlacement::build_from_stats(const Qwen35MoeRoutingStats & stats,
-                                                int total_hot_budget,
-                                                int min_hot_per_layer,
-                                                Qwen35MoeExpertPlacement & out,
-                                                std::string * err) {
+bool MoeHybridPlacement::build_from_stats(const MoeHybridRoutingStats & stats,
+                                          int total_hot_budget,
+                                          int min_hot_per_layer,
+                                          MoeHybridPlacement & out,
+                                          std::string * err) {
     if (stats.empty() || stats.n_layer <= 0 || stats.n_expert <= 0) {
         if (err) *err = "stats not initialized";
         return false;
@@ -127,7 +130,7 @@ bool Qwen35MoeExpertPlacement::build_from_stats(const Qwen35MoeRoutingStats & st
         return false;
     }
 
-    Qwen35MoeExpertPlacement tmp;
+    MoeHybridPlacement tmp;
     tmp.n_layer = stats.n_layer;
     tmp.n_expert = stats.n_expert;
     tmp.n_expert_used = stats.n_expert_used;
@@ -172,12 +175,12 @@ bool Qwen35MoeExpertPlacement::build_from_stats(const Qwen35MoeRoutingStats & st
     return true;
 }
 
-bool Qwen35MoeExpertPlacement::build_from_stats_with_layer_bytes(
-    const Qwen35MoeRoutingStats & stats,
+bool MoeHybridPlacement::build_from_stats_with_layer_bytes(
+    const MoeHybridRoutingStats & stats,
     const std::vector<uint64_t> & layer_expert_bytes,
     uint64_t total_hot_budget_bytes,
     int min_hot_per_layer,
-    Qwen35MoeExpertPlacement & out,
+    MoeHybridPlacement & out,
     std::string * err) {
     if (stats.empty() || stats.n_layer <= 0 || stats.n_expert <= 0) {
         if (err) *err = "stats not initialized";
@@ -203,7 +206,7 @@ bool Qwen35MoeExpertPlacement::build_from_stats_with_layer_bytes(
         return false;
     }
 
-    Qwen35MoeExpertPlacement tmp;
+    MoeHybridPlacement tmp;
     tmp.n_layer = stats.n_layer;
     tmp.n_expert = stats.n_expert;
     tmp.n_expert_used = stats.n_expert_used;
