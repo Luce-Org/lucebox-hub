@@ -169,7 +169,7 @@ def resolve_preset(name: str | None) -> ModelPreset:
 
 def _file_meta(api: HfApi, repo_id: str, filename: str) -> tuple[int, str | None]:
     """Return (expected_size, lfs_sha256_or_None) for filename in repo_id."""
-    info = api.repo_info(repo_id, files_metadata=True)
+    info = api.model_info(repo_id, files_metadata=True)
     for sib in info.siblings or []:
         if sib.rfilename == filename:
             sha = getattr(sib.lfs, "sha256", None) if sib.lfs else None

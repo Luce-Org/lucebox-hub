@@ -8,8 +8,9 @@ the heuristic prior.
 
 from __future__ import annotations
 
-from lucebox import autotune as autotune_mod
 from lucebox.types import HostFacts
+
+from lucebox import autotune as autotune_mod
 
 
 def _key(rt) -> tuple:
