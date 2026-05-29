@@ -2,6 +2,7 @@
 
 #include "laguna_layer_split_adapter.h"
 
+#include "common/backend_precision.h"
 #include "common/dflash_layer_split_runtime.h"
 #include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
@@ -42,6 +43,24 @@ bool LagunaLayerSplitAdapter::init() {
     if (!init_layer_split_runtime(runtime_cfg, shards_, snapshot_backends_)) {
         return false;
     }
+
+    std::vector<ggml_backend_t> shard_backends;
+    shard_backends.reserve(shards_.size());
+    for (const auto & shard : shards_) shard_backends.push_back(shard.backend);
+    const BackendActivationPolicy activation_policy =
+        select_common_activation_precision_policy(
+            shard_backends, /*force_f32=*/false,
+            "LUCEBOX_LAYER_SPLIT_ACT_TYPE");
+    activation_type_ = activation_policy.activation_type;
+    std::fprintf(stderr, "[laguna-target-split] activation=%s (%s",
+                 backend_precision_type_name(activation_type_),
+                 activation_policy.reason.c_str());
+    if (!activation_policy.runtime_arch.empty()) {
+        std::fprintf(stderr, ", arch=%s", activation_policy.runtime_arch.c_str());
+    } else if (activation_policy.cuda_sm > 0) {
+        std::fprintf(stderr, ", sm=%d", activation_policy.cuda_sm);
+    }
+    std::fprintf(stderr, ")\n");
 
     for (size_t i = 0; i < shards_.size(); ++i) {
         auto & shard = shards_[i];
@@ -105,7 +124,7 @@ bool LagunaLayerSplitAdapter::run_forward(
 
     ActivationPair acts;
     if (!activation_pair_init(acts, shards_.front().backend, hidden,
-                              n_tokens_total)) {
+                              n_tokens_total, activation_type_)) {
         std::fprintf(stderr, "[laguna-target-split] activation alloc failed gpu=%d\n",
                      shards_.front().gpu);
         return false;
@@ -122,8 +141,14 @@ bool LagunaLayerSplitAdapter::run_forward(
                 return false;
             }
             const size_t off = (size_t)i * acts.a->nb[1];
-            const size_t bytes = sizeof(float) * (size_t)hidden * n;
-            ggml_backend_tensor_set(acts.a, emb.data(), off, bytes);
+            if (!set_activation_tensor_from_f32(
+                    acts.a, emb.data(), off, (size_t)hidden * (size_t)n)) {
+                std::fprintf(stderr,
+                    "[laguna-target-split] unsupported activation type: %s\n",
+                    ggml_type_name(acts.a->type));
+                activation_pair_free(acts);
+                return false;
+            }
         }
     }
 
@@ -141,7 +166,7 @@ bool LagunaLayerSplitAdapter::run_forward(
         if (shard != current_shard) {
             ActivationPair next_acts;
             if (!activation_pair_init(next_acts, shard->backend, hidden,
-                                      n_tokens_total)) {
+                                      n_tokens_total, activation_type_)) {
                 activation_pair_free(acts);
                 return false;
             }

@@ -1,6 +1,7 @@
 // layer_split_forward.cpp — Multi-GPU layer-split forward pass.
 
 #include "layer_split_forward.h"
+#include "common/ggml_graph_precision.h"
 #include "internal.h"
 #include "graph_builders.h"
 #include "dflash_feature_ring.h"
@@ -13,7 +14,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <vector>
 
 namespace dflash::common {
 
@@ -39,8 +39,9 @@ bool compute_target_split_projection(
     ggml_tensor * act_view = ggml_view_2d(
         sg.ctx, act, hidden, n_tokens, act->nb[1],
         (size_t)token_offset * act->nb[1]);
-    ggml_tensor * normed = ggml_rms_norm(sg.ctx, act_view, DFLASH27B_RMS_EPS);
-    normed = ggml_mul(sg.ctx, normed, w.out_norm);
+    ggml_tensor * normed = ggml_rms_norm(
+        sg.ctx, rms_norm_input_f32(sg.ctx, act_view), DFLASH27B_RMS_EPS);
+    normed = ggml_mul(sg.ctx, normed, graph_tensor_f32(sg.ctx, w.out_norm));
     ggml_tensor * logits = ggml_mul_mat(sg.ctx, w.output, normed);
     ggml_set_name(logits, "target_split_logits");
     sg.logits = logits;
@@ -101,15 +102,23 @@ bool run_qwen35_layer_split_forward(
         DraftFeatureMirror * feature_ring,
         std::vector<int32_t> * argmax_out,
         std::vector<float> * logits_out,
-        DFlashDraftIpcClient * remote_draft) {
+        DFlashDraftIpcClient * remote_draft,
+        ggml_type activation_type) {
     if (shards.empty() || tokens.empty()) return false;
     const int hidden = shards.front().weights.n_embd;
     const int vocab = shards.front().weights.n_vocab;
     const int n_tokens_total = (int)tokens.size();
     ubatch = std::max(1, ubatch);
+    if ((feature_ring || remote_draft) && activation_type != GGML_TYPE_F32) {
+        std::fprintf(stderr,
+            "target-split capture requires F32 activation; got %s\n",
+            ggml_type_name(activation_type));
+        return false;
+    }
 
     ActivationPair acts;
-    if (!activation_pair_init(acts, shards.front().backend, hidden, n_tokens_total)) {
+    if (!activation_pair_init(acts, shards.front().backend, hidden, n_tokens_total,
+                              activation_type)) {
         std::fprintf(stderr, "target-split activation alloc failed on gpu %d\n", shards.front().gpu);
         return false;
     }
@@ -126,9 +135,15 @@ bool run_qwen35_layer_split_forward(
                 activation_pair_free(acts);
                 return false;
             }
-            ggml_backend_tensor_set(act_in, emb_buf.data(),
-                                    (size_t)i * act_in->nb[1],
-                                    sizeof(float) * (size_t)hidden * n);
+            if (!set_activation_tensor_from_f32(
+                    act_in, emb_buf.data(), (size_t)i * act_in->nb[1],
+                    (size_t)hidden * (size_t)n)) {
+                std::fprintf(stderr,
+                    "target-split unsupported activation type: %s\n",
+                    ggml_type_name(act_in->type));
+                activation_pair_free(acts);
+                return false;
+            }
         }
     }
 
@@ -144,7 +159,8 @@ bool run_qwen35_layer_split_forward(
         }
         if (shard != current_shard) {
             ActivationPair next_acts;
-            if (!activation_pair_init(next_acts, shard->backend, hidden, n_tokens_total)) {
+            if (!activation_pair_init(next_acts, shard->backend, hidden, n_tokens_total,
+                                      activation_type)) {
                 std::fprintf(stderr, "target-split activation alloc failed on gpu %d\n", shard->gpu);
                 activation_pair_free(acts);
                 return false;

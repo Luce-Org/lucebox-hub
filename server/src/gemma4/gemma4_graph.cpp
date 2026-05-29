@@ -16,6 +16,7 @@
 //   - Logit softcapping: tanh(logits/cap)*cap
 
 #include "gemma4_internal.h"
+#include "common/ggml_graph_precision.h"
 #include "common/gpu_runtime_compat.h"
 #include "dflash27b.h"
 #include "flashprefill.h"
@@ -36,6 +37,8 @@ static constexpr float GEMMA4_EPS = 1e-6f;
 
 static ggml_tensor * gemma4_rms_norm_mul(ggml_context * ctx, ggml_tensor * x,
                                           ggml_tensor * weight, float eps = GEMMA4_EPS) {
+    x = rms_norm_input_f32(ctx, x);
+    weight = graph_tensor_f32(ctx, weight);
     ggml_tensor * n = ggml_rms_norm(ctx, x, eps);
     return ggml_mul(ctx, n, weight);
 }
@@ -84,7 +87,7 @@ static ggml_tensor * build_gemma4_moe_block(ggml_context * ctx, ggml_tensor * at
     }
 
     // Router: rms_norm(attn_out) * (1/sqrt(n_embd)) * ffn_gate_inp_s → ffn_gate_inp → softmax
-    ggml_tensor * router_in = ggml_rms_norm(ctx, attn_out, w.norm_eps);
+    ggml_tensor * router_in = ggml_rms_norm(ctx, rms_norm_input_f32(ctx, attn_out), w.norm_eps);
     router_in = ggml_scale(ctx, router_in, 1.0f / std::sqrt((float)n_embd));
     if (L.ffn_gate_inp_s) {
         router_in = ggml_mul(ctx, router_in, L.ffn_gate_inp_s);
@@ -196,7 +199,7 @@ static ggml_tensor * build_gemma4_attn_block(
             Kcur = gemma4_rms_norm_mul(ctx, Kcur, L.k_norm, w.norm_eps);
         }
         // V also gets RMSNorm (gemma4 specific)
-        Vcur = ggml_rms_norm(ctx, Vcur, w.norm_eps);
+        Vcur = ggml_rms_norm(ctx, rms_norm_input_f32(ctx, Vcur), w.norm_eps);
 
         Kcur = ggml_rope_ext(ctx, Kcur, positions, freq_factors,
                               head_dim, GGML_ROPE_TYPE_NEOX,
@@ -282,9 +285,10 @@ static ggml_tensor * build_gemma4_layer(
     int capture_idx = -1)  // >=0: write to target_feat at this capture slot
 {
     const Gemma4Layer & L = w.layers[il];
+    ggml_tensor * inp_f32 = graph_tensor_f32(ctx, inp);
 
     // Pre-attn norm
-    ggml_tensor * cur = gemma4_rms_norm_mul(ctx, inp, L.attn_norm, w.norm_eps);
+    ggml_tensor * cur = gemma4_rms_norm_mul(ctx, inp_f32, L.attn_norm, w.norm_eps);
 
     // Attention
     cur = build_gemma4_attn_block(ctx, gf, w, L, cache, il, cur,
@@ -297,7 +301,7 @@ static ggml_tensor * build_gemma4_layer(
     }
 
     // Residual
-    ggml_tensor * attn_out = ggml_add(ctx, cur, inp);
+    ggml_tensor * attn_out = ggml_add(ctx, cur, inp_f32);
 
     // FFN
     const bool is_moe = (L.ffn_gate_inp != nullptr && il >= w.n_layer_dense_lead);
@@ -414,7 +418,7 @@ static ggml_tensor * build_gemma4_per_layer_input(
         (size_t)layer_idx * D * w.per_layer_model_proj->nb[1]);
     ggml_tensor * proj = ggml_mul_mat(ctx, proj_w_layer, embed);
     proj = ggml_scale(ctx, proj, 1.0f / std::sqrt((float)w.n_embd));
-    proj = ggml_rms_norm(ctx, proj, w.norm_eps);
+    proj = ggml_rms_norm(ctx, rms_norm_input_f32(ctx, proj), w.norm_eps);
     ggml_tensor * norm_w = ggml_view_1d(
         ctx, w.per_layer_proj_norm, D, (size_t)layer_idx * D * elt_norm);
     proj = ggml_mul(ctx, proj, norm_w);
@@ -654,7 +658,7 @@ bool gemma4_step(
         proj = ggml_reshape_3d(ctx, proj, D, L, n_tokens);  // [D, L, n_tokens]
 
         // 3. RMS norm on projection (normalizes over ne[0]=D for each (layer, token))
-        proj = ggml_rms_norm(ctx, proj, w.norm_eps);
+        proj = ggml_rms_norm(ctx, rms_norm_input_f32(ctx, proj), w.norm_eps);
         // Reshape norm weight from [D*L] to [D, L] for broadcast mul over n_tokens
         ggml_tensor * norm_w = ggml_reshape_2d(ctx, w.per_layer_proj_norm, D, L);
         proj = ggml_mul(ctx, proj, norm_w);
@@ -837,7 +841,7 @@ bool gemma4_verify_batch(
         ggml_tensor * proj = ggml_mul_mat(ctx, w.per_layer_model_proj, ie);
         proj = ggml_scale(ctx, proj, 1.0f / std::sqrt((float)w.n_embd));
         proj = ggml_reshape_3d(ctx, proj, D, L, n_tokens);
-        proj = ggml_rms_norm(ctx, proj, w.norm_eps);
+        proj = ggml_rms_norm(ctx, rms_norm_input_f32(ctx, proj), w.norm_eps);
         ggml_tensor * norm_w = ggml_reshape_2d(ctx, w.per_layer_proj_norm, D, L);
         proj = ggml_mul(ctx, proj, norm_w);
         per_layer_all = ggml_add(ctx, proj, inp_pl);
@@ -1143,7 +1147,7 @@ bool gemma4_prefill_bsa(
         proj = ggml_reshape_3d(ctx, proj, D_pl, L_pl, S);
 
         // RMS norm on projection
-        proj = ggml_rms_norm(ctx, proj, eps);
+        proj = ggml_rms_norm(ctx, rms_norm_input_f32(ctx, proj), eps);
         ggml_tensor * norm_w = ggml_reshape_2d(ctx, w.per_layer_proj_norm, D_pl, L_pl);
         proj = ggml_mul(ctx, proj, norm_w);
 
@@ -1231,7 +1235,7 @@ bool gemma4_prefill_bsa(
             ggml_set_input(pos_t);
 
             // Pre-attn norm.
-            ggml_tensor * h_norm = ggml_rms_norm(gA, h_view, eps);
+            ggml_tensor * h_norm = ggml_rms_norm(gA, rms_norm_input_f32(gA, h_view), eps);
             h_norm = ggml_mul(gA, h_norm, L.attn_norm);
 
             // Q projection + norm + RoPE.
@@ -1268,7 +1272,7 @@ bool gemma4_prefill_bsa(
                 ggml_tensor * V = L.wv ? ggml_mul_mat(gA, L.wv, h_norm)
                                        : ggml_mul_mat(gA, L.wk, h_norm);
                 V = ggml_reshape_3d(gA, V, D, Hk, cl);
-                V = ggml_rms_norm(gA, V, eps);
+                V = ggml_rms_norm(gA, rms_norm_input_f32(gA, V), eps);
                 V = ggml_reshape_2d(gA, V, kv_dim, cl);
 
                 const size_t kv_esz = ggml_type_size(half_type);

@@ -885,7 +885,7 @@ after_delta_net:
 
     // ── Gated output norm: rms_norm(output) * silu(z_4d)
     ggml_tensor * z_4d = ggml_reshape_4d(ctx, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
-    ggml_tensor * output_n = ggml_rms_norm(ctx, output, w.rms_eps);
+    ggml_tensor * output_n = ggml_rms_norm(ctx, rms_norm_input_f32(ctx, output), w.rms_eps);
     output_n = ggml_mul(ctx, output_n, L.ssm_norm);
     ggml_tensor * z_silu  = ggml_silu(ctx, z_4d);
     output_n = ggml_mul(ctx, output_n, z_silu);
@@ -931,8 +931,9 @@ static ggml_tensor * build_single_layer(
     const int * CAPTURE_LAYERS = w.capture_layer_ids;
     const int N_CAPTURE = w.n_capture_layers;
 
-    ggml_tensor * inpSA = inp;
-    ggml_tensor * cur   = rms_norm_mul(ctx, inp, L.attn_norm, eps);
+    ggml_tensor * inp_f32 = graph_tensor_f32(ctx, inp);
+    ggml_tensor * inpSA = inp_f32;
+    ggml_tensor * cur   = rms_norm_mul(ctx, inp_f32, L.attn_norm, eps);
 
     if (is_attn) {
         int fa_idx = 0;
@@ -1047,10 +1048,11 @@ QwenGraphOutputs build_qwen35_graph(
         const TargetLayer & L = w.layers[il];
         const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
 
-        ggml_tensor * inpSA = inpL;
+        ggml_tensor * inp_f32 = graph_tensor_f32(ctx, inpL);
+        ggml_tensor * inpSA = inp_f32;
 
         // Pre-attention norm
-        ggml_tensor * cur = rms_norm_mul(ctx, inpL, L.attn_norm, eps);
+        ggml_tensor * cur = rms_norm_mul(ctx, inp_f32, L.attn_norm, eps);
 
         if (is_attn) {
             cur = build_full_attn_block(ctx, gf, w, L, cur, in.positions, w.rope_sections,
@@ -1230,8 +1232,9 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
     const TargetLayer & L = w.layers[layer_idx];
     const bool is_attn = (((layer_idx + 1) % w.full_attention_interval) == 0);
 
-    ggml_tensor * inpSA = inp;
-    ggml_tensor * cur   = rms_norm_mul(ctx, inp, L.attn_norm, eps);
+    ggml_tensor * inp_f32 = graph_tensor_f32(ctx, inp);
+    ggml_tensor * inpSA = inp_f32;
+    ggml_tensor * cur   = rms_norm_mul(ctx, inp_f32, L.attn_norm, eps);
 
     if (is_attn) {
         int fa_idx = 0;

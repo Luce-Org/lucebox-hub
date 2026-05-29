@@ -498,6 +498,8 @@ bool load_target_gguf_laguna_partial(const std::string & path,
         if (ggml_backend_tensor_alloc(out.buf, a.tensor,
                                       base + a.buffer_offset) != GGML_STATUS_SUCCESS) {
             set_last_error("ggml_backend_tensor_alloc failed (laguna target)");
+            ggml_backend_buffer_free(out.buf);
+            out.buf = nullptr;
             gguf_free(gctx);
             return false;
         }

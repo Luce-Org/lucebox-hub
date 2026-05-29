@@ -74,6 +74,7 @@ private:
     std::vector<LagunaLayerSplitShard> shards_;
     std::vector<ggml_backend_t> snapshot_backends_;
     std::vector<LagunaLayerSplitSnapshot> snapshots_;
+    ggml_type activation_type_ = GGML_TYPE_F32;
     static constexpr int PREFIX_SLOTS = ModelBackend::kMaxSlots;
     SamplerCfg sampler_;
     std::mt19937_64 sampler_rng_{std::random_device{}()};

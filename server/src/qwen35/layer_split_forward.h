@@ -59,7 +59,8 @@ bool run_qwen35_layer_split_forward(
         DraftFeatureMirror * feature_ring = nullptr,
         std::vector<int32_t> * argmax_out = nullptr,
         std::vector<float> * logits_out = nullptr,
-        DFlashDraftIpcClient * remote_draft = nullptr);
+        DFlashDraftIpcClient * remote_draft = nullptr,
+        ggml_type activation_type = GGML_TYPE_F32);
 
 // Free all shards (weights, cache, backend).
 void free_qwen35_layer_split_shards(std::vector<Qwen35LayerSplitShard> & shards);

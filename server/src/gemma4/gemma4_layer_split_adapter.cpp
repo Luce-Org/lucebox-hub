@@ -2,6 +2,7 @@
 
 #include "gemma4_layer_split_adapter.h"
 
+#include "common/backend_precision.h"
 #include "common/dflash_layer_split_runtime.h"
 #include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
@@ -18,49 +19,6 @@
 namespace dflash::common {
 
 namespace {
-
-struct ActivationBuffer {
-    ggml_context * ctx = nullptr;
-    ggml_backend_buffer_t buf = nullptr;
-    ggml_tensor * tensor = nullptr;
-};
-
-void activation_buffer_free(ActivationBuffer & b) {
-    if (b.buf) {
-        ggml_backend_buffer_free(b.buf);
-        b.buf = nullptr;
-    }
-    if (b.ctx) {
-        ggml_free(b.ctx);
-        b.ctx = nullptr;
-    }
-    b.tensor = nullptr;
-}
-
-bool activation_buffer_init(ActivationBuffer & b,
-                            ggml_backend_t backend,
-                            int hidden,
-                            int n_tokens) {
-    activation_buffer_free(b);
-    if (hidden <= 0 || n_tokens <= 0) return false;
-    ggml_init_params ip{};
-    ip.mem_size = (size_t)4 * ggml_tensor_overhead() + 16 * 1024;
-    ip.no_alloc = true;
-    b.ctx = ggml_init(ip);
-    if (!b.ctx) return false;
-    b.tensor = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, hidden, n_tokens);
-    if (!b.tensor) {
-        activation_buffer_free(b);
-        return false;
-    }
-    ggml_set_name(b.tensor, "gemma4_target_split_orig_embed");
-    b.buf = ggml_backend_alloc_ctx_tensors(b.ctx, backend);
-    if (!b.buf) {
-        activation_buffer_free(b);
-        return false;
-    }
-    return true;
-}
 
 static bool tensor_ready(const ggml_tensor * t) {
     return t && t->buffer;
@@ -83,6 +41,24 @@ bool Gemma4LayerSplitAdapter::init() {
     if (!init_layer_split_runtime(runtime_cfg, shards_, snapshot_backends_)) {
         return false;
     }
+
+    std::vector<ggml_backend_t> shard_backends;
+    shard_backends.reserve(shards_.size());
+    for (const auto & shard : shards_) shard_backends.push_back(shard.backend);
+    const BackendActivationPolicy activation_policy =
+        select_common_activation_precision_policy(
+            shard_backends, /*force_f32=*/false,
+            "LUCEBOX_LAYER_SPLIT_ACT_TYPE");
+    activation_type_ = activation_policy.activation_type;
+    std::fprintf(stderr, "[gemma4-target-split] activation=%s (%s",
+                 backend_precision_type_name(activation_type_),
+                 activation_policy.reason.c_str());
+    if (!activation_policy.runtime_arch.empty()) {
+        std::fprintf(stderr, ", arch=%s", activation_policy.runtime_arch.c_str());
+    } else if (activation_policy.cuda_sm > 0) {
+        std::fprintf(stderr, ", sm=%d", activation_policy.cuda_sm);
+    }
+    std::fprintf(stderr, ")\n");
 
     for (size_t i = 0; i < shards_.size(); ++i) {
         auto & shard = shards_[i];
@@ -150,14 +126,15 @@ bool Gemma4LayerSplitAdapter::run_forward(
 
     ActivationPair acts;
     if (!activation_pair_init(acts, shards_.front().backend, hidden,
-                              n_tokens_total)) {
+                              n_tokens_total, activation_type_)) {
         std::fprintf(stderr, "[gemma4-target-split] activation alloc failed gpu=%d\n",
                      shards_.front().gpu);
         return false;
     }
     ActivationBuffer orig;
     if (!activation_buffer_init(orig, shards_.front().backend, hidden,
-                                n_tokens_total)) {
+                                n_tokens_total, activation_type_,
+                                "gemma4_target_split_orig_embed")) {
         activation_pair_free(acts);
         return false;
     }
@@ -176,9 +153,16 @@ bool Gemma4LayerSplitAdapter::run_forward(
             }
             for (int j = 0; j < hidden * n; ++j) emb[(size_t)j] *= scale;
             const size_t off = (size_t)i * acts.a->nb[1];
-            const size_t bytes = sizeof(float) * (size_t)hidden * n;
-            ggml_backend_tensor_set(acts.a, emb.data(), off, bytes);
-            ggml_backend_tensor_set(orig.tensor, emb.data(), off, bytes);
+            const size_t elems = (size_t)hidden * (size_t)n;
+            if (!set_activation_tensor_from_f32(acts.a, emb.data(), off, elems) ||
+                !set_activation_tensor_from_f32(orig.tensor, emb.data(), off, elems)) {
+                std::fprintf(stderr,
+                    "[gemma4-target-split] unsupported activation type: %s\n",
+                    ggml_type_name(acts.a->type));
+                activation_buffer_free(orig);
+                activation_pair_free(acts);
+                return false;
+            }
         }
     }
 
@@ -197,14 +181,15 @@ bool Gemma4LayerSplitAdapter::run_forward(
         if (shard != current_shard) {
             ActivationPair next_acts;
             if (!activation_pair_init(next_acts, shard->backend, hidden,
-                                      n_tokens_total)) {
+                                      n_tokens_total, activation_type_)) {
                 activation_buffer_free(orig);
                 activation_pair_free(acts);
                 return false;
             }
             ActivationBuffer next_orig;
             if (!activation_buffer_init(next_orig, shard->backend, hidden,
-                                        n_tokens_total)) {
+                                        n_tokens_total, activation_type_,
+                                        "gemma4_target_split_orig_embed")) {
                 activation_pair_free(next_acts);
                 activation_buffer_free(orig);
                 activation_pair_free(acts);

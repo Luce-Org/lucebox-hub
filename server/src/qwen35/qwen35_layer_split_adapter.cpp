@@ -2,6 +2,7 @@
 
 #include "qwen35_layer_split_adapter.h"
 
+#include "common/backend_precision.h"
 #include "common/dflash_spec_decode.h"
 #include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
@@ -34,6 +35,24 @@ bool Qwen35LayerSplitAdapter::init() {
     if (!init_layer_split_runtime(runtime_cfg, shards_, snapshot_backends_)) {
         return false;
     }
+
+    std::vector<ggml_backend_t> shard_backends;
+    shard_backends.reserve(shards_.size());
+    for (const auto & shard : shards_) shard_backends.push_back(shard.backend);
+    const BackendActivationPolicy activation_policy =
+        select_common_activation_precision_policy(
+            shard_backends, /*force_f32=*/cfg_.run_dflash,
+            "LUCEBOX_LAYER_SPLIT_ACT_TYPE");
+    activation_type_ = activation_policy.activation_type;
+    std::fprintf(stderr, "[target-split] activation=%s (%s",
+                 backend_precision_type_name(activation_type_),
+                 activation_policy.reason.c_str());
+    if (!activation_policy.runtime_arch.empty()) {
+        std::fprintf(stderr, ", arch=%s", activation_policy.runtime_arch.c_str());
+    } else if (activation_policy.cuda_sm > 0) {
+        std::fprintf(stderr, ", sm=%d", activation_policy.cuda_sm);
+    }
+    std::fprintf(stderr, ")\n");
 
     for (auto & shard : shards_) {
         const TargetLoadPlan plan =
@@ -169,7 +188,8 @@ bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
         (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
         /*argmax_out=*/nullptr,
         &prefill_last_logits_,
-        cfg_.run_dflash ? &remote_draft_ : nullptr);
+        cfg_.run_dflash ? &remote_draft_ : nullptr,
+        activation_type_);
 }
 
 bool Qwen35LayerSplitAdapter::snapshot_slot_valid(int slot) const {
@@ -376,9 +396,11 @@ bool Qwen35LayerSplitAdapter::decode_ar(
             return run_qwen35_layer_split_forward(
                 shards_, shards_.front().weights, one, pos, 1, next_tok,
                 cfg_.kq_stride_pad, cfg_.fa_window,
-                cfg_.run_dflash ? &feature_ring_ : nullptr,
+                (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
                 /*argmax_out=*/nullptr,
-                logits_out);
+                logits_out,
+                cfg_.run_dflash ? &remote_draft_ : nullptr,
+                activation_type_);
         },
         [&](int tok) { return is_eos_tok(tok, w); },
         out_tokens, io);

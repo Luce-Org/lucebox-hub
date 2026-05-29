@@ -17,6 +17,7 @@
 #include "server/http_server.h"
 #include "server/chat_template.h"
 #include "common/sampler.h"
+#include "common/backend_precision.h"
 #include "common/backend_ipc.h"
 #include "placement/pflash_placement.h"
 #include "common/io_utils.h"
@@ -1229,6 +1230,37 @@ static void test_validate_layer_split_weights_shape() {
 
     placement.layer_split_weights = {1.0, 2.0};
     TEST_ASSERT(validate_device_placement(placement, -1).empty());
+}
+
+static void test_backend_precision_cuda_sm_policy() {
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(90) == GGML_TYPE_BF16);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(80) == GGML_TYPE_BF16);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(75) == GGML_TYPE_F16);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(70) == GGML_TYPE_F16);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(60) == GGML_TYPE_F16);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(62) == GGML_TYPE_F32);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(61) == GGML_TYPE_F32);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(52) == GGML_TYPE_F32);
+}
+
+static void test_backend_precision_hip_arch_policy() {
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx90a") == GGML_TYPE_BF16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx942") == GGML_TYPE_BF16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx950") == GGML_TYPE_BF16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx1100") == GGML_TYPE_BF16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx1200") == GGML_TYPE_BF16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx906") == GGML_TYPE_F16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx1030") == GGML_TYPE_F16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx803") == GGML_TYPE_F32);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("") == GGML_TYPE_F32);
+}
+
+static void test_backend_precision_activation_type_combine() {
+    TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_BF16, GGML_TYPE_BF16) == GGML_TYPE_BF16);
+    TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_BF16, GGML_TYPE_F16) == GGML_TYPE_F16);
+    TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_F16, GGML_TYPE_BF16) == GGML_TYPE_F16);
+    TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_F16, GGML_TYPE_F32) == GGML_TYPE_F32);
+    TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_F32, GGML_TYPE_BF16) == GGML_TYPE_F32);
 }
 
 struct MockLayerSplitAdapter : LayerSplitAdapter {
@@ -2585,6 +2617,9 @@ int main() {
     RUN_TEST(test_parse_target_device_list_rejects_mixed_backend);
     RUN_TEST(test_parse_target_device_list_single_gpu_is_not_layer_split);
     RUN_TEST(test_validate_layer_split_weights_shape);
+    RUN_TEST(test_backend_precision_cuda_sm_policy);
+    RUN_TEST(test_backend_precision_hip_arch_policy);
+    RUN_TEST(test_backend_precision_activation_type_combine);
     RUN_TEST(test_layer_split_backend_inline_snapshot_and_restore_delta);
     RUN_TEST(test_layer_split_backend_sampling_capability_gate);
     RUN_TEST(test_layer_split_compress_nopark_uses_default_drafter_path);

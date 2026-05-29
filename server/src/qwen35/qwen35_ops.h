@@ -2,12 +2,15 @@
 
 #pragma once
 
+#include "common/ggml_graph_precision.h"
 #include "ggml.h"
 
 namespace dflash::common {
 
 inline ggml_tensor * rms_norm_mul(ggml_context * ctx, ggml_tensor * x,
                                   ggml_tensor * weight, float eps) {
+    x = rms_norm_input_f32(ctx, x);
+    weight = graph_tensor_f32(ctx, weight);
     ggml_tensor * n = ggml_rms_norm(ctx, x, eps);
     return ggml_mul(ctx, n, weight);
 }

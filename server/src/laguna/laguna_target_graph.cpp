@@ -18,6 +18,7 @@
 // for 30+ tokens on B-tree prompt; see Lucebox/Laguna-XS.2-GGUF README).
 
 #include "laguna_internal.h"
+#include "common/ggml_graph_precision.h"
 #include "internal.h"
 #include "dflash27b.h"
 
@@ -283,6 +284,8 @@ void reset_laguna_target_cache(LagunaTargetCache & c) {
 
 static ggml_tensor * laguna_rms_norm_mul(ggml_context * ctx, ggml_tensor * x,
                                           ggml_tensor * weight, float eps = LAGUNA_EPS) {
+    x = rms_norm_input_f32(ctx, x);
+    weight = graph_tensor_f32(ctx, weight);
     ggml_tensor * n = ggml_rms_norm(ctx, x, eps);
     return ggml_mul(ctx, n, weight);
 }
@@ -637,9 +640,10 @@ static ggml_tensor * build_laguna_layer(
     ggml_tensor * attn_mask_swa)
 {
     const LagunaTargetLayer & L = w.layers[il];
+    ggml_tensor * inp_f32 = graph_tensor_f32(ctx, inp);
 
     // Pre-attn norm
-    ggml_tensor * cur = laguna_rms_norm_mul(ctx, inp, L.attn_norm);
+    ggml_tensor * cur = laguna_rms_norm_mul(ctx, inp_f32, L.attn_norm);
 
     // Attention
     const bool is_full = laguna_is_full_attn_layer(w, il);
@@ -648,7 +652,7 @@ static ggml_tensor * build_laguna_layer(
                                     attn_mask, attn_mask_swa, kv_start, n_tokens, is_full);
 
     // Residual
-    ggml_tensor * ffn_inp = ggml_add(ctx, cur, inp);
+    ggml_tensor * ffn_inp = ggml_add(ctx, cur, inp_f32);
 
     // Pre-FFN norm
     cur = laguna_rms_norm_mul(ctx, ffn_inp, L.ffn_norm);
