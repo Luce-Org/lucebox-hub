@@ -1,4 +1,6 @@
-#include "qwen35moe_swap_manager.h"
+#include "../src/common/moe_hybrid_swap_manager.h"
+#include "../src/common/moe_hybrid_placement.h"
+#include "../src/common/moe_hybrid_routing_stats.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -13,7 +15,7 @@ static void expect(bool cond, const char * msg) {
 }
 
 int main() {
-    Qwen35MoeRoutingStats stats;
+    MoeHybridRoutingStats stats;
     stats.n_layer = 2;
     stats.n_expert = 4;
     stats.n_expert_used = 2;
@@ -23,7 +25,7 @@ int main() {
     };
     stats.layer_totals = {205, 194};
 
-    Qwen35MoeExpertPlacement placement;
+    MoeHybridPlacement placement;
     placement.n_layer = 2;
     placement.n_expert = 4;
     placement.n_expert_used = 2;
@@ -31,13 +33,13 @@ int main() {
     placement.hot_counts = {1, 1};
     placement.hot_expert_ids = {{1}, {0}};
 
-    Qwen35MoeSwapPolicy policy;
+    MoeHybridSwapPolicy policy;
     policy.max_swaps_total = 1;
     policy.min_promote_gain = 5;
 
-    Qwen35MoeSwapPlan plan;
+    MoeHybridSwapPlan plan;
     std::string err;
-    expect(build_qwen35moe_swap_plan(placement, stats, policy, plan, &err), err.c_str());
+    expect(build_moe_hybrid_swap_plan(placement, stats, policy, plan, &err), err.c_str());
     expect(plan.actions.size() == 1, "one swap planned");
     expect(plan.actions[0].layer_idx == 0, "layer0 swap");
     expect(plan.actions[0].evict_expert == 1, "evict weakest hot");

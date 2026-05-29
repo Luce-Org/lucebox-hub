@@ -481,4 +481,291 @@ void free_laguna_target_weights(LagunaTargetWeights & w) {
     w.output   = nullptr;
 }
 
+// ── Partial loader (hybrid mode) ────────────────────────────────────────
+//
+// Loads laguna GGUF but skips uploading expert tensor DATA to GPU.
+// Tensor metadata (shapes, offsets) is still parsed so that the hybrid
+// storage builder can use ggml_nbytes() to compute per-expert sizes.
+// Expert data will be loaded via mmap into the hot/cold split buffers.
+
+static bool is_laguna_expert_tensor(const char * name) {
+    // Expert tensors are: ffn_gate_exps, ffn_up_exps, ffn_down_exps
+    // (per-layer, named blk.<N>.ffn_{gate,up,down}_exps.weight)
+    return std::strstr(name, "ffn_gate_exps") != nullptr ||
+           std::strstr(name, "ffn_up_exps") != nullptr ||
+           std::strstr(name, "ffn_down_exps") != nullptr;
+}
+
+bool load_target_gguf_laguna_partial(const std::string & path,
+                                      ggml_backend_t       backend,
+                                      LagunaTargetWeights & out) {
+    // ── 1. Parse metadata (identical to full load) ───────────────────────
+    ggml_context * meta_ctx = nullptr;
+    gguf_init_params gip{};
+    gip.no_alloc = true;
+    gip.ctx      = &meta_ctx;
+    gguf_context * gctx = gguf_init_from_file(path.c_str(), gip);
+    if (!gctx) { set_last_error("gguf_init_from_file failed: " + path); return false; }
+
+    {
+        int64_t arch_id = gguf_find_key(gctx, "general.architecture");
+        if (arch_id < 0) { set_last_error("missing general.architecture"); gguf_free(gctx); return false; }
+        const char * arch = gguf_get_val_str(gctx, arch_id);
+        if (std::string(arch) != "laguna") {
+            set_last_error(std::string("unexpected arch: ") + arch + " (expected laguna)");
+            gguf_free(gctx); return false;
+        }
+    }
+
+    const uint32_t n_layer       = get_u32_or(gctx, "laguna.block_count",                     0);
+    const uint32_t n_embd        = get_u32_or(gctx, "laguna.embedding_length",                0);
+    const uint32_t n_ff          = get_u32_or(gctx, "laguna.feed_forward_length",             0);
+    const uint32_t n_ff_exp      = get_u32_or(gctx, "laguna.expert_feed_forward_length",      0);
+    const uint32_t n_ff_shexp    = get_u32_or(gctx, "laguna.expert_shared_feed_forward_length",0);
+    const uint32_t n_head_kv     = get_u32_or(gctx, "laguna.attention.head_count_kv",         0);
+    const uint32_t key_length    = get_u32_or(gctx, "laguna.attention.key_length",            0);
+    const uint32_t value_length  = get_u32_or(gctx, "laguna.attention.value_length",          0);
+    const uint32_t n_expert      = get_u32_or(gctx, "laguna.expert_count",                    0);
+    const uint32_t n_expert_used = get_u32_or(gctx, "laguna.expert_used_count",               0);
+    const uint32_t n_dense_lead  = get_u32_or(gctx, "laguna.leading_dense_block_count",       1);
+    const uint32_t sliding_win   = get_u32_or(gctx, "laguna.attention.sliding_window",        0);
+    const uint32_t n_rot_full    = get_u32_or(gctx, "laguna.rope.dimension_count",            0);
+    const uint32_t n_rot_swa     = get_u32_or(gctx, "laguna.rope.dimension_count_swa",        0);
+    const uint32_t n_vocab       = get_u32_or(gctx, "laguna.vocab_size",                      0);
+    const float  rope_base_full   = get_f32_or(gctx, "laguna.rope.freq_base",     0.0f);
+    const float  rope_base_swa    = get_f32_or(gctx, "laguna.rope.freq_base_swa", 0.0f);
+    const float  yarn_factor      = get_f32_or(gctx, "laguna.rope.scaling.factor",          0.0f);
+    const float  yarn_beta_fast   = get_f32_or(gctx, "laguna.rope.scaling.yarn_beta_fast",  64.0f);
+    const float  yarn_beta_slow   = get_f32_or(gctx, "laguna.rope.scaling.yarn_beta_slow",   1.0f);
+    const uint32_t yarn_orig_ctx  = get_u32_or(gctx, "laguna.rope.scaling.original_context_length", 4096);
+    const float  exp_w_scale      = get_f32_or(gctx, "laguna.expert_weights_scale", 1.0f);
+    const bool   exp_w_norm       = get_bool_or(gctx, "laguna.expert_weights_norm", true);
+    const uint32_t exp_gate_fn    = get_u32_or(gctx, "laguna.expert_gating_func", 2);
+
+    if (n_layer == 0 || n_embd == 0 || n_head_kv == 0 || key_length == 0 || value_length == 0 ||
+        n_ff == 0 || n_ff_exp == 0 || n_ff_shexp == 0 || n_expert == 0 || n_expert_used == 0 ||
+        sliding_win == 0 || n_rot_full == 0 || n_rot_swa == 0 || n_vocab == 0) {
+        set_last_error("missing or zero hparams (partial load)");
+        gguf_free(gctx); return false;
+    }
+    if (key_length != value_length) {
+        set_last_error("laguna: key_length != value_length not supported");
+        gguf_free(gctx); return false;
+    }
+
+    std::vector<uint32_t> heads_per_layer((size_t)n_layer, 0);
+    {
+        int64_t aid = gguf_find_key(gctx, "laguna.attention.head_count");
+        if (aid < 0) { set_last_error("missing laguna.attention.head_count"); gguf_free(gctx); return false; }
+        const enum gguf_type kt = gguf_get_kv_type(gctx, aid);
+        if (kt == GGUF_TYPE_ARRAY) {
+            const size_t n = gguf_get_arr_n(gctx, aid);
+            if (n != (size_t)n_layer) { set_last_error("head_count array len mismatch"); gguf_free(gctx); return false; }
+            const enum gguf_type elt = gguf_get_arr_type(gctx, aid);
+            const void * p = gguf_get_arr_data(gctx, aid);
+            for (uint32_t i = 0; i < n_layer; ++i) {
+                heads_per_layer[i] = (elt == GGUF_TYPE_INT32)
+                    ? (uint32_t)((const int32_t *)p)[i]
+                    : ((const uint32_t *)p)[i];
+            }
+        } else {
+            const uint32_t scalar = gguf_get_val_u32(gctx, aid);
+            for (uint32_t i = 0; i < n_layer; ++i) heads_per_layer[i] = scalar;
+        }
+    }
+
+    const uint32_t kEosKeyMissing = 0xFFFFFFFFu;
+    const uint32_t raw_bos = get_u32_or(gctx, "tokenizer.ggml.bos_token_id", kEosKeyMissing);
+    const uint32_t raw_eos = get_u32_or(gctx, "tokenizer.ggml.eos_token_id", kEosKeyMissing);
+    const uint32_t raw_eot = get_u32_or(gctx, "tokenizer.ggml.eot_token_id", kEosKeyMissing);
+    const uint32_t raw_pad = get_u32_or(gctx, "tokenizer.ggml.padding_token_id", kEosKeyMissing);
+
+    // Populate metadata
+    out.ctx     = meta_ctx;
+    out.backend = backend;
+    out.n_layer            = (int)n_layer;
+    out.n_embd             = (int)n_embd;
+    out.n_ff               = (int)n_ff;
+    out.n_ff_exp           = (int)n_ff_exp;
+    out.n_ff_shexp         = (int)n_ff_shexp;
+    out.n_head_kv          = (int)n_head_kv;
+    out.head_dim           = (int)key_length;
+    out.n_expert           = (int)n_expert;
+    out.n_expert_used      = (int)n_expert_used;
+    out.n_layer_dense_lead = (int)n_dense_lead;
+    out.sliding_window     = (int)sliding_win;
+    out.swa_pattern        = 4;
+    out.n_rot_full         = (int)n_rot_full;
+    out.n_rot_swa          = (int)n_rot_swa;
+    out.rope_freq_base_full= rope_base_full > 0 ? rope_base_full : 500000.0f;
+    out.rope_freq_base_swa = rope_base_swa  > 0 ? rope_base_swa  :  10000.0f;
+    out.yarn_factor        = yarn_factor    > 0 ? yarn_factor    :     32.0f;
+    out.yarn_beta_fast     = yarn_beta_fast;
+    out.yarn_beta_slow     = yarn_beta_slow;
+    out.yarn_orig_ctx      = (int)yarn_orig_ctx;
+    out.expert_weights_scale  = exp_w_scale > 0 ? exp_w_scale : 2.5f;
+    out.expert_weights_norm   = exp_w_norm;
+    out.expert_gating_sigmoid = (exp_gate_fn == 2);
+    out.bos_id      = (raw_bos == kEosKeyMissing) ? -1 : (int32_t)raw_bos;
+    out.eos_id      = (raw_eos == kEosKeyMissing) ? -1 : (int32_t)raw_eos;
+    out.eos_chat_id = (raw_eot == kEosKeyMissing) ? 24 : (int32_t)raw_eot;
+    out.pad_id      = (raw_pad == kEosKeyMissing) ? -1 : (int32_t)raw_pad;
+    if ((int)n_layer <= 40) {
+        for (uint32_t i = 0; i < n_layer; ++i) out.n_head_arr[i] = (int)heads_per_layer[i];
+    } else {
+        set_last_error("laguna: n_layer exceeds 40");
+        gguf_free(gctx); return false;
+    }
+
+    out.layers.assign((size_t)n_layer, LagunaTargetLayer{});
+
+    // ── 2. Resolve tensor pointers ───────────────────────────────────────
+    auto g = [&](const char * name) -> ggml_tensor * { return ggml_get_tensor(meta_ctx, name); };
+    out.tok_embd = g("token_embd.weight");
+    out.out_norm = g("output_norm.weight");
+    out.output   = g("output.weight");
+    if (!out.tok_embd || !out.out_norm || !out.output) {
+        set_last_error("missing top-level tensors"); gguf_free(gctx); return false;
+    }
+
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        char name[160];
+        auto fnd = [&](const char * suffix) -> ggml_tensor * {
+            std::snprintf(name, sizeof(name), "blk.%u.%s", il, suffix);
+            return ggml_get_tensor(meta_ctx, name);
+        };
+        LagunaTargetLayer & L = out.layers[il];
+        L.attn_norm = fnd("attn_norm.weight");
+        L.ffn_norm  = fnd("ffn_norm.weight");
+        L.wq        = fnd("attn_q.weight");
+        L.wk        = fnd("attn_k.weight");
+        L.wv        = fnd("attn_v.weight");
+        L.wo        = fnd("attn_output.weight");
+        L.q_norm    = fnd("attn_q_norm.weight");
+        L.k_norm    = fnd("attn_k_norm.weight");
+        L.wqkv_gate = fnd("attn_gate.weight");
+        if (!L.attn_norm || !L.ffn_norm || !L.wq || !L.wk || !L.wv || !L.wo ||
+            !L.q_norm || !L.k_norm || !L.wqkv_gate) {
+            set_last_error("layer missing attention tensors (partial)");
+            gguf_free(gctx); return false;
+        }
+        const bool is_dense = (il < n_dense_lead);
+        if (is_dense) {
+            L.w_gate = fnd("ffn_gate.weight");
+            L.w_up   = fnd("ffn_up.weight");
+            L.w_down = fnd("ffn_down.weight");
+        } else {
+            L.ffn_gate_inp    = fnd("ffn_gate_inp.weight");
+            L.ffn_exp_probs_b = fnd("exp_probs_b.bias");
+            L.ffn_gate_exps   = fnd("ffn_gate_exps.weight");
+            L.ffn_up_exps     = fnd("ffn_up_exps.weight");
+            L.ffn_down_exps   = fnd("ffn_down_exps.weight");
+            L.ffn_gate_shexp  = fnd("ffn_gate_shexp.weight");
+            L.ffn_up_shexp    = fnd("ffn_up_shexp.weight");
+            L.ffn_down_shexp  = fnd("ffn_down_shexp.weight");
+        }
+    }
+
+    // ── 3. Allocate + upload ONLY non-expert tensors to GPU ──────────────
+    // Expert tensor metadata (shapes) is valid for ggml_nbytes() queries but
+    // data is NOT uploaded — will be loaded from mmap into hybrid hot/cold.
+    LagunaMmap mm;
+    std::string err;
+    if (!mm.open_ro(path, err)) { set_last_error(err); gguf_free(gctx); return false; }
+    const size_t data_start = gguf_get_data_offset(gctx);
+    const int64_t n_tensors = gguf_get_n_tensors(gctx);
+
+    // Pre-pin tok_embd to host (same as full loader)
+    for (int64_t tid = 0; tid < n_tensors; ++tid) {
+        if (std::strcmp(gguf_get_tensor_name(gctx, tid), "token_embd.weight") == 0) {
+            out.tok_embd->data = (uint8_t *)mm.addr +
+                data_start + gguf_get_tensor_offset(gctx, tid);
+            break;
+        }
+    }
+
+    // Custom allocation: compute buffer size excluding expert tensors
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    size_t alloc_total = 0;
+
+    struct TensorAlloc { ggml_tensor * t; size_t file_off; size_t file_sz; size_t buf_off; };
+    std::vector<TensorAlloc> allocs;
+
+    for (int64_t tid = 0; tid < n_tensors; ++tid) {
+        const char * tname = gguf_get_tensor_name(gctx, tid);
+        ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
+        if (!t) continue;
+        if (std::string(tname) == "token_embd.weight") continue;  // stays on CPU
+        if (is_laguna_expert_tensor(tname)) continue;  // skip experts
+        alloc_total = (alloc_total + alignment - 1) & ~(alignment - 1);
+        TensorAlloc a;
+        a.t = t;
+        a.file_off = data_start + gguf_get_tensor_offset(gctx, tid);
+        a.file_sz  = gguf_get_tensor_size(gctx, tid);
+        a.buf_off  = alloc_total;
+        alloc_total += ggml_backend_buft_get_alloc_size(buft, t);
+        allocs.push_back(a);
+    }
+
+    out.buf = ggml_backend_alloc_buffer(backend, alloc_total);
+    if (!out.buf) {
+        set_last_error("buffer alloc failed (laguna partial)");
+        gguf_free(gctx); return false;
+    }
+    ggml_backend_buffer_set_usage(out.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    char * base = (char *)ggml_backend_buffer_get_base(out.buf);
+    for (const TensorAlloc & a : allocs) {
+        if (ggml_backend_tensor_alloc(out.buf, a.t, base + a.buf_off) != GGML_STATUS_SUCCESS) {
+            set_last_error("tensor_alloc failed (laguna partial)");
+            gguf_free(gctx); return false;
+        }
+    }
+
+    // ── 4. Upload non-expert tensor data ─────────────────────────────────
+    size_t total = 0;
+    size_t tok_embd_off = 0, tok_embd_sz = 0;
+    ggml_type tok_embd_type = GGML_TYPE_COUNT;
+    for (int64_t tid = 0; tid < n_tensors; ++tid) {
+        const char * tname = gguf_get_tensor_name(gctx, tid);
+        ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
+        if (!t) continue;
+        const size_t off = data_start + gguf_get_tensor_offset(gctx, tid);
+        const size_t sz  = gguf_get_tensor_size(gctx, tid);
+        if (std::string(tname) == "token_embd.weight") {
+            tok_embd_off  = off;
+            tok_embd_sz   = sz;
+            tok_embd_type = gguf_get_tensor_type(gctx, tid);
+            continue;
+        }
+        if (is_laguna_expert_tensor(tname)) continue;
+        ggml_backend_tensor_set(t, (const uint8_t *)mm.addr + off, 0, sz);
+        total += sz;
+    }
+
+    gguf_free(gctx);
+
+    // ── 5. CpuEmbedder ──────────────────────────────────────────────────
+    out.embedder.mmap_addr      = mm.addr;
+    out.embedder.mmap_len       = mm.len;
+#if !defined(_WIN32)
+    out.embedder.mmap_fd        = mm.fd;
+#else
+    out.embedder.mmap_hfile     = mm.hFile;
+    out.embedder.mmap_hmap      = mm.hMap;
+#endif
+    out.embedder.tok_embd_bytes = (const uint8_t *)mm.addr + tok_embd_off;
+    out.embedder.tok_embd_type  = tok_embd_type;
+    out.embedder.n_embd         = out.n_embd;
+    out.embedder.n_vocab        = (int64_t)n_vocab;
+    out.embedder.row_bytes      = tok_embd_sz / (size_t)n_vocab;
+    mm.release();
+
+    std::printf("[laguna-loader] partial: %" PRId64 " non-expert tensors on GPU %.2f GiB (experts skipped)\n",
+                (int64_t)allocs.size(), total / (1024.0 * 1024.0 * 1024.0));
+    std::fflush(stdout);
+    return true;
+}
+
 } // namespace dflash::common

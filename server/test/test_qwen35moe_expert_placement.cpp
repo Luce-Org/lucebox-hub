@@ -1,4 +1,5 @@
-#include "qwen35moe_expert_placement.h"
+#include "../src/common/moe_hybrid_placement.h"
+#include "../src/common/moe_hybrid_routing_stats.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -15,7 +16,7 @@ static void expect(bool cond, const char * msg) {
 }
 
 int main() {
-    Qwen35MoeRoutingStats stats;
+    MoeHybridRoutingStats stats;
     stats.n_layer = 2;
     stats.n_expert = 4;
     stats.n_expert_used = 2;
@@ -25,11 +26,11 @@ int main() {
     };
     stats.layer_totals = {280, 103};
 
-    Qwen35MoeExpertPlacement placement;
+    MoeHybridPlacement placement;
     std::string err;
-    expect(Qwen35MoeExpertPlacement::build_from_stats(stats, /*total_hot_budget=*/4,
-                                                      /*min_hot_per_layer=*/1,
-                                                      placement, &err), err.c_str());
+    expect(MoeHybridPlacement::build_from_stats(stats, /*total_hot_budget=*/4,
+                                                /*min_hot_per_layer=*/1,
+                                                placement, &err), err.c_str());
     expect(placement.n_layer == 2, "n_layer");
     expect(placement.hot_counts.size() == 2, "hot_counts size");
     expect(placement.hot_counts[0] == 3, "layer0 got extra hot slots");
@@ -41,17 +42,12 @@ int main() {
     expect(placement.is_hot(1, 0), "layer1 expert0 hot");
     expect(!placement.is_hot(1, 1), "layer1 expert1 cold");
 
-    TargetWeights w;
-    w.is_moe = true;
-    w.n_layer = 2;
-    w.n_expert = 4;
-    w.n_expert_used = 2;
-    expect(placement.matches(w), "placement matches weights");
+    expect(placement.matches(2, 4, 2), "placement matches dims");
 
-    const auto tmp = std::filesystem::temp_directory_path() / "qwen35moe-placement-test.json";
-    expect(placement.save_json(tmp.string(), &err), err.c_str());
-    Qwen35MoeExpertPlacement loaded;
-    expect(Qwen35MoeExpertPlacement::load_json(tmp.string(), loaded, &err), err.c_str());
+    const auto tmp = std::filesystem::temp_directory_path() / "moe-hybrid-placement-test.json";
+    expect(placement.save_json(tmp.string(), "moe_hybrid", &err), err.c_str());
+    MoeHybridPlacement loaded;
+    expect(MoeHybridPlacement::load_json(tmp.string(), loaded, &err), err.c_str());
     expect(loaded.hot_counts == placement.hot_counts, "loaded hot counts");
     expect(loaded.hot_expert_ids == placement.hot_expert_ids, "loaded hot ids");
     std::filesystem::remove(tmp);

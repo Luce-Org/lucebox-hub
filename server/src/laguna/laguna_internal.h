@@ -20,6 +20,7 @@
 //   - Vocab = 100352. BOS = 2. EOS = {2, 24}. Pad = 9.
 
 #pragma once
+#define DFLASH_LAGUNA_INTERNAL_H_INCLUDED
 
 #include <cstdint>
 #include <string>
@@ -133,6 +134,12 @@ inline bool laguna_is_full_attn_layer(const LagunaTargetWeights & w, int il) {
 bool load_target_gguf_laguna(const std::string & path,
                               ggml_backend_t       backend,
                               LagunaTargetWeights & out);
+
+// Partial loader for hybrid mode: loads non-expert tensors to GPU,
+// skips expert tensor data (metadata/shapes remain valid for size queries).
+bool load_target_gguf_laguna_partial(const std::string & path,
+                                      ggml_backend_t       backend,
+                                      LagunaTargetWeights & out);
 
 void free_laguna_target_weights(LagunaTargetWeights & w);
 

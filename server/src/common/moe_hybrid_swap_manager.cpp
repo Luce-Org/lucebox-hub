@@ -1,14 +1,15 @@
-#include "qwen35moe_swap_manager.h"
+#include "moe_hybrid_swap_manager.h"
+#include "moe_hybrid_routing_stats.h"
 
 #include <algorithm>
 
 namespace dflash::common {
 
-bool build_qwen35moe_swap_plan(const Qwen35MoeExpertPlacement & current,
-                               const Qwen35MoeRoutingStats & stats,
-                               const Qwen35MoeSwapPolicy & policy,
-                               Qwen35MoeSwapPlan & out,
-                               std::string * err) {
+bool build_moe_hybrid_swap_plan(const MoeHybridPlacement & current,
+                                const MoeHybridRoutingStats & stats,
+                                const MoeHybridSwapPolicy & policy,
+                                MoeHybridSwapPlan & out,
+                                std::string * err) {
     if (current.n_layer != stats.n_layer ||
         current.n_expert != stats.n_expert ||
         current.n_expert_used != stats.n_expert_used) {
@@ -16,14 +17,14 @@ bool build_qwen35moe_swap_plan(const Qwen35MoeExpertPlacement & current,
         return false;
     }
 
-    out = Qwen35MoeSwapPlan{};
+    out = MoeHybridSwapPlan{};
     out.next_placement = current;
     if (policy.max_swaps_total <= 0) {
         return true;
     }
 
     struct Candidate {
-        Qwen35MoeSwapAction action;
+        MoeHybridSwapAction action;
         uint64_t gain_delta = 0;
     };
     std::vector<Candidate> candidates;
