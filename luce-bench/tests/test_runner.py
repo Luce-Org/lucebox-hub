@@ -160,6 +160,92 @@ def test_run_case_thinking_control_fields_always_shipped():
     assert sent["body"]["reasoning_effort"] == "high"
 
 
+def test_run_case_reasoning_effort_flows_into_body():
+    """--reasoning-effort {low,medium,high} sets the think-mode field."""
+    case = {"id": "x", "kind": "integer", "question": "1+1?"}
+    for effort in ("low", "medium", "high"):
+        sent = _capture_body(case, think=True, reasoning_effort=effort)
+        assert sent["body"]["reasoning_effort"] == effort
+    # nothink always sends "none" regardless of the requested effort.
+    sent = _capture_body(case, think=False, reasoning_effort="medium")
+    assert sent["body"]["reasoning_effort"] == "none"
+
+
+def test_run_case_default_reasoning_effort_is_high():
+    """Back-compat: unset effort keeps the pre-flag default of 'high'."""
+    case = {"id": "x", "kind": "integer", "question": "1+1?"}
+    sent = _capture_body(case, think=True)
+    assert sent["body"]["reasoning_effort"] == "high"
+
+
+def test_run_case_thinking_budget_tokens_added_in_think():
+    """--thinking-budget-tokens N adds thinking.budget_tokens in think mode."""
+    case = {"id": "x", "kind": "integer", "question": "1+1?"}
+    sent = _capture_body(case, think=True, thinking_budget_tokens=1024)
+    assert sent["body"]["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+
+
+def test_run_case_thinking_budget_tokens_noop_in_nothink():
+    """budget_tokens is a no-op in nothink — the disabled block is untouched."""
+    case = {"id": "x", "kind": "integer", "question": "1+1?"}
+    sent = _capture_body(case, think=False, thinking_budget_tokens=1024)
+    assert sent["body"]["thinking"] == {"type": "disabled"}
+    assert "budget_tokens" not in sent["body"]["thinking"]
+
+
+def test_run_case_thinking_budget_tokens_unset_omitted():
+    """Unset budget → no budget_tokens field (byte-identical to before)."""
+    case = {"id": "x", "kind": "integer", "question": "1+1?"}
+    sent = _capture_body(case, think=True)
+    assert "budget_tokens" not in sent["body"]["thinking"]
+
+
+def test_run_case_card_tokens_win_over_family_map():
+    """A card's thinking_control tokens drive injection over the family map.
+
+    The card carries a distinctive token (``/deep_think``) that the
+    hardcoded FAMILY_TOKENS map would never produce for a qwen id — so
+    seeing it on the wire proves the card path won.
+    """
+    case = {"id": "x", "kind": "integer", "question": "1+1?"}
+    card = {
+        "name": "Qwen3.6 (custom)",
+        "thinking_control": {
+            "think_prompt_token": "/deep_think",
+            "nothink_prompt_token": "/no_think",
+            "injection_point": "user_turn_suffix",
+        },
+    }
+    sent = _capture_body(
+        case,
+        think=True,
+        model="qwen3.6-27b",
+        model_card=card,
+        thinking_control_flag="on",
+    )
+    assert sent["body"]["messages"][-1]["content"].endswith("/deep_think")
+
+
+def test_run_case_card_provenance_stamped_on_row():
+    """card_source / card_stem are echoed verbatim onto the returned row."""
+    case = {"id": "x", "kind": "integer", "question": "1+1?"}
+    row: dict = {}
+
+    def fake_urlopen(req, timeout=None):
+        return _mock_urlopen(_chat_response())
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        row = run_case(
+            url="http://localhost:8080",
+            case=case,
+            stream=False,
+            card_source="bundled",
+            card_stem="qwen3.6-27b",
+        )
+    assert row["card_source"] == "bundled"
+    assert row["card_stem"] == "qwen3.6-27b"
+
+
 def test_run_case_model_and_messages_shape():
     case = {"id": "x", "kind": "integer", "question": "1+1?"}
     sent = _capture_body(case, model="my-model")

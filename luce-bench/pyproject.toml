@@ -81,8 +81,20 @@ packages = ["src/lucebench"]
 # Fixtures live under src/lucebench/fixtures, so they're auto-included
 # as package data. No force-include needed (would duplicate entries).
 
+# Embed the canonical model cards at build time. The cards live at repo
+# root share/model_cards/ (the C++ server's on-disk contract); we copy
+# them into the wheel as package data under lucebench/_model_cards/ so the
+# standalone PyPI build can resolve cards without reaching repo share/.
+# The git tree carries NO duplicate — only built artifacts do. Path is
+# relative to this pyproject (luce-bench/), so ../share reaches repo root.
+[tool.hatch.build.targets.wheel.force-include]
+"../share/model_cards" = "lucebench/_model_cards"
+
 [tool.hatch.build.targets.sdist]
 include = ["src/lucebench", "README.md", "LICENSE", "NOTICE", "tests"]
+
+[tool.hatch.build.targets.sdist.force-include]
+"../share/model_cards" = "lucebench/_model_cards"
 
 [tool.ruff]
 line-length = 100

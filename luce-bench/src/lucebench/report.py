@@ -54,7 +54,11 @@ def _row_stats(canon: CanonicalResult) -> dict[str, Any]:
     graded.strict_pass), bypassing the writer's possibly-wrong-unit
     aggregate.
     """
-    rows = canon.rows
+    all_rows = canon.rows
+    # client_abort (Tier-2 budgeted) rows are a SEPARATE mode — keep them out
+    # of the single-pass pool entirely and surface them under `budgeted`.
+    rows = [r for r in all_rows if not _row_is_client_abort(r)]
+    budgeted = budgeted_mode_stats(all_rows)
     if not rows:
         return {
             "n": 0,
@@ -65,6 +69,7 @@ def _row_stats(canon: CanonicalResult) -> dict[str, Any]:
             "tok_per_s": 0.0,
             "comp_median": 0,
             "decode_tps_median": 0,
+            "budgeted": budgeted,
         }
     passes = sum(
         1
@@ -87,6 +92,61 @@ def _row_stats(canon: CanonicalResult) -> dict[str, Any]:
         # carry that as decode_tps_median.
         "tok_per_s": (sum(comp) / sum(walls)) if comp and walls and sum(walls) else 0,
         "decode_tps_median": statistics.median(decode_tps) if decode_tps else 0,
+        "budgeted": budgeted,
+    }
+
+
+def _row_is_client_abort(r: Any) -> bool:
+    """True iff a CanonicalRow's client_thinking block is in client_abort mode.
+
+    Tier-2 budgeted runs are a SEPARATE benchmark mode — these rows must not
+    be pooled with single-pass think/nothink rows in any aggregate.
+    """
+    ct = getattr(r, "client_thinking", None)
+    return ct is not None and getattr(ct, "mode", "off") == "client_abort"
+
+
+def budgeted_mode_stats(rows: list[Any]) -> dict[str, Any]:
+    """Aggregate ONLY the client_abort (Tier-2 budgeted) rows, honestly.
+
+    Comparability rules from docs/client-thinking-budget.md:
+
+      * client_abort rows are a distinct mode — callers select them with
+        :func:`_row_is_client_abort` and never pool them with single-pass
+        think/nothink rows.
+      * Rows with ``continuation == "unsupported"`` (provider rejected the
+        prefill / empty answer) or ``answer_started_before_abort == True``
+        (a re-prompt could duplicate/corrupt the answer) are EXCLUDED from
+        the aggregate accuracy — a provider-capability failure or corrupted
+        re-prompt must not be conflated with the model over-thinking.
+      * The headline always carries COVERAGE (graded / total) so a route with
+        many excluded rows can't look artificially strong on a shrunken sample.
+
+    Returns ``{total, graded, excluded, coverage, pass, rate}`` where ``rate``
+    is over the GRADED denominator (a fraction in [0,1]); ``coverage`` is
+    ``graded / total``. ``rate`` is 0.0 when nothing graded.
+    """
+    abort_rows = [r for r in rows if _row_is_client_abort(r)]
+    total = len(abort_rows)
+    graded_rows = []
+    for r in abort_rows:
+        ct = r.client_thinking
+        if ct.continuation == "unsupported" or ct.answer_started_before_abort:
+            continue
+        graded_rows.append(r)
+    graded = len(graded_rows)
+    passes = sum(
+        1
+        for r in graded_rows
+        if r.graded.get("pass") or r.graded.get("strict_pass")
+    )
+    return {
+        "total": total,
+        "graded": graded,
+        "excluded": total - graded,
+        "coverage": (graded / total) if total else 0.0,
+        "pass": passes,
+        "rate": (passes / graded) if graded else 0.0,
     }
 
 

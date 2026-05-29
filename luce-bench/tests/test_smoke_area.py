@@ -100,7 +100,7 @@ def test_preflight_unreachable_fails_fast():
     """Preflight against a closed port returns ok=False quickly."""
     # Port 1 is reserved / closed in practice. Use a tiny timeout so
     # the test stays sub-second even on slow CI.
-    ok, lines, _server_honors = _preflight("http://127.0.0.1:1", timeout_s=2)
+    ok, lines, _server_honors, _card = _preflight("http://127.0.0.1:1", timeout_s=2)
     assert ok is False
     # First line is the header, second is the liveness check — must be ✗.
     assert lines[0].startswith("[lucebench] preflight")

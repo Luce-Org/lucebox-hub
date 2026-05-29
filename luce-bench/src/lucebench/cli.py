@@ -31,6 +31,11 @@ from lucebench.areas import (
     smoke,
     truthfulqa_mc1,
 )
+from lucebench.model_cards import (
+    card_is_thinking_capable,
+    normalize_model_card_stem,
+    resolve_card,
+)
 from lucebench.runner import run_case
 
 
@@ -384,19 +389,22 @@ def _preflight(
     auth_header: str = "",
     timeout_s: int = 5,
     requested_model: str | None = None,
-) -> tuple[bool, list[str], bool]:
+) -> tuple[bool, list[str], bool, dict[str, Any] | None]:
     """Probe the server's liveness + OpenAI shape + lucebox /props endpoint.
 
-    Returns ``(ok, lines, server_honors_api_flags)`` where ``lines`` is
-    the printed grid (already formatted, one check per line), ``ok`` is
-    False iff a HARD check failed — which is "liveness" or "/v1/models
-    doesn't return a data list" — and ``server_honors_api_flags`` is True
-    iff the server's /props response surfaces ``model_card_source`` (the
+    Returns ``(ok, lines, server_honors_api_flags, props_model_card)`` where
+    ``lines`` is the printed grid (already formatted, one check per line),
+    ``ok`` is False iff a HARD check failed — which is "liveness" or
+    "/v1/models doesn't return a data list" — ``server_honors_api_flags`` is
+    True iff the server's /props response surfaces ``model_card_source`` (the
     marker that this is a lucebox stack which enforces thinking control
-    server-side). The /props check is lucebox-specific: missing/404 prints
-    a warning line but does NOT fail (OpenRouter, vLLM, stock ds4_server
-    don't expose /props), and in those cases ``server_honors_api_flags``
-    defaults to False so the client-side injection can take over.
+    server-side), and ``props_model_card`` is the verbatim ``/props.model_card``
+    dict (the authoritative card the server loaded) or None when /props is
+    absent / carries no card. The /props check is lucebox-specific:
+    missing/404 prints a warning line but does NOT fail (OpenRouter, vLLM,
+    stock ds4_server don't expose /props), and in those cases
+    ``server_honors_api_flags`` defaults to False so the client-side
+    injection can take over.
 
     Designed to run before any case fires so a typo'd --url surfaces in
     ~50ms instead of after 92 timeouts. The CLI gates this behind
@@ -443,7 +451,7 @@ def _preflight(
         liveness_detail = f"{type(e).__name__}: {e}"
     lines.append(_line("liveness", liveness_ok, liveness_detail))
     if not liveness_ok:
-        return False, lines, False
+        return False, lines, False, None
 
     # 2. /v1/models shape — OpenAI-compat servers return {"data": [...]}.
     models_ok = False
@@ -471,7 +479,7 @@ def _preflight(
         models_detail = "response was not JSON"
     lines.append(_line("/v1/models", models_ok, models_detail))
     if not models_ok:
-        return False, lines, False
+        return False, lines, False, None
 
     # 3. /props — lucebox-specific. Soft check: warn if absent, surface
     # the image identity + target GGUF basename + model_card_source when
@@ -489,7 +497,7 @@ def _preflight(
         # ``server_honors_api_flags=False`` here is what flips the auto-mode
         # client-side thinking injection on by default for these stacks.
         lines.append(_line("/props", True, "absent (non-lucebox server) — skipped"))
-        return True, lines, False
+        return True, lines, False, None
 
     bits: list[str] = []
 
@@ -545,7 +553,13 @@ def _preflight(
     # budget server-side via the chat template, so the auto-mode client-side
     # injection should stand down.
     server_honors = bool(card)
-    return True, lines, server_honors
+    # `/props.model_card` (props_schema 2+) is the verbatim sidecar JSON the
+    # server loaded — the authoritative card. Capture it so the CLI can pass
+    # it into the thinking resolver ahead of the bundled registry.
+    props_model_card = props.get("model_card") if isinstance(props, dict) else None
+    if not isinstance(props_model_card, dict):
+        props_model_card = None
+    return True, lines, server_honors, props_model_card
 
 
 def _forge_available() -> tuple[bool, str | None]:
@@ -648,6 +662,12 @@ def _run_standard_area_to_dir(
     no_fail_fast: bool,
     prompt_thinking_control: str,
     server_honors_api_flags: bool,
+    reasoning_effort: str = "high",
+    thinking_budget_tokens: int | None = None,
+    client_thinking_budget: int | None = None,
+    model_card: dict[str, Any] | None = None,
+    card_source: str | None = None,
+    card_stem: str | None = None,
 ) -> tuple[dict[str, Any] | None, bool]:
     """Drive a single stdlib area into ``<out_root>/<area>.json``.
 
@@ -665,6 +685,13 @@ def _run_standard_area_to_dir(
         flush=True,
     )
 
+    # Capability gate (see single-area path): only inject think/nothink
+    # tokens for a thinking-capable card; otherwise force the flag off so
+    # neither the card nor the family-map fallback injects.
+    effective_thinking_control = (
+        prompt_thinking_control if card_is_thinking_capable(model_card) else "off"
+    )
+
     rows: list[dict[str, Any]] = []
     for idx, case in enumerate(cases, start=1):
         row = run_case(
@@ -678,8 +705,14 @@ def _run_standard_area_to_dir(
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
-            thinking_control_flag=prompt_thinking_control,
+            thinking_control_flag=effective_thinking_control,
             server_honors_api_flags=server_honors_api_flags,
+            reasoning_effort=reasoning_effort,
+            thinking_budget_tokens=thinking_budget_tokens,
+            client_thinking_budget=client_thinking_budget,
+            model_card=model_card,
+            card_source=card_source,
+            card_stem=card_stem,
         )
         graded = cfg["grade"](case, row)
         row["pass"] = graded.get("pass", False)
@@ -885,6 +918,12 @@ def _run_sweep(args) -> int:
             no_fail_fast=args.no_fail_fast,
             prompt_thinking_control=getattr(args, "prompt_thinking_control", "off"),
             server_honors_api_flags=getattr(args, "server_honors_api_flags", False),
+            reasoning_effort=getattr(args, "reasoning_effort", "high"),
+            thinking_budget_tokens=getattr(args, "thinking_budget_tokens", None),
+            client_thinking_budget=getattr(args, "client_thinking_budget", None),
+            model_card=getattr(args, "resolved_card", None),
+            card_source=getattr(args, "card_source", None),
+            card_stem=getattr(args, "card_stem", None),
         )
         if aborted:
             return 3
@@ -1043,6 +1082,39 @@ def main() -> int:
         "tokens are picked from the model id (longest-prefix match) "
         "or from a model-card sidecar's thinking_control block.",
     )
+    ap.add_argument(
+        "--reasoning-effort",
+        choices=["low", "medium", "high"],
+        default="high",
+        help="OpenAI/OpenRouter reasoning_effort tier sent in think mode "
+        "(default: high — unchanged from pre-flag behavior). nothink always "
+        "sends 'none'. 'low'/'medium' are a Tier-1 native budget hint: a "
+        "provider that honors them yields shorter reasoning with zero "
+        "client machinery. Reported as its own benchmark setting — do not "
+        "pool medium/low runs with default-high think.",
+    )
+    ap.add_argument(
+        "--thinking-budget-tokens",
+        type=int,
+        default=None,
+        help="Tier-1 Anthropic-shape native budget hint. When set AND in "
+        "think mode, adds thinking.budget_tokens=N to the request body "
+        "(same shape lucebench-probe sends). No-op in nothink and when "
+        "unset. Servers that don't understand it ignore it.",
+    )
+    ap.add_argument(
+        "--client-thinking-budget",
+        type=int,
+        default=None,
+        help="Tier-2 client-side thinking budget (opt-in, default off). When "
+        "set AND in think mode, the client counts reasoning tokens as the "
+        "stream arrives (char/4 estimate) and, once over N, aborts the read "
+        "and issues a forced-</think> continuation (a fresh assistant-prefill "
+        "request) whose answer is graded — bounding thinking even on backends "
+        "that ignore the Tier-1 native hints (OpenRouter, MLX). client_abort "
+        "is a SEPARATE benchmark mode: its scores are not pooled with "
+        "single-pass think. No-op in nothink and when unset.",
+    )
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--top-p", type=float, default=None)
     ap.add_argument("--top-k", type=int, default=None)
@@ -1165,8 +1237,9 @@ def main() -> int:
             auth_for_probe = f"Bearer {token}"
 
     server_honors_api_flags = False
+    props_model_card: dict[str, Any] | None = None
     if not args.no_preflight:
-        ok, lines, server_honors_api_flags = _preflight(
+        ok, lines, server_honors_api_flags, props_model_card = _preflight(
             args.url,
             auth_header=auth_for_probe,
             timeout_s=5,
@@ -1183,6 +1256,7 @@ def main() -> int:
             )
             return 4
     args.server_honors_api_flags = server_honors_api_flags
+    args.props_model_card = props_model_card
 
     # /v1/models auto-resolution. Only fires when the user left --model
     # at the literal default; an explicit value (even if wrong) is
@@ -1211,6 +1285,29 @@ def main() -> int:
                 file=sys.stderr,
                 flush=True,
             )
+
+    # ── Card resolution + light preflight classification. Resolve the
+    # model card now that --model is finalized: /props.model_card wins
+    # (authoritative), else the bundled registry keyed by the normalized
+    # stem. The resolved card drives the thinking-token resolver in
+    # run_case (via model_card=), and its provenance is stamped per row.
+    # Logging only — we record the resolution and whether the model is
+    # thinking-capable; we do NOT build the full provider-capability matrix
+    # (Tier 2, deferred).
+    resolved_card, card_source = resolve_card(
+        args.model, getattr(args, "props_model_card", None)
+    )
+    card_stem = normalize_model_card_stem(args.model)
+    thinking_capable = card_is_thinking_capable(resolved_card)
+    args.resolved_card = resolved_card
+    args.card_source = card_source
+    args.card_stem = card_stem
+    print(
+        f"[lucebench] model_card: source={card_source} "
+        f"stem={card_stem or '(none)'} "
+        f"thinking_capable={thinking_capable}",
+        flush=True,
+    )
 
     # ── Multi-area dispatch: anything > 1 area in args.areas_list runs
     # through the sweep path, which writes per-area JSON + a combined
@@ -1307,6 +1404,16 @@ def main() -> int:
         flush=True,
     )
 
+    # Capability gate: only inject think/nothink tokens when the resolved
+    # card is thinking-capable. A non-thinking model (or unresolved card)
+    # forces the flag off so neither the card nor the family-map fallback
+    # injects a token into a model that has no thinking channel.
+    effective_thinking_control = (
+        getattr(args, "prompt_thinking_control", "off")
+        if card_is_thinking_capable(getattr(args, "resolved_card", None))
+        else "off"
+    )
+
     def _do(idx_case):
         idx, case = idx_case
         row = run_case(
@@ -1320,8 +1427,14 @@ def main() -> int:
             temperature=args.temperature,
             top_p=args.top_p,
             top_k=args.top_k,
-            thinking_control_flag=getattr(args, "prompt_thinking_control", "off"),
+            thinking_control_flag=effective_thinking_control,
             server_honors_api_flags=getattr(args, "server_honors_api_flags", False),
+            reasoning_effort=getattr(args, "reasoning_effort", "high"),
+            thinking_budget_tokens=getattr(args, "thinking_budget_tokens", None),
+            client_thinking_budget=getattr(args, "client_thinking_budget", None),
+            model_card=getattr(args, "resolved_card", None),
+            card_source=getattr(args, "card_source", None),
+            card_stem=getattr(args, "card_stem", None),
         )
         graded = cfg["grade"](case, row)
         row["pass"] = graded.get("pass", False)
