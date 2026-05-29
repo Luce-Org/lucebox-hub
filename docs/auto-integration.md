@@ -4,19 +4,19 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T21:53:27-04:00
+Last refresh: 2026-05-28T21:59:29-04:00
 Current base: `origin/main` `8782d07a`
-Current integration tip before this refresh: `easel/auto-integration` `984a0223`
+Current integration tip before this refresh: `easel/auto-integration` `a139fb53`
 Refreshed stack merge commit prepared in this run: none; stack already current
 Final manifest commit prepared after stack merge: this commit
 
 This branch is maintained as a reproducible patch stack over `origin/main`.
 The upstream base, writable remote tip, and carried contributor PR heads were
 already current at the start of this unattended run. This refresh revalidated
-open non-draft PR classification, fetched all current pull refs, and repeated
-direct merge probes for the still-unintegrated non-draft PRs in fresh isolated
-worktrees. No new non-draft contributor PR head appeared during the run, so no
-source stack rewrite was needed.
+the open PR set, fetched current pull refs, and confirmed the carried
+non-draft PR heads remain ancestors of the integration tip. No new non-draft
+contributor PR head appeared during the run, so no source stack rewrite was
+needed.
 
 ## Included in the current stack
 
@@ -40,21 +40,16 @@ source stack rewrite was needed.
 | #142 | `xabicasa/dflash-safetensors-draft-fp16` | `f2fbf62f` | included | FP16 safetensors drafter support is carried. |
 | #285 | `feat/lucebox-docker` | draft | partial draft dependency | Draft PR, outside the primary non-draft target, but earlier Docker/CLI/bench integration dependency remains partially carried. The current draft head `82ebf982` is not fully an ancestor. |
 
-## Fresh probe results from this run
+## Validation run
 
-| PR | Outcome | Notes |
-|---:|---|---|
-| current upstream/base | checked | `git merge --no-edit origin/main` in isolated worktree `/tmp/luce-cron-20260528-215415/reconcile` reported `Already up to date.`; no upstream reconciliation commit was needed. |
-| current integrated PRs | checked | Ancestor checks still pass for carried open non-draft PR refs: #295, #294, #289, #276, #274, #266, #152, and #142. Draft #297 also remains an ancestor. |
-| upstream-adjacent PRs | checked | #292/#298/#299/#300/#301/#302/#303 are included through `origin/main`. |
-| #237 | blocked-needs-human / selective-port | Fresh direct merge probe still conflicts across deleted legacy `dflash/` server files, `server/CMakeLists.txt`, backend factory/model backend, MTP common interfaces/orchestrator, Qwen35 loader/graph/backend/target files, and tests. Prior tmux-driven Claude/Codex review found this is not a safe mechanical merge because the old MTP API/loader/graph/decode path collides with current remote-draft, layer-split, pFlash, thinking-budget, telemetry, and MoE hooks. |
-| #221 | blocked-needs-human / dependency | Fresh direct merge probe still conflicts across old prefix-cache/MTP/common/Qwen35 files, server tests, legacy script paths, and benchmark artifacts. It still depends on a current-layout #237-equivalent MTP foundation before a useful port can be made. |
-| #154 | blocked-needs-human / dependency | Fresh direct merge probe conflicts in legacy `dflash/CMakeLists.txt`, MTP docs, `server/src/internal.h`, Qwen35 loader/target graph, MTP smoke/contract tests, and `test_dflash.cpp`. Portable only after current-layout Qwen35 MTP exists. |
-| #153 | blocked-needs-human / dependency | Fresh direct merge probe shows the same old-layout MTP integrated runtime conflict class as #154; requires current-layout loader/graph/cache design work. |
-| #137 | suggested-close/superseded | Fresh direct merge probe conflicts only in legacy `dflash/CMakeLists.txt`; current `server/CMakeLists.txt` owns CUDA arch/BSA handling. |
-| #135 | blocked-needs-human / selective-port | Fresh direct merge probe conflicts in `server/src/internal.h`, `server/src/qwen35/qwen35_target_graph.cpp`, and `server/test/test_dflash.cpp`. A prior tmux-driven Codex inspection concluded it is not mechanically resolvable: the PR's batched `n_seqs` target stepping and inline scheduler are based on the old monolithic harness and collide with current `TargetLoadPlan`, partial cache/layer ownership, FWHT K rotation, MoE/router capture, `last_token_logits_only`, daemon dispatch, layer-split daemon, draft IPC, peer access, sampler, prefix snapshot, and extracted module structure. |
-| #94 | suggested-close/superseded | Fresh direct merge probe conflicts in current draft graph/safetensors loader/internal files. Current code already carries the useful SWA draft parsing and causal-mask behavior; remaining branch edits are old-layout/obsolete. |
-| #48 | suggested-close/superseded | Fresh direct merge probe conflicts only in legacy `dflash/CMakeLists.txt`; current server CMake supersedes the old Blackwell arch detection patch. |
+This run performed:
+
+- `date -Is` -> 2026-05-28T21:59:29-04:00 for the run timestamp.
+- `git fetch --prune origin` and `git fetch --prune easel` completed successfully.
+- `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 30 --json number,title,headRefName,baseRefName,isDraft,author,updatedAt,labels` refreshed the open PR set; the only new observation versus the previous manifest is draft #304.
+- `git rev-list --left-right --count origin/main...HEAD` reports `0` behind and `367` ahead.
+- `git merge-base --is-ancestor` checks still pass for carried open non-draft PR refs: #295, #294, #289, #276, #274, #266, #152, and #142. Draft #297 also remains an ancestor.
+- `origin/main` remains the current upstream base; no source stack rewrite was needed.
 
 ## Pending / blocked-needs-human / selective-port candidates
 
@@ -77,24 +72,7 @@ and #193. #286 is the draft PR for the current auto-integration snapshot. #304
 is a draft LLM auto context compaction PR observed again in this run; it was not
 integrated because it is draft.
 
-## Validation run
-
-This run performed:
-
-- `date -Is` -> 2026-05-28T21:53:27-04:00 for the run timestamp.
-- `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status`, `HOME=/home/erik /home/erik/.local/bin/claude auth status --text`, and a harmless Codex `--help` smoke check all succeeded.
-- `git fetch --prune origin` and `git fetch --prune easel` completed separately; targeted pull-ref fetch recreated open PR refs for #304, #297, #295, #294, #291, #290, #289, #286, #285, #276, #275, #274, #266, #249, #237, #221, #193, #154, #153, #152, #142, #137, #135, #94, and #48.
-- Isolated reconciliation worktree `/tmp/luce-cron-20260528-215415/reconcile` was created from `easel/auto-integration`; `git merge --no-edit origin/main` reported `Already up to date.`
-- Ancestor checks still pass for carried open non-draft PR refs: #295, #294, #289, #276, #274, #266, #152, and #142. Draft #297 remains carried at `53dd1686`; draft #285 remains only partially carried.
-- Fresh direct merge probes were run in isolated worktrees for the still-unintegrated non-draft PRs #237, #221, #154, #153, #137, #135, #94, and #48; each still conflicts as summarized above. Probe log: `/tmp/luce-cron-20260528-215415/probe-results.txt`.
-- No new non-draft PR head required another external-agent run this cycle. The retained prior tmux-driven Codex/Claude feasibility inspections for the unchanged conflict classes remain applicable.
-- Manifest-only validation on the reconciliation worktree: `git diff --check HEAD -- docs/auto-integration.md` passed.
-- Full stack whitespace validation `git diff --check origin/main...HEAD` still reports only known pre-existing whitespace warnings outside this run's change (`luce-bench/src/lucebench/fixtures/forge_eval/scenarios/_model_quality.py`, `_stateful_model_quality.py`, and `scripts/docker_build_env.sh`).
-- Anchored conflict-marker scan on the reconciliation worktree `git grep -n -E '^(<<<<<<<|>>>>>>>|=======)( |$)' -- . ':!server/eval/humaneval_plus/humanevalplus.jsonl'` found no markers.
-
 ## Notes
 
-- This run produced a manifest-only refresh on top of `984a0223`; no source stack rewrite was needed because `origin/main`, `easel/auto-integration`, and all carried non-draft PR heads were unchanged.
-- Retained reconciliation worktree `/tmp/luce-cron-20260528-215415/reconcile` contains this manifest refresh.
-- Retained fresh conflict probe worktrees `/tmp/luce-cron-20260528-215415/probe-pr237`, `/tmp/luce-cron-20260528-215415/probe-pr221`, `/tmp/luce-cron-20260528-215415/probe-pr154`, `/tmp/luce-cron-20260528-215415/probe-pr153`, `/tmp/luce-cron-20260528-215415/probe-pr137`, `/tmp/luce-cron-20260528-215415/probe-pr135`, `/tmp/luce-cron-20260528-215415/probe-pr94`, and `/tmp/luce-cron-20260528-215415/probe-pr48` are intentionally left for review because they are conflicted.
-- Prior retained worktrees, probe logs, agent reports, and configure directories remain as listed in earlier manifest revisions; cleanup is separate maintenance.
+This run produced a manifest-only refresh on top of `a139fb53`; no source stack rewrite was needed because `origin/main`, `easel/auto-integration`, and all carried non-draft PR heads were unchanged.
+Prior probe logs and earlier conflict-triage notes remain valid for the still-blocked PRs listed above; no new direct-merge evidence changed their classification this run.
