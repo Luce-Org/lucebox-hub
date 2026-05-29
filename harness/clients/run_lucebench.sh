@@ -13,12 +13,20 @@
 # same way it surfaces an OpenCode or Hermes regression.
 #
 # Knobs (env var or default):
-#   LUCEBENCH_AREA      single area: code | longctx | agent | ds4-eval | forge
-#                       (default: empty → `--areas all`, every stdlib area;
-#                       forge requires the [forge] extra installed)
-#   LUCEBENCH_THINK     1 → --think, 0 → --no-think, empty → server default
-#                       (default: 0; nothink is ~4× faster on gemma-4-26b
-#                       per the 2026-05-26 think/nothink comparison)
+#   LUCEBENCH_AREA      area(s) to run; pass the comma list (or `all`) to
+#                       luce-bench directly.
+#                       (default: empty → the level1 set
+#                       `smoke,code,gsm8k,agent,longctx` — matches
+#                       `luce-bench/src/lucebench/levels.py:LEVELS["level1"]`.
+#                       Use `LUCEBENCH_AREA=all` for the full stdlib sweep;
+#                       `LUCEBENCH_AREA=forge` requires the [forge] extra.)
+#   LUCEBENCH_THINK     1 → --think, 0 → --no-think, empty → per-area
+#                       defaults from luce-bench's area cards (recommended).
+#                       Default empty so we don't override card-defined
+#                       defaults; set `LUCEBENCH_THINK=0` for the
+#                       ~4× faster nothink mode on gemma-4-26b (see
+#                       2026-05-26 think/nothink comparison) when running
+#                       A/B sweeps.
 #   LUCEBENCH_MAX_TOKENS overrides per-request decode cap when set
 #   LUCEBENCH_TIMEOUT   per-request wall timeout in seconds (default 300)
 #   LUCEBENCH_PARALLEL  in-flight concurrency (default 1 — single-GPU)
@@ -40,7 +48,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${VERIFY_MODE:=ddtree}"
 : "${EXTRA_SERVER_ARGS:=--lazy-draft}"
 : "${LUCEBENCH_AREA:=}"
-: "${LUCEBENCH_THINK:=0}"
+: "${LUCEBENCH_THINK:=}"
 : "${LUCEBENCH_MAX_TOKENS:=}"
 : "${LUCEBENCH_TIMEOUT:=300}"
 : "${LUCEBENCH_PARALLEL:=1}"
@@ -48,19 +56,32 @@ source "$SCRIPT_DIR/common.sh"
 
 CLIENT_OUT="$LOG_DIR/lucebench.out"
 
-# Build the luce-bench argv. With no LUCEBENCH_AREA, we run `--areas all`
-# (writes per-area JSONs + `_summary.{json,md}` under $LOG_DIR/lucebench-sweep/).
-# With LUCEBENCH_AREA=X, we run a single area to $LOG_DIR/lucebench-X.json.
+# Build the luce-bench argv. With no LUCEBENCH_AREA, we run the level1 set
+# (smoke + code + gsm8k + agent + longctx — the standard capability gate
+# documented in luce-bench/src/lucebench/levels.py), and write per-area
+# JSONs + `_summary.{json,md}` under $LOG_DIR/lucebench-sweep/.
+# With LUCEBENCH_AREA=X (single area), we write a single JSON to
+# $LOG_DIR/lucebench-X.json so the file name carries the area.
+# With LUCEBENCH_AREA=<comma list> or `all`, we sweep into lucebench-sweep/.
 # `--areas` is the canonical flag since luce-bench v0.2.5; the older
 # `--sweep` is still accepted but emits a deprecation note.
 lucebench_args=(--base-url "$BASE_URL" --model "$MODEL_ID" \
                 --timeout "$LUCEBENCH_TIMEOUT" --parallel "$LUCEBENCH_PARALLEL")
 
-if [[ -n "$LUCEBENCH_AREA" ]]; then
-  lucebench_args+=(--areas "$LUCEBENCH_AREA" \
-                   --json-out "$LOG_DIR/lucebench-$LUCEBENCH_AREA.json")
+# Default area set when LUCEBENCH_AREA is unset/empty: the level1 capability
+# gate (mirrors luce-bench's `--level level1`). Picking `all` here was too
+# broad — it tripped slow areas (ds4-eval, forge, agent_recorded) on every
+# default run.
+: "${LUCEBENCH_AREA_DEFAULT:=smoke,code,gsm8k,agent,longctx}"
+effective_area="${LUCEBENCH_AREA:-$LUCEBENCH_AREA_DEFAULT}"
+
+if [[ "$effective_area" == *","* || "$effective_area" == "all" ]]; then
+  # Multi-area or `all`: sweep, write per-area JSONs + a roll-up.
+  lucebench_args+=(--areas "$effective_area" --out-dir "$LOG_DIR" --name lucebench-sweep)
 else
-  lucebench_args+=(--areas all --out-dir "$LOG_DIR" --name lucebench-sweep)
+  # Single area: one JSON named after the area for convenient diffing.
+  lucebench_args+=(--areas "$effective_area" \
+                   --json-out "$LOG_DIR/lucebench-$effective_area.json")
 fi
 
 # --think / --no-think only applies when explicitly set. Leaving the flag

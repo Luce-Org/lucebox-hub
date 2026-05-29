@@ -247,7 +247,7 @@ ENV UV_LINK_MODE=hardlink \
 # With non-editable wheels the venv is self-contained and the build hook
 # only runs once, here, with root.
 RUN uv sync --no-dev --frozen --no-editable 2>/dev/null \
-    || uv sync --no-dev --no-editable
+    || uv sync --no-dev --frozen --no-editable
 
 # Host wrapper CLI containers run as the invoking host uid so bind-mounted
 # config/profile files are not left root-owned. Keep the uv-managed
