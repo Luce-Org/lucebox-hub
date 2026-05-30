@@ -232,12 +232,37 @@ def test_pick_multi_turn_case_for_budget():
         {"id": "med", "context_tokens_approx": 31000, "target_bucket_tokens": 32768},
         {"id": "big", "context_tokens_approx": 130000, "target_bucket_tokens": 131072},
     ]
-    # Plenty of budget — should pick the largest fitting.
+    # Plenty of budget — should pick the largest fitting (default
+    # safety_factor=0.7 → effective 140K; big at 130K fits).
     assert agent_recorded.pick_multi_turn_case_for_budget(cases, 200_000)["id"] == "big"
-    # Mid budget — should pick med, not small.
+    # Mid budget — 60K * 0.7 = 42K effective; small (7800) and med
+    # (31000) fit, big (130000) doesn't. Picker returns the larger.
     assert agent_recorded.pick_multi_turn_case_for_budget(cases, 60_000)["id"] == "med"
     # Below the smallest — returns None.
     assert agent_recorded.pick_multi_turn_case_for_budget(cases, 1_000) is None
+
+
+def test_pick_multi_turn_case_for_budget_safety_factor_excludes_near_ceiling():
+    """Regression for the 2026-05-30 gemma4 sweep failure: a case whose
+    ``context_tokens_approx`` is just under the raw prompt_budget
+    overshoots the real tokenizer count by ~40% and trips the server's
+    effort-tier ceiling. The default 0.7 safety_factor must reject it."""
+    cases = [
+        {"id": "small", "context_tokens_approx": 64000, "target_bucket_tokens": 65536},
+        # ``approx=102000`` ≤ raw budget 126976, but real tokens ≈ 140K
+        # would exceed; safety_factor must keep this case OUT.
+        {"id": "borderline", "context_tokens_approx": 102000, "target_bucket_tokens": 102400},
+    ]
+    # raw_budget=126976 → effective=88883. small (64K) fits; borderline (102K) does not.
+    picked = agent_recorded.pick_multi_turn_case_for_budget(cases, 126976)
+    assert picked["id"] == "small", f"safety_factor must exclude the borderline case, picked {picked}"
+
+    # Operator can override the safety factor — e.g. when the fixture
+    # has been re-tokenized accurately and the approx is the truth.
+    picked2 = agent_recorded.pick_multi_turn_case_for_budget(
+        cases, 126976, safety_factor=1.0
+    )
+    assert picked2["id"] == "borderline", "safety_factor=1.0 should allow borderline"
 
 
 def test_grade_prefill_and_decode_pass():

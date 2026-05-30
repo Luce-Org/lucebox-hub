@@ -231,7 +231,10 @@ def load_agent_recorded_multi_turn_cases(
 
 
 def pick_multi_turn_case_for_budget(
-    cases: list[dict[str, Any]], prompt_budget_tokens: int
+    cases: list[dict[str, Any]],
+    prompt_budget_tokens: int,
+    *,
+    safety_factor: float = 0.7,
 ) -> dict[str, Any] | None:
     """Pick the largest multi-turn case that fits within ``prompt_budget_tokens``.
 
@@ -239,8 +242,22 @@ def pick_multi_turn_case_for_budget(
     with ``max_ctx = N`` and a reply budget of ``r``, prompt_budget is
     ``N − r``. Returns ``None`` when no case fits (every case
     over-budget — caller should skip the cell or shrink the case).
+
+    ``safety_factor`` (default 0.7) accounts for the gap between the
+    extractor's ``chars / 4`` token approximation and the real
+    tokenizer + chat template expansion. Empirical evidence from the
+    gemma4-26b sweep on 2026-05-30 (see
+    ``docs/experiments/gemma4-26b-coding-agent-loop-sweep-2026-05-30.md``):
+    a 65205-approx-token Claude session tokenized to **90799 real
+    tokens** through the gemma chat template — a 1.39× expansion. The
+    102397-approx-token case overshoots a 126976-token budget at
+    max_ctx=131072 and triggers HTTP 400 server-side. Without a safety
+    margin the sweep's 131K cells fail uniformly. ``0.7`` corresponds
+    to a 1.43× expansion guard; tune downward if a future fixture is
+    even denser per char (e.g. heavy multibyte content).
     """
-    fit = [c for c in cases if c["context_tokens_approx"] <= prompt_budget_tokens]
+    effective_budget = int(prompt_budget_tokens * safety_factor)
+    fit = [c for c in cases if c["context_tokens_approx"] <= effective_budget]
     if not fit:
         return None
     return max(fit, key=lambda c: c["context_tokens_approx"])

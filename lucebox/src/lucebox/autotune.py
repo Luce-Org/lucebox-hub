@@ -72,7 +72,14 @@ def runtime_from_host(host: HostFacts) -> DflashRuntime:
         return DflashRuntime(max_ctx=32768)
     if host.vram_gb < 32:
         if host.is_wsl:
-            return DflashRuntime(budget=16, max_ctx=65536)
+            # Bumped from max_ctx=65536 → 98304 on 2026-05-30 after the
+            # coding-agent-loop sweep on sindri proved 98K serves real
+            # 90K-token agentic prompts with ~3 GB VRAM headroom and no
+            # CUDA VMM failures. See
+            # docs/experiments/gemma4-26b-coding-agent-loop-sweep-2026-05-30.md.
+            # The original 65K cap cited unverified VMM failures —
+            # bisect history showed no commit reproducing them.
+            return DflashRuntime(budget=16, max_ctx=98304)
         return DflashRuntime(max_ctx=98304)
     if host.vram_gb < 48:
         return DflashRuntime(max_ctx=131072)

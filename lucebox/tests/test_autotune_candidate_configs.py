@@ -81,9 +81,12 @@ def test_40gb_host_includes_f16_kv() -> None:
 
 
 def test_wsl_24gb_includes_wsl_heuristic() -> None:
-    """WSL drops the heuristic max_ctx to 65536; the bracket follows."""
+    """WSL 24 GB tier serves up to max_ctx=98304 (bumped from 65536
+    after the 2026-05-30 sweep; the original 65K cap cited unverified
+    VMM failures and the empirical run proved 90K-token prompts on
+    98K max_ctx work reliably). The bracket includes this base."""
     host = HostFacts(vram_gb=24, is_wsl=True)
     base = autotune_mod.runtime_from_host(host)
-    assert base.max_ctx == 65536  # WSL heuristic, see runtime_from_host  # noqa: PLR2004
+    assert base.max_ctx == 98304  # WSL heuristic, see runtime_from_host  # noqa: PLR2004
     configs = autotune_mod.candidate_configs(host)
     assert any(_key(c) == _key(base) for c in configs)
