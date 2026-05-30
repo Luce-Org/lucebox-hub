@@ -159,6 +159,12 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
     for (int il = 0; il < cfg.n_layer; ++il) {
         const MoeLayerDesc & desc = layer_descs[(size_t)il];
         MoeHybridLayerStorage & dst = out.layers[(size_t)il];
+
+        // Skip dense layers (no experts)
+        if (!desc.ffn_gate_exps && !desc.ffn_up_exps && !desc.ffn_down_exps && !desc.ffn_gate_up_exps) {
+            continue;
+        }
+
         dst.hot_expert_ids = placement.hot_expert_ids[(size_t)il];
         dst.hot_local_by_global.assign((size_t)cfg.n_expert, -1);
         dst.cold_local_by_global.assign((size_t)cfg.n_expert, -1);
@@ -328,6 +334,12 @@ bool build_moe_hybrid_storage_from_file(
         const MoeLayerDesc & desc = layer_descs[(size_t)il];
         const LayerExpertFileData & fd = file_data[(size_t)il];
         MoeHybridLayerStorage & dst = out.layers[(size_t)il];
+
+        // Skip dense layers (no experts)
+        if (!desc.ffn_gate_exps && !desc.ffn_up_exps && !desc.ffn_down_exps && !desc.ffn_gate_up_exps) {
+            continue;
+        }
+
         dst.hot_expert_ids = placement.hot_expert_ids[(size_t)il];
         dst.hot_local_by_global.assign((size_t)cfg.n_expert, -1);
         dst.cold_local_by_global.assign((size_t)cfg.n_expert, -1);
@@ -381,7 +393,10 @@ bool build_moe_hybrid_storage_from_file(
             }
             dst.hot_buf = ggml_backend_alloc_ctx_tensors(dst.hot_ctx, gpu_backend);
             if (!dst.hot_buf) {
-                if (err) *err = "failed to allocate hot expert GPU buffer";
+                char msg[128];
+                std::snprintf(msg, sizeof(msg),
+                    "failed to allocate hot expert GPU buffer (layer %d, %d hot experts)", il, hot_count);
+                if (err) *err = msg;
                 return false;
             }
 

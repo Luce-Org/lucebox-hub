@@ -199,7 +199,8 @@ bool MoeHybridPlacement::build_from_stats_with_layer_bytes(
     const int per_layer_floor = std::min(min_hot_per_layer, stats.n_expert);
     uint64_t floor_bytes = 0;
     for (int il = 0; il < stats.n_layer; ++il) {
-        floor_bytes += (uint64_t)per_layer_floor * layer_expert_bytes[(size_t)il];
+        if (layer_expert_bytes[(size_t)il] > 0)
+            floor_bytes += (uint64_t)per_layer_floor * layer_expert_bytes[(size_t)il];
     }
     if (floor_bytes > total_hot_budget_bytes) {
         if (err) *err = "min_hot_per_layer exceeds byte budget";
@@ -210,7 +211,10 @@ bool MoeHybridPlacement::build_from_stats_with_layer_bytes(
     tmp.n_layer = stats.n_layer;
     tmp.n_expert = stats.n_expert;
     tmp.n_expert_used = stats.n_expert_used;
-    tmp.hot_counts.assign((size_t)tmp.n_layer, per_layer_floor);
+    tmp.hot_counts.resize((size_t)tmp.n_layer);
+    for (int il = 0; il < tmp.n_layer; ++il) {
+        tmp.hot_counts[(size_t)il] = (layer_expert_bytes[(size_t)il] > 0) ? per_layer_floor : 0;
+    }
 
     std::vector<std::vector<int>> ranked((size_t)tmp.n_layer);
     for (int il = 0; il < tmp.n_layer; ++il) {
