@@ -182,10 +182,17 @@ def test_pick_winner_picks_highest_tps() -> None:
     assert sweep_mod._pick_winner([r1, r2, r3], "decode_tps_snapshot") is r2
 
 
-def test_pick_winner_agent_replay_filters_failures_and_ranks_by_speed() -> None:
-    """coding-agent-loop ranking: only passing cells qualify; higher
-    speed_metric wins; among ties, larger max_ctx then larger
-    fa_window then lower budget."""
+def test_pick_winner_agent_replay_filters_failures_and_ranks_by_ctx_then_speed() -> None:
+    """coding-agent-loop ranking (post-3dffb30): only passing cells
+    qualify; larger ``max_ctx`` is the PRIMARY sort key; within the
+    same max_ctx, higher ``speed_metric`` wins.
+
+    Cross-max_ctx speed comparisons are apples-to-oranges because
+    smaller-ctx cells run against shorter fixture cases (the picker
+    selects the largest case that fits). Sorting by speed first would
+    systematically pick the smaller context — see commit 3dffb30
+    (bragi sweep 2026-05-30) for the concrete metric artifact.
+    """
     failed = sweep_mod.CellResult(
         index=0,
         config=DflashRuntime(max_ctx=131072, fa_window=2048, budget=22),
@@ -196,7 +203,7 @@ def test_pick_winner_agent_replay_filters_failures_and_ranks_by_speed() -> None:
         pass_reason="HTTP 500",
         speed_metric=None,
     )
-    slow = sweep_mod.CellResult(
+    big_ctx_slow = sweep_mod.CellResult(
         index=1,
         config=DflashRuntime(max_ctx=131072, fa_window=0, budget=22),
         snapshot_dir=None,
@@ -206,7 +213,7 @@ def test_pick_winner_agent_replay_filters_failures_and_ranks_by_speed() -> None:
         pass_reason="ok",
         speed_metric=5.0,
     )
-    fast = sweep_mod.CellResult(
+    small_ctx_fast = sweep_mod.CellResult(
         index=2,
         config=DflashRuntime(max_ctx=98304, fa_window=2048, budget=22),
         snapshot_dir=None,
@@ -216,8 +223,39 @@ def test_pick_winner_agent_replay_filters_failures_and_ranks_by_speed() -> None:
         pass_reason="ok",
         speed_metric=25.0,
     )
-    winner = sweep_mod._pick_winner([failed, slow, fast], "agent_replay_pass_rate")
-    assert winner is fast, "highest speed_metric should win among passing cells"
+    winner = sweep_mod._pick_winner(
+        [failed, big_ctx_slow, small_ctx_fast], "agent_replay_pass_rate"
+    )
+    assert winner is big_ctx_slow, (
+        "larger max_ctx must win even when a smaller-ctx cell shows higher "
+        "speed_metric (different fixture cases → apples-to-oranges)"
+    )
+
+
+def test_pick_winner_agent_replay_speed_breaks_tie_within_same_max_ctx() -> None:
+    """Within the same max_ctx, higher speed_metric wins."""
+    slow_at_131k = sweep_mod.CellResult(
+        index=0,
+        config=DflashRuntime(max_ctx=131072, fa_window=0, budget=22),
+        snapshot_dir=None,
+        mean_decode_tps=None,
+        error=None,
+        passed=True,
+        speed_metric=2.5,
+    )
+    fast_at_131k = sweep_mod.CellResult(
+        index=1,
+        config=DflashRuntime(max_ctx=131072, fa_window=0, budget=16),
+        snapshot_dir=None,
+        mean_decode_tps=None,
+        error=None,
+        passed=True,
+        speed_metric=3.5,
+    )
+    winner = sweep_mod._pick_winner(
+        [slow_at_131k, fast_at_131k], "agent_replay_pass_rate"
+    )
+    assert winner is fast_at_131k
 
 
 def test_pick_winner_agent_replay_returns_none_when_all_failed() -> None:
