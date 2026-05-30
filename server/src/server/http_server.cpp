@@ -887,9 +887,18 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
 
         // Determine thinking mode BEFORE rendering so the template can inject
         // the <think>\n\n</think>\n\n block when thinking is disabled.
-        // Default: thinking OFF (Qwen3.6 thinking wrecks
-        // DFlash acceptance rates; clients opt in explicitly).
-        bool enable_thinking = false;
+        // Default: thinking ON for AGENTIC turns (tools present), OFF for plain
+        // chat. Decision turns ("which task next?") need a reasoning budget or
+        // the model EOS-es right after its action preamble with no tool_call,
+        // stalling the agent loop. Measured on 36 real captured agentic turns:
+        // tool-call rate 32/36 -> 36/36 (4 recoveries, 0 regressions); the
+        // older "thinking wrecks DFlash acceptance" claim did not reproduce
+        // (accept-rate equal-or-better with thinking on). Any explicit client
+        // opt-in/out below (reasoning / thinking / chat_template_kwargs) still
+        // overrides this default.
+        bool enable_thinking = body.contains("tools") &&
+                               body["tools"].is_array() &&
+                               !body["tools"].empty();
 
         // Track which fields the request explicitly set, so we can apply
         // §4.3 combined precedence: thinking.budget_tokens beats
