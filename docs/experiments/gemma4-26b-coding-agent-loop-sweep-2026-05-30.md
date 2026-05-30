@@ -37,6 +37,28 @@ the server's actual `prompt_tokens` after tokenization + chat template
 wrapping. Real gemma tokenization expands by ~1.39× relative to chars/4
 on this fixture.
 
+## Verification: 131K serves the level2 suite on sindri (2026-05-30 evening)
+
+After bragi's sweep showed 131K viable on a 23 GB Laptop, sindri was
+bumped to `max_ctx=131072, budget=22, fa_window=0` and re-ran the
+level2 area set. Drop-in works: no quality regression, longctx still
+100%.
+
+| area | 98K rate | 131K rate | delta |
+|---|---|---|---|
+| smoke | 100% (3/3) | 100% (3/3) | = |
+| code | 10% (1/10) | 10% (1/10) | = |
+| gsm8k | 91% (91/100) | 91% (91/100) | = |
+| truthfulqa-mc1 | 80% (80/100) | 76% (76/100) | −4 pp (stochastic) |
+| hellaswag | 70% (70/100) | 75% (75/100) | +5 pp (stochastic) |
+| agent | 50% (2/4) | 50% (2/4) | = |
+| longctx | 100% (6/6) | 100% (6/6) | = |
+
+VRAM at boot on 131K: 21.1 / 24.6 GiB used; ~3 GiB headroom. The
+longctx-64k cell prefilled 66,853 tokens in 45.9 s (~1450 tok/s
+prefill) and decoded 61 tokens in 955 ms (~64 tok/s decode).
+Snapshot: `…-gemma-131k-verify-2026-05-30-67f4`.
+
 ## Correction (added 2026-05-30 after bragi sweep)
 
 The 131K failures below were a **fixture-picker artifact, not a VRAM limit**.
