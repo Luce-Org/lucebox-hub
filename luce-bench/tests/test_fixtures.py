@@ -273,7 +273,7 @@ def test_preflight_props_schema3_image_and_target_displayed(monkeypatch):
         },
     }
     _stub_preflight_urlopen(monkeypatch, models, props)
-    ok, lines, _server_honors = _preflight("http://localhost:8080")
+    ok, lines, _server_honors, _card = _preflight("http://localhost:8080")
     assert ok is True
     # Find the /props line.
     props_line = next(line for line in lines if "/props" in line)
@@ -300,7 +300,7 @@ def test_preflight_props_schema2_falls_back(monkeypatch):
         },
     }
     _stub_preflight_urlopen(monkeypatch, models, props)
-    ok, lines, _server_honors = _preflight("http://localhost:8080")
+    ok, lines, _server_honors, _card = _preflight("http://localhost:8080")
     assert ok is True
     props_line = next(line for line in lines if "/props" in line)
     # No image=/target= bits when those fields are absent.
@@ -334,7 +334,7 @@ def test_preflight_props_build_image_fields_null(monkeypatch):
         "budget_envelope": {},
     }
     _stub_preflight_urlopen(monkeypatch, models, props)
-    ok, lines, _server_honors = _preflight("http://localhost:8080")
+    ok, lines, _server_honors, _card = _preflight("http://localhost:8080")
     assert ok is True
     props_line = next(line for line in lines if "/props" in line)
     assert "image=" not in props_line

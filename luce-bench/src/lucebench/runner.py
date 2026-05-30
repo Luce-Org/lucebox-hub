@@ -22,6 +22,42 @@ _SSE_DONE = "[DONE]"
 # Per-case overrides win via `case["max_tokens"]`.
 DEFAULT_MAX_TOKENS = 512
 
+# Tier-2 client-thinking-budget defaults (see docs/client-thinking-budget.md).
+# Reply reserve for the forced-`</think>` continuation when the card carries no
+# `hard_limit_reply_budget`.
+_CLIENT_THINKING_DEFAULT_REPLY_RESERVE = 4096
+# Fallback terminator when the card has no `thinking_terminator_hint`.
+_CLIENT_THINKING_DEFAULT_TERMINATOR = "</think>\n\n"
+
+
+def _estimate_reasoning_tokens(reasoning_text: str) -> int:
+    """Approximate reasoning-token count from accumulated text (char/4).
+
+    No tokenizer dependency — this is a soft gate, not an exact cutoff. It
+    miscounts math/code/CJK/whitespace-heavy text and, because it's only
+    checked once per streamed chunk, OVERSHOOTS the budget by up to one
+    chunk's worth of reasoning before the abort fires.
+    """
+    return len(reasoning_text) // 4
+
+
+def _resolve_terminator(card: dict[str, Any] | None) -> str:
+    """Pick the force-close phrase: card hint if present, else `</think>`."""
+    if isinstance(card, dict):
+        hint = card.get("thinking_terminator_hint")
+        if isinstance(hint, str) and hint:
+            return hint
+    return _CLIENT_THINKING_DEFAULT_TERMINATOR
+
+
+def _resolve_reply_reserve(card: dict[str, Any] | None) -> int:
+    """Reply `max_tokens` for the continuation: card budget else 4096."""
+    if isinstance(card, dict):
+        reserve = card.get("hard_limit_reply_budget")
+        if isinstance(reserve, int) and reserve > 0:
+            return reserve
+    return _CLIENT_THINKING_DEFAULT_REPLY_RESERVE
+
 DEFAULT_SYSTEM_PROMPT = (
     "You are solving a hard benchmark question. Reason carefully. "
     "The final answer must follow the requested format exactly."
@@ -143,6 +179,11 @@ def run_case(
     thinking_control_flag: str = "off",
     model_card: dict[str, Any] | None = None,
     server_honors_api_flags: bool = True,
+    reasoning_effort: str = "high",
+    thinking_budget_tokens: int | None = None,
+    client_thinking_budget: int | None = None,
+    card_source: str | None = None,
+    card_stem: str | None = None,
 ) -> dict[str, Any]:
     """Send one case to the server, return a normalized row dict.
 
@@ -155,6 +196,34 @@ def run_case(
     ``extra_body`` is merged into the request body verbatim — use for
     server-specific knobs (e.g. ``chat_template_kwargs``,
     ``reasoning_effort``, provider routing hints).
+
+    ``reasoning_effort`` sets the OpenAI/OpenRouter ``reasoning_effort``
+    request field in think mode (``"low"`` / ``"medium"`` / ``"high"``);
+    nothink always sends ``"none"`` regardless. Default ``"high"`` keeps
+    the wire body byte-identical to pre-feature behavior.
+
+    ``thinking_budget_tokens`` (Tier-1 native budget hint): when set AND in
+    think mode, adds ``thinking.budget_tokens=N`` to the Anthropic-shape
+    ``thinking`` block (mirrors lucebench.probe's think-low / think-medium
+    modes). Unset → the field is omitted and the body is unchanged.
+
+    ``client_thinking_budget`` (Tier-2 client abort + re-prompt): when set
+    AND in think mode AND streaming, the runner counts reasoning tokens as
+    the stream arrives (char/4 estimate) and, once the estimate exceeds N,
+    stops reading the stream and issues a SECOND, non-streamed request that
+    re-conditions on the captured partial reasoning plus the card's
+    ``thinking_terminator_hint`` (else ``</think>\\n\\n``) as an
+    assistant-prefill turn, think disabled. That continuation's answer is
+    graded. This is a FRESH conditioned sample, not a resumption of the
+    original decode. Per-row metadata lands under ``row["client_thinking"]``.
+    Unset → byte-identical to the pre-feature path (no second request, same
+    streaming). Reasoning that is neither marked by ``reasoning_content``
+    deltas nor ``<think>`` tags is ``marking="unmarked"``: no boundary
+    exists, so the run finishes normally and is never aborted.
+
+    ``card_source`` / ``card_stem`` are provenance only — stamped verbatim
+    onto the returned row for the result schema (see
+    :mod:`lucebench.model_cards`). They do not affect the wire body.
 
     ``thinking_control_flag`` toggles the client-side prompt-level
     injection fallback (see :mod:`lucebench._thinking`). The default
@@ -195,8 +264,14 @@ def run_case(
         # convention. Servers ignore what they don't understand.
         "chat_template_kwargs": {"enable_thinking": think},
         "thinking": {"type": "enabled" if think else "disabled"},
-        "reasoning_effort": "high" if think else "none",
+        "reasoning_effort": reasoning_effort if think else "none",
     }
+    # Tier-1 native budget hint (Anthropic shape). Only meaningful in think
+    # mode; nothink leaves the disabled block untouched. Mirrors the
+    # budget_tokens field probe.py sends for its think-low / think-medium
+    # modes — servers that don't understand it ignore it.
+    if think and thinking_budget_tokens is not None:
+        body["thinking"]["budget_tokens"] = int(thinking_budget_tokens)
     if stream:
         # Without include_usage the final SSE chunk omits the usage block
         # for OpenAI / OpenRouter (lucebox sends it either way). Without
@@ -240,6 +315,25 @@ def run_case(
         headers=headers,
     )
 
+    # Tier-2 client-thinking-budget is only meaningful with --think on a
+    # streamed request. Off otherwise — the block below records mode="off"
+    # and the streaming loop never aborts, so the wire path is byte-identical
+    # to the pre-feature behavior.
+    client_thinking_active = (
+        client_thinking_budget is not None and client_thinking_budget > 0 and think and stream
+    )
+    # Canonical "feature off / not engaged" block, stamped on every non-aborted
+    # return so the row schema is uniform whether or not the budget was set.
+    off_block: dict[str, Any] = {
+        "mode": "client_abort" if client_thinking_active else "off",
+        "requested_budget": client_thinking_budget if client_thinking_active else None,
+        "engaged": False,
+        "marking": "unmarked",
+        "reasoning_tokens_at_abort": 0,
+        "continuation": "skipped",
+        "answer_started_before_abort": False,
+    }
+
     t0 = time.perf_counter()
     if not stream:
         # Legacy single-shot POST. Kept for callers that explicitly opt
@@ -258,6 +352,9 @@ def run_case(
                 "wall_seconds": round(time.perf_counter() - t0, 3),
                 "http_status": None,
                 "streaming": False,
+                "card_source": card_source,
+                "card_stem": card_stem,
+                "client_thinking": off_block,
                 "_thinking_injection": injection_info,
             }
         wall = round(time.perf_counter() - t0, 3)
@@ -290,6 +387,9 @@ def run_case(
             "finish_reason": choice.get("finish_reason"),
             "finish_details": finish_details,
             "timings": usage.get("timings"),
+            "card_source": card_source,
+            "card_stem": card_stem,
+            "client_thinking": off_block,
             # Caller grades; we just normalize the wire shape.
             "_response": data,
             "_thinking_injection": injection_info,
@@ -308,6 +408,14 @@ def run_case(
     model_id: str | None = None
     last_chunk: dict[str, Any] = {}
     http_status: int | None = None
+    # Tier-2 abort bookkeeping. `marking` identifies the reasoning channel:
+    # "reasoning_content" (best), "think_tags" (<think>…</think> in content),
+    # or "unmarked" (no boundary — never abort, finish normally). `aborted`
+    # flips once the char/4 estimate trips the budget and we close the stream.
+    marking = "unmarked"
+    aborted = False
+    answer_started_before_abort = False
+    reasoning_tokens_at_abort = 0
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             http_status = resp.status
@@ -344,6 +452,52 @@ def run_case(
                 fd = choice.get("finish_details") or {}
                 if fd:
                     finish_details = fd
+
+                # ── Tier-2 client-thinking-budget gate. Identify the
+                # reasoning channel and estimate reasoning tokens (char/4)
+                # as deltas arrive; abort once over budget so a backend
+                # that ignores native hints can't reason to the ceiling.
+                if not client_thinking_active:
+                    continue
+                if piece_reason:
+                    # reasoning_content / reasoning deltas → authoritative.
+                    marking = "reasoning_content"
+                if marking == "reasoning_content":
+                    reasoning_text = "".join(reasoning_parts)
+                    # Any visible content delta alongside reasoning means the
+                    # answer has begun — a re-prompt could duplicate it.
+                    if piece_content:
+                        answer_started_before_abort = True
+                elif "<think>" in "".join(content_parts):
+                    # Inline <think>…</think> in the content stream. Count
+                    # chars from after the open tag to either the close tag
+                    # or, if still open, the current end of content. Anything
+                    # after </think> is the visible answer.
+                    marking = "think_tags"
+                    joined = "".join(content_parts)
+                    start = joined.find("<think>") + len("<think>")
+                    end = joined.find("</think>", start)
+                    if end == -1:
+                        reasoning_text = joined[start:]
+                    else:
+                        reasoning_text = joined[start:end]
+                        after = joined[end + len("</think>") :]
+                        if after.strip():
+                            answer_started_before_abort = True
+                else:
+                    # No reasoning_content, no <think> tag yet → unmarked.
+                    # Cannot identify thinking; do NOT abort.
+                    continue
+
+                est = _estimate_reasoning_tokens(reasoning_text)
+                # client_thinking_active guarantees the budget is a positive int.
+                if est > (client_thinking_budget or 0):
+                    # Over budget. Stop reading and close the stream (the
+                    # `with` block exits on break). char/4 overshoots by up
+                    # to one chunk, so `est` is the partial-at-abort estimate.
+                    reasoning_tokens_at_abort = est
+                    aborted = True
+                    break
     except Exception as e:
         return {
             "case_id": case.get("id"),
@@ -354,8 +508,79 @@ def run_case(
             "ttft_seconds": round(ttft, 4) if ttft is not None else None,
             "streaming": True,
             "http_status": http_status,
+            "card_source": card_source,
+            "card_stem": card_stem,
+            "client_thinking": off_block,
             "_thinking_injection": injection_info,
         }
+
+    # ── Tier-2 forced-`</think>` continuation. When the budget tripped, the
+    # captured partial reasoning is re-conditioned in a SECOND, independent
+    # request: original messages + an assistant-prefill turn carrying the
+    # partial reasoning plus the card's terminator, think disabled. This is a
+    # FRESH conditioned sample, not a resumption of the aborted decode — the
+    # original stream's server-side generation may keep running; we only
+    # stopped reading. The continuation's answer is what the caller grades.
+    if aborted:
+        partial_reasoning = (
+            "".join(reasoning_parts) if marking == "reasoning_content" else None
+        )
+        if partial_reasoning is None:
+            # think_tags: reconstruct the reasoning slice from content.
+            joined = "".join(content_parts)
+            start = joined.find("<think>") + len("<think>")
+            end = joined.find("</think>", start)
+            partial_reasoning = joined[start:] if end == -1 else joined[start:end]
+        cont_content, cont_ok = _client_thinking_continuation(
+            url=url,
+            base_messages=new_messages,
+            partial_reasoning=partial_reasoning,
+            terminator=_resolve_terminator(model_card),
+            reply_reserve=_resolve_reply_reserve(model_card),
+            model=model,
+            auth_header=auth_header,
+            timeout_s=timeout_s,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            extra_body=extra_body,
+        )
+        wall = round(time.perf_counter() - t0, 3)
+        client_thinking_block: dict[str, Any] = {
+            "mode": "client_abort",
+            "requested_budget": client_thinking_budget,
+            "engaged": True,
+            "marking": marking,
+            "reasoning_tokens_at_abort": reasoning_tokens_at_abort,
+            "continuation": "ok" if cont_ok else "unsupported",
+            "answer_started_before_abort": answer_started_before_abort,
+        }
+        return {
+            "case_id": case.get("id"),
+            "source": case.get("source"),
+            "kind": case.get("kind"),
+            "wall_seconds": wall,
+            "ttft_seconds": round(ttft, 4) if ttft is not None else None,
+            "streaming": True,
+            "http_status": http_status,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            # Estimated reasoning-at-abort; the aborted stream lacks final usage.
+            "reasoning_tokens": reasoning_tokens_at_abort,
+            # The continuation answer is graded; falls back to the (truncated)
+            # original content when the continuation is unsupported.
+            "content": cont_content if cont_ok else ("".join(content_parts) or None),
+            "reasoning_content": partial_reasoning or None,
+            "finish_reason": finish_reason,
+            "finish_details": finish_details,
+            "timings": None,
+            "card_source": card_source,
+            "card_stem": card_stem,
+            "client_thinking": client_thinking_block,
+            "_response": last_chunk,
+            "_thinking_injection": injection_info,
+        }
+
     wall = round(time.perf_counter() - t0, 3)
 
     ctd = usage.get("completion_tokens_details") or {}
@@ -367,6 +592,15 @@ def run_case(
 
     content = "".join(content_parts) if content_parts else None
     reasoning = "".join(reasoning_parts) if reasoning_parts else None
+
+    # Budget set but never tripped (thinking finished under N, or output was
+    # unmarked so no boundary existed): no second request, engaged=False. The
+    # `marking` reflects what we actually saw so an unmarked backend surfaces.
+    if client_thinking_active:
+        client_thinking_final = dict(off_block)
+        client_thinking_final["marking"] = marking
+    else:
+        client_thinking_final = off_block
 
     return {
         "case_id": case.get("id"),
@@ -384,7 +618,88 @@ def run_case(
         "finish_reason": finish_reason,
         "finish_details": finish_details,
         "timings": usage.get("timings"),
+        "card_source": card_source,
+        "card_stem": card_stem,
+        "client_thinking": client_thinking_final,
         # Caller grades; we just normalize the wire shape.
         "_response": last_chunk,
         "_thinking_injection": injection_info,
     }
+
+
+def _client_thinking_continuation(
+    *,
+    url: str,
+    base_messages: list[dict[str, Any]],
+    partial_reasoning: str,
+    terminator: str,
+    reply_reserve: int,
+    model: str,
+    auth_header: str,
+    timeout_s: int,
+    temperature: float | None,
+    top_p: float | None,
+    top_k: int | None,
+    extra_body: dict[str, Any] | None,
+) -> tuple[str | None, bool]:
+    """Tier-2 forced-`</think>` re-prompt — a fresh, non-streamed request.
+
+    Builds ``base_messages + [{role: assistant, content: <partial reasoning>
+    + terminator}]`` and POSTs it with thinking DISABLED (``enable_thinking``
+    false, ``reasoning_effort`` none, no Anthropic ``thinking`` budget) and its
+    own ``max_tokens`` reply reserve. The model is conditioned on the captured
+    partial reasoning followed by the terminator, so it should emit the visible
+    answer directly rather than keep reasoning.
+
+    This is a **fresh conditioned sample, not a decoder continuation** of the
+    aborted stream — the server has no memory of the original decode; we simply
+    feed the partial reasoning back as assistant context.
+
+    Returns ``(content, ok)``. ``ok`` is False — and the row is flagged
+    ``continuation="unsupported"`` by the caller — when the request errors, the
+    provider rejects the assistant-prefill, or the answer comes back empty.
+    NEVER raises: a provider-capability failure must not abort the benchmark.
+    """
+    messages = list(base_messages) + [
+        {"role": "assistant", "content": partial_reasoning + terminator}
+    ]
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": int(reply_reserve),
+        "stream": False,
+        "chat_template_kwargs": {"enable_thinking": False},
+        "thinking": {"type": "disabled"},
+        "reasoning_effort": "none",
+    }
+    if temperature is not None:
+        body["temperature"] = float(temperature)
+    if top_p is not None:
+        body["top_p"] = float(top_p)
+    if top_k is not None and top_k > 0:
+        body["top_k"] = int(top_k)
+    if extra_body:
+        body.update(extra_body)
+
+    headers = {"Content-Type": "application/json"}
+    if auth_header:
+        headers["Authorization"] = auth_header
+    req = urllib.request.Request(
+        url.rstrip("/") + "/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        return None, False
+    if not isinstance(data, dict):
+        return None, False
+    choice = (data.get("choices") or [{}])[0]
+    msg = choice.get("message", {}) if isinstance(choice, dict) else {}
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if not isinstance(content, str) or not content.strip():
+        # Empty answer or provider rejected the prefill → unsupported.
+        return None, False
+    return content, True

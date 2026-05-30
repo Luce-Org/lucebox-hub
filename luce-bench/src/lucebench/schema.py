@@ -118,6 +118,37 @@ class HostInfo:
 
 
 @dataclass
+class ClientThinking:
+    """Tier-2 client-thinking-budget provenance, per row.
+
+    Stamped by ``lucebench.runner.run_case`` when ``--client-thinking-budget``
+    is set (else ``mode="off"``). Documents whether the client aborted an
+    over-budget thinking stream and re-prompted with a forced terminator.
+
+    ``mode`` is ``"client_abort"`` when the Tier-2 feature is active for the
+    row, else ``"off"``. ``engaged`` is True only when the budget actually
+    tripped and the continuation fired. ``marking`` records how thinking was
+    identified in the stream: ``"reasoning_content"`` (deltas), ``"think_tags"``
+    (``<think>…</think>`` in content), or ``"unmarked"`` (no boundary — never
+    aborted). ``continuation`` is ``"ok"`` | ``"unsupported"`` | ``"skipped"``;
+    ``"unsupported"`` rows (provider rejected the prefill / empty answer) and
+    ``answer_started_before_abort`` rows are excluded from budgeted-mode
+    aggregate accuracy (see :func:`lucebench.report`).
+    """
+
+    mode: Literal["native_effort", "native_budget", "client_abort", "off"] = "off"
+    requested_budget: int | None = None
+    engaged: bool = False
+    marking: Literal["reasoning_content", "think_tags", "unmarked"] = "unmarked"
+    reasoning_tokens_at_abort: int = 0
+    continuation: Literal["ok", "unsupported", "skipped"] = "skipped"
+    answer_started_before_abort: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class CanonicalRow:
     """One per-case row in canonical form.
 
@@ -150,6 +181,16 @@ class CanonicalRow:
     finish_reason: str | None = None
     http_status: int | None = None
     error: str | None = None
+    # Model-card provenance (see lucebench.model_cards). Nullable for
+    # back-compat: historical result.json predating the card registry load
+    # with both None. ``card_source`` ∈ {"props","bundled","none"};
+    # ``card_stem`` is the normalized model id used for the bundled lookup.
+    card_source: str | None = None
+    card_stem: str | None = None
+    # Tier-2 client-thinking-budget block (see ClientThinking). Nullable for
+    # back-compat: rows predating the feature (and runs without the flag, which
+    # the runner stamps with mode="off") load with None when the key is absent.
+    client_thinking: ClientThinking | None = None
     graded: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -249,20 +290,44 @@ def host_from_dict(d: dict[str, Any] | None) -> HostInfo | None:
     return HostInfo(gpus=gpus, **kept)
 
 
+def client_thinking_from_dict(d: dict[str, Any] | None) -> ClientThinking | None:
+    """Build a ClientThinking from a plain dict (e.g. a runner row).
+
+    Tolerant of missing fields and extra keys; the canonical field set is
+    fixed by the dataclass. Returns None for a missing/non-dict block so
+    pre-feature rows load with ``client_thinking=None``.
+    """
+    if not isinstance(d, dict):
+        return None
+    kept: dict[str, Any] = {
+        f.name: d.get(f.name)
+        for f in dataclasses.fields(ClientThinking)
+        if f.name in d
+    }
+    return ClientThinking(**kept)
+
+
 def _row_from_dict(d: dict[str, Any]) -> CanonicalRow:
-    kept = {f.name: d.get(f.name) for f in dataclasses.fields(CanonicalRow) if f.name in d}
+    kept = {
+        f.name: d.get(f.name)
+        for f in dataclasses.fields(CanonicalRow)
+        if f.name in d and f.name != "client_thinking"
+    }
     # case_id is required by the dataclass; if it's missing fall back to
     # the legacy `id` so a half-normalised dict still loads cleanly.
     kept.setdefault("case_id", d.get("case_id") or d.get("id") or "")
-    return CanonicalRow(**kept)
+    ct = client_thinking_from_dict(d.get("client_thinking"))
+    return CanonicalRow(client_thinking=ct, **kept)
 
 
 __all__ = [
     "SCHEMA_VERSION",
     "CanonicalResult",
     "CanonicalRow",
+    "ClientThinking",
     "GpuInfo",
     "HostInfo",
+    "client_thinking_from_dict",
     "from_dict",
     "host_from_dict",
 ]
