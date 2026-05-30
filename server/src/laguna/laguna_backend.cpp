@@ -561,6 +561,7 @@ bool LagunaBackend::init_hybrid_mode() {
     // Step 2: Load/build routing stats
     MoeHybridRoutingStats hotness;
     std::string err;
+    std::string placement_source;
     if (hotness_path && hotness_path[0]) {
         if (!MoeHybridRoutingStats::load_csv(std::string(hotness_path), hotness, &err)) {
             std::fprintf(stderr, "[laguna-hybrid] hotness load failed: %s\n", err.c_str());
@@ -571,6 +572,7 @@ bool LagunaBackend::init_hybrid_mode() {
                           hotness.n_layer, hotness.n_expert, w_.n_layer, w_.n_expert);
             return false;
         }
+        placement_source = "file";
     } else {
         // Uniform hotness (budget-only mode, no hotness file)
         hotness.n_layer = w_.n_layer;
@@ -578,6 +580,7 @@ bool LagunaBackend::init_hybrid_mode() {
         hotness.n_expert_used = w_.n_expert_used;
         hotness.counts.assign((size_t)w_.n_layer * (size_t)w_.n_expert, 1);
         hotness.layer_totals.assign((size_t)w_.n_layer, (uint64_t)w_.n_expert);
+        placement_source = "uniform";
     }
 
     // Step 3: Query GPU memory and compute expert budget
@@ -657,11 +660,14 @@ bool LagunaBackend::init_hybrid_mode() {
     }
 
     std::printf("[laguna-hybrid] dynamic placement: gpu_total=%.2f GiB, core=%.2f GiB, "
-                "kv_cache=%.2f GiB (ctx=%d), expert_budget=%.2f GiB (of %.2f GiB total experts)\n",
+                "kv_cache=%.2f GiB (ctx=%d), warm=%.0f MB, safety=%.0f MB, "
+                "expert_budget=%.2f GiB (of %.2f GiB total experts)\n",
                 gpu_total / 1024.0 / 1024.0 / 1024.0,
                 core_bytes / 1024.0 / 1024.0 / 1024.0,
                 kv_total / 1024.0 / 1024.0 / 1024.0,
                 max_context,
+                warm_cache_bytes / 1024.0 / 1024.0,
+                safety_bytes / 1024.0 / 1024.0,
                 expert_budget / 1024.0 / 1024.0 / 1024.0,
                 total_expert_bytes / 1024.0 / 1024.0 / 1024.0);
     std::fflush(stdout);
@@ -778,11 +784,12 @@ bool LagunaBackend::init_hybrid_mode() {
         hot_bytes  += per_expert_bytes * (uint64_t)layer.hot_expert_ids.size();
         cold_bytes += per_expert_bytes * (uint64_t)layer.cold_expert_ids.size();
     }
-    std::printf("[laguna-hybrid] storage ready: total_hot=%d (%.2f GiB VRAM) total_cold=%d (%.2f GiB RAM)\n",
+    std::printf("[laguna-hybrid] storage ready: total_hot=%d (%.2f GiB VRAM) total_cold=%d (%.2f GiB RAM) source=%s\n",
                 placement.total_hot,
                 hot_bytes / 1024.0 / 1024.0 / 1024.0,
                 total_cold,
-                cold_bytes / 1024.0 / 1024.0 / 1024.0);
+                cold_bytes / 1024.0 / 1024.0 / 1024.0,
+                placement_source.c_str());
 
     if (total_cold > 0) {
         hybrid_mode_ = true;
