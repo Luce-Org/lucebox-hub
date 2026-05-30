@@ -58,35 +58,11 @@ bool LagunaBackend::init() {
         return false;
     }
 
-    // Check if hybrid mode is requested BEFORE full load
-    const char * hotness_path = std::getenv("DFLASH_LAGUNA_HOTNESS");
-    const char * budget_pct_env = std::getenv("DFLASH_EXPERT_BUDGET_PCT");
-    if ((hotness_path && hotness_path[0]) || (budget_pct_env && budget_pct_env[0])) {
-        // Hybrid mode: partial load (skip expert tensors)
-        if (!init_hybrid_mode()) {
-            ggml_backend_free(backend_); backend_ = nullptr;
-            return false;
-        }
-    } else {
-        // Full GPU mode: load everything
-        if (!load_target_gguf_laguna(args_.target_path, backend_, w_)) {
-            std::fprintf(stderr, "load failed: %s\n", dflash27b_last_error());
-            ggml_backend_free(backend_); backend_ = nullptr;
-            return false;
-        }
-        // Print VRAM allocation summary
-        size_t gpu_free = 0, gpu_total = 0;
-        ggml_backend_dev_t dev = ggml_backend_get_device(backend_);
-        if (dev) ggml_backend_dev_memory(dev, &gpu_free, &gpu_total);
-        const int n_moe_layers = w_.n_layer - w_.n_layer_dense_lead;
-        const int total_experts = n_moe_layers * w_.n_expert;
-        std::printf("[laguna] VRAM: %.2f GiB total, %.2f GiB used, %.2f GiB free\n",
-                    gpu_total / 1024.0 / 1024.0 / 1024.0,
-                    (gpu_total - gpu_free) / 1024.0 / 1024.0 / 1024.0,
-                    gpu_free / 1024.0 / 1024.0 / 1024.0);
-        std::printf("[laguna] all %d experts on GPU (%d MoE layers × %d experts)\n",
-                    total_experts, n_moe_layers, w_.n_expert);
-        std::fflush(stdout);
+    // Always use dynamic placement (like qwen35moe): partial load first,
+    // compute budget, then reload full if all experts fit.
+    if (!init_hybrid_mode()) {
+        ggml_backend_free(backend_); backend_ = nullptr;
+        return false;
     }
 
     cache_.kv_k_type = args_.kv_type;
@@ -659,7 +635,7 @@ bool LagunaBackend::init_hybrid_mode() {
         }
     }
 
-    std::printf("[laguna-hybrid] dynamic placement: gpu_total=%.2f GiB, core=%.2f GiB, "
+    std::printf("[laguna] dynamic placement: gpu_total=%.2f GiB, core=%.2f GiB, "
                 "kv_cache=%.2f GiB (ctx=%d), warm=%.0f MB, safety=%.0f MB, "
                 "expert_budget=%.2f GiB (of %.2f GiB total experts)\n",
                 gpu_total / 1024.0 / 1024.0 / 1024.0,
@@ -688,13 +664,19 @@ bool LagunaBackend::init_hybrid_mode() {
     }
 
     int total_moe_experts = (w_.n_layer - w_.n_layer_dense_lead) * w_.n_expert;
-    std::printf("[laguna-hybrid] placement result: %d hot experts, %d cold experts\n",
+    std::printf("[laguna] dynamic placement result: %d hot experts, %d cold experts\n",
                 placement.total_hot, total_moe_experts - placement.total_hot);
 
-    // If all experts fit, still use hybrid storage (partial load skipped expert buffers)
+    // If all experts fit, reload full model to GPU (non-hybrid path)
     if (placement.total_hot >= total_moe_experts) {
-        std::printf("[laguna-hybrid] all experts fit in VRAM — all-hot hybrid path\n");
+        std::printf("[laguna] all experts fit in VRAM, loading fully to GPU\n");
         std::fflush(stdout);
+        free_laguna_target_weights(w_);
+        if (!load_target_gguf_laguna(args_.target_path, backend_, w_)) {
+            std::fprintf(stderr, "[laguna] full reload failed: %s\n", dflash27b_last_error());
+            return false;
+        }
+        return true;
     }
 
     // Step 5: Load expert data from GGUF mmap into hot/cold split buffers
