@@ -119,20 +119,73 @@ MULTI_TURN_FIXTURE_PATH = SCRIPT_DIR / "fixtures" / "agent_recorded" / "multi_tu
 # even though it didn't literally say "Bash". Keys must match the
 # canonical names emitted by the collector (Claude tool names + the
 # normalized Codex shapes — see ``scripts/extract-agentic-fixture.py``).
+#
+# Also covers hyphen/underscore-named verbs that models commonly emit
+# when they invent their own tool format (``call:execute-bead:read-file``,
+# ``call:read_file``). Models running through this benchmark may not be
+# Claude/Codex — they only know what the prompt taught them, which is
+# often a DDX/bead-style verb namespace. We map those verbs back to the
+# Claude tool the fixture expected.
 _TOOL_SYNONYMS: dict[str, tuple[str, ...]] = {
-    "Bash": ("bash", "shell command", "shell", "run a command", "execute a command", "command line"),
-    "Read": ("read the file", "read file", "open the file", "view the file", "cat ", "look at"),
-    "Edit": ("edit the file", "modify the file", "edit ", "change the file", "patch the file"),
-    "Write": ("write the file", "create the file", "create a file", "write a new file"),
-    "Grep": ("grep", "search for", "search the code", "ripgrep", "rg "),
-    "Glob": ("glob", "find files", "list files matching"),
-    "MultiEdit": ("multiple edits", "multi-edit"),
-    "NotebookEdit": ("notebook edit", "edit the notebook"),
-    "WebFetch": ("fetch the url", "fetch the page", "web request"),
-    "WebSearch": ("web search", "search the web"),
+    "Bash": (
+        "bash", "shell command", "shell", "run a command",
+        "execute a command", "command line",
+        # Verb-style emissions. ``execute-bead`` alone is intentionally
+        # NOT here: bead execution is a tool-namespace that wraps many
+        # verbs (read_file, list_files, etc.) — the verb under the
+        # namespace decides what Claude tool it maps to, not the
+        # namespace itself.
+        "exec_command", "exec-command", "shell-exec", "run_shell",
+        "run-script", "exec_shell",
+    ),
+    "Read": (
+        "read the file", "read file", "open the file", "view the file",
+        "cat ", "look at",
+        "read_file", "read-file", "readfile", "fs.read", "fs:read", "open_file",
+    ),
+    "Edit": (
+        "edit the file", "modify the file", "edit ", "change the file",
+        "patch the file",
+        "edit_file", "edit-file", "modify_file", "modify-file", "fs.edit",
+    ),
+    "Write": (
+        "write the file", "create the file", "create a file", "write a new file",
+        "write_file", "write-file", "create_file", "create-file", "fs.write",
+    ),
+    "Grep": (
+        "grep", "search for", "search the code", "ripgrep", "rg ",
+        "grep_files", "grep-files", "search_code", "search-code",
+    ),
+    "Glob": (
+        "glob", "find files", "list files matching",
+        "list_files", "list-files", "ls_files", "ls-files", "ls ",
+        "find_files", "find-files", "readdir",
+    ),
+    "MultiEdit": ("multiple edits", "multi-edit", "multi_edit"),
+    "NotebookEdit": ("notebook edit", "edit the notebook", "notebook_edit"),
+    "WebFetch": (
+        "fetch the url", "fetch the page", "web request",
+        "fetch_url", "fetch-url", "http_get", "http-get",
+    ),
+    "WebSearch": (
+        "web search", "search the web", "search_web", "search-web",
+    ),
     "Task": ("subagent", "spawn an agent", "task tool"),
-    "apply_patch": ("apply_patch", "apply patch", "*** begin patch", "patch envelope"),
+    "apply_patch": (
+        "apply_patch", "apply-patch", "apply patch",
+        "*** begin patch", "patch envelope",
+    ),
 }
+
+# Compiled once: extract verbs from any ``call:<...:>:<verb>{...}`` or
+# ``call:<verb>{...}`` pattern the model emits. The fallback synonym
+# match handles plain-English mentions; this captures the structured
+# tool-call-shaped emissions models invent when given a custom tool
+# namespace in the prompt (DDX bead verbs, codex-mini-style commands,
+# etc.). The verb is whatever follows the LAST colon before the brace —
+# we strip the namespace prefix so ``call:execute-bead:read-file{}``
+# yields the verb ``read-file`` (which the Read synonym list matches).
+_CALL_VERB_RE = re.compile(r"\bcall:(?:[A-Za-z0-9_.-]+:)*([A-Za-z0-9_.-]+)\s*\{")
 
 # Phrases that signal the model refused / punted. Any of these in the
 # first ~200 chars of the reply forces a fail regardless of tool
@@ -299,22 +352,36 @@ def _refused(text: str) -> bool:
 
 
 def _tool_mentioned(text: str, tool: str) -> bool:
-    """True if the model named ``tool`` either by canonical name or by
-    one of the loose synonyms in ``_TOOL_SYNONYMS``.
+    """True if the model named ``tool`` either by canonical name, by
+    one of the loose synonyms in ``_TOOL_SYNONYMS``, or as the verb of a
+    ``call:<...>:<verb>{...}`` structured-tool-call emission.
 
     The canonical-name check is case-sensitive so plain English
     sentences (\"would edit the file\") don't accidentally match the
     capitalized ``Edit`` token; the synonym list covers the
-    lowercase / paraphrased cases.
+    lowercase / paraphrased cases; the call-verb pass covers models
+    that emit their own structured format when given a custom tool
+    namespace in the prompt.
     """
     if not text:
         return False
     if re.search(rf"\b{re.escape(tool)}\b", text):
         return True
     haystack = _normalize(text)
-    for syn in _TOOL_SYNONYMS.get(tool, ()):  # noqa: SIM118
+    synonyms = _TOOL_SYNONYMS.get(tool, ())
+    for syn in synonyms:
         if syn in haystack:
             return True
+    # Structured tool-call emissions: pull out every ``call:<verb>{...}``
+    # invocation and treat its verb as a synonym candidate. This catches
+    # models that invented their own tool format following a prompt's
+    # custom namespace (DDX bead verbs etc.) without forcing the grader
+    # to enumerate every prompt-driven naming convention.
+    if synonyms:
+        for m in _CALL_VERB_RE.finditer(text):
+            verb = m.group(1).lower()
+            if verb in synonyms:
+                return True
     return False
 
 

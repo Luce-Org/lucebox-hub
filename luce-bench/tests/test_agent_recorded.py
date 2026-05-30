@@ -294,3 +294,68 @@ def test_grade_prefill_and_decode_falls_back_to_reasoning_content():
     row = {"content": "", "reasoning_content": "I'd start by reading the relevant file.", "wall_s": 5.0}
     g = agent_recorded.grade_prefill_and_decode(row, min_response_chars=10)
     assert g["pass"] is True
+
+
+# ── call:<verb>{} structured-tool-call recognition ──────────────────
+
+
+def test_tool_mentioned_picks_up_hyphenated_call_verb():
+    """Regression for the 2026-05-30 gemma sweep: model emitted
+    ``call:execute-bead:read-file{path:...}`` which is real tool
+    engagement but the original grader missed it because no synonym
+    list contained ``read-file``."""
+    text = (
+        'call:execute-bead:read-file{path: "crates/foo/src/lib.rs"}\n\n'
+        'call:execute-bead:list-files{path: "src/"}\n\n'
+    )
+    assert agent_recorded._tool_mentioned(text, "Read") is True, (
+        "verb 'read-file' from a call:<ns>:<verb>{} emission should match Read"
+    )
+    assert agent_recorded._tool_mentioned(text, "Glob") is True, (
+        "verb 'list-files' should match Glob"
+    )
+
+
+def test_tool_mentioned_picks_up_snake_case_call_verb():
+    """The snake_case variant (read_file / list_files) is also common."""
+    text = 'call:exec-bead:read_file{path:"foo.txt"} call:exec-bead:list_files{}'
+    assert agent_recorded._tool_mentioned(text, "Read") is True
+    assert agent_recorded._tool_mentioned(text, "Glob") is True
+
+
+def test_tool_mentioned_call_verb_with_no_namespace_prefix():
+    """A bare ``call:read_file{}`` without namespace prefix still matches."""
+    text = 'call:read_file{path: "foo.txt"}'
+    assert agent_recorded._tool_mentioned(text, "Read") is True
+
+
+def test_tool_mentioned_call_verb_is_case_insensitive_on_verb():
+    """Verbs come back lowercased in the call: extractor regardless of
+    how the model spelled them."""
+    text = 'call:execute-bead:Read-File{path: "foo.txt"}'
+    assert agent_recorded._tool_mentioned(text, "Read") is True
+
+
+def test_tool_mentioned_unrelated_verb_still_misses():
+    """The expander should not give false positives on unrelated verbs."""
+    text = 'call:execute-bead:dance{}'
+    assert agent_recorded._tool_mentioned(text, "Read") is False
+    assert agent_recorded._tool_mentioned(text, "Bash") is False
+
+
+def test_grade_full_pass_with_call_verb_emission():
+    """End-to-end: a response built entirely of call:<verb>{} lines
+    (no plain English) lands in the pass bin when verbs cover the
+    expected tools and an expected file is named."""
+    case = _case(["Read", "Glob"], files=["lucebox.sh"])
+    row = {
+        "content": (
+            'call:execute-bead:list-files{path: "."}\n\n'
+            'call:execute-bead:read-file{path: "lucebox.sh"}\n'
+        )
+    }
+    g = agent_recorded.grade_agent_recorded_case(case, row)
+    assert g["bin"] == "pass", g
+    assert "Read" in g["tools_hit"]
+    assert "Glob" in g["tools_hit"]
+    assert "lucebox.sh" in g["files_hit"]
