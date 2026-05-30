@@ -95,21 +95,30 @@ _APPLY_PATCH = re.compile(
     r"apply_patch|\*\*\* Begin Patch",
     re.IGNORECASE,
 )
+# Structured call emission: ``call:<verb>{args}`` or
+# ``call:<namespace>:<verb>{args}``. Models trained on custom tool
+# namespaces (codex-mini, DDX bead executor, etc.) emit this format
+# instead of the OpenAI-style JSON tool_use envelope. Recognized as a
+# fourth agent-shape class — same intent as ``"name": "Read"`` in the
+# JSON path, just a different serialization.
+_CALL_INVOCATION = re.compile(r"\bcall:[A-Za-z0-9_.:-]+\s*\{")
 
 
 def grade_agent(user_message: str, completion: str) -> dict[str, Any]:
     """Pass if the response is agent-shaped.
 
-    See module docstring for the three PASS classes. We deliberately
-    don't grade *correctness* of the agent's plan — this probe is purely
-    "is the model engaging as an agent at all". Correctness is what
-    --area swe is for (when it lands).
+    See module docstring for the four PASS classes (code fence, JSON
+    tool call, apply_patch envelope, structured call:<verb>{} emission).
+    We deliberately don't grade *correctness* of the agent's plan —
+    this probe is purely "is the model engaging as an agent at all".
+    Correctness is what --area swe is for (when it lands).
     """
     text = completion or ""
     has_code_fence = bool(_CODE_FENCE.search(text))
     has_tool_call = bool(_JSON_TOOL_CALL.search(text))
     has_apply_patch = bool(_APPLY_PATCH.search(text))
-    pass_any = has_code_fence or has_tool_call or has_apply_patch
+    has_call_invocation = bool(_CALL_INVOCATION.search(text))
+    pass_any = has_code_fence or has_tool_call or has_apply_patch or has_call_invocation
     nonempty = len(text.strip()) >= 16
     return {
         "graded_pass": pass_any and nonempty,
