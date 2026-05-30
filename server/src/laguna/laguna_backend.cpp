@@ -73,6 +73,19 @@ bool LagunaBackend::init() {
             ggml_backend_free(backend_); backend_ = nullptr;
             return false;
         }
+        // Print VRAM allocation summary
+        size_t gpu_free = 0, gpu_total = 0;
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend_);
+        if (dev) ggml_backend_dev_memory(dev, &gpu_free, &gpu_total);
+        const int n_moe_layers = w_.n_layer - w_.n_layer_dense_lead;
+        const int total_experts = n_moe_layers * w_.n_expert;
+        std::printf("[laguna] VRAM: %.2f GiB total, %.2f GiB used, %.2f GiB free\n",
+                    gpu_total / 1024.0 / 1024.0 / 1024.0,
+                    (gpu_total - gpu_free) / 1024.0 / 1024.0 / 1024.0,
+                    gpu_free / 1024.0 / 1024.0 / 1024.0);
+        std::printf("[laguna] all %d experts on GPU (%d MoE layers × %d experts)\n",
+                    total_experts, n_moe_layers, w_.n_expert);
+        std::fflush(stdout);
     }
 
     cache_.kv_k_type = args_.kv_type;
@@ -653,8 +666,11 @@ bool LagunaBackend::init_hybrid_mode() {
         return false;
     }
 
-    // If all experts fit, no hybrid needed
     int total_moe_experts = (w_.n_layer - w_.n_layer_dense_lead) * w_.n_expert;
+    std::printf("[laguna-hybrid] placement result: %d hot experts, %d cold experts\n",
+                placement.total_hot, total_moe_experts - placement.total_hot);
+
+    // If all experts fit, no hybrid needed
     if (placement.total_hot >= total_moe_experts) {
         std::printf("[laguna-hybrid] all experts fit in VRAM, using full GPU path\n");
         std::fflush(stdout);
