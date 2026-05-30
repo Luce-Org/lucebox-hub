@@ -109,22 +109,39 @@ def _build_cases() -> list[dict[str, Any]]:
 
 LONGCTX_CASES = _build_cases()
 
-_RISK_PREFIX = re.compile(r"^\s*Risk\s*:\s*\S", re.IGNORECASE)
+# Pure-strict: the WHOLE response (after leading whitespace) starts with
+# "Risk:". This is what the instruction literally asks for.
+_RISK_PREFIX_STRICT = re.compile(r"^\s*Risk\s*:\s*\S", re.IGNORECASE)
+# Lenient: "Risk:" appears at the start of some line in the response.
+# Thinking-mode models often emit a short transition phrase ("I have to
+# give the solution based on the thinking directly now.\n\nRisk: ...")
+# before their actual answer line. Such responses *do* contain a
+# sentence starting with "Risk:", just not at byte zero. Accepting the
+# lenient match keeps `graded_pass` informative on reasoning models
+# while ``strict_pass`` preserves the literal-prefix metric for
+# regression detection.
+_RISK_LINE_LENIENT = re.compile(r"^\s*Risk\s*:\s*\S", re.IGNORECASE | re.MULTILINE)
 
 
 def grade_longctx(prompt: str, completion: str) -> dict[str, Any]:
-    """Pass if the model's visible reply begins with ``Risk:`` (its instruction)."""
+    """Pass if the model's reply contains a sentence starting with ``Risk:``.
+
+    Strict mode (literal prefix at offset zero) is also recorded so the
+    snapshot can quantify how much the model preambled before complying
+    with the format instruction.
+    """
     text = (completion or "").lstrip()
-    starts_with_risk = bool(_RISK_PREFIX.match(text))
     nonempty = len(text.strip()) >= 8
+    strict_match = bool(_RISK_PREFIX_STRICT.match(text))
+    lenient_match = bool(_RISK_LINE_LENIENT.search(text))
     return {
-        "graded_pass": starts_with_risk and nonempty,
-        "strict_pass": starts_with_risk and nonempty,
-        "format_pass": starts_with_risk,
-        "semantic_pass": starts_with_risk and nonempty,
+        "graded_pass": lenient_match and nonempty,
+        "strict_pass": strict_match and nonempty,
+        "format_pass": lenient_match,
+        "semantic_pass": lenient_match and nonempty,
         "semantic_hint": "risk" in text.lower(),
-        "status": "passed" if (starts_with_risk and nonempty) else "failed",
-        "ok": starts_with_risk and nonempty,
+        "status": "passed" if (lenient_match and nonempty) else "failed",
+        "ok": lenient_match and nonempty,
     }
 
 
@@ -138,5 +155,6 @@ def grade_longctx_case(case: dict[str, Any], row: dict[str, Any]) -> dict[str, A
         "correct": "starts-with-Risk:",
         "status": g["status"],
         "format_pass": g["format_pass"],
+        "strict_pass": g["strict_pass"],
         "semantic_hint": False,
     }
