@@ -5,6 +5,7 @@
 #include "pflash_drafter_ipc.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,7 +36,8 @@ int main(int argc, char ** argv) {
     } else {
         std::fprintf(stderr,
             "usage: %s --backend-ipc-mode=dflash-draft <draft.safetensors|draft.gguf> "
-            "--ring-cap=N --stream-fd=FD [--payload-fd=FD] [--draft-gpu=N]\n"
+            "--ring-cap=N --stream-fd=FD [--payload-fd=FD] "
+            "[--shared-payload-fd=FD --shared-payload-bytes=N] [--draft-gpu=N]\n"
             "   or: %s --backend-ipc-mode=pflash-compress <drafter.gguf> "
             "--stream-fd=FD [--draft-gpu=N]\n",
             argv[0],
@@ -47,6 +49,8 @@ int main(int argc, char ** argv) {
     int draft_gpu = 0;
     int payload_fd = -1;
     int stream_fd = -1;
+    int shared_payload_fd = -1;
+    size_t shared_payload_bytes = 0;
     for (int i = arg_begin; i < argc; i++) {
         if (std::strncmp(argv[i], "--ring-cap=", 11) == 0) {
             ring_cap = std::atoi(argv[i] + 11);
@@ -64,6 +68,16 @@ int main(int argc, char ** argv) {
             payload_fd = std::atoi(argv[i] + 13);
         } else if (std::strcmp(argv[i], "--payload-fd") == 0) {
             if (i + 1 < argc) payload_fd = std::atoi(argv[++i]);
+        } else if (std::strncmp(argv[i], "--shared-payload-fd=", 20) == 0) {
+            shared_payload_fd = std::atoi(argv[i] + 20);
+        } else if (std::strcmp(argv[i], "--shared-payload-fd") == 0) {
+            if (i + 1 < argc) shared_payload_fd = std::atoi(argv[++i]);
+        } else if (std::strncmp(argv[i], "--shared-payload-bytes=", 23) == 0) {
+            shared_payload_bytes = (size_t)std::strtoull(argv[i] + 23, nullptr, 10);
+        } else if (std::strcmp(argv[i], "--shared-payload-bytes") == 0) {
+            if (i + 1 < argc) {
+                shared_payload_bytes = (size_t)std::strtoull(argv[++i], nullptr, 10);
+            }
         } else {
             std::fprintf(stderr, "[backend-ipc-daemon] unknown option: %s\n", argv[i]);
             return 2;
@@ -73,7 +87,9 @@ int main(int argc, char ** argv) {
     switch (mode) {
         case BackendIpcMode::DFlashDraft:
             return run_dflash_draft_ipc_daemon(payload_path, ring_cap, draft_gpu,
-                                               stream_fd, payload_fd);
+                                               stream_fd, payload_fd,
+                                               shared_payload_fd,
+                                               shared_payload_bytes);
         case BackendIpcMode::PFlashCompress:
             return run_pflash_drafter_ipc_daemon(payload_path, draft_gpu, stream_fd);
     }
