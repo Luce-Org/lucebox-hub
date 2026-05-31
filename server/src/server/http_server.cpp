@@ -96,6 +96,32 @@ static size_t json_array_size(const json & value) {
     return value.is_array() ? value.size() : 0;
 }
 
+// ─── Admission gate ──────────────────────────────────────────────────────
+// Pre-compression sanity guard uses first principles: reject only when even
+// best-case compression cannot fit — (double)raw*keep_ratio + max_output > max_ctx.
+// This is keep-ratio-derived, so it correctly admits large prompts at low
+// keep ratios rather than using a hardcoded 4× multiplier calibrated to 0.25.
+
+bool check_admission(int effective_size, int raw_size,
+                     int max_output, int max_ctx, bool pflash_on,
+                     float pflash_keep_ratio) {
+    if (max_ctx <= 0) return true;  // no limit configured
+    if (pflash_on) {
+        // Pre-compression guard: reject only when even best-case compression
+        // cannot fit. Skip when keep_ratio <= 0 (degenerate config; let the
+        // post-compression gate decide).
+        if (pflash_keep_ratio > 0.0f) {
+            if ((double)raw_size * pflash_keep_ratio + max_output > (double)max_ctx)
+                return false;
+        }
+        // Pre-compression guard passed: admit. The real effective-size gate
+        // runs post-compression (caller passes pflash_on=false after pflash).
+        return true;
+    }
+    // Non-pflash (or post-compression): check effective size directly.
+    return effective_size + max_output <= max_ctx;
+}
+
 // Build the /props response body.
 //
 // Non-static so unit tests can call it directly (declared in http_server.h).
@@ -1104,7 +1130,8 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                     eos_str,
                     /*add_generation_prompt=*/true,
                     enable_thinking,
-                    tools_json);
+                    tools_json,
+                    chat_format_);
             } catch (const std::exception & e) {
                 send_error(fd, 500,
                     std::string("chat template (jinja) render failed: ") + e.what());
@@ -1137,8 +1164,27 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         return true;  // handled (with error)
     }
 
-    // Check context length.
-    if ((int)req.prompt_tokens.size() + req.max_output > config_.max_ctx) {
+    // Pre-compression admission: reject non-pflash requests that can't fit,
+    // and pflash requests whose raw prompt cannot possibly compress to fit
+    // (first-principles guard: raw*keep_ratio + max_output > max_ctx).
+    // The real post-compression gate runs in worker_loop after pflash runs.
+    const int raw_size = (int)req.prompt_tokens.size();
+    const bool pflash_will_run =
+        config_.max_ctx > 0 &&
+        config_.pflash_mode != ServerConfig::PflashMode::OFF &&
+        drafter_tokenizer_ != nullptr &&
+        (config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||
+         raw_size >= config_.pflash_threshold);
+    if (!check_admission(raw_size, raw_size, req.max_output, config_.max_ctx,
+                         /*pflash_on=*/false) && !pflash_will_run) {
+        // Non-pflash path: raw is the effective size, reject immediately.
+        send_error(fd, 400, "prompt + max_tokens exceeds context window");
+        return true;
+    }
+    if (pflash_will_run &&
+        !check_admission(raw_size, raw_size, req.max_output, config_.max_ctx,
+                         /*pflash_on=*/true, config_.pflash_keep_ratio)) {
+        // Pre-compression guard: best-case compression still can't fit.
         send_error(fd, 400, "prompt + max_tokens exceeds context window");
         return true;
     }
@@ -1261,6 +1307,7 @@ void HttpServer::worker_loop() {
         // If pflash is enabled and prompt exceeds threshold, compress.
         std::vector<int32_t> effective_prompt = req.prompt_tokens;
         bool pflash_compressed = false;
+        bool pflash_is_agentic = false;  // hoisted for post-generate guard
 
         if (config_.pflash_mode != ServerConfig::PflashMode::OFF &&
             drafter_tokenizer_ != nullptr)
@@ -1296,10 +1343,100 @@ void HttpServer::worker_loop() {
                         // 3. Compress via typed API
                         ModelBackend::CompressRequest creq;
                         creq.input_ids = std::move(drafter_ids);
-                        // Bandit: use per-session keep_ratio if session_id provided.
-                        creq.keep_ratio = req.session_id.empty()
-                            ? config_.pflash_keep_ratio
-                            : sessions_.get_keep_ratio(req.session_id);
+
+                        // TYPE-GATE router (default-off via pflash_router.enabled).
+                        // When enabled, detect request type and override keep_ratio +
+                        // cascade per the v2 policy.  When disabled → exact no-op.
+                        {
+                            // Extract agentic-signal bools from the parsed JSON
+                            // (json-walking belongs at the handler boundary, not
+                            //  in the pure router header).
+                            const bool _has_tools =
+                                req.tools.is_array() && !req.tools.empty();
+                            bool _has_tool_use_blocks = false;
+                            bool _has_tool_calls      = false;
+                            if (req.messages.is_array()) {
+                                for (const auto & _msg : req.messages) {
+                                    if (!_msg.is_object()) continue;
+                                    if (_msg.contains("tool_calls")) {
+                                        const auto & _tc = _msg["tool_calls"];
+                                        if (_tc.is_array() && !_tc.empty())
+                                            _has_tool_calls = true;
+                                    }
+                                    if (_msg.contains("content")) {
+                                        const auto & _c = _msg["content"];
+                                        if (_c.is_array()) {
+                                            for (const auto & _b : _c) {
+                                                if (!_b.is_object()) continue;
+                                                const std::string _bt = _b.value("type", "");
+                                                if (_bt == "tool_use" || _bt == "tool_result")
+                                                    _has_tool_use_blocks = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            const bool is_agentic = (detect_request_type(
+                                _has_tools, _has_tool_use_blocks, _has_tool_calls)
+                                    == RequestType::Agentic);
+                            pflash_is_agentic = is_agentic;  // hoist for post-generate guard
+                            const RequestFeatures rf {
+                                is_agentic,
+                                n_prompt
+                            };
+                            const RouterDecisionV2 rd = decide_v2(rf, config_.pflash_router);
+                            if (config_.pflash_router.enabled) {
+                                // Router is on: apply per-request keep + cascade override.
+                                // Bandit keeps winning if session_id is present — bandit
+                                // is the M2 lever for agentic keep level tuning.
+                                // For M1 the TYPE decision overrides keep_ratio when no
+                                // session bandit is active.
+                                if (req.session_id.empty()) {
+                                    creq.keep_ratio = (float)rd.keep_target;
+                                } else {
+                                    // PIECE 2: recover_full_next — one-shot full-keep recovery
+                                    // after a compression_failed turn.  Consumed here (one turn).
+                                    if (!req.session_id.empty() &&
+                                        sessions_.consume_recover_full_next(req.session_id)) {
+                                        creq.keep_ratio = (float)config_.pflash_router.full_keep_target;
+                                        std::fprintf(stderr,
+                                            "[pflash-guard] recover_full_next consumed — "
+                                            "session=%s full_keep=%.3f\n",
+                                            req.session_id.c_str(), creq.keep_ratio);
+                                    } else {
+                                        // PIECE 1: floor clamp — bandit must not undercut
+                                        // the router's agentic floor.
+                                        float raw_keep = sessions_.get_keep_ratio(req.session_id);
+                                        creq.keep_ratio = (float)clamp_keep_to_floor(
+                                            raw_keep,
+                                            config_.pflash_router.agentic_keep_target,
+                                            is_agentic);
+                                        if (is_agentic && creq.keep_ratio > raw_keep) {
+                                            std::fprintf(stderr,
+                                                "[pflash-router] floor-clamp: "
+                                                "agentic bandit %.3f < floor %.3f → %.3f\n",
+                                                raw_keep,
+                                                config_.pflash_router.agentic_keep_target,
+                                                creq.keep_ratio);
+                                        }
+                                    }
+                                }
+                                // cascade = use_transitive: 0 = off, 1 = on, -1 = env default
+                                creq.use_transitive = rd.cascade ? 1 : 0;
+                                std::fprintf(stderr,
+                                    "[pflash-router] type=%s keep=%.3f cascade=%s reason=%s\n",
+                                    is_agentic ? "agentic" : "retrieval",
+                                    creq.keep_ratio,
+                                    rd.cascade ? "on" : "off",
+                                    rd.reason);
+                            } else {
+                                // Router disabled: legacy keep_ratio path, no change.
+                                creq.keep_ratio = req.session_id.empty()
+                                    ? config_.pflash_keep_ratio
+                                    : sessions_.get_keep_ratio(req.session_id);
+                                // use_transitive stays at -1 (env default).
+                            }
+                        }
                         creq.drafter_path = config_.pflash_drafter_path;
                         creq.drafter_gpu = config_.pflash_drafter_gpu;
                         creq.skip_park = config_.pflash_skip_park;
@@ -1349,6 +1486,20 @@ void HttpServer::worker_loop() {
             }
         }
 
+        // Effective-size admission gate: check post-compression prompt fits max_ctx.
+        // For non-pflash requests this was already checked in handle_client;
+        // for pflash requests the raw guard passed but the effective size may
+        // still be too large (unlikely but possible if compression ratio is poor).
+        // Use pflash_on=false here so the function directly checks effective size
+        // (pflash_on=true only runs the pre-compression guard, not useful here).
+        if (!check_admission((int)effective_prompt.size(), (int)req.prompt_tokens.size(),
+                             req.max_output, config_.max_ctx,
+                             /*pflash_on=*/false,
+                             config_.pflash_keep_ratio)) {
+            fail_request(400, "prompt + max_tokens exceeds context window");
+            continue;
+        }
+
         // Build generate request.
         //
         // Thinking-budget v2 (Level 2): when caller opts in via
@@ -1387,6 +1538,11 @@ void HttpServer::worker_loop() {
         gen_req.sampler = req.sampler;
         gen_req.do_sample = req.sampler.needs_logit_processing();
         gen_req.stream = false;  // we handle streaming via on_token callback
+        // Widen verify window to cover the full compressed prompt; C2 gate in
+        // qwen35_backend.cpp selects spec-decode vs AR. See docs/pflash-adaptive-composition.md.
+        if (pflash_compressed) {
+            gen_req.fa_window_override = (int)effective_prompt.size() + 256;
+        }
 
         // Level 2 force-close: when thinking is opted in, the server is
         // configured with a hard-limit reply budget, and we resolved the
@@ -1611,18 +1767,36 @@ void HttpServer::worker_loop() {
         // doesn't grow monotonically across requests with different sizes.
         backend_.release_scratch();
 
-        // Bandit: update when spec decode actually ran — including 0-accept case,
-        // which signals the current keep_ratio is too low.
-        if (!req.session_id.empty() && result.spec_decode_ran) {
-            float old_keep = sessions_.get_keep_ratio(req.session_id);
-            int   old_turn = sessions_.turn_count(req.session_id);
-            sessions_.update(req.session_id, result.accept_rate);
-            float new_keep = sessions_.get_keep_ratio(req.session_id);
-            float ema      = sessions_.get_ema(req.session_id);
+        // PIECE 2: compression failure guard — deterministic recovery.
+        // When an agentic compressed turn produces an empty or degenerate response:
+        //   (a) skip the bandit update (failure noise — don't reward/penalise)
+        //   (b) schedule full-keep recovery for the next turn of this session
+        const bool agentic_compressed = pflash_is_agentic && pflash_compressed;
+        const int  n_response_tokens  = (int)result.tokens.size();
+        if (!req.session_id.empty() &&
+            compression_failed(n_response_tokens, result.degenerate_decode_close,
+                               agentic_compressed)) {
             std::fprintf(stderr,
-                "[pflash-bandit] session=%s turn=%d keep=%.4f->%.4f ema=%.3f accept=%.3f\n",
-                req.session_id.c_str(), old_turn + 1,
-                old_keep, new_keep, ema, result.accept_rate);
+                "[pflash-guard] compression_failed → full-keep next: "
+                "session=%s resp_tokens=%d degenerate=%s\n",
+                req.session_id.c_str(), n_response_tokens,
+                result.degenerate_decode_close ? "true" : "false");
+            sessions_.set_recover_full_next(req.session_id);
+            // Fall through — skip bandit update below (spec_decode_ran may still be true).
+        } else {
+            // Bandit: update when spec decode actually ran — including 0-accept case,
+            // which signals the current keep_ratio is too low.
+            if (!req.session_id.empty() && result.spec_decode_ran) {
+                float old_keep = sessions_.get_keep_ratio(req.session_id);
+                int   old_turn = sessions_.turn_count(req.session_id);
+                sessions_.update(req.session_id, result.accept_rate);
+                float new_keep = sessions_.get_keep_ratio(req.session_id);
+                float ema      = sessions_.get_ema(req.session_id);
+                std::fprintf(stderr,
+                    "[pflash-bandit] session=%s turn=%d keep=%.4f->%.4f ema=%.3f accept=%.3f\n",
+                    req.session_id.c_str(), old_turn + 1,
+                    old_keep, new_keep, ema, result.accept_rate);
+            }
         }
 
 
