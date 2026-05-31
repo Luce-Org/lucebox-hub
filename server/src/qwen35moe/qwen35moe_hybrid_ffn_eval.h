@@ -24,6 +24,30 @@ struct ResidualCombineGraph {
     ggml_tensor * cold_in = nullptr;       // [n_embd] F32 input (zeros when no cold)
     ggml_tensor * output = nullptr;        // [n_embd] F32 output
 
+    ResidualCombineGraph() = default;
+    ~ResidualCombineGraph() { free(); }
+    ResidualCombineGraph(const ResidualCombineGraph &) = delete;
+    ResidualCombineGraph & operator=(const ResidualCombineGraph &) = delete;
+    ResidualCombineGraph(ResidualCombineGraph && o) noexcept
+        : ctx(o.ctx), gf(o.gf), alloc(o.alloc),
+          residual_in(o.residual_in), hot_in(o.hot_in),
+          cold_in(o.cold_in), output(o.output) {
+        o.ctx = nullptr; o.gf = nullptr; o.alloc = nullptr;
+        o.residual_in = nullptr; o.hot_in = nullptr;
+        o.cold_in = nullptr; o.output = nullptr;
+    }
+    ResidualCombineGraph & operator=(ResidualCombineGraph && o) noexcept {
+        if (this != &o) {
+            free();
+            ctx = o.ctx; gf = o.gf; alloc = o.alloc;
+            residual_in = o.residual_in; hot_in = o.hot_in;
+            cold_in = o.cold_in; output = o.output;
+            o.ctx = nullptr; o.gf = nullptr; o.alloc = nullptr;
+            o.residual_in = nullptr; o.hot_in = nullptr;
+            o.cold_in = nullptr; o.output = nullptr;
+        }
+        return *this;
+    }
     bool valid() const { return ctx && gf && alloc && output; }
     void free();
     void destroy();
@@ -40,6 +64,24 @@ struct GpuResidentState {
 
     ResidualCombineGraph combine;
 
+    GpuResidentState() = default;
+    ~GpuResidentState() { destroy(); }
+    GpuResidentState(const GpuResidentState &) = delete;
+    GpuResidentState & operator=(const GpuResidentState &) = delete;
+    GpuResidentState(GpuResidentState && o) noexcept
+        : ctx(o.ctx), buf(o.buf), act_cur(o.act_cur),
+          combine(std::move(o.combine)) {
+        o.ctx = nullptr; o.buf = nullptr; o.act_cur = nullptr;
+    }
+    GpuResidentState & operator=(GpuResidentState && o) noexcept {
+        if (this != &o) {
+            destroy();
+            ctx = o.ctx; buf = o.buf; act_cur = o.act_cur;
+            combine = std::move(o.combine);
+            o.ctx = nullptr; o.buf = nullptr; o.act_cur = nullptr;
+        }
+        return *this;
+    }
     bool valid() const { return ctx && buf && act_cur && combine.valid(); }
     void destroy();
 };

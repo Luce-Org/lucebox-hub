@@ -910,12 +910,17 @@ bool eval_qwen35moe_hybrid_ffn_batched(
     if (n_tokens <= 0) return true;
 
     // ── Step 1: Partition routing into hot and cold ──
-    // Use dummy expert ID 0 with weight 0.0 for "other device" slots
-    // (ggml_mul_mat_id does not handle -1 IDs safely)
+    // Dummy slots use weight 0.0 and are distributed evenly across all experts
+    // to avoid pathological routing imbalance that triggers OOB in MMQ stream-k.
     const int total_slots = n_used * n_tokens;
-    std::vector<int32_t> hot_sel(total_slots, 0);
+    const int n_hot_stack = storage.gate_up_hot ? (int)storage.gate_up_hot->ne[2]
+                          : storage.gate_hot    ? (int)storage.gate_hot->ne[2]
+                          : 1;
+    std::vector<int32_t> hot_sel(total_slots);
+    for (int i = 0; i < total_slots; ++i) hot_sel[i] = i % n_hot_stack;
     std::vector<float>   hot_wts(total_slots, 0.0f);
-    std::vector<int32_t> cold_sel(total_slots, 0);
+    std::vector<int32_t> cold_sel(total_slots);
+    for (int i = 0; i < total_slots; ++i) cold_sel[i] = i % std::max(1, (int)(storage.down_cold ? storage.down_cold->ne[2] : 1));
     std::vector<float>   cold_wts(total_slots, 0.0f);
     bool has_hot = false, has_cold = false;
 
