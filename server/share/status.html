@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DFlash Server Status</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+       background: #0d1117; color: #c9d1d9; padding: 20px; }
+h1 { color: #58a6ff; margin-bottom: 16px; font-size: 1.5em; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+        padding: 16px; margin-bottom: 16px; }
+.card h2 { color: #8b949e; font-size: 0.85em; text-transform: uppercase;
+            letter-spacing: 0.05em; margin-bottom: 8px; }
+.badge { display: inline-block; padding: 3px 10px; border-radius: 12px;
+         font-size: 0.8em; font-weight: 600; }
+.badge-idle { background: #1f6feb33; color: #58a6ff; }
+.badge-prefill { background: #f0883e33; color: #f0883e; }
+.badge-decode { background: #3fb95033; color: #3fb950; }
+.stat { display: inline-block; margin-right: 24px; margin-bottom: 8px; }
+.stat-value { font-size: 1.4em; font-weight: 700; color: #f0f6fc; }
+.stat-label { font-size: 0.75em; color: #8b949e; }
+.prompt-box { background: #0d1117; border: 1px solid #30363d; border-radius: 4px;
+              padding: 8px 12px; font-family: monospace; font-size: 0.85em;
+              max-height: 80px; overflow: hidden; word-break: break-all;
+              color: #8b949e; margin-top: 8px; }
+.tokens-box { margin-top: 8px; }
+.token { display: inline-block; background: #1f6feb22; border: 1px solid #1f6feb;
+         border-radius: 4px; padding: 2px 6px; margin: 2px; font-family: monospace;
+         font-size: 0.8em; color: #79c0ff; }
+.chart-container { width: 100%; height: 200px; position: relative; }
+.chart-container svg { width: 100%; height: 100%; }
+.legend { display: flex; gap: 16px; margin-top: 8px; font-size: 0.75em; }
+.legend-item { display: flex; align-items: center; gap: 4px; }
+.legend-dot { width: 10px; height: 10px; border-radius: 50%; }
+.connection-status { float: right; font-size: 0.75em; padding: 3px 8px;
+                     border-radius: 4px; }
+.connected { background: #3fb95033; color: #3fb950; }
+.disconnected { background: #f8514933; color: #f85149; }
+#no-data { color: #484f58; text-align: center; padding: 40px; }
+</style>
+</head>
+<body>
+<h1>&#x26A1; DFlash Server Status
+  <span class="connection-status disconnected" id="conn-status">disconnected</span>
+</h1>
+
+<div class="card">
+  <h2>Current State</h2>
+  <div id="phase-section">
+    <span id="phase-badge" class="badge badge-idle">idle</span>
+    <span class="stat" style="margin-left:16px">
+      <span class="stat-value" id="total-req">0</span>
+      <span class="stat-label">total requests</span>
+    </span>
+  </div>
+  <div id="current-info" style="display:none; margin-top:12px;">
+    <div>
+      <span class="stat">
+        <span class="stat-value" id="cur-prompt-tokens">0</span>
+        <span class="stat-label">prompt tokens</span>
+      </span>
+      <span class="stat">
+        <span class="stat-value" id="cur-completion-tokens">0</span>
+        <span class="stat-label">completion tokens</span>
+      </span>
+      <span class="stat">
+        <span class="stat-value" id="cur-elapsed">0.0s</span>
+        <span class="stat-label">elapsed</span>
+      </span>
+    </div>
+    <div class="prompt-box" id="cur-prompt"></div>
+    <div class="tokens-box" id="cur-draft-tokens"></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Prefill Performance</h2>
+  <div class="chart-container" id="chart-prefill"></div>
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#f0883e"></div>Prefill tok/s</div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Decode Performance</h2>
+  <div class="chart-container" id="chart-decode"></div>
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#3fb950"></div>Decode tok/s</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#58a6ff"></div>Accept Rate %</div>
+  </div>
+</div>
+
+<script>
+function drawChart(containerId, datasets, yMax) {
+  const container = document.getElementById(containerId);
+  if (!datasets[0].data.length) {
+    container.innerHTML = '<div id="no-data">No data yet</div>';
+    return;
+  }
+  const W = 800, H = 180, PAD = 40;
+  const n = datasets[0].data.length;
+  const maxVal = yMax || Math.max(...datasets.flatMap(d => d.data), 1);
+
+  let svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">';
+  // Grid lines
+  for (let i = 0; i <= 4; i++) {
+    const y = PAD + (H - PAD * 2) * (1 - i / 4);
+    const val = (maxVal * i / 4).toFixed(0);
+    svg += '<line x1="' + PAD + '" y1="' + y + '" x2="' + (W - 10) + '" y2="' + y + '" stroke="#30363d" stroke-width="0.5"/>';
+    svg += '<text x="' + (PAD - 4) + '" y="' + (y + 4) + '" fill="#8b949e" font-size="10" text-anchor="end">' + val + '</text>';
+  }
+  // Data lines
+  for (const ds of datasets) {
+    let path = '';
+    for (let i = 0; i < n; i++) {
+      const x = PAD + (W - PAD - 10) * i / Math.max(n - 1, 1);
+      const y = PAD + (H - PAD * 2) * (1 - Math.min(ds.data[i] / maxVal, 1));
+      path += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
+    }
+    svg += '<path d="' + path + '" fill="none" stroke="' + ds.color + '" stroke-width="2"/>';
+    // Dots for last 10 points
+    const dotStart = Math.max(0, n - 10);
+    for (let i = dotStart; i < n; i++) {
+      const x = PAD + (W - PAD - 10) * i / Math.max(n - 1, 1);
+      const y = PAD + (H - PAD * 2) * (1 - Math.min(ds.data[i] / maxVal, 1));
+      svg += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="3" fill="' + ds.color + '"/>';
+    }
+  }
+  svg += '</svg>';
+  container.innerHTML = svg;
+}
+
+function update(data) {
+  // Phase badge
+  const badge = document.getElementById('phase-badge');
+  badge.textContent = data.phase;
+  badge.className = 'badge badge-' + data.phase;
+
+  document.getElementById('total-req').textContent = data.total_requests;
+
+  // Current info
+  const info = document.getElementById('current-info');
+  if (data.current) {
+    info.style.display = 'block';
+    document.getElementById('cur-prompt-tokens').textContent = data.current.prompt_tokens;
+    document.getElementById('cur-completion-tokens').textContent = data.current.completion_tokens;
+    document.getElementById('cur-elapsed').textContent = data.current.elapsed_s.toFixed(1) + 's';
+    document.getElementById('cur-prompt').textContent = data.current.prompt_excerpt || '(no excerpt)';
+    const dtContainer = document.getElementById('cur-draft-tokens');
+    if (data.current.draft_tokens && data.current.draft_tokens.length) {
+      dtContainer.innerHTML = '<strong style="color:#8b949e;font-size:0.8em">Draft tokens: </strong>' +
+        data.current.draft_tokens.map(function(t) { return '<span class="token">' + escapeHtml(t) + '</span>'; }).join('');
+    } else {
+      dtContainer.innerHTML = '';
+    }
+  } else {
+    info.style.display = 'none';
+  }
+
+  // Charts
+  const hist = data.perf_history || [];
+  const prefillData = hist.map(function(h) { return h.prefill_tok_s; });
+  const decodeData = hist.map(function(h) { return h.decode_tok_s; });
+  const acceptData = hist.map(function(h) { return h.accept_rate * 100; });
+
+  const prefillMax = Math.max.apply(null, prefillData.concat([100]));
+  drawChart('chart-prefill', [{data: prefillData, color: '#f0883e'}], prefillMax * 1.1);
+
+  const decodeMax = Math.max.apply(null, decodeData.concat(acceptData).concat([10]));
+  drawChart('chart-decode', [
+    {data: decodeData, color: '#3fb950'},
+    {data: acceptData, color: '#58a6ff'}
+  ], decodeMax * 1.1);
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// SSE connection
+function connectSSE() {
+  const connEl = document.getElementById('conn-status');
+  const es = new EventSource('/status/events');
+
+  es.onopen = function() {
+    connEl.textContent = 'connected';
+    connEl.className = 'connection-status connected';
+  };
+
+  es.addEventListener('status', function(e) {
+    try {
+      const data = JSON.parse(e.data);
+      update(data);
+    } catch (err) {}
+  });
+
+  es.onerror = function() {
+    connEl.textContent = 'disconnected';
+    connEl.className = 'connection-status disconnected';
+    es.close();
+    // Reconnect after 2 seconds
+    setTimeout(connectSSE, 2000);
+  };
+}
+
+connectSSE();
+</script>
+</body>
+</html>

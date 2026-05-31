@@ -12,6 +12,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -20,6 +22,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace dflash::common {
@@ -44,6 +47,8 @@ static constexpr char kServerName[] = "luce-dflash";
 static const std::vector<std::string> kApiEndpoints = {
     "GET /health",
     "GET /props",
+    "GET /status",
+    "GET /status/events",
     "GET /v1/models",
     "POST /v1/chat/completions",
     "POST /v1/messages",
@@ -462,6 +467,55 @@ HttpServer::HttpServer(ModelBackend & backend,
                    config.disk_cache_cold_max_tokens}, backend)
 {
     disk_cache_.init();
+    status_html_path_ = resolve_status_html();
+}
+
+// Resolve path to share/status.html at startup.
+std::string HttpServer::resolve_status_html() {
+    // 1. DFLASH_SHARE_DIR env var
+    if (const char * dir = std::getenv("DFLASH_SHARE_DIR")) {
+        std::string path = std::string(dir) + "/status.html";
+        struct stat st;
+        if (::stat(path.c_str(), &st) == 0) return path;
+    }
+    // 2. ../share/ relative to /proc/self/exe
+    char exe_buf[1024] = {};
+    ssize_t len = ::readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+    if (len > 0) {
+        exe_buf[len] = '\0';
+        std::string exe_dir(exe_buf);
+        auto slash = exe_dir.rfind('/');
+        if (slash != std::string::npos) {
+            exe_dir = exe_dir.substr(0, slash);
+            std::string path = exe_dir + "/../share/status.html";
+            struct stat st;
+            if (::stat(path.c_str(), &st) == 0) return path;
+        }
+    }
+    // 3. ./share/status.html (development)
+    {
+        struct stat st;
+        if (::stat("share/status.html", &st) == 0) return "share/status.html";
+    }
+    return {};
+}
+
+// Broadcast current status as SSE event to all connected /status/events clients.
+void HttpServer::broadcast_status() {
+    std::string event = status_.to_sse_event();
+    std::lock_guard<std::mutex> lk(sse_mu_);
+    std::vector<int> dead;
+    for (int fd : sse_fds_) {
+        ssize_t sent = ::send(fd, event.data(), event.size(), MSG_NOSIGNAL);
+        if (sent <= 0) {
+            dead.push_back(fd);
+        }
+    }
+    for (int fd : dead) {
+        ::close(fd);
+        sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
+                       sse_fds_.end());
+    }
 }
 
 HttpServer::~HttpServer() {
@@ -478,6 +532,13 @@ void HttpServer::shutdown() {
     }
     if (worker_thread_.joinable()) {
         worker_thread_.join();
+    }
+
+    // Close SSE client connections.
+    {
+        std::lock_guard<std::mutex> lk(sse_mu_);
+        for (int fd : sse_fds_) ::close(fd);
+        sse_fds_.clear();
     }
 
     // Drain any pending jobs.
@@ -674,6 +735,60 @@ void HttpServer::handle_client(int fd) {
         send_response(fd, 200, "application/json", body.dump() + "\n");
         ::close(fd);
         return;
+    }
+
+    // Status page: serve HTML file from disk.
+    if (hr.method == "GET" && hr.path == "/status") {
+        if (status_html_path_.empty()) {
+            send_error(fd, 404,
+                "status.html not found. Set DFLASH_SHARE_DIR or place it in share/status.html");
+            ::close(fd);
+            return;
+        }
+        std::ifstream ifs(status_html_path_);
+        if (!ifs.is_open()) {
+            send_error(fd, 500, "failed to open status.html");
+            ::close(fd);
+            return;
+        }
+        std::ostringstream oss;
+        oss << ifs.rdbuf();
+        send_response(fd, 200, "text/html; charset=utf-8", oss.str());
+        ::close(fd);
+        return;
+    }
+
+    // Status JSON snapshot (for non-SSE clients / debugging).
+    if (hr.method == "GET" && hr.path == "/status/json") {
+        send_response(fd, 200, "application/json", status_.to_json().dump() + "\n");
+        ::close(fd);
+        return;
+    }
+
+    // Status SSE stream: hold connection open and push updates.
+    if (hr.method == "GET" && hr.path == "/status/events") {
+        // Send SSE headers.
+        const char * headers =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: keep-alive\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "\r\n";
+        if (!send_all(fd, headers, std::strlen(headers))) {
+            ::close(fd);
+            return;
+        }
+        // Send initial state immediately.
+        std::string initial = status_.to_sse_event();
+        send_all(fd, initial.data(), initial.size());
+        // Register for future broadcasts. The fd is NOT closed here — it stays
+        // open until the client disconnects (detected on next broadcast send).
+        {
+            std::lock_guard<std::mutex> lk(sse_mu_);
+            sse_fds_.push_back(fd);
+        }
+        return;  // Do NOT close fd — it's now owned by the SSE broadcast loop.
     }
 
     // Models endpoint.
@@ -1111,6 +1226,20 @@ void HttpServer::worker_loop() {
         const auto & req = job->req;
         auto started_at = std::chrono::steady_clock::now();
 
+        // Track live status for /status page. RAII guard ensures idle on all paths.
+        std::string prompt_excerpt;
+        if (!req.prompt_tokens.empty()) {
+            // Decode first ~40 tokens as a prompt excerpt (cheap, bounded).
+            const int excerpt_len = std::min((int)req.prompt_tokens.size(), 40);
+            std::vector<int32_t> excerpt_toks(req.prompt_tokens.begin(),
+                                               req.prompt_tokens.begin() + excerpt_len);
+            prompt_excerpt = tokenizer_.decode(excerpt_toks);
+            if (prompt_excerpt.size() > 200) prompt_excerpt.resize(200);
+        }
+        status_.set_running(prompt_excerpt, (int)req.prompt_tokens.size(), req.stream);
+        broadcast_status();
+        StatusGuard status_guard{status_};
+
         auto finish_job = [&]() {
             std::lock_guard<std::mutex> lk(job->mu);
             job->done = true;
@@ -1429,12 +1558,29 @@ void HttpServer::worker_loop() {
         DaemonIO io;
         io.stream_fd = -1;  // no pipe — we write SSE directly
 
+        // Inference observer: updates status page with draft tokens per step.
+        io.observer = [&](const char * phase, const std::vector<int32_t> & tokens) {
+            std::vector<std::string> token_strs;
+            token_strs.reserve(tokens.size());
+            for (int32_t t : tokens) {
+                token_strs.push_back(tokenizer_.token_text(t));
+            }
+            status_.set_draft_tokens(token_strs);
+            broadcast_status();
+        };
+
         int completion_tokens = 0;
         bool client_disconnected = false;
 
         io.on_token = [&](int32_t token) -> bool {
             if (client_disconnected) return false;
             completion_tokens++;
+
+            // Update status page every 10 tokens (low overhead).
+            if (completion_tokens % 10 == 0) {
+                status_.update_completion_tokens(completion_tokens);
+                broadcast_status();
+            }
 
             // Skip EOS/EOT/special tokens — don't forward to SSE.
             int32_t eos = tokenizer_.eos_id();
@@ -1507,6 +1653,10 @@ void HttpServer::worker_loop() {
             backend_.free_drafter();    // free pflash drafter (~1.4 GB) if loaded
             backend_.unpark("draft");   // reload decode draft (~3.3 GB)
         }
+
+        // Transition status to decode phase.
+        status_.set_decode();
+        broadcast_status();
 
         GenerateResult result;
         if (using_restore) {
@@ -1604,6 +1754,25 @@ void HttpServer::worker_loop() {
         // message_delta usage, Responses response.completed usage).
         // See docs/specs/thinking-budget.md §6.3.
         GenTimings gen_timings{ result.prefill_s, result.decode_s };
+
+        // Record performance for /status page.
+        if (result.ok) {
+            PerfRecord perf;
+            perf.prompt_tokens = (int)req.prompt_tokens.size();
+            perf.completion_tokens = completion_tokens;
+            perf.prefill_tok_s = (result.prefill_s > 0.0)
+                ? (double)req.prompt_tokens.size() / result.prefill_s : 0.0;
+            perf.decode_tok_s = (result.decode_s > 0.0)
+                ? (double)completion_tokens / result.decode_s : 0.0;
+            perf.accept_rate = result.accept_rate;
+            perf.cache_hit = using_restore;
+            perf.pflash = pflash_compressed;
+            perf.spec_decode = result.spec_decode_ran;
+            perf.timestamp = std::chrono::steady_clock::now();
+            status_.record_perf(perf);
+            status_.update_completion_tokens(completion_tokens);
+            broadcast_status();
+        }
         if (req.stream && !client_disconnected) {
             auto final_chunks = emitter.emit_finish(completion_tokens, &gen_timings);
             for (const auto & chunk : final_chunks) {

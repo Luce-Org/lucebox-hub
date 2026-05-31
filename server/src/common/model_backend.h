@@ -25,6 +25,14 @@ namespace dflash::common {
 // Return true to continue generation, false to abort.
 using TokenCallback = std::function<bool(int32_t token)>;
 
+// Inference observer callback for live status updates. Called by backends
+// at each spec-decode step to report phase/detail. When empty, backends
+// skip the call (zero overhead).
+//   phase: "draft", "verify", "accept", "prefill_chunk"
+//   detail: JSON string with step-specific data
+using InferenceObserver = std::function<void(const char * phase,
+                                             const std::vector<int32_t> & tokens)>;
+
 // ─── I/O handle passed to backend methods that need protocol output ─────
 struct DaemonIO {
     int stream_fd = -1;
@@ -34,6 +42,10 @@ struct DaemonIO {
     // flag is set and the caller should abort generation.
     TokenCallback on_token;
     mutable bool cancelled = false;
+
+    // Optional inference observer for /status page. When set, backends call
+    // this at each spec-decode step with draft tokens and phase info.
+    InferenceObserver observer;
 
     // Write a single int32 to the stream fd (token or -1 sentinel).
     // Also invokes on_token if set. Sets cancelled=true if on_token

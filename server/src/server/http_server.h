@@ -22,6 +22,7 @@
 #include "common/pflash_drafter_ipc.h"
 #include "model_card.h"
 #include "adaptive_keep_ratio.h"
+#include "server_status.h"
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -286,6 +287,20 @@ private:
 
     // Per-session adaptive keep_ratio bandit state.
     HttpServerSessions sessions_;
+
+    // Live status tracker (read by /status/json, written by worker thread).
+    ServerStatus status_;
+
+    // SSE client connections for /status/events push.
+    std::mutex             sse_mu_;
+    std::vector<int>       sse_fds_;
+
+    // Broadcast current status to all SSE clients. Removes dead fds.
+    void broadcast_status();
+
+    // Resolve and cache path to share/status.html.
+    std::string status_html_path_;
+    std::string resolve_status_html();
 
     // Track prompt tokens for each snapshot slot (for shutdown save).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
