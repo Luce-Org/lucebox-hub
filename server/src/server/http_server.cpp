@@ -529,8 +529,13 @@ void HttpServer::broadcast_status() {
 
 // Broadcast a token text delta as an incremental SSE event.
 void HttpServer::broadcast_token(const std::string & text) {
-    json j = {{"text", text}};
-    std::string event = "event: token\ndata: " + j.dump() + "\n\n";
+    // Token text may contain incomplete UTF-8 (tokens can split multi-byte
+    // codepoints). Manually build the SSE payload with json string escaping
+    // that replaces invalid UTF-8 with U+FFFD instead of throwing.
+    json j;
+    j["text"] = text;
+    std::string event = "event: token\ndata: " +
+        j.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
     std::lock_guard<std::mutex> lk(sse_mu_);
     std::vector<int> dead;
     for (int fd : sse_fds_) {
@@ -788,7 +793,8 @@ void HttpServer::handle_client(int fd) {
 
     // Status JSON snapshot (for non-SSE clients / debugging).
     if (hr.method == "GET" && hr.path == "/status/json") {
-        send_response(fd, 200, "application/json", status_.to_json().dump() + "\n");
+        send_response(fd, 200, "application/json",
+            status_.to_json().dump(-1, ' ', false, json::error_handler_t::replace) + "\n");
         ::close(fd);
         return;
     }

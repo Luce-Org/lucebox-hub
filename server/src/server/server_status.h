@@ -205,9 +205,8 @@ public:
         return j;
     }
 
-    // Format as SSE event string: "event: status\ndata: {json}\n\n"
     std::string to_sse_event() const {
-        std::string data = to_json().dump();
+        std::string data = to_json().dump(-1, ' ', false, json::error_handler_t::replace);
         return "event: status\ndata: " + data + "\n\n";
     }
 
