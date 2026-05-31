@@ -35,11 +35,19 @@ static float bf16_bits_to_f32(uint16_t bits) {
     return v.f;
 }
 
-static bool tokens_contain(const std::vector<int32_t> & tokens,
-                           const std::vector<int32_t> & needle) {
+static bool tokens_contain_recent_sequence(const std::vector<int32_t> & tokens,
+                                           const std::vector<int32_t> & needle,
+                                           size_t max_trailing) {
     if (needle.empty() || tokens.size() < needle.size()) return false;
-    return std::search(tokens.begin(), tokens.end(),
-                       needle.begin(), needle.end()) != tokens.end();
+    const size_t last_start = tokens.size() - needle.size();
+    const size_t first_start =
+        last_start > max_trailing ? last_start - max_trailing : 0;
+    for (size_t start = first_start; start <= last_start; ++start) {
+        if (std::equal(needle.begin(), needle.end(), tokens.begin() + start)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool tokens_have_recent_any(const std::vector<int32_t> & tokens,
@@ -54,6 +62,13 @@ static bool tokens_have_recent_any(const std::vector<int32_t> & tokens,
         }
     }
     return false;
+}
+
+static int env_int_or_default(const char * name, int fallback) {
+    if (const char * raw = std::getenv(name)) {
+        if (*raw) return std::atoi(raw);
+    }
+    return fallback;
 }
 }  // namespace
 
@@ -969,6 +984,13 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
 
     auto t_dec0_ar = std::chrono::steady_clock::now();
     const size_t out_tokens_at_entry = out_tokens.size();
+    static const int _min_floor = env_int_or_default("DFLASH_MIN_TOKENS", 0);
+    static const int _repeat_guard = []{
+        const int explicit_guard =
+            env_int_or_default("DFLASH_DEGENERATE_RUN_TOKENS", -1);
+        if (explicit_guard >= 0) return explicit_guard;
+        return env_int_or_default("DFLASH_MIN_TOKENS", 0) > 0 ? 32 : 0;
+    }();
 
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
@@ -1053,7 +1075,6 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         // 'preamble then stop, no tool_call' agentic stall. Env-gated so the
         // default production lane is byte-for-byte unchanged.
         {
-            static const int _min_floor = []{ const char* e = std::getenv("DFLASH_MIN_TOKENS"); return e ? std::atoi(e) : 0; }();
             if (_min_floor > 0 && (int)out_tokens.size() < _min_floor && IS_EOS_TOK(next_tok, w_)) {
                 int alt = -1; float altbest = -1e30f;
                 for (int v = 0; v < vocab; v++) {
@@ -1077,6 +1098,22 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         if (io.cancelled) break;
 
         if (IS_EOS_TOK(next_tok, w_)) break;
+
+        if (_repeat_guard > 0 && (int)out_tokens.size() >= _repeat_guard) {
+            int run = 1;
+            for (int j = (int)out_tokens.size() - 2; j >= 0; --j) {
+                if (out_tokens[j] != next_tok) break;
+                run++;
+            }
+            if (run >= _repeat_guard) {
+                std::fprintf(stderr,
+                    "[degenerate-decode] token %d repeated %d times - "
+                    "breaking AR loop at committed=%d\n",
+                    next_tok, run, committed);
+                if (degenerate_close_out) *degenerate_close_out = true;
+                break;
+            }
+        }
 
         // Degenerate-decode watchdog. Once we're past the budget-hook's
         // close sequence (model in post-`</think>` content phase), watch
@@ -1283,6 +1320,26 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             }
         }
 
+        if (last_tok < 0 && !out_tokens.empty()) {
+            std::fprintf(stderr,
+                "[spec-decode] invalid draft seed %d after %d emitted tokens; "
+                "switching to AR\n",
+                last_tok, (int)out_tokens.size());
+            step_graph_destroy(draft_sg);
+            cache_.last_tok = out_tokens.back();
+            const int ar_n_gen = n_gen - n_generated;
+            if (ar_n_gen <= 0) {
+                io.emit(-1);
+                return true;
+            }
+            BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
+            bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
+                                    tail_hook, forced_close_out,
+                                    degenerate_close_out);
+            io.emit(-1);
+            return ok;
+        }
+
         // 1. Build noise input for draft
         noise_ids[0] = last_tok;
         for (int i = 1; i < q_len; i++) noise_ids[i] = target->mask_token_id();
@@ -1433,15 +1490,25 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         bool hit_eos = false;
         bool floor_to_ar = false;
         bool inject_tool_prefix = false;
+        constexpr size_t kActionSuffixLookback = 16;
+        constexpr size_t kSkipSequenceLookback = 64;
         int emitted = 0;
         for (int i = 0; i < commit_n; i++) {
             if (_min_floor > 0 && (int)out_tokens.size() < _min_floor &&
                 IS_EOS_TOK(replay_tok[i], w_)) {
+                // Action preambles often end as "I'll check:\n\n" before EOS.
+                // Tokenization makes the colon several tokens back, so keep a
+                // modest trailing window while still requiring a recent action
+                // suffix and no nearby completion phrase.
                 const bool can_inject_tool =
                     stall_tool_prefix_tokens && !stall_tool_prefix_tokens->empty() &&
                     stall_action_suffix_tokens && !stall_action_suffix_tokens->empty() &&
-                    tokens_have_recent_any(out_tokens, *stall_action_suffix_tokens, 4) &&
-                    !(stall_skip_tokens && tokens_contain(out_tokens, *stall_skip_tokens));
+                    tokens_have_recent_any(out_tokens, *stall_action_suffix_tokens,
+                                           kActionSuffixLookback) &&
+                    !(stall_skip_tokens &&
+                      tokens_contain_recent_sequence(out_tokens,
+                                                     *stall_skip_tokens,
+                                                     kSkipSequenceLookback));
                 if (can_inject_tool) {
                     FILE* _d = std::fopen("/tmp/dflash_floor.log", "a");
                     if (_d) {
