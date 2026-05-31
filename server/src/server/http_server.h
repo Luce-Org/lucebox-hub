@@ -298,6 +298,9 @@ private:
     // Broadcast current status to all SSE clients. Removes dead fds.
     void broadcast_status();
 
+    // Broadcast incremental token text to SSE clients.
+    void broadcast_token(const std::string & text);
+
     // Resolve and cache path to share/status.html.
     std::string status_html_path_;
     std::string resolve_status_html();

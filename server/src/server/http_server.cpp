@@ -527,6 +527,25 @@ void HttpServer::broadcast_status() {
     }
 }
 
+// Broadcast a token text delta as an incremental SSE event.
+void HttpServer::broadcast_token(const std::string & text) {
+    json j = {{"text", text}};
+    std::string event = "event: token\ndata: " + j.dump() + "\n\n";
+    std::lock_guard<std::mutex> lk(sse_mu_);
+    std::vector<int> dead;
+    for (int fd : sse_fds_) {
+        ssize_t sent = ::send(fd, event.data(), event.size(), MSG_NOSIGNAL);
+        if (sent <= 0) {
+            dead.push_back(fd);
+        }
+    }
+    for (int fd : dead) {
+        ::close(fd);
+        sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
+                       sse_fds_.end());
+    }
+}
+
 HttpServer::~HttpServer() {
     shutdown();
 }
@@ -1245,7 +1264,24 @@ void HttpServer::worker_loop() {
             prompt_excerpt = tokenizer_.decode(excerpt_toks);
             if (prompt_excerpt.size() > 200) prompt_excerpt.resize(200);
         }
-        status_.set_running(prompt_excerpt, (int)req.prompt_tokens.size(), req.stream);
+        {
+            ServerStatus::RequestInfo info;
+            info.model = req.model;
+            info.format = api_format_name(req.format);
+            info.session_id = req.session_id;
+            info.max_output = req.max_output;
+            info.temperature = req.sampler.temp;
+            info.top_p = req.sampler.top_p;
+            info.top_k = req.sampler.top_k;
+            info.thinking_enabled = req.thinking_enabled;
+            status_.set_running(prompt_excerpt, (int)req.prompt_tokens.size(), req.stream, info);
+        }
+        // Store messages JSON for request inspection (truncate to avoid huge payloads).
+        if (!req.messages.is_null()) {
+            std::string msg_str = req.messages.dump();
+            if (msg_str.size() > 4096) msg_str.resize(4096);
+            status_.set_messages(msg_str);
+        }
         broadcast_status();
         StatusGuard status_guard{status_};
 
@@ -1563,6 +1599,10 @@ void HttpServer::worker_loop() {
             snap_slot,
             snap_cut);
 
+        // Update status page with cache/pflash/spec-decode flags.
+        status_.set_flags(using_restore, pflash_compressed, !config_.draft_path.empty());
+        broadcast_status();
+
         // Set up DaemonIO with on_token callback for streaming + disconnect.
         DaemonIO io;
         io.stream_fd = -1;  // no pipe — we write SSE directly
@@ -1600,6 +1640,7 @@ void HttpServer::worker_loop() {
 
             // Gemma4 thinking channel: map <|channel> → <think>, <channel|> → </think>\n
             if (raw == "<|channel>") {
+                broadcast_token("<think>");
                 if (req.stream) {
                     auto chunks = emitter.emit_token("<think>");
                     for (const auto & chunk : chunks)
@@ -1608,6 +1649,7 @@ void HttpServer::worker_loop() {
                 return true;
             }
             if (raw == "<channel|>") {
+                broadcast_token("</think>\n");
                 if (req.stream) {
                     auto chunks = emitter.emit_token("</think>\n");
                     for (const auto & chunk : chunks)
@@ -1624,6 +1666,7 @@ void HttpServer::worker_loop() {
             // reasoning_content with empty visible content. Forward the text
             // form into the emitter so parse_reasoning() can split correctly.
             if (raw == "<think>" || raw == "</think>") {
+                broadcast_token(raw == "</think>" ? "</think>\n" : "<think>");
                 if (req.stream) {
                     auto chunks = emitter.emit_token(
                         raw == "</think>" ? "</think>\n" : "<think>");
@@ -1641,6 +1684,11 @@ void HttpServer::worker_loop() {
             }
 
             std::string text = tokenizer_.token_text(token);
+
+            // Send token text to status page clients (browser accumulates).
+            if (!text.empty()) {
+                broadcast_token(text);
+            }
 
             if (req.stream && !text.empty()) {
                 auto chunks = emitter.emit_token(text);

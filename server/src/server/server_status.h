@@ -50,9 +50,21 @@ class ServerStatus {
 public:
     static constexpr int kMaxHistory = 50;
 
+    // Request details passed at set_running time.
+    struct RequestInfo {
+        std::string model;
+        std::string format;       // "chat", "anthropic", "responses"
+        std::string session_id;
+        int         max_output       = 0;
+        float       temperature      = 0.0f;
+        float       top_p            = 1.0f;
+        int         top_k            = 0;
+        bool        thinking_enabled = false;
+    };
+
     // Called by worker thread to update live state.
     void set_running(const std::string & prompt_excerpt, int prompt_tokens,
-                     bool is_stream) {
+                     bool is_stream, const RequestInfo & info) {
         std::lock_guard<std::mutex> lk(mu_);
         phase_ = InferencePhase::PREFILL;
         prompt_excerpt_ = prompt_excerpt;
@@ -60,12 +72,28 @@ public:
         completion_tokens_ = 0;
         is_stream_ = is_stream;
         draft_tokens_.clear();
+        request_info_ = info;
+        cache_hit_ = false;
+        pflash_ = false;
+        spec_decode_ = false;
         started_at_ = std::chrono::steady_clock::now();
+    }
+
+    void set_messages(const std::string & messages_json) {
+        std::lock_guard<std::mutex> lk(mu_);
+        messages_json_ = messages_json;
     }
 
     void set_decode() {
         std::lock_guard<std::mutex> lk(mu_);
         phase_ = InferencePhase::DECODE;
+    }
+
+    void set_flags(bool cache_hit, bool pflash, bool spec_decode) {
+        std::lock_guard<std::mutex> lk(mu_);
+        cache_hit_ = cache_hit;
+        pflash_ = pflash;
+        spec_decode_ = spec_decode;
     }
 
     void update_completion_tokens(int n) {
@@ -105,6 +133,9 @@ public:
         std::vector<PerfRecord> history;
         int total_requests = 0;
         double elapsed_s = 0.0;
+        RequestInfo info;
+        bool cache_hit = false, pflash = false, spec_decode = false;
+        std::string messages_json;
 
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -116,6 +147,11 @@ public:
             draft_tokens = draft_tokens_;
             history = perf_history_;
             total_requests = total_requests_;
+            info = request_info_;
+            cache_hit = cache_hit_;
+            pflash = pflash_;
+            spec_decode = spec_decode_;
+            messages_json = messages_json_;
             if (phase != InferencePhase::IDLE) {
                 elapsed_s = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - started_at_).count();
@@ -134,6 +170,18 @@ public:
                 {"stream", is_stream},
                 {"elapsed_s", elapsed_s},
                 {"draft_tokens", draft_tokens},
+                {"model", info.model},
+                {"format", info.format},
+                {"max_output", info.max_output},
+                {"temperature", info.temperature},
+                {"top_p", info.top_p},
+                {"top_k", info.top_k},
+                {"thinking_enabled", info.thinking_enabled},
+                {"session_id", info.session_id},
+                {"cache_hit", cache_hit},
+                {"pflash", pflash},
+                {"spec_decode", spec_decode},
+                {"messages", messages_json},
             };
         } else {
             j["current"] = nullptr;
@@ -174,6 +222,11 @@ private:
     bool is_stream_ = false;
     std::vector<std::string> draft_tokens_;
     std::chrono::steady_clock::time_point started_at_;
+    RequestInfo request_info_;
+    bool cache_hit_ = false;
+    bool pflash_ = false;
+    bool spec_decode_ = false;
+    std::string messages_json_;
 
     // History.
     std::vector<PerfRecord> perf_history_;
