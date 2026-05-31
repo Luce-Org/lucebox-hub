@@ -24,6 +24,10 @@
 
 namespace dflash::common {
 
+#ifndef POLLRDHUP
+#define POLLRDHUP 0
+#endif
+
 // ─── /props constants ───────────────────────────────────────────────────
 //
 // SERVER_NAME / SERVER_VERSION mirror the Python server's identity strings
@@ -76,6 +80,57 @@ static const char * api_format_name(ApiFormat format) {
 static size_t json_array_size(const json & value) {
     return value.is_array() ? value.size() : 0;
 }
+
+static bool client_socket_disconnected(int fd) {
+    struct pollfd pfd{fd, POLLIN | POLLHUP | POLLERR | POLLNVAL | POLLRDHUP, 0};
+    int pr;
+    do {
+        pr = poll(&pfd, 1, 0);
+    } while (pr < 0 && errno == EINTR);
+    if (pr <= 0) return false;
+    if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL | POLLRDHUP)) return true;
+    if (!(pfd.revents & POLLIN)) return false;
+
+    char byte;
+    ssize_t n = recv(fd, &byte, 1, MSG_PEEK);
+    if (n == 0) return true;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+        return false;
+    }
+    return n < 0;
+}
+
+class RequestDisconnectWatcher {
+public:
+    explicit RequestDisconnectWatcher(int fd) : fd_(fd) {
+        thread_ = std::thread([this]() {
+            while (!done_.load(std::memory_order_relaxed)) {
+                if (client_socket_disconnected(fd_)) {
+                    cancelled_.store(true, std::memory_order_relaxed);
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+    }
+
+    ~RequestDisconnectWatcher() {
+        done_.store(true, std::memory_order_relaxed);
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+    bool cancelled() const {
+        return cancelled_.load(std::memory_order_relaxed);
+    }
+
+private:
+    int fd_;
+    std::atomic<bool> cancelled_{false};
+    std::atomic<bool> done_{false};
+    std::thread thread_;
+};
 
 // Build the /props response body.
 //
@@ -751,14 +806,34 @@ void HttpServer::handle_client(int fd) {
 bool HttpServer::route_request(int fd, const HttpRequest & hr) {
     if (hr.method != "POST") return false;
 
+    // Watch for disconnects from the start of request handling. Large agent
+    // prompts can spend meaningful time in render/tokenize before any SSE
+    // write occurs, so cancellation cannot wait until generation starts.
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    RequestDisconnectWatcher disconnect_watcher(fd);
+
     std::fprintf(stderr, "[server] request path=%s body_bytes=%zu\n",
                  hr.path.c_str(), hr.body.size());
 
     ParsedRequest req;
     std::string err;
+    auto request_cancelled = [&]() {
+        return disconnect_watcher.cancelled();
+    };
+    auto drop_cancelled_request = [&](const char * phase) {
+        std::fprintf(stderr,
+            "[server] client disconnected during %s before enqueue; "
+            "dropping request path=%s id=%s\n",
+            phase,
+            hr.path.c_str(),
+            req.response_id.c_str());
+        return true;
+    };
 
     try {
         json body = json::parse(hr.body);
+        if (request_cancelled()) return drop_cancelled_request("json_parse");
 
         // Common fields.
         req.stream = body.value("stream", false);
@@ -880,10 +955,12 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         } else {
             return false;
         }
+        if (request_cancelled()) return drop_cancelled_request("message_parse");
 
         // Render messages to text and tokenize.
         std::vector<ChatMessage> chat_msgs =
             normalize_chat_messages(req.messages, req.format, tool_memory_);
+        if (request_cancelled()) return drop_cancelled_request("message_normalize");
 
         // Determine thinking mode BEFORE rendering so the template can inject
         // the <think>\n\n</think>\n\n block when thinking is disabled.
@@ -1044,22 +1121,29 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                                             true, enable_thinking,
                                             tools_json);
         }
-        req.prompt_tokens = tokenizer_.encode(rendered);
+        if (request_cancelled()) return drop_cancelled_request("template_render");
+        req.prompt_tokens = tokenizer_.encode(rendered, request_cancelled);
+        if (request_cancelled()) return drop_cancelled_request("tokenize");
 
         // count_tokens: short-circuit after tokenization. Skip generation
         // entirely — Anthropic's contract is just `{"input_tokens": N}`.
         if (count_tokens_only) {
+            if (request_cancelled()) return drop_cancelled_request("count_tokens");
             json resp = {{"input_tokens", (int)req.prompt_tokens.size()}};
             send_response(fd, 200, "application/json", resp.dump() + "\n");
             return true;
         }
 
+    } catch (const TokenizationCancelled &) {
+        return drop_cancelled_request("tokenize");
     } catch (const std::exception & e) {
+        if (request_cancelled()) return drop_cancelled_request("parse_error");
         send_error(fd, 400, std::string("JSON parse error: ") + e.what());
         return true;  // handled (with error)
     }
 
     // Check context length.
+    if (request_cancelled()) return drop_cancelled_request("context_check");
     if ((int)req.prompt_tokens.size() + req.max_output > config_.max_ctx) {
         send_error(fd, 400, "prompt + max_tokens exceeds context window");
         return true;
@@ -1080,21 +1164,37 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         req.stop_sequences.size(),
         req.model.c_str());
 
-    // Set socket non-blocking for send() stall detection during streaming.
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-
     // Enqueue job and wait for worker.
     ServerJob job;
     job.fd = fd;
     job.req = std::move(req);
+    job.cancelled.store(request_cancelled(), std::memory_order_relaxed);
 
     enqueue(&job);
 
-    // Wait for the worker to signal completion.
+    // Wait for the worker to signal completion. While the worker is busy it
+    // cannot observe a pre-token disconnect by sending SSE, so the client
+    // thread keeps watching the socket and flips the job's cooperative
+    // cancellation flag if the peer goes away.
     {
         std::unique_lock<std::mutex> lk(job.mu);
-        job.cv.wait(lk, [&]() { return job.done; });
+        bool disconnect_logged = false;
+        while (!job.done) {
+            if (job.cv.wait_for(lk, std::chrono::milliseconds(100),
+                                [&]() { return job.done; })) {
+                break;
+            }
+            lk.unlock();
+            if (!disconnect_logged && request_cancelled()) {
+                job.cancelled.store(true, std::memory_order_relaxed);
+                disconnect_logged = true;
+                std::fprintf(stderr,
+                    "[server] client disconnected before worker completed; "
+                    "cancelling chat %s\n",
+                    job.req.response_id.c_str());
+            }
+            lk.lock();
+        }
     }
 
     return true;
@@ -1110,6 +1210,9 @@ void HttpServer::worker_loop() {
         int fd = job->fd;
         const auto & req = job->req;
         auto started_at = std::chrono::steady_clock::now();
+        auto job_cancelled = [job]() {
+            return job->cancelled.load(std::memory_order_relaxed);
+        };
 
         auto finish_job = [&]() {
             std::lock_guard<std::mutex> lk(job->mu);
@@ -1140,10 +1243,19 @@ void HttpServer::worker_loop() {
             req.max_output,
             json_array_size(req.tools));
 
+        if (job_cancelled()) {
+            std::fprintf(stderr,
+                "[server] chat CANCELLED %s before generation started\n",
+                req.response_id.c_str());
+            finish_job();
+            continue;
+        }
+
         // Send SSE headers.
         if (req.stream) {
             if (!send_sse_headers(fd)) {
                 // Client already disconnected before we started.
+                job->cancelled.store(true, std::memory_order_relaxed);
                 finish_job();
                 continue;
             }
@@ -1165,6 +1277,7 @@ void HttpServer::worker_loop() {
                 }
             }
             if (!start_ok) {
+                job->cancelled.store(true, std::memory_order_relaxed);
                 finish_job();
                 continue;
             }
@@ -1385,7 +1498,13 @@ void HttpServer::worker_loop() {
                 cold_req.snap_pos = cold_boundary;  // save at end of prefix
                 DaemonIO cold_io;
                 cold_io.stream_fd = -1;
+                cold_io.is_cancelled = job_cancelled;
                 auto cold_result = backend_.generate_with_empty_spec_fallback(cold_req, cold_io);
+                if (cold_io.should_cancel()) {
+                    job->cancelled.store(true, std::memory_order_relaxed);
+                    finish_job();
+                    continue;
+                }
                 if (cold_result.ok && backend_.snapshot_used(DISK_STAGING_SLOT)) {
                     disk_cache_.learn_layout(DISK_STAGING_SLOT);
                     std::vector<int32_t> prefix_tokens(effective_prompt.begin(),
@@ -1428,13 +1547,17 @@ void HttpServer::worker_loop() {
         // Set up DaemonIO with on_token callback for streaming + disconnect.
         DaemonIO io;
         io.stream_fd = -1;  // no pipe — we write SSE directly
+        io.is_cancelled = job_cancelled;
 
         int completion_tokens = 0;
         bool visible_output_seen = false;
         bool client_disconnected = false;
 
         io.on_token = [&](int32_t token) -> bool {
-            if (client_disconnected) return false;
+            if (client_disconnected || job_cancelled()) {
+                client_disconnected = true;
+                return false;
+            }
             completion_tokens++;
 
             // Skip EOS/EOT/special tokens — don't forward to SSE.
@@ -1521,6 +1644,10 @@ void HttpServer::worker_loop() {
             result = backend_.restore_and_generate_with_empty_spec_fallback(cache_slot, gen_req, io);
         } else {
             result = backend_.generate_with_empty_spec_fallback(gen_req, io);
+        }
+        if (io.should_cancel()) {
+            client_disconnected = true;
+            job->cancelled.store(true, std::memory_order_relaxed);
         }
 
         // Lazy-draft: park decode draft after generate to free VRAM.

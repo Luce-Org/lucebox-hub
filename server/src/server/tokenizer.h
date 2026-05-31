@@ -10,11 +10,22 @@
 #pragma once
 
 #include <cstdint>
+#include <exception>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace dflash::common {
+
+class TokenizationCancelled final : public std::exception {
+public:
+    const char * what() const noexcept override {
+        return "tokenization cancelled";
+    }
+};
+
+using TokenizerCancelCallback = std::function<bool()>;
 
 class Tokenizer {
 public:
@@ -31,6 +42,9 @@ public:
     // ─── Encode ──────────────────────────────────────────────────────
     // Tokenize a UTF-8 string into token IDs.
     std::vector<int32_t> encode(const std::string & text) const;
+    std::vector<int32_t> encode(
+        const std::string & text,
+        const TokenizerCancelCallback & should_cancel) const;
 
     // ─── Decode ──────────────────────────────────────────────────────
     // Convert a single token ID to its text representation.
@@ -55,10 +69,14 @@ public:
 
 private:
     // Pre-tokenize text into pieces using Qwen3/3.5 regex pattern.
-    std::vector<std::string> pre_tokenize(const std::string & text) const;
+    std::vector<std::string> pre_tokenize(
+        const std::string & text,
+        const TokenizerCancelCallback & should_cancel) const;
 
     // Apply BPE merges to a single pre-tokenized piece.
-    std::vector<int32_t> bpe_encode_piece(const std::string & piece) const;
+    std::vector<int32_t> bpe_encode_piece(
+        const std::string & piece,
+        const TokenizerCancelCallback & should_cancel) const;
 
     // Vocabulary: id → token string
     std::vector<std::string> id_to_token_;

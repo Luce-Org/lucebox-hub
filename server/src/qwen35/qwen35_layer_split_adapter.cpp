@@ -380,7 +380,7 @@ bool Qwen35LayerSplitAdapter::decode_ar(
 
     out_tokens.push_back(last_tok);
     io.emit(last_tok);
-    if (io.cancelled) {
+    if (io.should_cancel()) {
         io.emit(-1);
         return true;
     }
@@ -401,7 +401,7 @@ bool Qwen35LayerSplitAdapter::decode_ar(
         }
         out_tokens.push_back(next_tok);
         io.emit(next_tok);
-        if (io.cancelled) break;
+        if (io.should_cancel()) break;
         if (is_eos_tok(next_tok, shards_.front().weights)) break;
         last_tok = next_tok;
         ++committed;

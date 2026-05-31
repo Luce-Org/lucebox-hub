@@ -25,6 +25,7 @@ namespace dflash::common {
 // Token callback for streaming generation. Called once per committed token.
 // Return true to continue generation, false to abort.
 using TokenCallback = std::function<bool(int32_t token)>;
+using CancelCallback = std::function<bool()>;
 
 // ─── I/O handle passed to backend methods that need protocol output ─────
 struct DaemonIO {
@@ -34,7 +35,12 @@ struct DaemonIO {
     // (excluding the -1 sentinel). If it returns false, the `cancelled`
     // flag is set and the caller should abort generation.
     TokenCallback on_token;
+    CancelCallback is_cancelled;
     mutable bool cancelled = false;
+
+    // Observe cooperative cancellation even before a token callback fires
+    // (for example while a long prefill/spec-decode step is still working).
+    bool should_cancel() const;
 
     // Write a single int32 to the stream fd (token or -1 sentinel).
     // Also invokes on_token if set. Sets cancelled=true if on_token

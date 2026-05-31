@@ -29,7 +29,18 @@ namespace dflash::common {
 
 // ── DaemonIO ────────────────────────────────────────────────────────────
 
+bool DaemonIO::should_cancel() const {
+    if (cancelled) return true;
+    if (is_cancelled && is_cancelled()) {
+        cancelled = true;
+        return true;
+    }
+    return false;
+}
+
 void DaemonIO::emit(int32_t v) const {
+    if (should_cancel()) return;
+
     // Call the token callback for non-sentinel tokens.
     if (on_token && v >= 0) {
         if (!on_token(v)) {

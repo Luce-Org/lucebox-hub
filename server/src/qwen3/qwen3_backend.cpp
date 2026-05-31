@@ -384,6 +384,7 @@ int Qwen3Backend::do_prefill(const std::vector<int32_t> & tokens,
     std::vector<float> embed_buf((size_t)chunk * hidden);
 
     for (int start = 0; start < total; start += chunk) {
+        if (io.should_cancel()) return -1;
         const int n = std::min(chunk, total - start);
 
         // CPU embedding: read rows from tok_embd (which is on GPU)
@@ -422,6 +423,7 @@ int Qwen3Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (!do_step(embed_buf.data(), n, kv_offset + start, logits)) {
             return -1;
         }
+        if (io.should_cancel()) return -1;
         committed = kv_offset + start + n;
         cache_.cur_pos = committed;
         last_logits_ = std::move(logits);
@@ -464,7 +466,7 @@ bool Qwen3Backend::do_decode(int committed, int n_gen,
         io.emit(next);
         committed++;
         cache_.cur_pos = committed;
-        if (io.cancelled) break;
+        if (io.should_cancel()) break;
 
         // Check EOS
         if (next == 151643 || next == 151645) break;
@@ -525,7 +527,15 @@ GenerateResult Qwen3Backend::generate(const GenerateRequest & req,
     // Prefill
     const int committed = do_prefill(req.prompt, out_io);
     if (committed < 0) {
+        if (out_io.should_cancel()) {
+            result.ok = true;
+            return result;
+        }
         result.error = "prefill";
+        return result;
+    }
+    if (out_io.should_cancel()) {
+        result.ok = true;
         return result;
     }
 
@@ -596,7 +606,7 @@ GenerateResult Qwen3Backend::generate(const GenerateRequest & req,
         }
         result.tokens.push_back(first);
         out_io.emit(first);
-        if (out_io.cancelled) {
+        if (out_io.should_cancel()) {
             out_io.emit(-1);
             result.ok = true;
             return result;
@@ -691,9 +701,17 @@ GenerateResult Qwen3Backend::restore_and_generate(int slot,
                                         req.prompt.end());
         const int committed = do_prefill(remaining, out_io, prefix_len);
         if (committed < 0) {
+            if (out_io.should_cancel()) {
+                result.ok = true;
+                return result;
+            }
             result.error = "prefill after restore";
             return result;
         }
+    }
+    if (out_io.should_cancel()) {
+        result.ok = true;
+        return result;
     }
 
     // Now generate (decode) from here
@@ -763,7 +781,7 @@ GenerateResult Qwen3Backend::restore_and_generate(int slot,
         }
         result.tokens.push_back(first);
         out_io.emit(first);
-        if (out_io.cancelled) {
+        if (out_io.should_cancel()) {
             out_io.emit(-1);
             result.ok = true;
             return result;

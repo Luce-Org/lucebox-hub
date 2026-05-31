@@ -6,8 +6,9 @@
 //   - Per-client thread: parse HTTP request, enqueue job, wait for completion
 //   - Single worker thread: dequeue jobs, call ModelBackend::generate()
 //
-// Client disconnect detection: the worker writes SSE chunks via send().
-// If send() fails (EPIPE/ECONNRESET), generation aborts immediately.
+// Client disconnect detection: the client thread watches the socket while the
+// worker owns generation. The worker also treats failed SSE writes as
+// cancellation, so pre-token and mid-stream disconnects both abort generation.
 
 #pragma once
 
@@ -311,6 +312,7 @@ private:
 struct ServerJob {
     int           fd = -1;
     ParsedRequest req;
+    std::atomic<bool> cancelled{false};
     bool          done = false;
     std::mutex    mu;
     std::condition_variable cv;
