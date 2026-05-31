@@ -53,6 +53,7 @@ bool init_layer_split_shard_metas(
     for (size_t i = 0; i < shards.size(); ++i) {
         auto * shard = shards[i];
         if (!shard) return false;
+        shard->placement_backend = PlacementBackend::Auto;
         shard->gpu = gpus[i];
         shard->layer_begin = ranges[i].begin;
         shard->layer_end = ranges[i].end;

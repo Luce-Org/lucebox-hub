@@ -31,9 +31,9 @@ LagunaBackend::LagunaBackend(const LagunaBackendArgs & args)
 LagunaBackend::~LagunaBackend() { shutdown(); }
 
 bool LagunaBackend::init() {
-    backend_ = ggml_backend_cuda_init(0);
+    backend_ = ggml_backend_cuda_init(args_.device.gpu);
     if (!backend_) {
-        std::fprintf(stderr, "cuda init failed\n");
+        std::fprintf(stderr, "cuda init failed gpu=%d\n", args_.device.gpu);
         return false;
     }
 

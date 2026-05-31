@@ -20,6 +20,7 @@ struct LayerSplitRange {
 };
 
 struct LayerSplitShardMeta {
+    PlacementBackend placement_backend = PlacementBackend::Auto;
     int gpu = 0;
     int layer_begin = 0;
     int layer_end = 0;

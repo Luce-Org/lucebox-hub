@@ -175,8 +175,12 @@ bool copy_capture_slice_to_draft_ring(
     int chunk_start,
     int start_pos,
     int n_tokens) {
-    if (!feature_ring.target_feat || capture_idx < 0 || n_tokens <= 0 || start_pos < 0) return true;
-    if (feature_ring.cap <= 0) return false;
+    if (!feature_ring.target_feat || n_tokens <= 0) return true;
+    if (capture_idx < 0 || capture_idx >= feature_ring.n_target_layers ||
+        start_pos < 0 || feature_ring.cap <= 0 ||
+        feature_ring.hidden_size <= 0) {
+        return false;
+    }
     const int hidden = feature_ring.hidden_size;
     const size_t dst_stride = feature_ring.target_feat->nb[1];
     const size_t src_stride = act_out->nb[1];
@@ -193,6 +197,35 @@ bool copy_capture_slice_to_draft_ring(
         }
     }
     return cudaDeviceSynchronize() == cudaSuccess;
+}
+
+bool copy_host_capture_slice_to_draft_ring(
+    DraftFeatureMirror & feature_ring,
+    int capture_idx,
+    int start_pos,
+    int n_tokens,
+    const float * host,
+    size_t host_elems) {
+    if (!feature_ring.target_feat || n_tokens <= 0) return true;
+    if (capture_idx < 0 || capture_idx >= feature_ring.n_target_layers ||
+        start_pos < 0 || !host || feature_ring.cap <= 0 ||
+        feature_ring.hidden_size <= 0) {
+        return false;
+    }
+    const int hidden = feature_ring.hidden_size;
+    const size_t expected = (size_t)n_tokens * (size_t)hidden;
+    if (host_elems != expected) return false;
+    const size_t dst_stride = feature_ring.target_feat->nb[1];
+    const size_t row_bytes = (size_t)hidden * sizeof(float);
+    for (int i = 0; i < n_tokens; ++i) {
+        const int slot = (start_pos + i) % feature_ring.cap;
+        const float * src = host + (size_t)i * (size_t)hidden;
+        const size_t dst_offset =
+            (size_t)slot * dst_stride +
+            (size_t)capture_idx * (size_t)hidden * sizeof(float);
+        ggml_backend_tensor_set(feature_ring.target_feat, src, dst_offset, row_bytes);
+    }
+    return true;
 }
 
 bool copy_feature_ring_range_to_tensor(

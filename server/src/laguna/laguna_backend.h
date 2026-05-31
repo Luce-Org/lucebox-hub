@@ -8,6 +8,7 @@
 
 #include "model_backend.h"
 #include "laguna_internal.h"
+#include "placement/placement_config.h"
 #include "qwen3_drafter.h"
 
 #include "ggml.h"
@@ -22,6 +23,7 @@ namespace dflash::common {
 
 struct LagunaBackendArgs {
     std::string target_path;
+    DevicePlacement device;
     int         max_ctx   = 16384;
     int         chunk     = 2048;
     ggml_type   kv_type   = GGML_TYPE_Q8_0;

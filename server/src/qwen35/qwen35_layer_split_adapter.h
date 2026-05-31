@@ -8,7 +8,9 @@
 #include "layer_split_types.h"
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
+#include "placement/remote_target_shard_config.h"
 #include "qwen3/qwen3_drafter.h"
+#include "qwen35_target_shard_ipc.h"
 #include "step_graph.h"
 #include "internal.h"
 
@@ -27,6 +29,7 @@ struct Qwen35LayerSplitAdapterConfig {
     DevicePlacement device;
     int draft_gpu = 0;
     RemoteDraftConfig remote_draft;
+    RemoteTargetShardConfig remote_target_shard;
 
     int fa_window = 0;  // 0 = full attention. qwen3.6 full-attn layers must see the whole context; a finite window drops the system prompt/tools -> breaks tool calls.
     int kq_stride_pad = 32;
@@ -55,6 +58,7 @@ public:
     bool decode_ar(int last_tok, int committed, int n_gen,
                    std::vector<int32_t> & out_tokens,
                    const DaemonIO & io) override;
+    bool supports_cpu_sampling() const override { return true; }
 
     bool can_dflash_decode() const override;
     bool decode_dflash(const std::vector<int32_t> & prompt, int base_pos,
@@ -81,6 +85,10 @@ public:
 
 private:
     bool load_draft();
+    bool init_mixed_target_split();
+    bool use_mixed_target_split() const {
+        return remote_target_shard_.active() && !shards_.empty();
+    }
     bool snapshot_slot_valid(int slot) const;
     bool snapshot_draft_features(int slot);
     void free_draft_feature_snapshot(int slot);
@@ -93,12 +101,14 @@ private:
     DraftWeights draft_weights_;
     DraftFeatureMirror feature_ring_;
     DFlashDraftIpcClient remote_draft_;
+    Qwen35TargetShardIpcClient remote_target_shard_;
     StepGraph draft_sg_;
     StepGraph proj_sg_;
     DrafterContext pflash_drafter_;
     bool pflash_drafter_loaded_ = false;
     static constexpr int PREFIX_SLOTS = ModelBackend::kMaxSlots;
     std::vector<std::vector<PrefixSnapshot>> prefix_snapshots_;
+    std::vector<std::vector<float>> snapshot_prefill_logits_;
     std::vector<ggml_backend_t> snapshot_backends_;
     struct DraftFeatureSnapshot {
         int cur_pos = 0;
@@ -114,6 +124,7 @@ private:
     SamplerCfg sampler_;
     std::mt19937_64 sampler_rng_{std::random_device{}()};
     std::unique_ptr<DFlashTarget> dflash_target_;
+    std::vector<float> prefill_last_logits_;
 };
 
 }  // namespace dflash::common

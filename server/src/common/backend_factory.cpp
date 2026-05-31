@@ -6,6 +6,7 @@
 #include "qwen35_backend.h"
 #include "qwen35moe_backend.h"
 #include "laguna_backend.h"
+#include "laguna_layer_split_adapter.h"
 #include "qwen3_backend.h"
 #include "gemma4_backend.h"
 #include "gemma4_layer_split_adapter.h"
@@ -53,6 +54,7 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
             cfg.device             = args.device;
             cfg.draft_gpu          = args.draft_device.gpu;
             cfg.remote_draft       = args.remote_draft;
+            cfg.remote_target_shard = args.remote_target_shard;
             cfg.fa_window          = args.fa_window;
             cfg.kq_stride_pad      = args.kq_stride_pad;
             cfg.draft_swa_window   = args.draft_swa_window;
@@ -124,8 +126,24 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
         return backend;
 
     } else if (arch == "laguna") {
+        if (args.device.is_layer_split()) {
+            LagunaLayerSplitAdapterConfig cfg;
+            cfg.target_path = args.model_path;
+            cfg.device      = args.device;
+            cfg.chunk       = args.chunk;
+
+            auto adapter = std::make_unique<LagunaLayerSplitAdapter>(cfg);
+            auto backend = std::make_unique<LayerSplitBackend>(std::move(adapter));
+            if (!backend->init()) {
+                std::fprintf(stderr, "[backend_factory] LayerSplitBackend(laguna) init failed\n");
+                return nullptr;
+            }
+            return backend;
+        }
+
         LagunaBackendArgs lcfg;
         lcfg.target_path = args.model_path;
+        lcfg.device      = args.device;
         lcfg.max_ctx     = args.device.max_ctx;
         lcfg.chunk       = args.chunk;
         // kv_type defaults to Q8_0 in LagunaBackendArgs

@@ -237,6 +237,7 @@ add_library(dflash_common STATIC
     src/laguna/laguna_target_graph.cpp
     src/laguna/laguna_daemon.cpp
     src/laguna/laguna_backend.cpp
+    src/laguna/laguna_layer_split_adapter.cpp
     src/common/backend_ipc.cpp
     src/common/dflash_feature_ring.cpp
     src/common/dflash_capture.cpp
@@ -246,6 +247,7 @@ add_library(dflash_common STATIC
     src/common/dflash_draft_graph.cpp
     src/common/dflash_spec_decode.cpp
     src/common/layer_split_backend.cpp
+    src/common/layer_split_runtime.cpp
     src/qwen35/graph_builders.cpp
     src/qwen35moe/qwen35moe_ffn.cpp
     src/qwen35moe/qwen35moe_backend.cpp
@@ -256,6 +258,8 @@ add_library(dflash_common STATIC
     src/qwen35moe/qwen35moe_hybrid_ffn_eval.cpp
     src/qwen35moe/qwen35moe_swap_manager.cpp
     src/qwen35/layer_split_forward.cpp
+    src/qwen35/qwen35_target_shard_ipc.cpp
+    src/qwen35/qwen35_target_shard_ipc_daemon.cpp
     src/qwen35/layer_split_daemon.cpp
     src/qwen35/qwen35_backend.cpp
     src/qwen35/qwen35_layer_split_adapter.cpp
