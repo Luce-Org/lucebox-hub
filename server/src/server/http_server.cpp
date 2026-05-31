@@ -1686,8 +1686,9 @@ void HttpServer::worker_loop() {
 
             const std::string & raw = tokenizer_.raw_token(token);
 
-            // Gemma4 thinking channel: map <|channel> → <think>, <channel|> → </think>\n
-            if (raw == "<|channel>") {
+            // Gemma4 thinking channel: map <|channel>* → <think>, <channel|> → </think>\n
+            // raw vocab token is "<|channel>thought", not just "<|channel>".
+            if (raw.starts_with("<|channel>")) {
                 if (req.stream) {
                     auto chunks = emitter.emit_token("<think>");
                     for (const auto & chunk : chunks)
@@ -1881,8 +1882,8 @@ void HttpServer::worker_loop() {
                     const std::string & raw = tokenizer_.raw_token(tok);
                     if (tok == tokenizer_.eos_id()) continue;
                     if (tok == tokenizer_.eos_chat_id()) continue;
-                    // Gemma4 channel → think mapping
-                    if (raw == "<|channel>") { emitter.emit_token("<think>"); continue; }
+                    // Gemma4 channel → think mapping; raw token is "<|channel>thought"
+                    if (raw.starts_with("<|channel>")) { emitter.emit_token("<think>"); continue; }
                     if (raw == "<channel|>") { emitter.emit_token("</think>\n"); continue; }
                     // Qwen3.6 thinking tokens (id 248068 / 248069) — must
                     // forward as text so the emitter transitions
