@@ -1,11 +1,12 @@
 // Tool call parser implementation.
 //
-// Five detection patterns, tried in order:
+// Six detection patterns, tried in order:
 // 1. <tool_call><function=NAME>...<parameter=K>V</parameter>...</function></tool_call>
 // 2. <function=NAME>...params...</function>  (bare, outside tool_call)
 // 3. <function=NAME(k="v", ...)></function>  (function-signature style)
 // 4. <tool_code>{JSON}</tool_code>
 // 5. Bare JSON objects with name+arguments fields
+// 6. Native claude-code XML tags: <bash>CMD</bash>, <read>PATH</read>, etc.
 
 #include "tool_parser.h"
 
@@ -161,6 +162,75 @@ static const std::regex & re_tool_code() {
     return r;
 }
 
+// Pattern 6: native claude-code XML tags.
+// Matches <bash>BODY</bash>, <read>BODY</read>, etc.
+static const std::regex & re_native_tag() {
+    static std::regex r(R"(<(bash|read|write|edit|ls|grep|glob)>([\s\S]*?)</\1>)",
+                        std::regex::icase);
+    return r;
+}
+
+// ─── Parameter-name alias resolution ────────────────────────────────────
+
+// Some quantized models (e.g. Qwen3.6-Q3) emit short forms of canonical
+// parameter names (cmd instead of command, path instead of file_path).
+// Map the emitted key to the schema's actual key when an alias is found.
+// Pure helper — returns the original `emitted` if no alias matches.
+static std::string resolve_param_alias(const std::string & emitted, const json & props) {
+    if (!props.is_object() || props.empty()) return emitted;
+
+    std::string lower = emitted;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+    // 1. Direct case-insensitive match against schema keys.
+    for (auto it = props.begin(); it != props.end(); ++it) {
+        std::string name = it.key();
+        std::string lname = name;
+        std::transform(lname.begin(), lname.end(), lname.begin(), ::tolower);
+        if (lname == lower) return name;
+    }
+
+    // 2. Alias map: common shortenings <=> canonical forms.
+    static const std::vector<std::pair<std::string, std::vector<std::string>>> aliases = {
+        {"cmd",        {"command"}},
+        {"command",    {"cmd"}},
+        {"path",       {"file_path", "directory", "dir"}},
+        {"file_path",  {"path", "file"}},
+        {"file",       {"file_path", "path"}},
+        {"filepath",   {"file_path"}},
+        {"dir",        {"directory", "path"}},
+        {"directory",  {"dir", "path"}},
+        {"query",      {"pattern", "q"}},
+        {"pattern",    {"query", "regex"}},
+        {"regex",      {"pattern"}},
+        {"q",          {"query", "pattern"}},
+        {"expr",       {"expression"}},
+        {"expression", {"expr"}},
+        {"text",       {"content"}},
+        {"content",    {"text"}},
+        {"src",        {"source"}},
+        {"source",     {"src"}},
+        {"dst",        {"destination", "target"}},
+        {"destination", {"dst", "target"}},
+        {"target",     {"dst", "destination"}},
+    };
+
+    for (const auto & [key, candidates] : aliases) {
+        if (key != lower) continue;
+        for (const std::string & candidate : candidates) {
+            for (auto pit = props.begin(); pit != props.end(); ++pit) {
+                std::string pname = pit.key();
+                std::string lpname = pname;
+                std::transform(lpname.begin(), lpname.end(), lpname.begin(), ::tolower);
+                if (lpname == candidate) return pname;
+            }
+        }
+        break;
+    }
+
+    return emitted;  // no alias matched; keep as-is
+}
+
 // ─── XML parameter parser ───────────────────────────────────────────────
 
 static json parse_xml_params(const std::string & region, const std::string & fn_name,
@@ -183,7 +253,8 @@ static json parse_xml_params(const std::string & region, const std::string & fn_
         if (!v.empty() && v.front() == '\n') v.erase(v.begin());
         if (!v.empty() && v.back() == '\n') v.pop_back();
 
-        args[k] = convert_param_value(v, k, props);
+        std::string canonical_k = resolve_param_alias(k, props);
+        args[canonical_k] = convert_param_value(v, canonical_k, props);
     }
     return args;
 }
@@ -304,6 +375,48 @@ static bool parse_function_sig_args(const std::string & arg_text, json & out_arg
         }
     }
     return true;
+}
+
+// ─── Native tag helpers ─────────────────────────────────────────────────
+
+// Case-insensitive lookup of `tag` in the tools array.
+// Returns the tool's canonical name if found, otherwise returns `tag` as-is.
+static std::string lookup_tool_name(const std::string & tag, const json & tools) {
+    if (tools.is_null() || !tools.is_array() || tools.empty()) return tag;
+
+    std::string lower_tag = tag;
+    std::transform(lower_tag.begin(), lower_tag.end(), lower_tag.begin(), ::tolower);
+
+    for (const auto & t : tools) {
+        const auto & fn = t.contains("function") ? t["function"] : t;
+        if (!fn.is_object()) continue;
+        std::string name = fn.value("name", "");
+        if (name.empty()) continue;
+        std::string lower_name = name;
+        std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+        if (lower_name == lower_tag) return name;
+    }
+    return tag;  // no match → lowercase tag name
+}
+
+// Map native tag name to its default argument key + body.
+static json tag_to_args(const std::string & tag, const std::string & body) {
+    json args = json::object();
+    std::string lower = tag;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+    if (lower == "bash")        args["command"] = body;
+    else if (lower == "read")   args["file_path"] = body;
+    else if (lower == "grep")   args["pattern"] = body;
+    else if (lower == "glob")   args["pattern"] = body;
+    else if (lower == "write")  args["content"] = body;
+    else if (lower == "edit")   args["content"] = body;
+    else if (lower == "ls") {
+        if (!body.empty()) args["path"] = body;
+    } else {
+        args["content"] = body;  // unknown tag fallback
+    }
+    return args;
 }
 
 // ─── Main parser ────────────────────────────────────────────────────────
@@ -444,6 +557,29 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
                 add_call(name, args, start, end_pos);
             }
             cursor = end_pos;
+        }
+    }
+
+    // Pattern 6: native claude-code XML tags (<bash>, <read>, <write>, <edit>, <ls>, <grep>, <glob>)
+    // Gate: only fire when the request actually provided tools. Otherwise
+    // legitimate prose like "please read the manual" or "grep for the pattern"
+    // gets eaten as a phantom tool call and the surrounding text is stripped
+    // via the removals span. Mirrors the streaming gate has_request_tools().
+    if (tools.is_array() && !tools.empty())
+    {
+        auto begin = std::sregex_iterator(text.begin(), text.end(), re_native_tag());
+        auto end = std::sregex_iterator();
+        for (auto it = begin; it != end; ++it) {
+            size_t pos = it->position();
+            if (overlaps(removals, pos)) continue;
+            std::string tag  = (*it)[1].str();
+            std::string body = (*it)[2].str();
+            // Strip leading/trailing newline (consistent with parameter parser at line 172).
+            if (!body.empty() && body.front() == '\n') body.erase(body.begin());
+            if (!body.empty() && body.back()  == '\n') body.pop_back();
+
+            std::string canonical = lookup_tool_name(tag, tools);
+            add_call(canonical, tag_to_args(tag, body), pos, pos + it->length());
         }
     }
 
