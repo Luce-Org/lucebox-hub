@@ -1868,8 +1868,14 @@ void HttpServer::worker_loop() {
             PerfRecord perf;
             perf.prompt_tokens = (int)req.prompt_tokens.size();
             perf.completion_tokens = completion_tokens;
+            // Use actual prefilled token count: on cache hit the backend only
+            // prefills the delta beyond the cached prefix, so dividing the full
+            // prompt size by delta time would be wrong.
+            const int prefill_tokens = using_restore
+                ? std::max(0, (int)effective_prompt.size() - prefix_len)
+                : (int)effective_prompt.size();
             perf.prefill_tok_s = (result.prefill_s > 0.0)
-                ? (double)req.prompt_tokens.size() / result.prefill_s : 0.0;
+                ? (double)prefill_tokens / result.prefill_s : 0.0;
             perf.decode_tok_s = (result.decode_s > 0.0)
                 ? (double)completion_tokens / result.decode_s : 0.0;
             perf.accept_rate = result.accept_rate;
