@@ -17,6 +17,7 @@
 #include "server/http_server.h"
 #include "server/chat_template.h"
 #include "common/sampler.h"
+#include "common/backend_precision.h"
 #include "common/backend_ipc.h"
 #include "placement/pflash_placement.h"
 #include "common/io_utils.h"
@@ -1231,6 +1232,37 @@ static void test_validate_layer_split_weights_shape() {
     TEST_ASSERT(validate_device_placement(placement, -1).empty());
 }
 
+static void test_backend_precision_cuda_sm_policy() {
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(90) == GGML_TYPE_BF16);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(80) == GGML_TYPE_BF16);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(75) == GGML_TYPE_F16);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(70) == GGML_TYPE_F16);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(60) == GGML_TYPE_F16);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(62) == GGML_TYPE_F32);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(61) == GGML_TYPE_F32);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(52) == GGML_TYPE_F32);
+}
+
+static void test_backend_precision_hip_arch_policy() {
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx90a") == GGML_TYPE_BF16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx942") == GGML_TYPE_BF16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx950") == GGML_TYPE_BF16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx1100") == GGML_TYPE_BF16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx1200") == GGML_TYPE_BF16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx906") == GGML_TYPE_F16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx1030") == GGML_TYPE_F16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx803") == GGML_TYPE_F32);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("") == GGML_TYPE_F32);
+}
+
+static void test_backend_precision_activation_type_combine() {
+    TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_BF16, GGML_TYPE_BF16) == GGML_TYPE_BF16);
+    TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_BF16, GGML_TYPE_F16) == GGML_TYPE_F16);
+    TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_F16, GGML_TYPE_BF16) == GGML_TYPE_F16);
+    TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_F16, GGML_TYPE_F32) == GGML_TYPE_F32);
+    TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_F32, GGML_TYPE_BF16) == GGML_TYPE_F32);
+}
+
 struct MockLayerSplitAdapter : LayerSplitAdapter {
     int max_ctx = 128;
     bool reset_called = false;
@@ -1246,6 +1278,7 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     std::vector<int32_t> emitted_tokens;
     bool dflash_enabled = false;
     bool dflash_called = false;
+    bool sampling_enabled = false;
     int shutdown_calls = 0;
     ModelBackend::CompressRequest last_compress_req;
 
@@ -1280,6 +1313,7 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
         return true;
     }
     bool can_dflash_decode() const override { return dflash_enabled; }
+    bool supports_cpu_sampling() const override { return sampling_enabled; }
     bool decode_dflash(const std::vector<int32_t> & prompt, int base_pos,
                        int last_tok, int n_gen, std::vector<int32_t> & out_tokens,
                        const DaemonIO & io) override {
@@ -1372,6 +1406,42 @@ static void test_layer_split_backend_inline_snapshot_and_restore_delta() {
     TEST_ASSERT(raw->prefill_sizes[0] == 1);
     TEST_ASSERT(raw->dflash_base == 3);
     TEST_ASSERT(raw->dflash_last == 99);
+}
+
+static void test_layer_split_backend_sampling_capability_gate() {
+    {
+        auto * raw = new MockLayerSplitAdapter();
+        LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
+
+        GenerateRequest req;
+        req.prompt = {10, 11};
+        req.n_gen = 1;
+        req.do_sample = true;
+        req.sampler.temp = 0.8f;
+        DaemonIO io;
+        GenerateResult result = backend.generate(req, io);
+
+        TEST_ASSERT(!result.ok);
+        TEST_ASSERT(result.error == "sampling_unsupported");
+    }
+
+    {
+        auto * raw = new MockLayerSplitAdapter();
+        raw->sampling_enabled = true;
+        LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
+
+        GenerateRequest req;
+        req.prompt = {10, 11};
+        req.n_gen = 1;
+        req.do_sample = true;
+        req.sampler.temp = 0.8f;
+        DaemonIO io;
+        GenerateResult result = backend.generate(req, io);
+
+        TEST_ASSERT(result.ok);
+        TEST_ASSERT(result.tokens.size() == 1);
+        TEST_ASSERT(result.tokens[0] == 12);
+    }
 }
 
 static void test_layer_split_compress_nopark_uses_default_drafter_path() {
@@ -2659,7 +2729,11 @@ int main() {
     RUN_TEST(test_parse_target_device_list_rejects_mixed_backend);
     RUN_TEST(test_parse_target_device_list_single_gpu_is_not_layer_split);
     RUN_TEST(test_validate_layer_split_weights_shape);
+    RUN_TEST(test_backend_precision_cuda_sm_policy);
+    RUN_TEST(test_backend_precision_hip_arch_policy);
+    RUN_TEST(test_backend_precision_activation_type_combine);
     RUN_TEST(test_layer_split_backend_inline_snapshot_and_restore_delta);
+    RUN_TEST(test_layer_split_backend_sampling_capability_gate);
     RUN_TEST(test_layer_split_compress_nopark_uses_default_drafter_path);
     RUN_TEST(test_layer_split_compress_rejects_bad_keep_ratio);
     RUN_TEST(test_layer_split_backend_shutdown_is_idempotent);

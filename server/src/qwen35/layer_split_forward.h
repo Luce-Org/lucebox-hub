@@ -32,6 +32,18 @@ bool compute_target_split_argmax(
         int vocab,
         std::vector<int32_t> & argmax_out);
 
+bool compute_target_split_projection(
+        StepGraph & sg,
+        const TargetWeights & w,
+        ggml_backend_t backend,
+        ggml_tensor * act,
+        int token_offset,
+        int n_tokens,
+        int hidden,
+        int vocab,
+        std::vector<int32_t> * argmax_out,
+        std::vector<float> * logits_out);
+
 // Run a full forward pass through all shards, writing K/V into each shard's
 // cache.  Returns the argmax of the last token in `last_tok`.
 // Optionally captures features into `feature_ring` / remote draft.
@@ -47,7 +59,8 @@ bool run_qwen35_layer_split_forward(
         DraftFeatureMirror * feature_ring = nullptr,
         std::vector<int32_t> * argmax_out = nullptr,
         std::vector<float> * logits_out = nullptr,
-        DFlashDraftIpcClient * remote_draft = nullptr);
+        DFlashDraftIpcClient * remote_draft = nullptr,
+        ggml_type activation_type = GGML_TYPE_F32);
 
 // Free all shards (weights, cache, backend).
 void free_qwen35_layer_split_shards(std::vector<Qwen35LayerSplitShard> & shards);

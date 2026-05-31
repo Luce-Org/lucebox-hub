@@ -55,6 +55,7 @@ public:
     bool decode_ar(int last_tok, int committed, int n_gen,
                    std::vector<int32_t> & out_tokens,
                    const DaemonIO & io) override;
+    bool supports_cpu_sampling() const override { return true; }
 
     bool can_dflash_decode() const override;
     bool decode_dflash(const std::vector<int32_t> & prompt, int base_pos,
@@ -95,10 +96,12 @@ private:
     DFlashDraftIpcClient remote_draft_;
     StepGraph draft_sg_;
     StepGraph proj_sg_;
+    ggml_type activation_type_ = GGML_TYPE_F32;
     DrafterContext pflash_drafter_;
     bool pflash_drafter_loaded_ = false;
     static constexpr int PREFIX_SLOTS = ModelBackend::kMaxSlots;
     std::vector<std::vector<PrefixSnapshot>> prefix_snapshots_;
+    std::vector<std::vector<float>> snapshot_prefill_logits_;
     std::vector<ggml_backend_t> snapshot_backends_;
     struct DraftFeatureSnapshot {
         int cur_pos = 0;
@@ -114,6 +117,7 @@ private:
     SamplerCfg sampler_;
     std::mt19937_64 sampler_rng_{std::random_device{}()};
     std::unique_ptr<DFlashTarget> dflash_target_;
+    std::vector<float> prefill_last_logits_;
 };
 
 }  // namespace dflash::common

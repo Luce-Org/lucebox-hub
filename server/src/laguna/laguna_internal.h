@@ -26,8 +26,10 @@
 #include <vector>
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 
+#include "common/layer_split_utils.h"
 #include "internal.h"  // for CpuEmbedder
 
 namespace dflash::common {
@@ -134,6 +136,11 @@ bool load_target_gguf_laguna(const std::string & path,
                               ggml_backend_t       backend,
                               LagunaTargetWeights & out);
 
+bool load_target_gguf_laguna_partial(const std::string & path,
+                                      ggml_backend_t backend,
+                                      const TargetLoadPlan & plan,
+                                      LagunaTargetWeights & out);
+
 void free_laguna_target_weights(LagunaTargetWeights & w);
 
 // ---- Forward graph (Phase 2; signatures only for now) -------------------
@@ -160,6 +167,12 @@ bool create_laguna_target_cache(const LagunaTargetWeights & w,
                                  int max_ctx,
                                  ggml_backend_t backend,
                                  LagunaTargetCache & out);
+bool create_laguna_target_cache_partial(const LagunaTargetWeights & w,
+                                         int max_ctx,
+                                         ggml_backend_t backend,
+                                         int layer_begin,
+                                         int layer_end,
+                                         LagunaTargetCache & out);
 void free_laguna_target_cache(LagunaTargetCache & c);
 void reset_laguna_target_cache(LagunaTargetCache & c);
 
@@ -251,5 +264,46 @@ bool laguna_step(
     int                         kv_start,
     bool                        no_mask,
     std::vector<float> &        out_logits);
+
+struct LagunaLayerStepGraph {
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t alloc = nullptr;
+    ggml_tensor * positions = nullptr;
+    ggml_tensor * attn_mask = nullptr;
+    ggml_tensor * attn_mask_swa = nullptr;
+};
+
+void laguna_layer_step_graph_free(LagunaLayerStepGraph & sg);
+void laguna_layer_step_graph_destroy(LagunaLayerStepGraph & sg);
+
+bool build_laguna_layer_step(
+    LagunaLayerStepGraph & sg,
+    const LagunaTargetWeights & w,
+    LagunaTargetCache & cache,
+    ggml_backend_t backend,
+    int layer_idx,
+    ggml_tensor * act_in,
+    ggml_tensor * act_out,
+    int chunk_start,
+    int n_tokens,
+    int kv_start);
+
+bool compute_laguna_split_argmax(
+    ggml_backend_t backend,
+    const LagunaTargetWeights & w,
+    ggml_tensor * act,
+    int token_offset,
+    int n_tokens,
+    std::vector<int32_t> & out_argmax);
+
+bool compute_laguna_split_projection(
+    ggml_backend_t backend,
+    const LagunaTargetWeights & w,
+    ggml_tensor * act,
+    int token_offset,
+    int n_tokens,
+    std::vector<int32_t> * out_argmax,
+    std::vector<float> * out_logits);
 
 } // namespace dflash::common

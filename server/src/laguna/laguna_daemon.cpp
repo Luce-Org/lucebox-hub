@@ -21,6 +21,7 @@ namespace dflash::common {
 int run_laguna_daemon(const LagunaDaemonArgs & args) {
     LagunaBackendArgs bargs;
     bargs.target_path = args.target_path;
+    bargs.device      = args.device;
     bargs.max_ctx     = args.device.max_ctx;
     bargs.chunk       = args.chunk;
     bargs.kv_type     = args.kv_type;

@@ -2,10 +2,12 @@
 
 #include "qwen35_layer_split_adapter.h"
 
+#include "common/backend_precision.h"
 #include "common/dflash_spec_decode.h"
 #include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
 #include "common/sampler.h"
+#include "common/layer_split_runtime.h"
 #include "qwen35/layer_split_forward.h"
 #include "qwen35/qwen35_layer_split_dflash_target.h"
 #include "qwen3/qwen3_drafter.h"
@@ -25,40 +27,32 @@ Qwen35LayerSplitAdapter::Qwen35LayerSplitAdapter(
 Qwen35LayerSplitAdapter::~Qwen35LayerSplitAdapter() { shutdown(); }
 
 bool Qwen35LayerSplitAdapter::init() {
-    if (!cfg_.target_path || cfg_.device.layer_split_gpus.size() < 2) {
-        std::fprintf(stderr, "[target-split] invalid layer-split config\n");
+    const LayerSplitRuntimeInit runtime_cfg{
+        cfg_.target_path,
+        &cfg_.device,
+        "target-split",
+    };
+    if (!init_layer_split_runtime(runtime_cfg, shards_, snapshot_backends_)) {
         return false;
     }
 
-    const auto info = inspect_gguf_model_info(cfg_.target_path);
-    const int n_layer = info.n_layer;
-    if (n_layer <= 0) {
-        std::fprintf(stderr, "[target-split] failed to inspect target layer count\n");
-        return false;
+    std::vector<ggml_backend_t> shard_backends;
+    shard_backends.reserve(shards_.size());
+    for (const auto & shard : shards_) shard_backends.push_back(shard.backend);
+    const BackendActivationPolicy activation_policy =
+        select_common_activation_precision_policy(
+            shard_backends, /*force_f32=*/cfg_.run_dflash,
+            "LUCEBOX_LAYER_SPLIT_ACT_TYPE");
+    activation_type_ = activation_policy.activation_type;
+    std::fprintf(stderr, "[target-split] activation=%s (%s",
+                 backend_precision_type_name(activation_type_),
+                 activation_policy.reason.c_str());
+    if (!activation_policy.runtime_arch.empty()) {
+        std::fprintf(stderr, ", arch=%s", activation_policy.runtime_arch.c_str());
+    } else if (activation_policy.cuda_sm > 0) {
+        std::fprintf(stderr, ", sm=%d", activation_policy.cuda_sm);
     }
-    const auto ranges = compute_layer_ranges(
-        n_layer,
-        (int)cfg_.device.layer_split_gpus.size(),
-        cfg_.device.layer_split_weights);
-    if (ranges.size() != cfg_.device.layer_split_gpus.size()) {
-        std::fprintf(stderr,
-            "[target-split] bad layer split for %zu GPUs and %d layers\n",
-            cfg_.device.layer_split_gpus.size(), n_layer);
-        return false;
-    }
-
-    shards_.resize(cfg_.device.layer_split_gpus.size());
-    auto shard_metas = layer_split_shard_metas(shards_);
-    if (!init_layer_split_shard_metas(
-            shard_metas, cfg_.device.layer_split_gpus, ranges, "target-split")) {
-        return false;
-    }
-
-    (void)enable_layer_split_peer_access(
-        cfg_.device.layer_split_gpus, cfg_.device.peer_access);
-
-    if (!init_layer_split_snapshot_backends(
-            shard_metas, snapshot_backends_, "target-split")) return false;
+    std::fprintf(stderr, ")\n");
 
     for (auto & shard : shards_) {
         const TargetLoadPlan plan =
@@ -86,6 +80,7 @@ bool Qwen35LayerSplitAdapter::init() {
     for (auto & slot : prefix_snapshots_) {
         slot.resize(shards_.size());
     }
+    snapshot_prefill_logits_.resize(PREFIX_SLOTS);
     draft_feature_snapshots_.resize(PREFIX_SLOTS);
 
     return true;
@@ -171,6 +166,7 @@ void Qwen35LayerSplitAdapter::begin_request(const GenerateRequest & req) {
 
 void Qwen35LayerSplitAdapter::reset_request_state() {
     for (auto & shard : shards_) reset_target_cache(shard.cache);
+    prefill_last_logits_.clear();
 }
 
 bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
@@ -190,8 +186,10 @@ bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
         shards_, shards_.front().weights, prompt, base_pos, ubatch, last_tok,
         cfg_.kq_stride_pad, /*fa_window=*/0,
         (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
-        /*argmax_out=*/nullptr, /*logits_out=*/nullptr,
-        cfg_.run_dflash ? &remote_draft_ : nullptr);
+        /*argmax_out=*/nullptr,
+        &prefill_last_logits_,
+        cfg_.run_dflash ? &remote_draft_ : nullptr,
+        activation_type_);
 }
 
 bool Qwen35LayerSplitAdapter::snapshot_slot_valid(int slot) const {
@@ -215,6 +213,8 @@ bool Qwen35LayerSplitAdapter::snapshot_save(int slot) {
             return false;
         }
     }
+    if (snapshot_prefill_logits_.size() != (size_t)PREFIX_SLOTS) return false;
+    snapshot_prefill_logits_[(size_t)slot] = prefill_last_logits_;
     if (!snapshot_draft_features(slot)) {
         snapshot_free(slot);
         return false;
@@ -227,6 +227,9 @@ void Qwen35LayerSplitAdapter::snapshot_free(int slot) {
     for (auto & snap : prefix_snapshots_[(size_t)slot]) {
         free_prefix_snapshot(snap);
     }
+    if (snapshot_prefill_logits_.size() == (size_t)PREFIX_SLOTS) {
+        snapshot_prefill_logits_[(size_t)slot].clear();
+    }
     free_draft_feature_snapshot(slot);
 }
 
@@ -236,6 +239,10 @@ bool Qwen35LayerSplitAdapter::snapshot_used(int slot) const {
     if (snaps.size() != shards_.size()) return false;
     for (const auto & snap : snaps) {
         if (!snap.ctx) return false;
+    }
+    if (snapshot_prefill_logits_.size() != (size_t)PREFIX_SLOTS ||
+        snapshot_prefill_logits_[(size_t)slot].empty()) {
+        return false;
     }
     if (cfg_.run_dflash && cfg_.draft_path) {
         if (draft_feature_snapshots_.size() != (size_t)PREFIX_SLOTS) return false;
@@ -261,6 +268,8 @@ bool Qwen35LayerSplitAdapter::snapshot_restore(int slot) {
             return false;
         }
     }
+    if (snapshot_prefill_logits_.size() != (size_t)PREFIX_SLOTS) return false;
+    prefill_last_logits_ = snapshot_prefill_logits_[(size_t)slot];
     if (!restore_draft_features(slot)) return false;
     return true;
 }
@@ -377,41 +386,28 @@ bool Qwen35LayerSplitAdapter::decode_ar(
         std::vector<int32_t> & out_tokens,
         const DaemonIO & io) {
     if (n_gen <= 0) return true;
-
-    out_tokens.push_back(last_tok);
-    io.emit(last_tok);
-    if (io.cancelled) {
-        io.emit(-1);
-        return true;
-    }
-    if (is_eos_tok(last_tok, shards_.front().weights)) {
-        io.emit(-1);
-        return true;
-    }
-    ++committed;
-
-    for (int i = 1; i < n_gen; ++i) {
-        std::vector<int32_t> one(1, last_tok);
-        int next_tok = -1;
-        if (!run_qwen35_layer_split_forward(
-                shards_, shards_.front().weights, one, committed, 1, next_tok,
+    const auto & w = shards_.front().weights;
+    const int vocab = w.n_vocab;
+    return run_layer_split_ar_decode(
+        last_tok, committed, n_gen, vocab, prefill_last_logits_, sampler_,
+        sampler_rng_,
+        [&](const std::vector<int32_t> & one, int pos, int & next_tok,
+            std::vector<float> * logits_out) {
+            return run_qwen35_layer_split_forward(
+                shards_, shards_.front().weights, one, pos, 1, next_tok,
                 cfg_.kq_stride_pad, cfg_.fa_window,
-                cfg_.run_dflash ? &feature_ring_ : nullptr)) {
-            return false;
-        }
-        out_tokens.push_back(next_tok);
-        io.emit(next_tok);
-        if (io.cancelled) break;
-        if (is_eos_tok(next_tok, shards_.front().weights)) break;
-        last_tok = next_tok;
-        ++committed;
-    }
-    io.emit(-1);
-    return true;
+                (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
+                /*argmax_out=*/nullptr,
+                logits_out,
+                cfg_.run_dflash ? &remote_draft_ : nullptr,
+                activation_type_);
+        },
+        [&](int tok) { return is_eos_tok(tok, w); },
+        out_tokens, io);
 }
 
 bool Qwen35LayerSplitAdapter::can_dflash_decode() const {
-    return cfg_.run_dflash && cfg_.draft_path && sampler_.temp == 0.0f;
+    return cfg_.run_dflash && cfg_.draft_path && !sampler_.needs_logit_processing();
 }
 
 bool Qwen35LayerSplitAdapter::decode_dflash(
@@ -499,6 +495,7 @@ void Qwen35LayerSplitAdapter::shutdown() {
         for (auto & snap : slot) free_prefix_snapshot(snap);
     }
     prefix_snapshots_.clear();
+    snapshot_prefill_logits_.clear();
     draft_feature_snapshots_.clear();
     auto shard_metas = layer_split_shard_metas(shards_);
     free_layer_split_snapshot_backends(shard_metas, snapshot_backends_);
