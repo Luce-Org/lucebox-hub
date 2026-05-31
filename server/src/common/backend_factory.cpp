@@ -54,6 +54,7 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
             cfg.device             = args.device;
             cfg.draft_gpu          = args.draft_device.gpu;
             cfg.remote_draft       = args.remote_draft;
+            cfg.remote_target_shard = args.remote_target_shard;
             cfg.fa_window          = args.fa_window;
             cfg.kq_stride_pad      = args.kq_stride_pad;
             cfg.draft_swa_window   = args.draft_swa_window;

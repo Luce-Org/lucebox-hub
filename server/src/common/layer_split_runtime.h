@@ -61,6 +61,9 @@ bool init_layer_split_runtime(const LayerSplitRuntimeInit & cfg,
             cfg.log_prefix)) {
         return false;
     }
+    for (size_t i = 0; i < shard_metas.size(); ++i) {
+        shard_metas[i]->placement_backend = cfg.device->layer_split_backend(i);
+    }
 
     (void)enable_layer_split_peer_access(
         cfg.device->layer_split_gpus, cfg.device->peer_access);

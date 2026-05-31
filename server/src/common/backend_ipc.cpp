@@ -28,6 +28,7 @@ const char * backend_ipc_mode_name(BackendIpcMode mode) {
     switch (mode) {
         case BackendIpcMode::DFlashDraft: return "dflash-draft";
         case BackendIpcMode::PFlashCompress: return "pflash-compress";
+        case BackendIpcMode::Qwen35TargetShard: return "qwen35-target-shard";
     }
     return "unknown";
 }
@@ -39,6 +40,10 @@ bool parse_backend_ipc_mode(const std::string & value, BackendIpcMode & out) {
     }
     if (value == "pflash-compress") {
         out = BackendIpcMode::PFlashCompress;
+        return true;
+    }
+    if (value == "qwen35-target-shard") {
+        out = BackendIpcMode::Qwen35TargetShard;
         return true;
     }
     return false;

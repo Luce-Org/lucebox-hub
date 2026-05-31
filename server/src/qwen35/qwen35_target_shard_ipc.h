@@ -1,0 +1,93 @@
+// Qwen35 target-shard IPC mode for mixed-backend layer split.
+
+#pragma once
+
+#include "common/backend_ipc.h"
+#include "ggml-backend.h"
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace dflash::common {
+
+struct Qwen35TargetCaptureSlice {
+    int capture_idx = -1;
+    int start_pos = 0;
+    int n_tokens = 0;
+    std::vector<float> data;
+};
+
+class Qwen35TargetShardIpcClient {
+public:
+    Qwen35TargetShardIpcClient() = default;
+    Qwen35TargetShardIpcClient(const Qwen35TargetShardIpcClient &) = delete;
+    Qwen35TargetShardIpcClient & operator=(const Qwen35TargetShardIpcClient &) = delete;
+    ~Qwen35TargetShardIpcClient() { close(); }
+
+    bool start(const std::string & bin,
+               const std::string & target_path,
+               const std::vector<int> & gpus,
+               const std::vector<int> & layer_begins,
+               const std::vector<int> & layer_ends,
+               int max_ctx,
+               int max_verify_tokens,
+               int kq_stride_pad,
+               int fa_window,
+               int hidden,
+               int vocab,
+               int max_tokens,
+               const std::string & work_dir,
+               bool enable_dflash);
+
+    bool forward(int base_pos,
+                 int n_tokens,
+                 const std::vector<float> & boundary_activation,
+                 bool need_logits,
+                 int & last_tok,
+                 std::vector<int32_t> * argmax_out,
+                 std::vector<float> * logits_out,
+                 std::vector<Qwen35TargetCaptureSlice> * captures_out = nullptr);
+
+    bool project_hidden_to_tokens(const float * hidden,
+                                  int n_tokens,
+                                  std::vector<int32_t> & tokens_out);
+
+    bool snapshot_kv();
+    bool restore_kv();
+    bool snapshot_save(int slot);
+    void snapshot_free(int slot);
+    bool snapshot_restore(int slot);
+
+    bool active() const { return active_; }
+    void close();
+
+private:
+    BackendIpcProcess process_;
+    bool active_ = false;
+    int hidden_ = 0;
+    int vocab_ = 0;
+};
+
+bool copy_activation_to_host(const ggml_tensor * act,
+                             ggml_backend_t src_backend,
+                             int token_offset,
+                             int n_tokens,
+                             int hidden,
+                             std::vector<float> & out);
+
+int run_qwen35_target_shard_ipc_daemon(const char * target_path,
+                                       const std::vector<int> & gpus,
+                                       const std::vector<int> & layer_begins,
+                                       const std::vector<int> & layer_ends,
+                                       int max_ctx,
+                                       int max_verify_tokens,
+                                       int kq_stride_pad,
+                                       int fa_window,
+                                       int stream_fd,
+                                       int payload_fd = -1,
+                                       int shared_payload_fd = -1,
+                                       size_t shared_payload_bytes = 0,
+                                       bool enable_dflash = false);
+
+}  // namespace dflash::common

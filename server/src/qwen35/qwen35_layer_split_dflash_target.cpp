@@ -17,12 +17,14 @@ Qwen35LayerSplitDFlashTarget::Qwen35LayerSplitDFlashTarget(
         DraftFeatureMirror * feature_ring,
         int kq_stride_pad,
         int fa_window,
-        DFlashDraftIpcClient * remote_draft)
+        DFlashDraftIpcClient * remote_draft,
+        Qwen35TargetShardIpcClient * remote_target_shard)
     : shards_(shards),
       feature_ring_(feature_ring),
       kq_stride_pad_(kq_stride_pad),
       fa_window_(fa_window),
-      remote_draft_(remote_draft) {
+      remote_draft_(remote_draft),
+      remote_target_shard_(remote_target_shard) {
     if (!shards_.empty()) {
         const TargetWeights & w = shards_.front().weights;
         capture_ids_.assign(w.capture_layer_ids,
@@ -36,6 +38,12 @@ bool Qwen35LayerSplitDFlashTarget::verify_batch(
         int & last_tok,
         std::vector<int32_t> * all_argmax) {
     if (shards_.empty()) return false;
+    if (remote_target_shard_ && remote_target_shard_->active()) {
+        return run_qwen35_mixed_layer_split_forward(
+            shards_, *remote_target_shard_, shards_.front().weights, tokens,
+            base_pos, (int)tokens.size(), last_tok, kq_stride_pad_, fa_window_,
+            all_argmax, /*logits_out=*/nullptr, feature_ring_, remote_draft_);
+    }
     return run_qwen35_layer_split_forward(
         shards_, shards_.front().weights, tokens, base_pos, (int)tokens.size(),
         last_tok, kq_stride_pad_, fa_window_,
@@ -45,11 +53,17 @@ bool Qwen35LayerSplitDFlashTarget::verify_batch(
 
 bool Qwen35LayerSplitDFlashTarget::snapshot_kv() {
     for (auto & shard : shards_) snapshot_ssm_state(shard.cache);
+    if (remote_target_shard_ && remote_target_shard_->active()) {
+        return remote_target_shard_->snapshot_kv();
+    }
     return true;
 }
 
 bool Qwen35LayerSplitDFlashTarget::restore_kv() {
     for (auto & shard : shards_) restore_ssm_state(shard.cache);
+    if (remote_target_shard_ && remote_target_shard_->active()) {
+        return remote_target_shard_->restore_kv();
+    }
     return true;
 }
 
@@ -69,6 +83,10 @@ bool Qwen35LayerSplitDFlashTarget::project_hidden_to_tokens(
         int n_tokens,
         std::vector<int32_t> & tokens_out) {
     if (shards_.empty() || n_tokens <= 0) return false;
+    if (remote_target_shard_ && remote_target_shard_->active()) {
+        return remote_target_shard_->project_hidden_to_tokens(hidden, n_tokens,
+                                                              tokens_out);
+    }
 
     auto & back = shards_.back();
     if (!proj_sg_.gf || !proj_sg_.hidden_input ||

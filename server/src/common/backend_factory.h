@@ -13,6 +13,7 @@
 #include "model_backend.h"
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
+#include "placement/remote_target_shard_config.h"
 
 #include <memory>
 #include <string>
@@ -33,6 +34,7 @@ struct BackendArgs {
     DevicePlacement device;
     DevicePlacement draft_device;
     RemoteDraftConfig remote_draft;
+    RemoteTargetShardConfig remote_target_shard;
 
     // I/O — only used when running under daemon_loop (legacy). The new
     // server passes -1 and uses on_token callbacks instead.
