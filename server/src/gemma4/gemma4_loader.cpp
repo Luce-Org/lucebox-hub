@@ -568,6 +568,15 @@ void free_gemma4_cache(Gemma4Cache & c) {
     c.cur_pos = 0;
 }
 
+void free_gemma4_target_feat(Gemma4Cache & c) {
+    if (c.feat_buf) { ggml_backend_buffer_free(c.feat_buf); c.feat_buf = nullptr; }
+    if (c.feat_ctx) { ggml_free(c.feat_ctx); c.feat_ctx = nullptr; }
+    c.target_feat = nullptr;
+    c.target_feat_cap = 0;
+    c.n_capture_layers = 0;
+    c.capture_layer_ids.clear();
+}
+
 bool create_gemma4_target_feat(ggml_backend_t backend, Gemma4Cache & cache,
                                 int n_capture_layers, int hidden_size, int cap) {
     if (n_capture_layers <= 0 || hidden_size <= 0 || cap <= 0) return false;

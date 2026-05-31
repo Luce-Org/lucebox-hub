@@ -127,6 +127,9 @@ private:
                         const DaemonIO & io,
                         const BudgetHook * budget_hook = nullptr,
                         bool * forced_close_out = nullptr);
+
+    bool load_decode_draft();
+    void free_decode_draft();
 };
 
 }  // namespace dflash::common

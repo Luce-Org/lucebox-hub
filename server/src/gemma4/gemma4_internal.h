@@ -199,6 +199,7 @@ bool  create_gemma4_cache_partial(ggml_backend_t backend,
 void  free_gemma4_cache(Gemma4Cache & c);
 
 // Allocate target_feat ring buffer (call after draft load determines n_capture_layers).
+void  free_gemma4_target_feat(Gemma4Cache & c);
 bool  create_gemma4_target_feat(ggml_backend_t backend, Gemma4Cache & cache,
                                  int n_capture_layers, int hidden_size, int cap);
 
