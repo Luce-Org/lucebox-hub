@@ -227,6 +227,9 @@ private:
                         float & out_accept_rate,
                         bool & out_spec_ran,
                         const std::vector<int32_t> * hint_tokens = nullptr,
+                        const std::vector<int32_t> * stall_tool_prefix_tokens = nullptr,
+                        const std::vector<int32_t> * stall_action_suffix_tokens = nullptr,
+                        const std::vector<int32_t> * stall_skip_tokens = nullptr,
                         const BudgetHook * budget_hook = nullptr,
                         bool * forced_close_out = nullptr,
                         bool * degenerate_close_out = nullptr);

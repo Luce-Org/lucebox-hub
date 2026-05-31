@@ -1332,6 +1332,41 @@ void HttpServer::worker_loop() {
                 gen_req.hint_tokens = &hint_tokens_storage;
             }
         }
+        std::vector<int32_t> stall_tool_prefix_tokens_storage;
+        std::vector<int32_t> stall_action_suffix_tokens_storage;
+        std::vector<int32_t> stall_skip_tokens_storage;
+        if (!req.tools.empty() && std::getenv("DFLASH_STALL_TOOL_PREFIX")) {
+            bool has_terminal_tool = false;
+            for (const auto & tool : req.tools) {
+                if (!tool.contains("function") || !tool["function"].is_object()) continue;
+                if (tool["function"].value("name", "") == "terminal") {
+                    has_terminal_tool = true;
+                    break;
+                }
+            }
+            stall_tool_prefix_tokens_storage = tokenizer_.encode(
+                has_terminal_tool
+                    ? "\n<function=terminal>\n<parameter=command>\n"
+                    : "\n<function=");
+            stall_action_suffix_tokens_storage = tokenizer_.encode(":");
+            auto add_suffix_terminal = [&](const std::string & text) {
+                auto ids = tokenizer_.encode(text);
+                if (ids.empty()) return;
+                int32_t tok = ids.back();
+                if (std::find(stall_action_suffix_tokens_storage.begin(),
+                              stall_action_suffix_tokens_storage.end(), tok) ==
+                    stall_action_suffix_tokens_storage.end()) {
+                    stall_action_suffix_tokens_storage.push_back(tok);
+                }
+            };
+            add_suffix_terminal("`:");
+            add_suffix_terminal("):");
+            add_suffix_terminal("\":");
+            stall_skip_tokens_storage = tokenizer_.encode(" done");
+            gen_req.stall_tool_prefix_tokens = &stall_tool_prefix_tokens_storage;
+            gen_req.stall_action_suffix_tokens = &stall_action_suffix_tokens_storage;
+            gen_req.stall_skip_tokens = &stall_skip_tokens_storage;
+        }
 
         // Prefix cache: check for cached KV state.
         auto [cache_slot, prefix_len] = prefix_cache_.lookup(effective_prompt);
