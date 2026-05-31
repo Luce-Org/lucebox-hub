@@ -10,7 +10,9 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include <arpa/inet.h>
@@ -75,6 +77,90 @@ static const char * api_format_name(ApiFormat format) {
 
 static size_t json_array_size(const json & value) {
     return value.is_array() ? value.size() : 0;
+}
+
+static bool env_flag_enabled(const char * name) {
+    const char * raw = std::getenv(name);
+    if (!raw || !*raw) return false;
+    std::string value(raw);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return value != "0" && value != "false" && value != "no" &&
+           value != "off";
+}
+
+static const json * find_tool_function(const json & tools,
+                                       const std::string & name) {
+    if (!tools.is_array() || name.empty()) return nullptr;
+    for (const auto & tool : tools) {
+        if (!tool.contains("function") || !tool["function"].is_object()) {
+            continue;
+        }
+        const json & fn = tool["function"];
+        if (fn.value("name", "") == name) return &fn;
+    }
+    return nullptr;
+}
+
+static std::string first_tool_parameter_name(const json & function_def) {
+    const auto & params = function_def.value("parameters", json::object());
+    if (params.contains("required") && params["required"].is_array()) {
+        for (const auto & name : params["required"]) {
+            if (name.is_string()) return name.get<std::string>();
+        }
+    }
+    if (params.contains("properties") && params["properties"].is_object()) {
+        for (const auto & item : params["properties"].items()) {
+            return item.key();
+        }
+    }
+    return "";
+}
+
+static const json * select_stall_recovery_function(const json & tools,
+                                                   const json & tool_choice) {
+    if (!tools.is_array() || tools.empty()) return nullptr;
+
+    if (tool_choice.is_object() && tool_choice.contains("function") &&
+        tool_choice["function"].is_object()) {
+        const std::string forced_name =
+            tool_choice["function"].value("name", "");
+        // If the request forced a concrete function, recovery must honor it;
+        // falling back to terminal here would synthesize invalid tool XML.
+        return find_tool_function(tools, forced_name);
+    }
+
+    if (tool_choice.is_string() && tool_choice.get<std::string>() == "required" &&
+        tools.size() == 1 && tools[0].contains("function") &&
+        tools[0]["function"].is_object()) {
+        return &tools[0]["function"];
+    }
+
+    if (const json * terminal = find_tool_function(tools, "terminal")) {
+        return terminal;
+    }
+    if (tools.size() == 1 && tools[0].contains("function") &&
+        tools[0]["function"].is_object()) {
+        return &tools[0]["function"];
+    }
+    return nullptr;
+}
+
+static std::string build_stall_tool_prefix(const json & tools,
+                                           const json & tool_choice) {
+    const json * function_def =
+        select_stall_recovery_function(tools, tool_choice);
+    if (!function_def) return "\n<function=";
+
+    const std::string name = function_def->value("name", "");
+    if (name.empty()) return "\n<function=";
+
+    std::string prefix = "\n<function=" + name + ">\n";
+    std::string param = first_tool_parameter_name(*function_def);
+    if (!param.empty()) {
+        prefix += "<parameter=" + param + ">\n";
+    }
+    return prefix;
 }
 
 // Build the /props response body.
@@ -1332,6 +1418,32 @@ void HttpServer::worker_loop() {
                 gen_req.hint_tokens = &hint_tokens_storage;
             }
         }
+        std::vector<int32_t> stall_tool_prefix_tokens_storage;
+        std::vector<int32_t> stall_action_suffix_tokens_storage;
+        std::vector<int32_t> stall_skip_tokens_storage;
+        if (!req.tools.empty() && env_flag_enabled("DFLASH_STALL_TOOL_PREFIX")) {
+            stall_tool_prefix_tokens_storage =
+                tokenizer_.encode(build_stall_tool_prefix(req.tools,
+                                                          req.tool_choice));
+            stall_action_suffix_tokens_storage = tokenizer_.encode(":");
+            auto add_suffix_terminal = [&](const std::string & text) {
+                auto ids = tokenizer_.encode(text);
+                if (ids.empty()) return;
+                int32_t tok = ids.back();
+                if (std::find(stall_action_suffix_tokens_storage.begin(),
+                              stall_action_suffix_tokens_storage.end(), tok) ==
+                    stall_action_suffix_tokens_storage.end()) {
+                    stall_action_suffix_tokens_storage.push_back(tok);
+                }
+            };
+            add_suffix_terminal("`:");
+            add_suffix_terminal("):");
+            add_suffix_terminal("\":");
+            stall_skip_tokens_storage = tokenizer_.encode(" done");
+            gen_req.stall_tool_prefix_tokens = &stall_tool_prefix_tokens_storage;
+            gen_req.stall_action_suffix_tokens = &stall_action_suffix_tokens_storage;
+            gen_req.stall_skip_tokens = &stall_skip_tokens_storage;
+        }
 
         // Prefix cache: check for cached KV state.
         auto [cache_slot, prefix_len] = prefix_cache_.lookup(effective_prompt);
@@ -1704,6 +1816,9 @@ void HttpServer::worker_loop() {
                     if (at_cap) {
                         effective_finish_reason = "length";
                     }
+                }
+                if (result.degenerate_decode_close) {
+                    effective_finish_reason = "length";
                 }
                 json choice = {
                     {"index", 0}, {"message", msg},
