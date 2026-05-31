@@ -237,6 +237,7 @@ add_library(dflash_common STATIC
     src/laguna/laguna_target_graph.cpp
     src/laguna/laguna_daemon.cpp
     src/laguna/laguna_backend.cpp
+    src/laguna/laguna_layer_split_adapter.cpp
     src/common/backend_ipc.cpp
     src/common/dflash_feature_ring.cpp
     src/common/dflash_capture.cpp

@@ -42,10 +42,13 @@
 #include "dflash27b.h"
 
 #include <cinttypes>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #if !defined(_WIN32)
 #include <cerrno>
@@ -129,11 +132,58 @@ bool     get_bool_or(const gguf_context * g, const char * key, bool fallback) {
     int64_t id = gguf_find_key(g, key); return (id < 0) ? fallback : (bool)gguf_get_val_bool(g, id);
 }
 
+size_t align_up_size(size_t x, size_t a) {
+    if (a == 0) return x;
+    const size_t r = x % a;
+    return r == 0 ? x : x + (a - r);
+}
+
+bool parse_block_tensor_name(const char * name, int & layer_id) {
+    const char prefix[] = "blk.";
+    const size_t prefix_len = sizeof(prefix) - 1;
+    if (std::strncmp(name, prefix, prefix_len) != 0) return false;
+    const char * p = name + prefix_len;
+    if (*p < '0' || *p > '9') return false;
+    char * end = nullptr;
+    const long v = std::strtol(p, &end, 10);
+    if (!end || *end != '.' || v < 0 || v > INT_MAX) return false;
+    layer_id = (int)v;
+    return true;
+}
+
+bool should_load_laguna_tensor(const char * name, const TargetLoadPlan & plan) {
+    if (std::strcmp(name, "token_embd.weight") == 0) return false;
+    if (std::strcmp(name, "output_norm.weight") == 0 ||
+        std::strcmp(name, "output.weight") == 0) {
+        return plan.load_output;
+    }
+    int layer_id = -1;
+    if (parse_block_tensor_name(name, layer_id)) {
+        return layer_id >= plan.layer_begin && layer_id < plan.layer_end;
+    }
+    return false;
+}
+
+struct LagunaTensorAlloc {
+    ggml_tensor * tensor = nullptr;
+    size_t file_offset = 0;
+    size_t file_size = 0;
+    size_t buffer_offset = 0;
+};
+
 } // namespace
 
 bool load_target_gguf_laguna(const std::string & path,
                               ggml_backend_t       backend,
                               LagunaTargetWeights & out) {
+    TargetLoadPlan plan;
+    return load_target_gguf_laguna_partial(path, backend, plan, out);
+}
+
+bool load_target_gguf_laguna_partial(const std::string & path,
+                                      ggml_backend_t backend,
+                                      const TargetLoadPlan & plan_in,
+                                      LagunaTargetWeights & out) {
 
     // ── 1. Parse metadata ────────────────────────────────────────────────
     ggml_context * meta_ctx = nullptr;
@@ -393,28 +443,67 @@ bool load_target_gguf_laguna(const std::string & path,
         }
     }
 
-    // ── 3. Allocate CUDA buffer for tensors. Pre-pin tok_embd to host memory
-    //       so the allocator skips it (only allocates tensors with data == NULL).
-    //       Saves ~110 MiB VRAM; the embedder reads tok_embd directly from mmap.
+    TargetLoadPlan plan = plan_in;
+    if (plan.layer_begin < 0) plan.layer_begin = 0;
+    if (plan.layer_end < 0) plan.layer_end = (int)n_layer;
+    if (plan.layer_begin > plan.layer_end || plan.layer_end > (int)n_layer) {
+        char e[160];
+        std::snprintf(e, sizeof(e),
+            "laguna: invalid layer range [%d,%d) for n_layer=%u",
+            plan.layer_begin, plan.layer_end, n_layer);
+        set_last_error(e);
+        gguf_free(gctx);
+        return false;
+    }
+
+    // ── 3. Allocate backend buffer only for selected tensors. Token embedding
+    //       stays CPU-only and is owned by the CpuEmbedder mmap.
     LagunaMmap mm;
     std::string err;
     if (!mm.open_ro(path, err)) { set_last_error(err); gguf_free(gctx); return false; }
-    const size_t  data_start = gguf_get_data_offset(gctx);
+    const size_t data_start = gguf_get_data_offset(gctx);
     const int64_t n_tensors  = gguf_get_n_tensors(gctx);
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    std::vector<LagunaTensorAlloc> allocs;
+    size_t alloc_total = 0;
     for (int64_t tid = 0; tid < n_tensors; ++tid) {
-        if (std::strcmp(gguf_get_tensor_name(gctx, tid), "token_embd.weight") == 0) {
-            out.tok_embd->data = (uint8_t *)mm.addr +
-                data_start + gguf_get_tensor_offset(gctx, tid);
-            break;
-        }
+        const char * tname = gguf_get_tensor_name(gctx, tid);
+        ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
+        if (!t || !should_load_laguna_tensor(tname, plan)) continue;
+        alloc_total = align_up_size(alloc_total, alignment);
+        LagunaTensorAlloc a;
+        a.tensor = t;
+        a.file_offset = data_start + gguf_get_tensor_offset(gctx, tid);
+        a.file_size = gguf_get_tensor_size(gctx, tid);
+        a.buffer_offset = alloc_total;
+        alloc_total += ggml_backend_buft_get_alloc_size(buft, t);
+        allocs.push_back(a);
     }
-    out.buf = ggml_backend_alloc_ctx_tensors(meta_ctx, backend);
-    if (!out.buf) {
-        set_last_error("ggml_backend_alloc_ctx_tensors failed (laguna target)");
-        gguf_free(gctx); return false;
+    if (allocs.empty()) {
+        set_last_error("laguna: load plan selected no GPU tensors");
+        gguf_free(gctx);
+        return false;
     }
 
-    // ── 4. Copy tensor bytes to GPU; remember tok_embd offset for the embedder ─
+    out.buf = ggml_backend_alloc_buffer(backend, alloc_total);
+    if (!out.buf) {
+        set_last_error("ggml_backend_alloc_buffer failed (laguna target)");
+        gguf_free(gctx); return false;
+    }
+    ggml_backend_buffer_set_usage(out.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    char * base = (char *)ggml_backend_buffer_get_base(out.buf);
+    for (const LagunaTensorAlloc & a : allocs) {
+        if (ggml_backend_tensor_alloc(out.buf, a.tensor,
+                                      base + a.buffer_offset) != GGML_STATUS_SUCCESS) {
+            set_last_error("ggml_backend_tensor_alloc failed (laguna target)");
+            gguf_free(gctx);
+            return false;
+        }
+    }
+
+    // ── 4. Copy selected tensor bytes to GPU; remember tok_embd for embedder ─
     size_t total = 0;
     size_t tok_embd_off = 0, tok_embd_sz = 0;
     ggml_type tok_embd_type = GGML_TYPE_COUNT;
@@ -434,6 +523,7 @@ bool load_target_gguf_laguna(const std::string & path,
             tok_embd_type = gguf_get_tensor_type(gctx, tid);
             continue;
         }
+        if (!should_load_laguna_tensor(tname, plan)) continue;
         ggml_backend_tensor_set(t, (const uint8_t *)mm.addr + off, 0, sz);
         total += sz;
     }
@@ -463,8 +553,9 @@ bool load_target_gguf_laguna(const std::string & path,
 
     char summary[224];
     std::snprintf(summary, sizeof(summary),
-        "laguna target loaded: %" PRId64 " tensors on GPU %.2f GiB, tok_embd %.0f MiB CPU-only (%s)",
-        n_tensors, total / (1024.0 * 1024.0 * 1024.0),
+        "laguna target loaded: layers [%d,%d) output=%d tensors=%zu GPU %.2f GiB, tok_embd %.0f MiB CPU-only (%s)",
+        plan.layer_begin, plan.layer_end, plan.load_output ? 1 : 0,
+        allocs.size(), total / (1024.0 * 1024.0 * 1024.0),
         tok_embd_sz / (1024.0 * 1024.0), ggml_type_name(tok_embd_type));
     set_last_error(summary);
     std::printf("[laguna-loader] %s\n", summary);
