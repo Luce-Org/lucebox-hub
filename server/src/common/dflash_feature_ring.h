@@ -80,6 +80,15 @@ bool copy_capture_slice_to_draft_ring(
     int start_pos,
     int n_tokens);
 
+// Copy one host-side F32 capture slice into the DraftFeatureMirror ring buffer.
+bool copy_host_capture_slice_to_draft_ring(
+    DraftFeatureMirror & feature_ring,
+    int capture_idx,
+    int start_pos,
+    int n_tokens,
+    const float * host,
+    size_t host_elems);
+
 // Copy n_tokens rows from the DraftFeatureMirror ring buffer into a
 // destination tensor (typically the draft graph's target_hidden_cat input).
 bool copy_feature_ring_range_to_tensor(

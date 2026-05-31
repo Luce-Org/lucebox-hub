@@ -17,6 +17,7 @@
 #include "layer_split_forward.h"
 #include "dflash_feature_ring.h"
 #include "dflash_draft_ipc.h"
+#include "qwen35_target_shard_ipc.h"
 #include "step_graph.h"
 
 #include <vector>
@@ -30,7 +31,8 @@ public:
                                  DraftFeatureMirror * feature_ring,
                                  int kq_stride_pad,
                                  int fa_window,
-                                 DFlashDraftIpcClient * remote_draft = nullptr);
+                                 DFlashDraftIpcClient * remote_draft = nullptr,
+                                 Qwen35TargetShardIpcClient * remote_target_shard = nullptr);
 
     ~Qwen35LayerSplitDFlashTarget() override;
 
@@ -61,6 +63,7 @@ private:
     int                                  kq_stride_pad_;
     int                                  fa_window_;
     DFlashDraftIpcClient *               remote_draft_;
+    Qwen35TargetShardIpcClient *         remote_target_shard_;
 
     std::vector<int> capture_ids_;
     StepGraph        proj_sg_;

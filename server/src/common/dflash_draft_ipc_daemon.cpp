@@ -21,10 +21,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
+
+#if !defined(_WIN32)
+#  include <sys/mman.h>
+#  include <unistd.h>
+#endif
 
 namespace dflash::common {
 
@@ -42,9 +48,12 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
                                 int ring_cap,
                                 int draft_gpu,
                                 int stream_fd,
-                                int payload_fd) {
+                                int payload_fd,
+                                int shared_payload_fd,
+                                size_t shared_payload_bytes) {
 #if defined(_WIN32)
-    (void)draft_path; (void)ring_cap; (void)draft_gpu; (void)stream_fd; (void)payload_fd;
+    (void)draft_path; (void)ring_cap; (void)draft_gpu; (void)stream_fd;
+    (void)payload_fd; (void)shared_payload_fd; (void)shared_payload_bytes;
     std::fprintf(stderr, "DFlash draft IPC daemon is only implemented on POSIX hosts\n");
     return 2;
 #else
@@ -55,10 +64,29 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
         return 2;
     }
 
+    void * shared_payload = nullptr;
+    if (shared_payload_fd >= 0 || shared_payload_bytes > 0) {
+        if (shared_payload_fd < 0 || shared_payload_bytes == 0) {
+            std::fprintf(stderr, "[draft-ipc-daemon] bad shared payload fd/size\n");
+            stream_status(stream_fd, -1);
+            return 1;
+        }
+        shared_payload = ::mmap(nullptr, shared_payload_bytes, PROT_READ | PROT_WRITE,
+                                MAP_SHARED, shared_payload_fd, 0);
+        if (shared_payload == MAP_FAILED) {
+            std::fprintf(stderr, "[draft-ipc-daemon] shared payload mmap failed\n");
+            stream_status(stream_fd, -1);
+            return 1;
+        }
+    }
+
     ggml_backend_t backend = ggml_backend_cuda_init(std::max(0, draft_gpu));
     if (!backend) {
         std::fprintf(stderr, "[draft-ipc-daemon] backend init failed gpu=%d\n", draft_gpu);
         stream_status(stream_fd, -1);
+        if (shared_payload && shared_payload != MAP_FAILED) {
+            ::munmap(shared_payload, shared_payload_bytes);
+        }
         return 1;
     }
 
@@ -75,6 +103,9 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
                      dflash27b_last_error());
         stream_status(stream_fd, -1);
         ggml_backend_free(backend);
+        if (shared_payload && shared_payload != MAP_FAILED) {
+            ::munmap(shared_payload, shared_payload_bytes);
+        }
         return 1;
     }
 
@@ -86,6 +117,9 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
         stream_status(stream_fd, -1);
         free_draft_weights(draft_weights);
         ggml_backend_free(backend);
+        if (shared_payload && shared_payload != MAP_FAILED) {
+            ::munmap(shared_payload, shared_payload_bytes);
+        }
         return 1;
     }
 
@@ -333,6 +367,33 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
             stream_status(stream_fd, 0);
             continue;
         }
+        if (cmd == "feature_slice_shared") {
+            int capture_idx = -1;
+            int start_pos = -1;
+            int n_tokens = 0;
+            size_t bytes = 0;
+            uint64_t sequence = 0;
+            iss >> capture_idx >> start_pos >> n_tokens >> bytes >> sequence;
+            const size_t expected_bytes = (size_t)n_tokens * (size_t)hidden * sizeof(float);
+            if (!iss || sequence == 0 || !shared_payload ||
+                capture_idx < 0 || capture_idx >= n_tgt_layers ||
+                start_pos < 0 || n_tokens <= 0 || bytes != expected_bytes ||
+                !backend_ipc_payload_in_bounds(0, bytes, shared_payload_bytes)) {
+                std::fprintf(stderr, "[draft-ipc-daemon] bad feature_slice_shared: %s\n",
+                             line.c_str());
+                stream_status(stream_fd, -1);
+                continue;
+            }
+            std::vector<float> slice(bytes / sizeof(float));
+            std::memcpy(slice.data(), shared_payload, bytes);
+            if (!store_feature_slice(capture_idx, start_pos, n_tokens, slice)) {
+                std::fprintf(stderr, "[draft-ipc-daemon] store feature_slice_shared failed\n");
+                stream_status(stream_fd, -1);
+                continue;
+            }
+            stream_status(stream_fd, 0);
+            continue;
+        }
         if (cmd == "propose") {
             int committed = -1;
             int ctx_len = 0;
@@ -352,6 +413,28 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
                 continue;
             }
 
+            if (run_proposal(committed, ctx_len) == ProposalResult::StreamFailed) {
+                break;
+            }
+            continue;
+        }
+        if (cmd == "propose_shared") {
+            int committed = -1;
+            int ctx_len = 0;
+            size_t bytes = 0;
+            uint64_t sequence = 0;
+            iss >> committed >> ctx_len >> bytes >> sequence;
+            const size_t expected_bytes = noise_embed.size() * sizeof(float);
+            if (!iss || sequence == 0 || !shared_payload ||
+                committed < 0 || ctx_len <= 0 || ctx_len > feature_ring.cap ||
+                bytes != expected_bytes ||
+                !backend_ipc_payload_in_bounds(0, bytes, shared_payload_bytes)) {
+                std::fprintf(stderr, "[draft-ipc-daemon] bad propose_shared: %s\n",
+                             line.c_str());
+                stream_status(stream_fd, -1);
+                continue;
+            }
+            std::memcpy(noise_embed.data(), shared_payload, bytes);
             if (run_proposal(committed, ctx_len) == ProposalResult::StreamFailed) {
                 break;
             }
@@ -388,6 +471,9 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
     draft_feature_mirror_free(feature_ring);
     free_draft_weights(draft_weights);
     ggml_backend_free(backend);
+    if (shared_payload && shared_payload != MAP_FAILED) {
+        ::munmap(shared_payload, shared_payload_bytes);
+    }
     std::fprintf(stderr, "[draft-ipc-daemon] stopped\n");
     return 0;
 #endif

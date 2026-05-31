@@ -57,7 +57,8 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
         result.error = "context";
         return result;
     }
-    if (req.do_sample && req.sampler.temp > 0.0f) {
+    if (req.do_sample && req.sampler.needs_logit_processing() &&
+        !adapter_->supports_cpu_sampling()) {
         result.error = "sampling_unsupported";
         return result;
     }
@@ -141,6 +142,18 @@ bool LayerSplitBackend::snapshot_used(int slot) const {
 
 int LayerSplitBackend::snapshot_cur_pos(int slot) const {
     return adapter_ ? adapter_->snapshot_cur_pos(slot) : 0;
+}
+
+ModelBackend::SnapshotRef LayerSplitBackend::snapshot_ref(int slot) const {
+    return adapter_ ? adapter_->snapshot_ref(slot) : SnapshotRef{};
+}
+
+bool LayerSplitBackend::snapshot_adopt(int slot,
+                                       ggml_context * ctx,
+                                       ggml_backend_buffer_t buf,
+                                       int cur_pos,
+                                       int32_t last_tok) {
+    return adapter_ && adapter_->snapshot_adopt(slot, ctx, buf, cur_pos, last_tok);
 }
 
 GenerateResult LayerSplitBackend::restore_and_generate(

@@ -1,47 +1,47 @@
-// Gemma4 layer-split adapter.
+// Laguna target layer-split adapter.
 
 #pragma once
 
 #include "common/layer_split_backend.h"
 #include "common/layer_split_utils.h"
-#include "gemma4_internal.h"
+#include "laguna_internal.h"
 #include "placement/placement_config.h"
 
 #include "ggml-backend.h"
 
+#include <random>
 #include <vector>
 
 namespace dflash::common {
 
-struct Gemma4LayerSplitAdapterConfig {
+struct LagunaLayerSplitAdapterConfig {
     const char * target_path = nullptr;
     DevicePlacement device;
-    int chunk = 512;
-    int fa_window = 0;
+    int chunk = 2048;
 };
 
-struct Gemma4LayerSplitShard : LayerSplitShardMeta {
-    Gemma4Weights weights;
-    Gemma4Cache cache;
-    Gemma4LayerStepGraph layer_graph;
+struct LagunaLayerSplitShard : LayerSplitShardMeta {
+    LagunaTargetWeights weights;
+    LagunaTargetCache cache;
+    LagunaLayerStepGraph layer_graph;
 };
 
-struct Gemma4LayerSplitSnapshot {
+struct LagunaLayerSplitSnapshot {
     int cur_pos = 0;
     int32_t last_tok = -1;
-    std::vector<Gemma4Snapshot> shards;
+    std::vector<LagunaCacheSnapshot> shards;
     std::vector<float> prefill_last_logits;
 };
 
-class Gemma4LayerSplitAdapter : public LayerSplitAdapter {
+class LagunaLayerSplitAdapter : public LayerSplitAdapter {
 public:
-    explicit Gemma4LayerSplitAdapter(const Gemma4LayerSplitAdapterConfig & cfg);
-    ~Gemma4LayerSplitAdapter() noexcept override;
+    explicit LagunaLayerSplitAdapter(const LagunaLayerSplitAdapterConfig & cfg);
+    ~LagunaLayerSplitAdapter() override;
 
-    Gemma4LayerSplitAdapter(const Gemma4LayerSplitAdapter &) = delete;
-    Gemma4LayerSplitAdapter & operator=(const Gemma4LayerSplitAdapter &) = delete;
+    LagunaLayerSplitAdapter(const LagunaLayerSplitAdapter &) = delete;
+    LagunaLayerSplitAdapter & operator=(const LagunaLayerSplitAdapter &) = delete;
 
-    const char * name() const override { return "gemma4"; }
+    const char * name() const override { return "laguna"; }
     bool init() override;
     int max_context() const override { return cfg_.device.max_ctx; }
 
@@ -59,6 +59,10 @@ public:
     bool snapshot_used(int slot) const override;
     int snapshot_cur_pos(int slot) const override;
     bool snapshot_restore(int slot) override;
+    ModelBackend::SnapshotRef snapshot_ref(int slot) const override;
+    bool snapshot_adopt(int slot, ggml_context * ctx,
+                        ggml_backend_buffer_t buf, int cur_pos,
+                        int32_t last_tok) override;
     int current_last_token() const override;
 
     void free_drafter() override {}
@@ -69,17 +73,22 @@ private:
                      int base_pos,
                      int & last_tok,
                      std::vector<float> * logits_out = nullptr);
+    bool rebuild_disk_snapshot(int slot);
 
-    Gemma4LayerSplitAdapterConfig cfg_;
-    std::vector<Gemma4LayerSplitShard> shards_;
+    LagunaLayerSplitAdapterConfig cfg_;
+    std::vector<LagunaLayerSplitShard> shards_;
     std::vector<ggml_backend_t> snapshot_backends_;
-    std::vector<Gemma4LayerSplitSnapshot> snapshots_;
+    std::vector<LagunaLayerSplitSnapshot> snapshots_;
+    std::vector<std::vector<ggml_tensor *>> snapshot_prefill_logit_tensors_;
+    std::vector<ggml_context *> disk_snapshot_contexts_;
+    std::vector<ggml_backend_buffer_t> disk_snapshot_buffers_;
+    std::vector<ggml_backend_t> disk_snapshot_backends_;
     static constexpr int PREFIX_SLOTS = ModelBackend::kMaxSlots;
     SamplerCfg sampler_;
     std::mt19937_64 sampler_rng_{std::random_device{}()};
     std::vector<float> prefill_last_logits_;
 };
 
-void free_gemma4_layer_split_shards(std::vector<Gemma4LayerSplitShard> & shards);
+void free_laguna_layer_split_shards(std::vector<LagunaLayerSplitShard> & shards);
 
 }  // namespace dflash::common

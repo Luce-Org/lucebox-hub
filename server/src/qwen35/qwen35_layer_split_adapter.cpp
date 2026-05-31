@@ -6,15 +6,20 @@
 #include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
 #include "common/sampler.h"
+#include "common/layer_split_runtime.h"
+#include "common/snapshot_backend.h"
 #include "qwen35/layer_split_forward.h"
 #include "qwen35/qwen35_layer_split_dflash_target.h"
 #include "qwen3/qwen3_drafter.h"
 
 #include "ggml-cuda.h"
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <string>
 
 namespace dflash::common {
 
@@ -25,40 +30,18 @@ Qwen35LayerSplitAdapter::Qwen35LayerSplitAdapter(
 Qwen35LayerSplitAdapter::~Qwen35LayerSplitAdapter() { shutdown(); }
 
 bool Qwen35LayerSplitAdapter::init() {
-    if (!cfg_.target_path || cfg_.device.layer_split_gpus.size() < 2) {
-        std::fprintf(stderr, "[target-split] invalid layer-split config\n");
-        return false;
+    if (cfg_.device.is_mixed_layer_split()) {
+        return init_mixed_target_split();
     }
 
-    const auto info = inspect_gguf_model_info(cfg_.target_path);
-    const int n_layer = info.n_layer;
-    if (n_layer <= 0) {
-        std::fprintf(stderr, "[target-split] failed to inspect target layer count\n");
+    const LayerSplitRuntimeInit runtime_cfg{
+        cfg_.target_path,
+        &cfg_.device,
+        "target-split",
+    };
+    if (!init_layer_split_runtime(runtime_cfg, shards_, snapshot_backends_)) {
         return false;
     }
-    const auto ranges = compute_layer_ranges(
-        n_layer,
-        (int)cfg_.device.layer_split_gpus.size(),
-        cfg_.device.layer_split_weights);
-    if (ranges.size() != cfg_.device.layer_split_gpus.size()) {
-        std::fprintf(stderr,
-            "[target-split] bad layer split for %zu GPUs and %d layers\n",
-            cfg_.device.layer_split_gpus.size(), n_layer);
-        return false;
-    }
-
-    shards_.resize(cfg_.device.layer_split_gpus.size());
-    auto shard_metas = layer_split_shard_metas(shards_);
-    if (!init_layer_split_shard_metas(
-            shard_metas, cfg_.device.layer_split_gpus, ranges, "target-split")) {
-        return false;
-    }
-
-    (void)enable_layer_split_peer_access(
-        cfg_.device.layer_split_gpus, cfg_.device.peer_access);
-
-    if (!init_layer_split_snapshot_backends(
-            shard_metas, snapshot_backends_, "target-split")) return false;
 
     for (auto & shard : shards_) {
         const TargetLoadPlan plan =
@@ -86,8 +69,154 @@ bool Qwen35LayerSplitAdapter::init() {
     for (auto & slot : prefix_snapshots_) {
         slot.resize(shards_.size());
     }
+    snapshot_prefill_logits_.resize(PREFIX_SLOTS);
+    snapshot_prefill_logit_tensors_.resize(PREFIX_SLOTS);
+    disk_snapshot_contexts_.assign(PREFIX_SLOTS, nullptr);
+    disk_snapshot_buffers_.assign(PREFIX_SLOTS, nullptr);
+    disk_snapshot_backends_.assign(PREFIX_SLOTS, nullptr);
     draft_feature_snapshots_.resize(PREFIX_SLOTS);
 
+    return true;
+}
+
+bool Qwen35LayerSplitAdapter::init_mixed_target_split() {
+    if (!cfg_.remote_target_shard.enabled() ||
+        cfg_.device.layer_split_gpus.size() < 2) {
+        std::fprintf(stderr,
+            "[target-split] mixed target split requires at least two shards and "
+            "remote target shard IPC\n");
+        return false;
+    }
+    if (cfg_.device.layer_split_backend(0) != compiled_placement_backend()) {
+        std::fprintf(stderr,
+            "[target-split] first mixed shard must match compiled backend\n");
+        return false;
+    }
+    size_t remote_begin = 0;
+    while (remote_begin < cfg_.device.layer_split_gpus.size() &&
+           cfg_.device.layer_split_backend(remote_begin) == compiled_placement_backend()) {
+        ++remote_begin;
+    }
+    if (remote_begin == 0 || remote_begin >= cfg_.device.layer_split_gpus.size()) {
+        std::fprintf(stderr,
+            "[target-split] mixed target split requires one local backend group "
+            "followed by one remote backend group\n");
+        return false;
+    }
+    const PlacementBackend remote_backend = cfg_.device.layer_split_backend(remote_begin);
+    for (size_t i = remote_begin; i < cfg_.device.layer_split_gpus.size(); ++i) {
+        if (cfg_.device.layer_split_backend(i) != remote_backend) {
+            std::fprintf(stderr,
+                "[target-split] mixed target split supports one backend boundary only\n");
+            return false;
+        }
+    }
+
+    const auto info = inspect_gguf_model_info(cfg_.target_path);
+    const int n_layer = info.n_layer;
+    if (n_layer <= 0) {
+        std::fprintf(stderr, "[target-split] failed to inspect target layer count\n");
+        return false;
+    }
+    const auto ranges = compute_layer_ranges(
+        n_layer, (int)cfg_.device.layer_split_gpus.size(),
+        cfg_.device.layer_split_weights);
+    if (ranges.size() != cfg_.device.layer_split_gpus.size()) {
+        std::fprintf(stderr,
+            "[target-split] bad mixed layer split for %zu GPUs and %d layers\n",
+            cfg_.device.layer_split_gpus.size(), n_layer);
+        return false;
+    }
+
+    shards_.resize(remote_begin);
+    for (size_t i = 0; i < remote_begin; ++i) {
+        Qwen35LayerSplitShard & local = shards_[i];
+        local.placement_backend = cfg_.device.layer_split_backend(i);
+        local.gpu = cfg_.device.layer_split_gpus[i];
+        local.layer_begin = ranges[i].begin;
+        local.layer_end = ranges[i].end;
+        local.backend = ggml_backend_cuda_init(local.gpu);
+        if (!local.backend) {
+            std::fprintf(stderr, "[target-split] local backend init failed gpu=%d\n",
+                         local.gpu);
+            return false;
+        }
+    }
+
+    for (auto & local : shards_) {
+        const TargetLoadPlan local_plan =
+            make_layer_split_load_plan<TargetLoadPlan>(local, /*is_last_shard=*/false);
+        if (!load_target_gguf_partial(cfg_.target_path, local.backend, local_plan,
+                                      local.weights) ||
+            !create_target_cache_partial(local.weights, cfg_.device.max_ctx,
+                                         cfg_.max_verify_tokens, local.backend,
+                                         local.cache,
+                                         /*prefill_only=*/!cfg_.run_dflash,
+                                         local.layer_begin, local.layer_end,
+                                         /*allocate_target_feat=*/false)) {
+            std::fprintf(stderr, "[target-split] mixed local load/cache gpu=%d: %s\n",
+                         local.gpu, dflash27b_last_error());
+            return false;
+        }
+    }
+
+    std::vector<int> remote_gpus;
+    std::vector<int> remote_layer_begins;
+    std::vector<int> remote_layer_ends;
+    for (size_t i = remote_begin; i < cfg_.device.layer_split_gpus.size(); ++i) {
+        remote_gpus.push_back(cfg_.device.layer_split_gpus[i]);
+        remote_layer_begins.push_back(ranges[i].begin);
+        remote_layer_ends.push_back(ranges[i].end);
+    }
+    if (!remote_target_shard_.start(
+            cfg_.remote_target_shard.ipc_bin, cfg_.target_path, remote_gpus,
+            remote_layer_begins, remote_layer_ends, cfg_.device.max_ctx,
+            cfg_.max_verify_tokens, cfg_.kq_stride_pad, cfg_.fa_window,
+            shards_.front().weights.n_embd, shards_.front().weights.n_vocab,
+            std::max(1, cfg_.device.max_ctx),
+            cfg_.remote_target_shard.work_dir,
+            cfg_.run_dflash)) {
+        std::fprintf(stderr,
+            "[target-split] remote target shard start failed layers=[%d,%d)\n",
+            remote_layer_begins.front(), remote_layer_ends.back());
+        return false;
+    }
+
+    if (cfg_.draft_path && cfg_.run_dflash && !load_draft()) {
+        return false;
+    }
+
+    for (const auto & local : shards_) {
+        std::fprintf(stderr, "[target-split] local %s:%d layers=[%d,%d)\n",
+                     placement_backend_name(local.placement_backend),
+                     local.gpu, local.layer_begin, local.layer_end);
+    }
+    for (size_t i = 0; i < remote_gpus.size(); ++i) {
+        std::fprintf(stderr, "[target-split] remote %s:%d layers=[%d,%d)\n",
+                     placement_backend_name(remote_backend),
+                     remote_gpus[i], remote_layer_begins[i], remote_layer_ends[i]);
+    }
+
+    prefix_snapshots_.resize(PREFIX_SLOTS);
+    for (auto & slot : prefix_snapshots_) {
+        slot.resize(shards_.size());
+    }
+    snapshot_backends_.assign(shards_.size(), nullptr);
+    for (size_t i = 0; i < shards_.size(); ++i) {
+        snapshot_backends_[i] = create_snapshot_backend(shards_[i].backend);
+        if (!snapshot_backends_[i]) {
+            std::fprintf(stderr,
+                "[target-split] mixed snapshot backend init failed gpu=%d\n",
+                shards_[i].gpu);
+            return false;
+        }
+    }
+    snapshot_prefill_logits_.resize(PREFIX_SLOTS);
+    snapshot_prefill_logit_tensors_.resize(PREFIX_SLOTS);
+    disk_snapshot_contexts_.assign(PREFIX_SLOTS, nullptr);
+    disk_snapshot_buffers_.assign(PREFIX_SLOTS, nullptr);
+    disk_snapshot_backends_.assign(PREFIX_SLOTS, nullptr);
+    draft_feature_snapshots_.resize(PREFIX_SLOTS);
     return true;
 }
 
@@ -171,6 +300,7 @@ void Qwen35LayerSplitAdapter::begin_request(const GenerateRequest & req) {
 
 void Qwen35LayerSplitAdapter::reset_request_state() {
     for (auto & shard : shards_) reset_target_cache(shard.cache);
+    prefill_last_logits_.clear();
 }
 
 bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
@@ -186,11 +316,22 @@ bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
     if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
         ubatch = std::max(1, std::atoi(s));
     }
+    if (use_mixed_target_split()) {
+        return run_qwen35_mixed_layer_split_forward(
+            shards_, remote_target_shard_, shards_.front().weights,
+            prompt, base_pos, ubatch, last_tok,
+            cfg_.kq_stride_pad, /*fa_window=*/0,
+            /*argmax_out=*/nullptr,
+            &prefill_last_logits_,
+            (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
+            remote_draft_.active() ? &remote_draft_ : nullptr);
+    }
     return run_qwen35_layer_split_forward(
         shards_, shards_.front().weights, prompt, base_pos, ubatch, last_tok,
         cfg_.kq_stride_pad, /*fa_window=*/0,
         (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
-        /*argmax_out=*/nullptr, /*logits_out=*/nullptr,
+        /*argmax_out=*/nullptr,
+        &prefill_last_logits_,
         cfg_.run_dflash ? &remote_draft_ : nullptr);
 }
 
@@ -215,7 +356,17 @@ bool Qwen35LayerSplitAdapter::snapshot_save(int slot) {
             return false;
         }
     }
+    if (use_mixed_target_split() && !remote_target_shard_.snapshot_save(slot)) {
+        snapshot_free(slot);
+        return false;
+    }
+    if (snapshot_prefill_logits_.size() != (size_t)PREFIX_SLOTS) return false;
+    snapshot_prefill_logits_[(size_t)slot] = prefill_last_logits_;
     if (!snapshot_draft_features(slot)) {
+        snapshot_free(slot);
+        return false;
+    }
+    if (!use_mixed_target_split() && !rebuild_disk_snapshot(slot)) {
         snapshot_free(slot);
         return false;
     }
@@ -224,8 +375,39 @@ bool Qwen35LayerSplitAdapter::snapshot_save(int slot) {
 
 void Qwen35LayerSplitAdapter::snapshot_free(int slot) {
     if (!snapshot_slot_valid(slot)) return;
+    ggml_context * disk_ctx = nullptr;
+    ggml_backend_buffer_t disk_buf = nullptr;
+    ggml_backend_t disk_backend = nullptr;
+    if (disk_snapshot_contexts_.size() == (size_t)PREFIX_SLOTS &&
+        slot < (int)disk_snapshot_contexts_.size()) {
+        disk_ctx = disk_snapshot_contexts_[(size_t)slot];
+        disk_buf = disk_snapshot_buffers_[(size_t)slot];
+        disk_snapshot_contexts_[(size_t)slot] = nullptr;
+        disk_snapshot_buffers_[(size_t)slot] = nullptr;
+        if (disk_snapshot_backends_.size() == (size_t)PREFIX_SLOTS &&
+            disk_snapshot_backends_[(size_t)slot]) {
+            disk_backend = disk_snapshot_backends_[(size_t)slot];
+            disk_snapshot_backends_[(size_t)slot] = nullptr;
+        }
+    }
     for (auto & snap : prefix_snapshots_[(size_t)slot]) {
-        free_prefix_snapshot(snap);
+        if (disk_ctx && snap.ctx == disk_ctx) {
+            snap = PrefixSnapshot{};
+        } else {
+            free_prefix_snapshot(snap);
+        }
+    }
+    if (disk_buf) ggml_backend_buffer_free(disk_buf);
+    if (disk_ctx) ggml_free(disk_ctx);
+    if (disk_backend) ggml_backend_free(disk_backend);
+    if (snapshot_prefill_logits_.size() == (size_t)PREFIX_SLOTS) {
+        snapshot_prefill_logits_[(size_t)slot].clear();
+    }
+    if (snapshot_prefill_logit_tensors_.size() == (size_t)PREFIX_SLOTS) {
+        snapshot_prefill_logit_tensors_[(size_t)slot].clear();
+    }
+    if (use_mixed_target_split()) {
+        remote_target_shard_.snapshot_free(slot);
     }
     free_draft_feature_snapshot(slot);
 }
@@ -236,6 +418,10 @@ bool Qwen35LayerSplitAdapter::snapshot_used(int slot) const {
     if (snaps.size() != shards_.size()) return false;
     for (const auto & snap : snaps) {
         if (!snap.ctx) return false;
+    }
+    if (snapshot_prefill_logits_.size() != (size_t)PREFIX_SLOTS ||
+        snapshot_prefill_logits_[(size_t)slot].empty()) {
+        return false;
     }
     if (cfg_.run_dflash && cfg_.draft_path) {
         if (draft_feature_snapshots_.size() != (size_t)PREFIX_SLOTS) return false;
@@ -261,7 +447,347 @@ bool Qwen35LayerSplitAdapter::snapshot_restore(int slot) {
             return false;
         }
     }
+    if (use_mixed_target_split() &&
+        !remote_target_shard_.snapshot_restore(slot)) {
+        return false;
+    }
+    if (snapshot_prefill_logits_.size() != (size_t)PREFIX_SLOTS) return false;
+    prefill_last_logits_ = snapshot_prefill_logits_[(size_t)slot];
     if (!restore_draft_features(slot)) return false;
+    return true;
+}
+
+bool Qwen35LayerSplitAdapter::rebuild_disk_snapshot(int slot) {
+    if (!snapshot_slot_valid(slot) || use_mixed_target_split()) return false;
+    if (disk_snapshot_contexts_.size() != (size_t)PREFIX_SLOTS ||
+        disk_snapshot_buffers_.size() != (size_t)PREFIX_SLOTS ||
+        disk_snapshot_backends_.size() != (size_t)PREFIX_SLOTS) {
+        return false;
+    }
+    if (disk_snapshot_buffers_[(size_t)slot]) {
+        ggml_backend_buffer_free(disk_snapshot_buffers_[(size_t)slot]);
+        disk_snapshot_buffers_[(size_t)slot] = nullptr;
+    }
+    if (disk_snapshot_contexts_[(size_t)slot]) {
+        ggml_free(disk_snapshot_contexts_[(size_t)slot]);
+        disk_snapshot_contexts_[(size_t)slot] = nullptr;
+    }
+    if (disk_snapshot_backends_[(size_t)slot]) {
+        ggml_backend_free(disk_snapshot_backends_[(size_t)slot]);
+        disk_snapshot_backends_[(size_t)slot] = nullptr;
+    }
+
+    const auto & snaps = prefix_snapshots_[(size_t)slot];
+    const bool has_dflash_features = cfg_.run_dflash && cfg_.draft_path;
+    const DraftFeatureSnapshot * draft_snap = nullptr;
+    if (has_dflash_features) {
+        if (draft_feature_snapshots_.size() != (size_t)PREFIX_SLOTS) return false;
+        draft_snap = &draft_feature_snapshots_[(size_t)slot];
+        if (draft_snap->cur_pos <= 0 || draft_snap->start_pos < 0 ||
+            draft_snap->n_tokens <= 0 || draft_snap->cap <= 0 ||
+            draft_snap->n_target_layers <= 0 || draft_snap->hidden_size <= 0 ||
+            draft_snap->data.empty()) {
+            return false;
+        }
+    }
+
+    size_t n_tensors = 1;  // prefill logits
+    if (has_dflash_features) n_tensors += 2;  // metadata + feature rows
+    for (const auto & snap : snaps) {
+        if (!snap.ctx) return false;
+        for (ggml_tensor * t = ggml_get_first_tensor(snap.ctx); t;
+             t = ggml_get_next_tensor(snap.ctx, t)) {
+            n_tensors++;
+        }
+    }
+
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * (n_tensors + 8) + 4096;
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return false;
+
+    struct CopyPair {
+        ggml_tensor * src = nullptr;
+        ggml_tensor * dst = nullptr;
+    };
+    std::vector<CopyPair> copies;
+    copies.reserve(n_tensors);
+
+    for (size_t shard_idx = 0; shard_idx < snaps.size(); ++shard_idx) {
+        const auto & snap = snaps[shard_idx];
+        for (ggml_tensor * src = ggml_get_first_tensor(snap.ctx); src;
+             src = ggml_get_next_tensor(snap.ctx, src)) {
+            ggml_tensor * dst = ggml_dup_tensor(ctx, src);
+            if (!dst) {
+                ggml_free(ctx);
+                return false;
+            }
+            const std::string name =
+                "ls" + std::to_string(shard_idx) + "_" + src->name;
+            ggml_set_name(dst, name.c_str());
+            copies.push_back({src, dst});
+        }
+    }
+
+    const auto & logits = snapshot_prefill_logits_[(size_t)slot];
+    if (logits.empty()) {
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_tensor * logits_t =
+        ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t)logits.size());
+    if (!logits_t) {
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_set_name(logits_t, "snap_prefill_logits");
+
+    ggml_tensor * draft_meta_t = nullptr;
+    ggml_tensor * draft_data_t = nullptr;
+    if (has_dflash_features && draft_snap) {
+        draft_meta_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 5);
+        if (!draft_meta_t) {
+            ggml_free(ctx);
+            return false;
+        }
+        ggml_set_name(draft_meta_t, "dflash_feature_meta");
+        draft_data_t = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_F32, (int64_t)draft_snap->data.size());
+        if (!draft_data_t) {
+            ggml_free(ctx);
+            return false;
+        }
+        ggml_set_name(draft_data_t, "dflash_feature_data");
+    }
+
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    if (!cpu) {
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+    if (!buf) {
+        ggml_backend_free(cpu);
+        ggml_free(ctx);
+        return false;
+    }
+
+    std::vector<uint8_t> tmp(4 * 1024 * 1024);
+    for (const CopyPair & cp : copies) {
+        const size_t nbytes = ggml_nbytes(cp.src);
+        size_t offset = 0;
+        while (offset < nbytes) {
+            const size_t chunk = std::min(tmp.size(), nbytes - offset);
+            ggml_backend_tensor_get(cp.src, tmp.data(), offset, chunk);
+            ggml_backend_tensor_set(cp.dst, tmp.data(), offset, chunk);
+            offset += chunk;
+        }
+    }
+    ggml_backend_tensor_set(logits_t, logits.data(), 0,
+                            sizeof(float) * logits.size());
+    if (draft_meta_t && draft_data_t && draft_snap) {
+        const int32_t meta[5] = {
+            draft_snap->cur_pos,
+            draft_snap->start_pos,
+            draft_snap->n_tokens,
+            draft_snap->cap,
+            draft_snap->n_target_layers,
+        };
+        ggml_backend_tensor_set(draft_meta_t, meta, 0, sizeof(meta));
+        ggml_backend_tensor_set(draft_data_t, draft_snap->data.data(), 0,
+                                sizeof(float) * draft_snap->data.size());
+    }
+
+    disk_snapshot_contexts_[(size_t)slot] = ctx;
+    disk_snapshot_buffers_[(size_t)slot] = buf;
+    disk_snapshot_backends_[(size_t)slot] = cpu;
+    return true;
+}
+
+ModelBackend::SnapshotRef Qwen35LayerSplitAdapter::snapshot_ref(int slot) const {
+    ModelBackend::SnapshotRef ref;
+    if (use_mixed_target_split()) return ref;
+    if (!snapshot_used(slot)) return ref;
+    if (slot < 0 || slot >= (int)disk_snapshot_contexts_.size()) return ref;
+    ref.ctx = disk_snapshot_contexts_[(size_t)slot];
+    ref.buf = disk_snapshot_buffers_[(size_t)slot];
+    ref.cur_pos = snapshot_cur_pos(slot);
+    ref.last_tok = prefix_snapshots_[(size_t)slot].empty()
+        ? current_last_token()
+        : prefix_snapshots_[(size_t)slot].front().last_tok;
+    return ref;
+}
+
+bool Qwen35LayerSplitAdapter::snapshot_adopt(int slot,
+                                             ggml_context * ctx,
+                                             ggml_backend_buffer_t buf,
+                                             int cur_pos,
+                                             int32_t last_tok) {
+    if (use_mixed_target_split() || !snapshot_slot_valid(slot) || !ctx ||
+        !buf || cur_pos <= 0) {
+        return false;
+    }
+    snapshot_free(slot);
+    auto & snaps = prefix_snapshots_[(size_t)slot];
+    if (snaps.size() != shards_.size()) snaps.resize(shards_.size());
+    if (snapshot_prefill_logits_.size() != (size_t)PREFIX_SLOTS ||
+        snapshot_prefill_logit_tensors_.size() != (size_t)PREFIX_SLOTS ||
+        disk_snapshot_contexts_.size() != (size_t)PREFIX_SLOTS ||
+        disk_snapshot_buffers_.size() != (size_t)PREFIX_SLOTS ||
+        disk_snapshot_backends_.size() != (size_t)PREFIX_SLOTS) {
+        return false;
+    }
+
+    ggml_tensor * logits_tensor = nullptr;
+    ggml_tensor * dflash_feature_meta = nullptr;
+    ggml_tensor * dflash_feature_data = nullptr;
+
+    auto fail = [&]() {
+        for (auto & snap : snaps) snap = PrefixSnapshot{};
+        snapshot_prefill_logits_[(size_t)slot].clear();
+        snapshot_prefill_logit_tensors_[(size_t)slot].clear();
+        free_draft_feature_snapshot(slot);
+        return false;
+    };
+
+    for (size_t shard_idx = 0; shard_idx < shards_.size(); ++shard_idx) {
+        auto & snap = snaps[shard_idx];
+        snap.attn_k_snap.assign(shards_[shard_idx].cache.attn_k.size(), nullptr);
+        snap.attn_v_snap.assign(shards_[shard_idx].cache.attn_v.size(), nullptr);
+        snap.ssm_state_snap.assign(shards_[shard_idx].cache.ssm_state.size(), nullptr);
+        snap.conv_state_snap.assign(shards_[shard_idx].cache.conv_state.size(), nullptr);
+        snap.target_feat_snap = nullptr;
+        snap.cur_pos = cur_pos;
+        snap.last_tok = last_tok;
+        snap.kv_k_type = shards_[shard_idx].cache.kv_k_type;
+        snap.max_ctx = shards_[shard_idx].cache.max_ctx;
+        snap.target_feat_cap = shards_[shard_idx].cache.target_feat_cap;
+    }
+    snapshot_prefill_logits_[(size_t)slot].clear();
+    snapshot_prefill_logit_tensors_[(size_t)slot].assign(shards_.size(), nullptr);
+
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+        if (!t->name[0]) continue;
+        if (std::strcmp(t->name, "snap_prefill_logits") == 0) {
+            logits_tensor = t;
+            continue;
+        }
+        if (std::strcmp(t->name, "dflash_feature_meta") == 0) {
+            dflash_feature_meta = t;
+            continue;
+        }
+        if (std::strcmp(t->name, "dflash_feature_data") == 0) {
+            dflash_feature_data = t;
+            continue;
+        }
+        int shard_idx = -1;
+        int idx = -1;
+        if (std::sscanf(t->name, "ls%d_snap_cache_k_%d", &shard_idx, &idx) == 2 &&
+            shard_idx >= 0 && shard_idx < (int)shards_.size() &&
+            idx >= 0 && idx < (int)snaps[(size_t)shard_idx].attn_k_snap.size()) {
+            snaps[(size_t)shard_idx].attn_k_snap[(size_t)idx] = t;
+        } else if (std::sscanf(t->name, "ls%d_snap_cache_v_%d", &shard_idx, &idx) == 2 &&
+                   shard_idx >= 0 && shard_idx < (int)shards_.size() &&
+                   idx >= 0 && idx < (int)snaps[(size_t)shard_idx].attn_v_snap.size()) {
+            snaps[(size_t)shard_idx].attn_v_snap[(size_t)idx] = t;
+        } else if (std::sscanf(t->name, "ls%d_snap_ssm_state_%d", &shard_idx, &idx) == 2 &&
+                   shard_idx >= 0 && shard_idx < (int)shards_.size() &&
+                   idx >= 0 && idx < (int)snaps[(size_t)shard_idx].ssm_state_snap.size()) {
+            snaps[(size_t)shard_idx].ssm_state_snap[(size_t)idx] = t;
+        } else if (std::sscanf(t->name, "ls%d_snap_conv_state_%d", &shard_idx, &idx) == 2 &&
+                   shard_idx >= 0 && shard_idx < (int)shards_.size() &&
+                   idx >= 0 && idx < (int)snaps[(size_t)shard_idx].conv_state_snap.size()) {
+            snaps[(size_t)shard_idx].conv_state_snap[(size_t)idx] = t;
+        } else if (std::sscanf(t->name, "ls%d_snap_target_feat", &shard_idx) == 1 &&
+                   shard_idx >= 0 && shard_idx < (int)shards_.size()) {
+            snaps[(size_t)shard_idx].target_feat_snap = t;
+        } else if (std::sscanf(t->name, "ls%d_snap_prefill_logits", &shard_idx) == 1 &&
+                   shard_idx >= 0 && shard_idx < (int)shards_.size()) {
+            snapshot_prefill_logit_tensors_[(size_t)slot][(size_t)shard_idx] = t;
+            logits_tensor = t;
+        }
+    }
+
+    for (size_t shard_idx = 0; shard_idx < shards_.size(); ++shard_idx) {
+        auto & snap = snaps[shard_idx];
+        for (size_t i = 0; i < snap.attn_k_snap.size(); ++i) {
+            const bool cache_has_kv =
+                shards_[shard_idx].cache.attn_k[i] || shards_[shard_idx].cache.attn_v[i];
+            if (cache_has_kv && (!snap.attn_k_snap[i] || !snap.attn_v_snap[i])) {
+                return fail();
+            }
+        }
+        for (size_t i = 0; i < snap.ssm_state_snap.size(); ++i) {
+            const bool cache_has_state =
+                shards_[shard_idx].cache.ssm_state[i] || shards_[shard_idx].cache.conv_state[i];
+            if (cache_has_state && (!snap.ssm_state_snap[i] || !snap.conv_state_snap[i])) {
+                return fail();
+            }
+        }
+        if (shards_[shard_idx].cache.target_feat && !snap.target_feat_snap) {
+            return fail();
+        }
+    }
+
+    if (!logits_tensor || logits_tensor->ne[0] <= 0) {
+        return fail();
+    }
+    snapshot_prefill_logits_[(size_t)slot].assign((size_t)logits_tensor->ne[0], 0.0f);
+    ggml_backend_tensor_get(logits_tensor,
+                            snapshot_prefill_logits_[(size_t)slot].data(),
+                            0,
+                            sizeof(float) *
+                                snapshot_prefill_logits_[(size_t)slot].size());
+
+    if (cfg_.run_dflash && cfg_.draft_path) {
+        if (!dflash_feature_meta || !dflash_feature_data ||
+            dflash_feature_meta->type != GGML_TYPE_I32 ||
+            dflash_feature_data->type != GGML_TYPE_F32 ||
+            dflash_feature_meta->ne[0] < 5 ||
+            dflash_feature_data->ne[0] <= 0) {
+            return fail();
+        }
+        int32_t meta[5] = {};
+        ggml_backend_tensor_get(dflash_feature_meta, meta, 0, sizeof(meta));
+        auto & draft_snap = draft_feature_snapshots_[(size_t)slot];
+        draft_snap.cur_pos = meta[0];
+        draft_snap.start_pos = meta[1];
+        draft_snap.n_tokens = meta[2];
+        draft_snap.cap = meta[3];
+        draft_snap.n_target_layers = meta[4];
+        const int hidden = remote_draft_.active() ? remote_draft_.hidden_size()
+                                                  : feature_ring_.hidden_size;
+        if (draft_snap.cur_pos <= 0 || draft_snap.start_pos < 0 ||
+            draft_snap.n_tokens <= 0 || draft_snap.cap <= 0 ||
+            draft_snap.n_target_layers <= 0 || hidden <= 0) {
+            return fail();
+        }
+        const size_t expected =
+            (size_t)draft_snap.n_tokens *
+            (size_t)draft_snap.n_target_layers *
+            (size_t)hidden;
+        if ((size_t)dflash_feature_data->ne[0] != expected) {
+            return fail();
+        }
+        draft_snap.hidden_size = hidden;
+        draft_snap.data.assign(expected, 0.0f);
+        ggml_backend_tensor_get(dflash_feature_data, draft_snap.data.data(), 0,
+                                sizeof(float) * draft_snap.data.size());
+    } else {
+        free_draft_feature_snapshot(slot);
+    }
+
+    for (auto & snap : snaps) {
+        snap.ctx = ctx;
+        snap.buf = buf;
+    }
+    disk_snapshot_contexts_[(size_t)slot] = ctx;
+    disk_snapshot_buffers_[(size_t)slot] = buf;
+    disk_snapshot_backends_[(size_t)slot] = nullptr;
+    std::fprintf(stderr,
+                 "[target-split] adopted disk snapshot slot=%d shards=%zu pos=%d\n",
+                 slot, shards_.size(), cur_pos);
     return true;
 }
 
@@ -377,41 +903,37 @@ bool Qwen35LayerSplitAdapter::decode_ar(
         std::vector<int32_t> & out_tokens,
         const DaemonIO & io) {
     if (n_gen <= 0) return true;
-
-    out_tokens.push_back(last_tok);
-    io.emit(last_tok);
-    if (io.cancelled) {
-        io.emit(-1);
-        return true;
-    }
-    if (is_eos_tok(last_tok, shards_.front().weights)) {
-        io.emit(-1);
-        return true;
-    }
-    ++committed;
-
-    for (int i = 1; i < n_gen; ++i) {
-        std::vector<int32_t> one(1, last_tok);
-        int next_tok = -1;
-        if (!run_qwen35_layer_split_forward(
-                shards_, shards_.front().weights, one, committed, 1, next_tok,
+    const auto & w = shards_.front().weights;
+    const int vocab = w.n_vocab;
+    return run_layer_split_ar_decode(
+        last_tok, committed, n_gen, vocab, prefill_last_logits_, sampler_,
+        sampler_rng_,
+        [&](const std::vector<int32_t> & one, int pos, int & next_tok,
+            std::vector<float> * logits_out) {
+            if (use_mixed_target_split()) {
+                return run_qwen35_mixed_layer_split_forward(
+                    shards_, remote_target_shard_, shards_.front().weights,
+                    one, pos, 1, next_tok,
+                    cfg_.kq_stride_pad, cfg_.fa_window,
+                    /*argmax_out=*/nullptr,
+                    logits_out,
+                    (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
+                    remote_draft_.active() ? &remote_draft_ : nullptr);
+            }
+            return run_qwen35_layer_split_forward(
+                shards_, shards_.front().weights, one, pos, 1, next_tok,
                 cfg_.kq_stride_pad, cfg_.fa_window,
-                cfg_.run_dflash ? &feature_ring_ : nullptr)) {
-            return false;
-        }
-        out_tokens.push_back(next_tok);
-        io.emit(next_tok);
-        if (io.cancelled) break;
-        if (is_eos_tok(next_tok, shards_.front().weights)) break;
-        last_tok = next_tok;
-        ++committed;
-    }
-    io.emit(-1);
-    return true;
+                (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
+                /*argmax_out=*/nullptr,
+                logits_out,
+                cfg_.run_dflash ? &remote_draft_ : nullptr);
+        },
+        [&](int tok) { return is_eos_tok(tok, w); },
+        out_tokens, io);
 }
 
 bool Qwen35LayerSplitAdapter::can_dflash_decode() const {
-    return cfg_.run_dflash && cfg_.draft_path && sampler_.temp == 0.0f;
+    return cfg_.run_dflash && cfg_.draft_path && !sampler_.needs_logit_processing();
 }
 
 bool Qwen35LayerSplitAdapter::decode_dflash(
@@ -421,7 +943,8 @@ bool Qwen35LayerSplitAdapter::decode_dflash(
     Qwen35LayerSplitDFlashTarget target(
         shards_, use_remote_draft ? nullptr : &feature_ring_,
         cfg_.kq_stride_pad, cfg_.fa_window,
-        use_remote_draft ? &remote_draft_ : nullptr);
+        use_remote_draft ? &remote_draft_ : nullptr,
+        use_mixed_target_split() ? &remote_target_shard_ : nullptr);
     DaemonIO collect_io = io.with_token_callback([&](int32_t tok) -> bool {
         out_tokens.push_back(tok);
         return true;
@@ -485,7 +1008,8 @@ DFlashTarget * Qwen35LayerSplitAdapter::dflash_target() {
             shards_,
             (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
             cfg_.kq_stride_pad, cfg_.fa_window,
-            remote_draft_.active() ? &remote_draft_ : nullptr);
+            remote_draft_.active() ? &remote_draft_ : nullptr,
+            use_mixed_target_split() ? &remote_target_shard_ : nullptr);
     }
     return dflash_target_.get();
 }
@@ -493,12 +1017,18 @@ DFlashTarget * Qwen35LayerSplitAdapter::dflash_target() {
 void Qwen35LayerSplitAdapter::shutdown() {
     dflash_target_.reset();
     free_drafter();
+    for (int slot = 0; slot < (int)prefix_snapshots_.size(); ++slot) {
+        snapshot_free(slot);
+    }
+    remote_target_shard_.close();
     draft_feature_mirror_free(feature_ring_);
     free_draft_weights(draft_weights_);
-    for (auto & slot : prefix_snapshots_) {
-        for (auto & snap : slot) free_prefix_snapshot(snap);
-    }
     prefix_snapshots_.clear();
+    snapshot_prefill_logits_.clear();
+    snapshot_prefill_logit_tensors_.clear();
+    disk_snapshot_contexts_.clear();
+    disk_snapshot_buffers_.clear();
+    disk_snapshot_backends_.clear();
     draft_feature_snapshots_.clear();
     auto shard_metas = layer_split_shard_metas(shards_);
     free_layer_split_snapshot_backends(shard_metas, snapshot_backends_);
