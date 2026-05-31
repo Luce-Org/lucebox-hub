@@ -12,6 +12,7 @@
 #pragma once
 
 #include "common/model_backend.h"
+#include "common/regime_router.h"
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "tool_memory.h"
@@ -143,13 +144,18 @@ struct ServerConfig {
     enum class PflashMode { OFF, AUTO, ALWAYS };
     PflashMode  pflash_mode      = PflashMode::OFF;
     int         pflash_threshold = 32000;   // token count threshold for AUTO mode
-    float       pflash_keep_ratio = 0.05f;  // fraction of tokens to keep
+    float       pflash_keep_ratio = 0.10f;  // fraction of tokens to keep
     std::string pflash_drafter_path;        // path to drafter GGUF (Qwen3-0.6B)
     int         pflash_drafter_gpu = 0;     // backend-local GPU for PFlash drafter
     bool        pflash_remote_drafter = false; // use IPC drafter for mixed backends
     RemoteDraftConfig pflash_remote;        // IPC binary/work-dir for remote PFlash drafter
     bool        pflash_skip_park = false;   // skip park/unpark for >=32GB GPUs
     bool        lazy_draft      = false;   // park decode draft when idle to save VRAM
+
+    // TYPE-gate compression router (v2).
+    // Default: disabled (exact no-op, correct-by-construction).
+    // Enable via PFLASH_ROUTER_ENABLE=1 env var at server startup.
+    RouterPolicyV2 pflash_router;          // enabled=false by default
 
     // Disk prefix cache
     std::string disk_cache_dir;             // empty = disabled
@@ -355,6 +361,23 @@ struct ServerJob {
     std::condition_variable cv;
     ServerJob *   next = nullptr;
 };
+
+// ─── Admission gate (pure, testable) ────────────────────────────────────
+// Returns true when the request should be admitted (effective prompt fits).
+//
+// effective_size   : post-compression prompt token count (== raw_size when
+//                    pflash is off or the prompt is below threshold).
+// raw_size         : pre-compression token count; used for the pre-compression
+//                    sanity guard: reject early when even best-case compression
+//                    cannot fit — i.e. raw*keep_ratio + max_output > max_ctx.
+// max_output       : request's requested generation tokens.
+// max_ctx          : server's configured context window (--max-ctx).
+// pflash_on        : true when pflash compressed this request.
+// pflash_keep_ratio: configured keep fraction; drives the pre-compression guard.
+//                    Guard is skipped when <= 0.
+bool check_admission(int effective_size, int raw_size,
+                     int max_output, int max_ctx, bool pflash_on,
+                     float pflash_keep_ratio = 0.10f);
 
 // ─── Parse session_id from a chat-completion JSON body ──────────────────
 // Returns empty string when session_id is absent or not a string (int/null/array).

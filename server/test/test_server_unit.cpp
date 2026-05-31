@@ -23,6 +23,7 @@
 #include "placement/placement_config.h"
 #include "common/layer_split_backend.h"
 #include "common/layer_split_utils.h"
+#include "qwen35/c2_gate.h"
 #include <nlohmann/json.hpp>
 
 #include <cmath>
@@ -889,7 +890,7 @@ static void test_pflash_config_defaults() {
     ServerConfig cfg;
     TEST_ASSERT(cfg.pflash_mode == ServerConfig::PflashMode::OFF);
     TEST_ASSERT(cfg.pflash_threshold == 32000);
-    TEST_ASSERT(cfg.pflash_keep_ratio > 0.04f && cfg.pflash_keep_ratio < 0.06f);
+    TEST_ASSERT(cfg.pflash_keep_ratio > 0.09f && cfg.pflash_keep_ratio < 0.11f);
     TEST_ASSERT(cfg.pflash_drafter_path.empty());
     TEST_ASSERT(!cfg.pflash_skip_park);
 }
@@ -951,6 +952,76 @@ static void test_pflash_threshold_always_mode() {
     bool should = (cfg.pflash_mode == ServerConfig::PflashMode::ALWAYS) ||
                   (cfg.pflash_mode == ServerConfig::PflashMode::AUTO && n_prompt >= cfg.pflash_threshold);
     TEST_ASSERT(should);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Admission gate tests (check_admission pure helper)
+// ═══════════════════════════════════════════════════════════════════════
+
+static void test_admission_pflash_raw_large_effective_fits() {
+    // pflash on, raw=170000, effective=65000, max_output=512, max_ctx=131072 → ADMITTED
+    TEST_ASSERT(check_admission(/*effective=*/65000, /*raw=*/170000,
+                                /*max_output=*/512, /*max_ctx=*/131072,
+                                /*pflash_on=*/true));
+}
+
+static void test_admission_pflash_effective_too_large() {
+    // Post-compression: effective still too large → REJECTED.
+    // The post-compression call uses pflash_on=false (direct effective check).
+    TEST_ASSERT(!check_admission(/*effective=*/131000, /*raw=*/170000,
+                                 /*max_output=*/512, /*max_ctx=*/131072,
+                                 /*pflash_on=*/false));
+}
+
+static void test_admission_no_pflash_raw_too_large() {
+    // pflash off, raw > max_ctx → REJECTED (unchanged from original behavior)
+    TEST_ASSERT(!check_admission(/*effective=*/100000, /*raw=*/100000,
+                                 /*max_output=*/512, /*max_ctx=*/8192,
+                                 /*pflash_on=*/false));
+}
+
+static void test_admission_small_request_admitted() {
+    // Normal small request → ADMITTED regardless of pflash flag
+    TEST_ASSERT(check_admission(/*effective=*/1000, /*raw=*/1000,
+                                /*max_output=*/512, /*max_ctx=*/8192,
+                                /*pflash_on=*/false));
+    TEST_ASSERT(check_admission(/*effective=*/1000, /*raw=*/1000,
+                                /*max_output=*/512, /*max_ctx=*/8192,
+                                /*pflash_on=*/true));
+}
+
+static void test_admission_pflash_raw_sanity_guard() {
+    // pflash on, keep_ratio=0.25 (explicit guard-test input), raw=32769:
+    // 32769*0.25 + 512 = 8704.25 > 8192 → REJECTED.
+    TEST_ASSERT(!check_admission(/*effective=*/1000, /*raw=*/32769,
+                                 /*max_output=*/512, /*max_ctx=*/8192,
+                                 /*pflash_on=*/true, /*keep_ratio=*/0.25f));
+}
+
+static void test_admission_no_max_ctx_always_admits() {
+    // max_ctx=0 means no limit: always admit
+    TEST_ASSERT(check_admission(/*effective=*/999999, /*raw=*/999999,
+                                /*max_output=*/9999, /*max_ctx=*/0,
+                                /*pflash_on=*/false));
+}
+
+static void test_admission_keep_ratio_derived_guard_admits_low_ratio() {
+    // keep_ratio=0.05, raw=65536 (8× max_ctx=8192):
+    // best-case effective = 65536*0.05 = 3276.8 tokens.
+    // 3276.8 + 512 = 3788.8 < 8192 → guard PASSES → ADMITTED.
+    // The old hardcoded 4× guard would have rejected (65536 > 4*8192=32768).
+    TEST_ASSERT(check_admission(/*effective=*/65536, /*raw=*/65536,
+                                /*max_output=*/512, /*max_ctx=*/8192,
+                                /*pflash_on=*/true, /*keep_ratio=*/0.05f));
+}
+
+static void test_admission_keep_ratio_derived_guard_rejects_impossible() {
+    // keep_ratio=0.05, raw=2_000_000, max_ctx=8192:
+    // best-case effective = 2000000*0.05 = 100000 tokens.
+    // 100000 + 512 = 100512 > 8192 → REJECTED.
+    TEST_ASSERT(!check_admission(/*effective=*/2000000, /*raw=*/2000000,
+                                 /*max_output=*/512, /*max_ctx=*/8192,
+                                 /*pflash_on=*/true, /*keep_ratio=*/0.05f));
 }
 
 static void test_pflash_placement_same_backend_local() {
@@ -1436,6 +1507,91 @@ static void test_integration_qwen3_disable_thinking_render_to_emit_stays_in_cont
 
     TEST_ASSERT(em.reasoning_text().empty());
     TEST_ASSERT(em.accumulated_text().find("Hello there") != std::string::npos);
+}
+
+
+// ---------------------------------------------------------------------------
+// Drafter / target distribution alignment (closed <think> prefill on Qwen3).
+// The hard-coded Qwen renderer appends a closed think prefill when thinking is
+// disabled; some Qwen3.6 Jinja templates omit it. render_chat_template_jinja
+// mirrors the hard-coded behavior when arch_hint == QWEN3 && !enable_thinking
+// && the rendered prompt ends with a bare assistant generation marker.
+// ---------------------------------------------------------------------------
+
+static const char QWEN3_BARE_ASSISTANT_TPL[] =
+    "{%- for m in messages -%}"
+    "<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n"
+    "{%- endfor -%}"
+    "{%- if add_generation_prompt -%}"
+    "<|im_start|>assistant\n"
+    "{%- endif -%}";
+
+static void test_jinja_render_qwen3_closes_think_when_thinking_off() {
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    auto out = render_chat_template_jinja(
+        QWEN3_BARE_ASSISTANT_TPL, msgs, "", "",
+        /*add_gen=*/true, /*think=*/false, /*tools=*/"",
+        /*arch_hint=*/ChatFormat::QWEN3).text;
+    TEST_ASSERT(out.find("<|im_start|>assistant\n<think>\n\n</think>\n\n") != std::string::npos);
+}
+
+static void test_jinja_render_does_not_close_think_when_thinking_on() {
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    auto out = render_chat_template_jinja(
+        QWEN3_BARE_ASSISTANT_TPL, msgs, "", "",
+        /*add_gen=*/true, /*think=*/true, /*tools=*/"",
+        /*arch_hint=*/ChatFormat::QWEN3).text;
+    TEST_ASSERT(out.find("</think>") == std::string::npos);
+}
+
+static void test_jinja_render_does_not_close_think_for_non_qwen3_arch() {
+    // Laguna and Gemma4 do not use ChatML tokens; the closed-think suffix
+    // must NOT be appended for them even if the rendered prompt happens to
+    // end with the same string.
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    auto out_laguna = render_chat_template_jinja(
+        QWEN3_BARE_ASSISTANT_TPL, msgs, "", "",
+        /*add_gen=*/true, /*think=*/false, /*tools=*/"",
+        /*arch_hint=*/ChatFormat::LAGUNA).text;
+    TEST_ASSERT(out_laguna.find("</think>") == std::string::npos);
+    auto out_gemma4 = render_chat_template_jinja(
+        QWEN3_BARE_ASSISTANT_TPL, msgs, "", "",
+        /*add_gen=*/true, /*think=*/false, /*tools=*/"",
+        /*arch_hint=*/ChatFormat::GEMMA4).text;
+    TEST_ASSERT(out_gemma4.find("</think>") == std::string::npos);
+}
+
+static void test_chat_format_for_arch_qwen35moe_returns_qwen3() {
+    // qwen35moe MUST inherit ChatFormat::QWEN3 — the closed-think prefill
+    // depends on it, and a future enum-add must not silently flip behavior.
+    TEST_ASSERT(chat_format_for_arch("qwen35moe") == ChatFormat::QWEN3);
+    TEST_ASSERT(chat_format_for_arch("qwen35")    == ChatFormat::QWEN3);
+    TEST_ASSERT(chat_format_for_arch("qwen3")     == ChatFormat::QWEN3);
+    TEST_ASSERT(chat_format_for_arch("laguna")    == ChatFormat::LAGUNA);
+    TEST_ASSERT(chat_format_for_arch("gemma4")    == ChatFormat::GEMMA4);
+}
+
+static void test_jinja_render_does_not_double_append_close_think() {
+    // A user-supplied template that already closes the think block must not
+    // get a second </think> suffix from the bare-marker post-processing.
+    static const char TPL_ALREADY_CLOSED[] =
+        "{%- for m in messages -%}"
+        "<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n"
+        "{%- endfor -%}"
+        "{%- if add_generation_prompt -%}"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        "{%- endif -%}";
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    auto out = render_chat_template_jinja(
+        TPL_ALREADY_CLOSED, msgs, "", "",
+        /*add_gen=*/true, /*think=*/false, /*tools=*/"",
+        /*arch_hint=*/ChatFormat::QWEN3).text;
+    // Exactly one </think> — the one the template emitted itself.
+    size_t first  = out.find("</think>");
+    size_t second = (first == std::string::npos) ? std::string::npos
+                                                  : out.find("</think>", first + 1);
+    TEST_ASSERT(first  != std::string::npos);
+    TEST_ASSERT(second == std::string::npos);
 }
 
 static void test_normalize_responses_tool_followup_messages() {
@@ -3046,6 +3202,58 @@ static void test_generate_result_accept_rate_zero_when_no_spec_decode() {
     TEST_ASSERT(r.accept_rate == 0.0f);
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// C2 gate: c2_spec_decode_permitted() unit tests
+//
+// Gate logic: permit spec-decode when eff_fa_window <= 2*fa_window_cfg.
+// eff_fa_window = fa_window_override when set, else fa_window_cfg.
+//
+// Empirical validation (Round 5 bench):
+// - D_composition 128K: effective_in=10988, eff_fa_window=11244 > 4096
+//   → gate BLOCKS spec-decode → AR at 27.5 tok/s (correct — spec at 5.74)
+// - D_composition short: eff_fa_window <= 4096 → gate permits spec-decode
+// ═══════════════════════════════════════════════════════════════════════
+
+static void test_c2_gate_no_override_always_permits() {
+    // fa_window_override == 0 → no pflash, always spec-decode permitted.
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(0, 2048, 1));
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(0, 2048, 4096));
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(0, 2048, 131072));
+}
+
+static void test_c2_gate_128k_compressed_blocks_spec() {
+    // Round 5 D 128K: effective_in=10988, fa_window_override=11244.
+    // 11244 > 2*2048=4096 → gate correctly BLOCKS spec-decode (AR wins empirically).
+    int fa_window_cfg = 2048;
+    int compressed_size = 10988;
+    int fa_window_override = compressed_size + 256;  // = 11244
+    TEST_ASSERT(!dflash::common::c2_spec_decode_permitted(
+        fa_window_override, fa_window_cfg, compressed_size));
+}
+
+static void test_c2_gate_65k_compressed_blocks_spec() {
+    // D 65K cell: effective_in≈5383, fa_window_override≈5639 > 4096 → blocks.
+    int compressed_size = 5383;
+    int fa_window_override = compressed_size + 256;
+    TEST_ASSERT(!dflash::common::c2_spec_decode_permitted(
+        fa_window_override, 2048, compressed_size));
+}
+
+static void test_c2_gate_small_compressed_permits_spec() {
+    // Small compressed KV (override <= 2*fa_window): spec-decode permitted.
+    // fa_window_override=3000 <= 4096 → permit
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(3000, 2048, 2744));
+    // fa_window_override=4096 == 2*2048 → permit (at boundary)
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(4096, 2048, 3840));
+}
+
+static void test_c2_gate_boundary_at_2x_fa_window() {
+    // At exactly 2*fa_window_cfg: permit (<=).
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(4096, 2048, 3840));
+    // At 2*fa_window_cfg + 1: block.
+    TEST_ASSERT(!dflash::common::c2_spec_decode_permitted(4097, 2048, 3841));
+}
+
 int main() {
     std::fprintf(stderr, "══════════════════════════════════════════\n");
     std::fprintf(stderr, " Server Unit Tests\n");
@@ -3128,6 +3336,17 @@ int main() {
     RUN_TEST(test_pflash_compress_result_defaults);
     RUN_TEST(test_pflash_threshold_auto_mode);
     RUN_TEST(test_pflash_threshold_always_mode);
+
+    std::fprintf(stderr, "\n── Admission gate ──\n");
+    RUN_TEST(test_admission_pflash_raw_large_effective_fits);
+    RUN_TEST(test_admission_pflash_effective_too_large);
+    RUN_TEST(test_admission_no_pflash_raw_too_large);
+    RUN_TEST(test_admission_small_request_admitted);
+    RUN_TEST(test_admission_pflash_raw_sanity_guard);
+    RUN_TEST(test_admission_no_max_ctx_always_admits);
+    RUN_TEST(test_admission_keep_ratio_derived_guard_admits_low_ratio);
+    RUN_TEST(test_admission_keep_ratio_derived_guard_rejects_impossible);
+
     RUN_TEST(test_pflash_placement_same_backend_local);
     RUN_TEST(test_pflash_placement_mixed_backend_remote);
     RUN_TEST(test_pflash_placement_auto_draft_follows_target);
@@ -3141,6 +3360,11 @@ int main() {
     RUN_TEST(test_jinja_render_empty_tools_skipped);
     RUN_TEST(test_jinja_render_bos_eos_threaded);
     RUN_TEST(test_jinja_render_empty_template_throws);
+    RUN_TEST(test_jinja_render_qwen3_closes_think_when_thinking_off);
+    RUN_TEST(test_jinja_render_does_not_close_think_when_thinking_on);
+    RUN_TEST(test_jinja_render_does_not_close_think_for_non_qwen3_arch);
+    RUN_TEST(test_chat_format_for_arch_qwen35moe_returns_qwen3);
+    RUN_TEST(test_jinja_render_does_not_double_append_close_think);
     RUN_TEST(test_jinja_render_bad_tools_json_throws);
     RUN_TEST(test_chat_template_qwen3_enable_thinking_pre_opens);
     RUN_TEST(test_chat_template_qwen3_disable_thinking_does_not_pre_open);
@@ -3228,6 +3452,13 @@ int main() {
     RUN_TEST(test_generate_result_accept_rate_in_usage_openai);
     RUN_TEST(test_generate_result_accept_rate_in_usage_anthropic);
     RUN_TEST(test_generate_result_accept_rate_zero_when_no_spec_decode);
+
+    std::fprintf(stderr, "\n── C2 gate (spec-decode gate) ──\n");
+    RUN_TEST(test_c2_gate_no_override_always_permits);
+    RUN_TEST(test_c2_gate_128k_compressed_blocks_spec);
+    RUN_TEST(test_c2_gate_65k_compressed_blocks_spec);
+    RUN_TEST(test_c2_gate_small_compressed_permits_spec);
+    RUN_TEST(test_c2_gate_boundary_at_2x_fa_window);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");
     std::fprintf(stderr, " Results: %d assertions, %d failures\n",
