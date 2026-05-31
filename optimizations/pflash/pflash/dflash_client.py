@@ -116,10 +116,12 @@ class DflashClient:
         if sys.platform == "win32":
             self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                          stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT,
                                          close_fds=False, env=env)
         else:
             self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                          stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT,
                                          pass_fds=(self.w_pipe,), env=env)
         self._start_stdout_reader()
         os.close(self.w_pipe)
