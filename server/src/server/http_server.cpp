@@ -49,6 +49,7 @@ static const std::vector<std::string> kApiEndpoints = {
     "GET /props",
     "GET /status",
     "GET /status/events",
+    "GET /status/json",
     "GET /v1/models",
     "POST /v1/chat/completions",
     "POST /v1/messages",
@@ -509,14 +510,42 @@ std::string HttpServer::resolve_status_html() {
     return {};
 }
 
+// Send data to an SSE client fd with a short (1s) timeout to avoid stalling
+// the inference worker. Returns false if the send fails or times out.
+static bool sse_try_send(int fd, const void * data, size_t len) {
+    const char * p = static_cast<const char *>(data);
+    size_t sent = 0;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (sent < len) {
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) return false;
+
+        struct pollfd pfd = {fd, POLLOUT, 0};
+        int ret;
+        do {
+            ret = poll(&pfd, 1, static_cast<int>(std::min(remaining, (long)50)));
+        } while (ret < 0 && errno == EINTR);
+        if (ret < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
+        if (ret == 0) continue;
+
+        ssize_t n = ::send(fd, p + sent, len - sent, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            return false;
+        }
+        sent += n;
+    }
+    return true;
+}
+
 // Broadcast current status as SSE event to all connected /status/events clients.
 void HttpServer::broadcast_status() {
     std::string event = status_.to_sse_event();
     std::lock_guard<std::mutex> lk(sse_mu_);
     std::vector<int> dead;
     for (int fd : sse_fds_) {
-        ssize_t sent = ::send(fd, event.data(), event.size(), MSG_NOSIGNAL);
-        if (sent <= 0) {
+        if (!sse_try_send(fd, event.data(), event.size())) {
             dead.push_back(fd);
         }
     }
@@ -539,8 +568,24 @@ void HttpServer::broadcast_token(const std::string & text) {
     std::lock_guard<std::mutex> lk(sse_mu_);
     std::vector<int> dead;
     for (int fd : sse_fds_) {
-        ssize_t sent = ::send(fd, event.data(), event.size(), MSG_NOSIGNAL);
-        if (sent <= 0) {
+        if (!sse_try_send(fd, event.data(), event.size())) {
+            dead.push_back(fd);
+        }
+    }
+    for (int fd : dead) {
+        ::close(fd);
+        sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
+                       sse_fds_.end());
+    }
+}
+
+// Send an SSE comment as a heartbeat to detect disconnected clients when idle.
+void HttpServer::sse_heartbeat() {
+    static const char ping[] = ":heartbeat\n\n";
+    std::lock_guard<std::mutex> lk(sse_mu_);
+    std::vector<int> dead;
+    for (int fd : sse_fds_) {
+        if (!sse_try_send(fd, ping, sizeof(ping) - 1)) {
             dead.push_back(fd);
         }
     }
@@ -2167,7 +2212,15 @@ void HttpServer::enqueue(ServerJob * job) {
 
 ServerJob * HttpServer::dequeue() {
     std::unique_lock<std::mutex> lk(queue_mu_);
-    queue_cv_.wait(lk, [this]() { return queue_head_ != nullptr || stopping_.load(); });
+    // Use timed wait so the worker periodically wakes to send SSE heartbeats.
+    while (!queue_head_ && !stopping_.load()) {
+        if (queue_cv_.wait_for(lk, std::chrono::seconds(30)) == std::cv_status::timeout) {
+            // Send SSE heartbeat (comment line) to detect disconnected clients.
+            lk.unlock();
+            sse_heartbeat();
+            lk.lock();
+        }
+    }
     if (!queue_head_) return nullptr;
     ServerJob * j = queue_head_;
     queue_head_ = j->next;

@@ -213,6 +213,9 @@ function update(data) {
     if (curId !== lastRequestId) {
       outputText = '';
       lastRequestId = curId;
+      // Clear output and messages for the new request
+      document.getElementById('cur-output').textContent = '';
+      document.getElementById('cur-messages').innerHTML = '';
     }
 
     document.getElementById('cur-prompt-tokens').textContent = data.current.prompt_tokens;
@@ -267,9 +270,11 @@ function update(data) {
       msgEl.innerHTML = '<span style="color:#484f58">(no messages)</span>';
     }
 
-    // Output (accumulated client-side)
+    // Output — only set if empty (incremental append handles tokens)
     const outEl = document.getElementById('cur-output');
-    outEl.textContent = outputText;
+    if (outEl.textContent === '' && outputText) {
+      outEl.textContent = outputText;
+    }
     outEl.scrollTop = outEl.scrollHeight;
   } else {
     info.style.display = 'none';
@@ -311,14 +316,14 @@ function connectSSE() {
     } catch (err) {}
   });
 
-  // Incremental token events — accumulate in browser
+  // Incremental token events — append to DOM incrementally (no full re-render)
   es.addEventListener('token', function(e) {
     try {
       const data = JSON.parse(e.data);
       if (data.text) {
         outputText += data.text;
         const outEl = document.getElementById('cur-output');
-        outEl.textContent = outputText;
+        outEl.appendChild(document.createTextNode(data.text));
         outEl.scrollTop = outEl.scrollHeight;
       }
     } catch (err) {}

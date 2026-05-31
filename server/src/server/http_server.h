@@ -301,6 +301,9 @@ private:
     // Broadcast incremental token text to SSE clients.
     void broadcast_token(const std::string & text);
 
+    // Send SSE heartbeat comment to prune disconnected clients.
+    void sse_heartbeat();
+
     // Resolve and cache path to share/status.html.
     std::string status_html_path_;
     std::string resolve_status_html();
