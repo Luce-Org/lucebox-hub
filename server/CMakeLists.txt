@@ -725,6 +725,15 @@ if(DFLASH27B_TESTS)
         else()
             target_link_libraries(dflash_server PRIVATE hip::host)
         endif()
+
+        # Copy share/status.html next to the binary so it can be found at runtime.
+        file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/share")
+        add_custom_command(TARGET dflash_server POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/share/status.html"
+                "${CMAKE_CURRENT_BINARY_DIR}/share/status.html"
+            COMMENT "Copying status.html to build/share/"
+        )
     endif()
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc/backend_ipc_main.cpp")

@@ -478,7 +478,7 @@ std::string HttpServer::resolve_status_html() {
         struct stat st;
         if (::stat(path.c_str(), &st) == 0) return path;
     }
-    // 2. ../share/ relative to /proc/self/exe
+    // 2. share/ relative to /proc/self/exe (build dir or installed prefix)
     char exe_buf[1024] = {};
     ssize_t len = ::readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
     if (len > 0) {
@@ -487,9 +487,18 @@ std::string HttpServer::resolve_status_html() {
         auto slash = exe_dir.rfind('/');
         if (slash != std::string::npos) {
             exe_dir = exe_dir.substr(0, slash);
-            std::string path = exe_dir + "/../share/status.html";
-            struct stat st;
-            if (::stat(path.c_str(), &st) == 0) return path;
+            // 2a. <exe_dir>/share/status.html  (build directory layout)
+            {
+                std::string path = exe_dir + "/share/status.html";
+                struct stat st;
+                if (::stat(path.c_str(), &st) == 0) return path;
+            }
+            // 2b. <exe_dir>/../share/status.html  (installed prefix layout)
+            {
+                std::string path = exe_dir + "/../share/status.html";
+                struct stat st;
+                if (::stat(path.c_str(), &st) == 0) return path;
+            }
         }
     }
     // 3. ./share/status.html (development)
