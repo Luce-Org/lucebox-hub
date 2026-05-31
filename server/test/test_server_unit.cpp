@@ -2413,6 +2413,79 @@ static void test_usage_timings_omitted_when_null() {
     TEST_ASSERT(finish_str.find("[DONE]") != std::string::npos);
 }
 
+// ModelBackend common empty-spec retry tests
+// ═══════════════════════════════════════════════════════════════════════
+
+struct EmptySpecRetryBackend : MockBackend {
+    int generate_calls = 0;
+    int restore_calls = 0;
+    bool generate_saw_force_ar = false;
+    bool restore_saw_force_ar = false;
+
+    GenerateResult generate(const GenerateRequest & req,
+                            const DaemonIO &) override {
+        generate_calls++;
+        GenerateResult result;
+        result.ok = true;
+        if (req.force_ar_decode) {
+            generate_saw_force_ar = true;
+            result.tokens = {42};
+        } else {
+            result.spec_decode_ran = true;
+        }
+        return result;
+    }
+
+    GenerateResult restore_and_generate(int, const GenerateRequest & req,
+                                        const DaemonIO &) override {
+        restore_calls++;
+        GenerateResult result;
+        result.ok = true;
+        if (req.force_ar_decode) {
+            restore_saw_force_ar = true;
+            result.tokens = {84};
+        } else {
+            result.spec_decode_ran = true;
+        }
+        return result;
+    }
+};
+
+static void test_model_backend_retries_empty_spec_generate_once_with_ar() {
+    EmptySpecRetryBackend backend;
+    GenerateRequest req;
+    req.prompt = {1, 2, 3};
+    req.n_gen = 4;
+    DaemonIO io;
+
+    GenerateResult result = backend.generate_with_empty_spec_fallback(req, io);
+
+    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.tokens.size() == 1);
+    TEST_ASSERT(result.tokens[0] == 42);
+    TEST_ASSERT(result.spec_decode_ran);
+    TEST_ASSERT(backend.generate_calls == 2);
+    TEST_ASSERT(backend.generate_saw_force_ar);
+}
+
+static void test_model_backend_retries_empty_spec_restore_once_with_ar() {
+    EmptySpecRetryBackend backend;
+    GenerateRequest req;
+    req.prompt = {1, 2, 3};
+    req.n_gen = 4;
+    DaemonIO io;
+
+    GenerateResult result =
+        backend.restore_and_generate_with_empty_spec_fallback(7, req, io);
+
+    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.tokens.size() == 1);
+    TEST_ASSERT(result.tokens[0] == 84);
+    TEST_ASSERT(result.spec_decode_ran);
+    TEST_ASSERT(backend.restore_calls == 2);
+    TEST_ASSERT(backend.restore_saw_force_ar);
+}
+
 // GenerateResult.accept_rate plumbing tests (Day 1 of bandit MVP)
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -2640,6 +2713,10 @@ int main() {
     RUN_TEST(test_usage_timings_responses_streaming);
     RUN_TEST(test_usage_timings_zero_decode_no_div_by_zero);
     RUN_TEST(test_usage_timings_omitted_when_null);
+
+    std::fprintf(stderr, "\n── ModelBackend empty-spec retry ──\n");
+    RUN_TEST(test_model_backend_retries_empty_spec_generate_once_with_ar);
+    RUN_TEST(test_model_backend_retries_empty_spec_restore_once_with_ar);
 
     std::fprintf(stderr, "\n── GenerateResult.accept_rate ──\n");
     RUN_TEST(test_generate_result_accept_rate_defaults_to_zero);

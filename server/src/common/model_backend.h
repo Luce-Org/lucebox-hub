@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <string>
 #include <vector>
@@ -100,6 +101,10 @@ struct GenerateRequest {
     const std::vector<int32_t> * hint_tokens = nullptr;
     // Optional thinking-budget hook — see BudgetHook docs above.
     BudgetHook                 budget_hook;
+    // Common retry knob. Upper layers set this after a speculative decode
+    // path returns success but emits no tokens, so each backend can route the
+    // retry through its existing AR path without copying retry policy.
+    bool                       force_ar_decode = false;
 };
 
 struct GenerateResult {
@@ -149,6 +154,18 @@ struct ModelBackend {
     virtual GenerateResult generate(const GenerateRequest & req,
                                      const DaemonIO & io) = 0;
 
+    GenerateResult generate_with_empty_spec_fallback(const GenerateRequest & req,
+                                                     const DaemonIO & io) {
+        GenerateResult result = generate(req, io);
+        if (!should_retry_empty_spec_decode(req, result)) return result;
+
+        std::fprintf(stderr,
+            "[backend] spec-decode produced zero tokens; retrying with AR decode\n");
+        GenerateRequest retry = req;
+        retry.force_ar_decode = true;
+        return merge_empty_spec_retry_result(result, generate(retry, io));
+    }
+
     // ── Snapshots ────────────────────────────────────────────────────
     // With right-sized CPU-resident snapshots, each slot costs only
     // ~(cur_pos × 5 KB) of system RAM, so we can afford many slots.
@@ -164,6 +181,41 @@ struct ModelBackend {
     virtual GenerateResult restore_and_generate(int slot,
                                                  const GenerateRequest & req,
                                                  const DaemonIO & io) = 0;
+
+    GenerateResult restore_and_generate_with_empty_spec_fallback(
+            int slot, const GenerateRequest & req, const DaemonIO & io) {
+        GenerateResult result = restore_and_generate(slot, req, io);
+        if (!should_retry_empty_spec_decode(req, result)) return result;
+
+        std::fprintf(stderr,
+            "[backend] restored spec-decode produced zero tokens; retrying with AR decode\n");
+        GenerateRequest retry = req;
+        retry.force_ar_decode = true;
+        return merge_empty_spec_retry_result(result,
+                                             restore_and_generate(slot, retry, io));
+    }
+
+    static bool should_retry_empty_spec_decode(const GenerateRequest & req,
+                                               const GenerateResult & result) {
+        return req.n_gen > 0
+            && !req.force_ar_decode
+            && result.ok
+            && result.spec_decode_ran
+            && result.tokens.empty();
+    }
+
+    static GenerateResult merge_empty_spec_retry_result(
+            const GenerateResult & first, GenerateResult retry) {
+        retry.prefill_s += first.prefill_s;
+        retry.decode_s += first.decode_s;
+        retry.accept_rate = first.accept_rate;
+        retry.spec_decode_ran = first.spec_decode_ran || retry.spec_decode_ran;
+        retry.budget_forced_close =
+            first.budget_forced_close || retry.budget_forced_close;
+        retry.degenerate_decode_close =
+            first.degenerate_decode_close || retry.degenerate_decode_close;
+        return retry;
+    }
 
     // ── Snapshot serialization (for ondisk prefix cache) ─────────────
     // Read-only reference to a snapshot's ggml tensors for serialization.

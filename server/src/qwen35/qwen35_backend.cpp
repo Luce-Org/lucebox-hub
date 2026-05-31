@@ -577,22 +577,23 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
         // without sacrificing spec-decode throughput for the bulk of
         // generation. Most requests never hit the tail because the
         // model closes </think> naturally well before the budget edge.
-        {
-        bool _sd_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
-                             result.accept_rate, result.spec_decode_ran,
-                             req.hint_tokens, &req.budget_hook,
-                             &result.budget_forced_close,
-                             &result.degenerate_decode_close);
-        if (_sd_ok && result.tokens.empty()) {
-            // FIX: spec-decode degenerate empty (EOS as first token) on certain
-            // agentic turns -> fall back to AR decode, which is verified to produce
-            // correct non-empty output for exactly these contexts (temp-0 parity).
-            _sd_ok = do_ar_decode(committed, req.n_gen, result.tokens, out_io, req.budget_hook, &result.budget_forced_close, &result.degenerate_decode_close);
+        bool decode_ok = false;
+        if (req.force_ar_decode) {
+            decode_ok = do_ar_decode(committed, req.n_gen, result.tokens, out_io,
+                                     req.budget_hook,
+                                     &result.budget_forced_close,
+                                     &result.degenerate_decode_close);
+            out_io.emit(-1);
+        } else {
+            decode_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
+                                       result.accept_rate, result.spec_decode_ran,
+                                       req.hint_tokens, &req.budget_hook,
+                                       &result.budget_forced_close,
+                                       &result.degenerate_decode_close);
         }
-        if (!_sd_ok) {
+        if (!decode_ok) {
             result.error = "decode";
             return result;
-        }
         }
         result.decode_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_decode_start).count();
@@ -677,22 +678,23 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
         // without sacrificing spec-decode throughput for the bulk of
         // generation. Most requests never hit the tail because the
         // model closes </think> naturally well before the budget edge.
-        {
-        bool _sd_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
-                             result.accept_rate, result.spec_decode_ran,
-                             req.hint_tokens, &req.budget_hook,
-                             &result.budget_forced_close,
-                             &result.degenerate_decode_close);
-        if (_sd_ok && result.tokens.empty()) {
-            // FIX: spec-decode degenerate empty (EOS as first token) on certain
-            // agentic turns -> fall back to AR decode, which is verified to produce
-            // correct non-empty output for exactly these contexts (temp-0 parity).
-            _sd_ok = do_ar_decode(committed, req.n_gen, result.tokens, out_io, req.budget_hook, &result.budget_forced_close, &result.degenerate_decode_close);
+        bool decode_ok = false;
+        if (req.force_ar_decode) {
+            decode_ok = do_ar_decode(committed, req.n_gen, result.tokens, out_io,
+                                     req.budget_hook,
+                                     &result.budget_forced_close,
+                                     &result.degenerate_decode_close);
+            out_io.emit(-1);
+        } else {
+            decode_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
+                                       result.accept_rate, result.spec_decode_ran,
+                                       req.hint_tokens, &req.budget_hook,
+                                       &result.budget_forced_close,
+                                       &result.degenerate_decode_close);
         }
-        if (!_sd_ok) {
+        if (!decode_ok) {
             result.error = "decode";
             return result;
-        }
         }
         result.decode_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_decode_start).count();
