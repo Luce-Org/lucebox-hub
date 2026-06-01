@@ -173,6 +173,10 @@ void Qwen35LayerSplitAdapter::reset_request_state() {
     for (auto & shard : shards_) reset_target_cache(shard.cache);
 }
 
+int Qwen35LayerSplitAdapter::prefill_chunk_tokens() const {
+    return cfg_.chunk > 0 ? cfg_.chunk : 0;
+}
+
 bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
                                       int base_pos, int & last_tok) {
     if (prompt.empty()) return false;

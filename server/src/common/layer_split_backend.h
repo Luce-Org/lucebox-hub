@@ -25,6 +25,7 @@ public:
 
     virtual void begin_request(const GenerateRequest & req) { (void)req; }
     virtual void reset_request_state() = 0;
+    virtual int prefill_chunk_tokens() const { return 0; }
     virtual bool prefill(const std::vector<int32_t> & prompt,
                          int base_pos, int & last_tok) = 0;
     virtual bool decode_ar(int last_tok, int committed, int n_gen,

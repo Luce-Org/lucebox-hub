@@ -1248,6 +1248,7 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     bool dflash_called = false;
     int shutdown_calls = 0;
     ModelBackend::CompressRequest last_compress_req;
+    int prefill_chunk = 0;
 
     const char * name() const override { return "mock"; }
     bool init() override { return true; }
@@ -1257,6 +1258,7 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
         current_pos = 0;
         current_last = -1;
     }
+    int prefill_chunk_tokens() const override { return prefill_chunk; }
     bool prefill(const std::vector<int32_t> & prompt,
                  int base_pos, int & last_tok) override {
         prefill_bases.push_back(base_pos);
@@ -1372,6 +1374,28 @@ static void test_layer_split_backend_inline_snapshot_and_restore_delta() {
     TEST_ASSERT(raw->prefill_sizes[0] == 1);
     TEST_ASSERT(raw->dflash_base == 3);
     TEST_ASSERT(raw->dflash_last == 99);
+}
+
+static void test_layer_split_backend_chunks_prefill_by_adapter_limit() {
+    auto * raw = new MockLayerSplitAdapter();
+    raw->prefill_chunk = 3;
+    LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
+
+    GenerateRequest req;
+    req.prompt = {1, 2, 3, 4, 5, 6, 7, 8};
+    req.n_gen = 1;
+    DaemonIO io;
+    GenerateResult result = backend.generate(req, io);
+
+    TEST_ASSERT(result.ok);
+    TEST_ASSERT(raw->prefill_bases.size() == 3);
+    TEST_ASSERT(raw->prefill_sizes.size() == 3);
+    TEST_ASSERT(raw->prefill_bases[0] == 0);
+    TEST_ASSERT(raw->prefill_sizes[0] == 3);
+    TEST_ASSERT(raw->prefill_bases[1] == 3);
+    TEST_ASSERT(raw->prefill_sizes[1] == 3);
+    TEST_ASSERT(raw->prefill_bases[2] == 6);
+    TEST_ASSERT(raw->prefill_sizes[2] == 2);
 }
 
 static void test_layer_split_compress_nopark_uses_default_drafter_path() {
@@ -2660,6 +2684,7 @@ int main() {
     RUN_TEST(test_parse_target_device_list_single_gpu_is_not_layer_split);
     RUN_TEST(test_validate_layer_split_weights_shape);
     RUN_TEST(test_layer_split_backend_inline_snapshot_and_restore_delta);
+    RUN_TEST(test_layer_split_backend_chunks_prefill_by_adapter_limit);
     RUN_TEST(test_layer_split_compress_nopark_uses_default_drafter_path);
     RUN_TEST(test_layer_split_compress_rejects_bad_keep_ratio);
     RUN_TEST(test_layer_split_backend_shutdown_is_idempotent);

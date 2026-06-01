@@ -31,6 +31,7 @@ struct Qwen35LayerSplitAdapterConfig {
     int fa_window = 0;  // 0 = full attention. qwen3.6 full-attn layers must see the whole context; a finite window drops the system prompt/tools -> breaks tool calls.
     int kq_stride_pad = 32;
     int draft_ctx_max = 4096;
+    int chunk = 512;
     int max_verify_tokens = DFLASH27B_DRAFT_BLOCK_SIZE;
     bool run_dflash = false;
     int draft_swa_window = 0;
@@ -50,6 +51,7 @@ public:
 
     void begin_request(const GenerateRequest & req) override;
     void reset_request_state() override;
+    int prefill_chunk_tokens() const override;
     bool prefill(const std::vector<int32_t> & prompt,
                  int base_pos, int & last_tok) override;
     bool decode_ar(int last_tok, int committed, int n_gen,
