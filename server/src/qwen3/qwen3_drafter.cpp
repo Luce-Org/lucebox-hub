@@ -127,7 +127,16 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
 
 bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
                   int gpu, DrafterContext & out) {
-    return load_drafter(gguf_path, /*gpu_layers=*/999, DrafterArch::Qwen3_0p6b, gpu, out);
+    DrafterArch arch = DrafterArch::Qwen3_0p6b;
+    {
+        std::string lower = gguf_path;
+        for (auto & c : lower) c = (char)std::tolower((unsigned char)c);
+        if (lower.find("qwen3.5") != std::string::npos ||
+            lower.find("qwen35")  != std::string::npos) {
+            arch = DrafterArch::Qwen35_0p8b;
+        }
+    }
+    return load_drafter(gguf_path, /*gpu_layers=*/999, arch, gpu, out);
 }
 
 bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,

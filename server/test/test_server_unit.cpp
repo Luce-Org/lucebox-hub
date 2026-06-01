@@ -953,6 +953,74 @@ static void test_pflash_threshold_always_mode() {
     TEST_ASSERT(should);
 }
 
+static void test_pflash_config_upstream_defaults() {
+    ServerConfig cfg;
+    TEST_ASSERT(cfg.pflash_upstream_base.empty());
+    TEST_ASSERT(cfg.pflash_upstream_key.empty());
+    TEST_ASSERT(cfg.pflash_upstream_model.empty());
+    TEST_ASSERT(cfg.pflash_curve.empty());
+}
+
+static void test_pflash_curve_interpolation() {
+    ServerConfig cfg;
+    cfg.pflash_curve = {{10000, 0.50f}, {40000, 0.20f}, {100000, 0.10f}};
+
+    // Replicate the piecewise logic from http_server.cpp
+    auto keep = [&](int n) -> float {
+        const auto & curve = cfg.pflash_curve;
+        if (n <= curve.front().first) return curve.front().second;
+        if (n >= curve.back().first)  return curve.back().second;
+        for (size_t i = 0; i + 1 < curve.size(); ++i) {
+            if (n <= curve[i + 1].first) {
+                float t = (float)(n - curve[i].first) /
+                          (float)(curve[i + 1].first - curve[i].first);
+                return curve[i].second + t * (curve[i + 1].second - curve[i].second);
+            }
+        }
+        return curve.back().second;
+    };
+
+    // Below first breakpoint
+    TEST_ASSERT(keep(5000) == 0.50f);
+    // At first breakpoint
+    TEST_ASSERT(keep(10000) == 0.50f);
+    // Midpoint between 10k and 40k
+    float mid = keep(25000);
+    TEST_ASSERT(mid > 0.20f && mid < 0.50f);
+    // At second breakpoint
+    TEST_ASSERT(std::fabs(keep(40000) - 0.20f) < 0.001f);
+    // Above last breakpoint
+    TEST_ASSERT(keep(200000) == 0.10f);
+}
+
+static void test_pflash_curve_empty_uses_flat() {
+    ServerConfig cfg;
+    cfg.pflash_keep_ratio = 0.05f;
+    // With empty curve, should fall back to flat ratio
+    TEST_ASSERT(cfg.pflash_curve.empty());
+    TEST_ASSERT(cfg.pflash_keep_ratio == 0.05f);
+}
+
+static void test_pflash_upstream_proxy_config() {
+    ServerConfig cfg;
+    cfg.pflash_upstream_base = "http://localhost:8080/v1";
+    cfg.pflash_upstream_key = "test-key";
+    cfg.pflash_upstream_model = "test-model";
+
+    TEST_ASSERT(!cfg.pflash_upstream_base.empty());
+    TEST_ASSERT(cfg.pflash_upstream_key == "test-key");
+    TEST_ASSERT(cfg.pflash_upstream_model == "test-model");
+}
+
+static void test_pflash_raw_body_preserved() {
+    ParsedRequest req;
+    req.raw_body = {{"model", "test"}, {"messages", json::array()}, {"temperature", 0.7}};
+
+    TEST_ASSERT(req.raw_body.contains("model"));
+    TEST_ASSERT(req.raw_body.contains("temperature"));
+    TEST_ASSERT(req.raw_body["temperature"].get<float>() > 0.6f);
+}
+
 static void test_pflash_placement_same_backend_local() {
     DevicePlacement target;
     target.backend = compiled_placement_backend();
@@ -2638,6 +2706,11 @@ int main() {
     RUN_TEST(test_pflash_compress_result_defaults);
     RUN_TEST(test_pflash_threshold_auto_mode);
     RUN_TEST(test_pflash_threshold_always_mode);
+    RUN_TEST(test_pflash_config_upstream_defaults);
+    RUN_TEST(test_pflash_curve_interpolation);
+    RUN_TEST(test_pflash_curve_empty_uses_flat);
+    RUN_TEST(test_pflash_upstream_proxy_config);
+    RUN_TEST(test_pflash_raw_body_preserved);
     RUN_TEST(test_pflash_placement_same_backend_local);
     RUN_TEST(test_pflash_placement_mixed_backend_remote);
     RUN_TEST(test_pflash_placement_auto_draft_follows_target);

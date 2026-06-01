@@ -22,6 +22,7 @@
 
 #include "gguf.h"
 
+#include <algorithm>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -389,6 +390,30 @@ int main(int argc, char ** argv) {
             sconfig.pflash_drafter_path = argv[++i];
         } else if (std::strcmp(argv[i], "--prefill-skip-park") == 0) {
             sconfig.pflash_skip_park = true;
+        } else if (std::strcmp(argv[i], "--prefill-upstream-base") == 0 && i + 1 < argc) {
+            sconfig.pflash_upstream_base = argv[++i];
+            // Strip trailing slash
+            while (!sconfig.pflash_upstream_base.empty() && sconfig.pflash_upstream_base.back() == '/')
+                sconfig.pflash_upstream_base.pop_back();
+        } else if (std::strcmp(argv[i], "--prefill-upstream-key") == 0 && i + 1 < argc) {
+            sconfig.pflash_upstream_key = argv[++i];
+        } else if (std::strcmp(argv[i], "--prefill-upstream-model") == 0 && i + 1 < argc) {
+            sconfig.pflash_upstream_model = argv[++i];
+        } else if (std::strcmp(argv[i], "--prefill-curve") == 0 && i + 1 < argc) {
+            sconfig.pflash_curve.clear();
+            while (i + 1 < argc && argv[i + 1][0] != '-') {
+                const char * arg = argv[++i];
+                const char * colon = std::strchr(arg, ':');
+                if (!colon) {
+                    std::fprintf(stderr, "[server] --prefill-curve: bad format '%s' (expected TOKENS:RATIO)\n", arg);
+                    print_usage(argv[0]);
+                    return 1;
+                }
+                int tok = std::atoi(arg);
+                float ratio = (float)std::atof(colon + 1);
+                sconfig.pflash_curve.push_back({tok, ratio});
+            }
+            std::sort(sconfig.pflash_curve.begin(), sconfig.pflash_curve.end());
         } else if (std::strcmp(argv[i], "--lazy-draft") == 0) {
             sconfig.lazy_draft = true;
         } else if (std::strcmp(argv[i], "--chat-template-file") == 0 && i + 1 < argc) {
@@ -545,6 +570,17 @@ int main(int argc, char ** argv) {
                      sconfig.pflash_threshold, sconfig.pflash_keep_ratio,
                      sconfig.pflash_drafter_gpu,
                      (int)sconfig.pflash_skip_park);
+        if (!sconfig.pflash_curve.empty()) {
+            std::fprintf(stderr, "[server] pflash curve:");
+            for (const auto & p : sconfig.pflash_curve)
+                std::fprintf(stderr, " %d:%.3f", p.first, p.second);
+            std::fprintf(stderr, "\n");
+        }
+        if (!sconfig.pflash_upstream_base.empty()) {
+            std::fprintf(stderr, "[server] pflash upstream: %s  model=%s\n",
+                         sconfig.pflash_upstream_base.c_str(),
+                         sconfig.pflash_upstream_model.c_str());
+        }
     }
 
     // Honor DFLASH27B_DRAFT_SWA env (documented in server/README.md) when --draft-swa is absent.
