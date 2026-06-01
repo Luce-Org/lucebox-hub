@@ -12,6 +12,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <utility>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -24,8 +26,19 @@
 
 namespace dflash::common {
 
-#ifndef POLLRDHUP
-#define POLLRDHUP 0
+// Linux reports peer half-close promptly via POLLRDHUP. macOS/BSD do not
+// expose that flag, so those builds rely on HUP/ERR plus readable EOF detected
+// by the MSG_PEEK fallback in client_socket_disconnected().
+#ifdef POLLRDHUP
+static constexpr short kDisconnectPollEvents =
+    static_cast<short>(POLLIN | POLLHUP | POLLERR | POLLNVAL | POLLRDHUP);
+static constexpr short kDisconnectCloseEvents =
+    static_cast<short>(POLLHUP | POLLERR | POLLNVAL | POLLRDHUP);
+#else
+static constexpr short kDisconnectPollEvents =
+    static_cast<short>(POLLIN | POLLHUP | POLLERR | POLLNVAL);
+static constexpr short kDisconnectCloseEvents =
+    static_cast<short>(POLLHUP | POLLERR | POLLNVAL);
 #endif
 
 // ─── /props constants ───────────────────────────────────────────────────
@@ -82,13 +95,13 @@ static size_t json_array_size(const json & value) {
 }
 
 static bool client_socket_disconnected(int fd) {
-    struct pollfd pfd{fd, POLLIN | POLLHUP | POLLERR | POLLNVAL | POLLRDHUP, 0};
+    struct pollfd pfd{fd, kDisconnectPollEvents, 0};
     int pr;
     do {
         pr = poll(&pfd, 1, 0);
     } while (pr < 0 && errno == EINTR);
     if (pr <= 0) return false;
-    if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL | POLLRDHUP)) return true;
+    if (pfd.revents & kDisconnectCloseEvents) return true;
     if (!(pfd.revents & POLLIN)) return false;
 
     char byte;
@@ -100,36 +113,111 @@ static bool client_socket_disconnected(int fd) {
     return n < 0;
 }
 
-class RequestDisconnectWatcher {
+class DisconnectPoller {
 public:
-    explicit RequestDisconnectWatcher(int fd) : fd_(fd) {
+    static DisconnectPoller & instance() {
+        static DisconnectPoller poller;
+        return poller;
+    }
+
+    uint64_t watch(int fd, std::shared_ptr<std::atomic<bool>> cancelled) {
+        std::lock_guard<std::mutex> lk(mu_);
+        const uint64_t id = next_id_++;
+        watches_.push_back({id, fd, std::move(cancelled)});
+        cv_.notify_one();
+        return id;
+    }
+
+    void unwatch(uint64_t id) {
+        std::lock_guard<std::mutex> lk(mu_);
+        watches_.erase(
+            std::remove_if(watches_.begin(), watches_.end(),
+                           [&](const Watch & watch) { return watch.id == id; }),
+            watches_.end());
+    }
+
+private:
+    struct Watch {
+        uint64_t id;
+        int fd;
+        std::weak_ptr<std::atomic<bool>> cancelled;
+    };
+
+    DisconnectPoller() {
         thread_ = std::thread([this]() {
-            while (!done_.load(std::memory_order_relaxed)) {
-                if (client_socket_disconnected(fd_)) {
-                    cancelled_.store(true, std::memory_order_relaxed);
-                    return;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
+            run();
         });
     }
 
-    ~RequestDisconnectWatcher() {
-        done_.store(true, std::memory_order_relaxed);
+    ~DisconnectPoller() {
+        stopping_.store(true, std::memory_order_relaxed);
+        cv_.notify_one();
         if (thread_.joinable()) {
             thread_.join();
         }
     }
 
+    void run() {
+        while (!stopping_.load(std::memory_order_relaxed)) {
+            std::vector<std::pair<int, std::shared_ptr<std::atomic<bool>>>> active;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait_for(lk, std::chrono::milliseconds(100), [&]() {
+                    return stopping_.load(std::memory_order_relaxed) ||
+                           !watches_.empty();
+                });
+                if (stopping_.load(std::memory_order_relaxed)) return;
+
+                for (auto it = watches_.begin(); it != watches_.end(); ) {
+                    auto cancelled = it->cancelled.lock();
+                    if (!cancelled) {
+                        it = watches_.erase(it);
+                        continue;
+                    }
+                    active.push_back({it->fd, std::move(cancelled)});
+                    ++it;
+                }
+            }
+
+            for (const auto & [fd, cancelled] : active) {
+                if (!cancelled->load(std::memory_order_relaxed) &&
+                    client_socket_disconnected(fd)) {
+                    cancelled->store(true, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
+
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::vector<Watch> watches_;
+    std::thread thread_;
+    std::atomic<bool> stopping_{false};
+    uint64_t next_id_ = 1;
+};
+
+class RequestDisconnectWatcher {
+public:
+    explicit RequestDisconnectWatcher(int fd)
+        : fd_(fd)
+        , cancelled_(std::make_shared<std::atomic<bool>>(false))
+        , watch_id_(DisconnectPoller::instance().watch(fd_, cancelled_)) {
+    }
+
+    ~RequestDisconnectWatcher() {
+        if (watch_id_ != 0) {
+            DisconnectPoller::instance().unwatch(watch_id_);
+        }
+    }
+
     bool cancelled() const {
-        return cancelled_.load(std::memory_order_relaxed);
+        return cancelled_->load(std::memory_order_relaxed);
     }
 
 private:
     int fd_;
-    std::atomic<bool> cancelled_{false};
-    std::atomic<bool> done_{false};
-    std::thread thread_;
+    std::shared_ptr<std::atomic<bool>> cancelled_;
+    uint64_t watch_id_ = 0;
 };
 
 // Build the /props response body.
@@ -806,12 +894,22 @@ void HttpServer::handle_client(int fd) {
 bool HttpServer::route_request(int fd, const HttpRequest & hr) {
     if (hr.method != "POST") return false;
 
-    // Watch for disconnects from the start of request handling. Large agent
+    const bool generation_route =
+        hr.path == "/v1/chat/completions" ||
+        hr.path == "/v1/messages" ||
+        hr.path == "/v1/responses";
+
+    // Watch generation routes from the start of request handling. Large agent
     // prompts can spend meaningful time in render/tokenize before any SSE
     // write occurs, so cancellation cannot wait until generation starts.
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    RequestDisconnectWatcher disconnect_watcher(fd);
+    // count_tokens is bounded to parse/tokenize/response and avoids watcher
+    // registration on its short request path.
+    std::unique_ptr<RequestDisconnectWatcher> disconnect_watcher;
+    if (generation_route) {
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        disconnect_watcher = std::make_unique<RequestDisconnectWatcher>(fd);
+    }
 
     std::fprintf(stderr, "[server] request path=%s body_bytes=%zu\n",
                  hr.path.c_str(), hr.body.size());
@@ -819,7 +917,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
     ParsedRequest req;
     std::string err;
     auto request_cancelled = [&]() {
-        return disconnect_watcher.cancelled();
+        return disconnect_watcher && disconnect_watcher->cancelled();
     };
     auto drop_cancelled_request = [&](const char * phase) {
         std::fprintf(stderr,
@@ -1567,6 +1665,10 @@ void HttpServer::worker_loop() {
 
             const std::string & raw = tokenizer_.raw_token(token);
 
+            // Reasoning delimiters are intentionally counted as visible stream
+            // output. The cache gate below is meant to reject zero-output
+            // disconnect/empty-spec cases, not streams where the client saw a
+            // reasoning-only response.
             // Gemma4 thinking channel: map <|channel> → <think>, <channel|> → </think>\n
             if (raw == "<|channel>") {
                 visible_output_seen = true;

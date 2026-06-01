@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -31,12 +32,29 @@ using CancelCallback = std::function<bool()>;
 struct DaemonIO {
     int stream_fd = -1;
 
+    DaemonIO() = default;
+    DaemonIO(const DaemonIO & other)
+        : stream_fd(other.stream_fd)
+        , on_token(other.on_token)
+        , is_cancelled(other.is_cancelled)
+        , cancelled(other.cancelled.load(std::memory_order_relaxed)) {}
+
+    DaemonIO & operator=(const DaemonIO & other) {
+        if (this == &other) return *this;
+        stream_fd = other.stream_fd;
+        on_token = other.on_token;
+        is_cancelled = other.is_cancelled;
+        cancelled.store(other.cancelled.load(std::memory_order_relaxed),
+                        std::memory_order_relaxed);
+        return *this;
+    }
+
     // Optional token callback. When set, emit() calls this for each token
     // (excluding the -1 sentinel). If it returns false, the `cancelled`
     // flag is set and the caller should abort generation.
     TokenCallback on_token;
     CancelCallback is_cancelled;
-    mutable bool cancelled = false;
+    mutable std::atomic<bool> cancelled{false};
 
     // Observe cooperative cancellation even before a token callback fires
     // (for example while a long prefill/spec-decode step is still working).

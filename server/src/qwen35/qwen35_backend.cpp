@@ -42,7 +42,7 @@ static float bf16_bits_to_f32(uint16_t bits) {
 
 static bool qwen35_empty_visible_output(const std::vector<int32_t> & tokens,
                                         const TargetWeights & w) {
-    if (tokens.empty()) return false;
+    if (tokens.empty()) return true;
     for (int32_t tok : tokens) {
         if (!IS_EOS_TOK(tok, w)) return false;
     }
