@@ -169,6 +169,11 @@ bool run_dflash_spec_decode(
             }
         }
 
+        // Notify observer with draft tokens for this step.
+        if (io.observer) {
+            io.observer("draft", draft_tok);
+        }
+
         // ── Verify pass: speculative target forward over q_len tokens ────
         if (!target.snapshot_kv()) {
             std::fprintf(stderr, "dflash-spec snapshot_kv failed\n");
@@ -234,6 +239,12 @@ bool run_dflash_spec_decode(
         n_generated += emitted;
         n_accept_sum += std::min(accept_n, emitted);
         n_draft_steps++;
+
+        // Notify observer with accepted tokens for this step.
+        if (io.observer) {
+            io.observer("verify", replay_tok);
+        }
+
         if (io.cancelled) break;
         if (hit_eos) break;
     }

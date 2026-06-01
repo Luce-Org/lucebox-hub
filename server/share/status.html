@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DFlash Server Status</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+       background: #0d1117; color: #c9d1d9; padding: 20px; }
+h1 { color: #58a6ff; margin-bottom: 16px; font-size: 1.5em; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+        padding: 16px; margin-bottom: 16px; }
+.card h2 { color: #8b949e; font-size: 0.85em; text-transform: uppercase;
+            letter-spacing: 0.05em; margin-bottom: 8px; }
+.badge { display: inline-block; padding: 3px 10px; border-radius: 12px;
+         font-size: 0.8em; font-weight: 600; }
+.badge-idle { background: #1f6feb33; color: #58a6ff; }
+.badge-prefill { background: #f0883e33; color: #f0883e; }
+.badge-decode { background: #3fb95033; color: #3fb950; }
+.stat { display: inline-block; margin-right: 24px; margin-bottom: 8px; }
+.stat-value { font-size: 1.4em; font-weight: 700; color: #f0f6fc; }
+.stat-label { font-size: 0.75em; color: #8b949e; }
+.tag { display: inline-block; padding: 2px 8px; border-radius: 4px;
+       font-size: 0.7em; font-weight: 600; margin-right: 6px; margin-top: 4px; }
+.tag-green { background: #3fb95022; color: #3fb950; border: 1px solid #3fb95044; }
+.tag-orange { background: #f0883e22; color: #f0883e; border: 1px solid #f0883e44; }
+.tag-blue { background: #1f6feb22; color: #58a6ff; border: 1px solid #1f6feb44; }
+.tag-gray { background: #8b949e22; color: #8b949e; border: 1px solid #8b949e44; }
+.params-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+               gap: 8px; margin-top: 8px; }
+.param { background: #0d1117; border: 1px solid #30363d; border-radius: 4px;
+         padding: 6px 10px; }
+.param-label { font-size: 0.7em; color: #8b949e; text-transform: uppercase; }
+.param-value { font-size: 0.9em; color: #f0f6fc; font-weight: 500; }
+.text-box { background: #0d1117; border: 1px solid #30363d; border-radius: 4px;
+            padding: 8px 12px; font-family: monospace; font-size: 0.82em;
+            max-height: 300px; overflow-y: auto; word-break: break-word;
+            white-space: pre-wrap; color: #c9d1d9; margin-top: 8px; line-height: 1.5; }
+.text-box:empty::after { content: '(waiting...)'; color: #484f58; }
+.messages-box { background: #0d1117; border: 1px solid #30363d; border-radius: 4px;
+                padding: 8px 12px; font-family: monospace; font-size: 0.78em;
+                max-height: 200px; overflow-y: auto; word-break: break-word;
+                white-space: pre-wrap; color: #8b949e; margin-top: 8px; }
+.tokens-box { margin-top: 8px; }
+.token { display: inline-block; background: #1f6feb22; border: 1px solid #1f6feb;
+         border-radius: 4px; padding: 2px 6px; margin: 2px; font-family: monospace;
+         font-size: 0.8em; color: #79c0ff; }
+.chart-container { width: 100%; height: 180px; position: relative; }
+.chart-container svg { width: 100%; height: 100%; }
+.legend { display: flex; gap: 16px; margin-top: 8px; font-size: 0.75em; }
+.legend-item { display: flex; align-items: center; gap: 4px; }
+.legend-dot { width: 10px; height: 10px; border-radius: 50%; }
+.connection-status { float: right; font-size: 0.75em; padding: 3px 8px;
+                     border-radius: 4px; }
+.connected { background: #3fb95033; color: #3fb950; }
+.disconnected { background: #f8514933; color: #f85149; }
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<h1>&#x26A1; DFlash Server Status
+  <span class="connection-status disconnected" id="conn-status">disconnected</span>
+</h1>
+
+<div class="card">
+  <h2>Current Request</h2>
+  <div id="phase-section">
+    <span id="phase-badge" class="badge badge-idle">idle</span>
+    <span class="stat" style="margin-left:16px">
+      <span class="stat-value" id="total-req">0</span>
+      <span class="stat-label">total requests</span>
+    </span>
+  </div>
+  <div id="current-info" style="display:none; margin-top:12px;">
+    <div>
+      <span class="stat">
+        <span class="stat-value" id="cur-prompt-tokens">0</span>
+        <span class="stat-label">prompt tokens</span>
+      </span>
+      <span class="stat">
+        <span class="stat-value" id="cur-completion-tokens">0</span>
+        <span class="stat-label">completion tokens</span>
+      </span>
+      <span class="stat">
+        <span class="stat-value" id="cur-elapsed">0.0s</span>
+        <span class="stat-label">elapsed</span>
+      </span>
+      <span class="stat">
+        <span class="stat-value" id="cur-toks">-</span>
+        <span class="stat-label">tok/s (live)</span>
+      </span>
+    </div>
+    <div id="cur-tags"></div>
+    <div class="params-grid" id="cur-params"></div>
+    <div class="tokens-box" id="cur-draft-tokens"></div>
+  </div>
+</div>
+
+<div class="two-col" id="req-resp-section" style="display:none;">
+  <div class="card">
+    <h2>Request Messages</h2>
+    <div class="messages-box" id="cur-messages"></div>
+  </div>
+  <div class="card">
+    <h2>Response Output</h2>
+    <div class="text-box" id="cur-output"></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Prefill Performance</h2>
+  <div class="chart-container" id="chart-prefill"></div>
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#f0883e"></div>Prefill tok/s</div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Decode Performance</h2>
+  <div class="chart-container" id="chart-decode"></div>
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#3fb950"></div>Decode tok/s</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#58a6ff"></div>Accept Rate %</div>
+  </div>
+</div>
+
+<script>
+// Client-side state
+let outputText = '';
+let lastRequestId = null;
+
+function drawChart(containerId, datasets, yMax) {
+  const container = document.getElementById(containerId);
+  if (!datasets[0].data.length) {
+    container.innerHTML = '<div style="color:#484f58;text-align:center;padding:40px">No data yet</div>';
+    return;
+  }
+  const W = 800, H = 160, PAD = 40;
+  const n = datasets[0].data.length;
+  const maxVal = yMax || Math.max(...datasets.flatMap(d => d.data), 1);
+
+  let svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">';
+  for (let i = 0; i <= 4; i++) {
+    const y = PAD + (H - PAD * 2) * (1 - i / 4);
+    const val = (maxVal * i / 4).toFixed(0);
+    svg += '<line x1="' + PAD + '" y1="' + y + '" x2="' + (W - 10) + '" y2="' + y + '" stroke="#30363d" stroke-width="0.5"/>';
+    svg += '<text x="' + (PAD - 4) + '" y="' + (y + 4) + '" fill="#8b949e" font-size="10" text-anchor="end">' + val + '</text>';
+  }
+  for (const ds of datasets) {
+    let path = '';
+    for (let i = 0; i < n; i++) {
+      const x = PAD + (W - PAD - 10) * i / Math.max(n - 1, 1);
+      const y = PAD + (H - PAD * 2) * (1 - Math.min(ds.data[i] / maxVal, 1));
+      path += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
+    }
+    svg += '<path d="' + path + '" fill="none" stroke="' + ds.color + '" stroke-width="2"/>';
+    const dotStart = Math.max(0, n - 10);
+    for (let i = dotStart; i < n; i++) {
+      const x = PAD + (W - PAD - 10) * i / Math.max(n - 1, 1);
+      const y = PAD + (H - PAD * 2) * (1 - Math.min(ds.data[i] / maxVal, 1));
+      svg += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="3" fill="' + ds.color + '"/>';
+    }
+  }
+  svg += '</svg>';
+  container.innerHTML = svg;
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function formatMessages(messagesStr) {
+  if (!messagesStr) return '';
+  try {
+    const msgs = JSON.parse(messagesStr);
+    if (!Array.isArray(msgs)) return escapeHtml(messagesStr);
+    return msgs.map(function(m) {
+      const role = m.role || '?';
+      let content = '';
+      if (typeof m.content === 'string') content = m.content;
+      else if (Array.isArray(m.content)) {
+        content = m.content.map(function(p) {
+          if (p.type === 'text') return p.text || '';
+          return '[' + p.type + ']';
+        }).join('');
+      }
+      // Truncate long messages for display
+      if (content.length > 500) content = content.substring(0, 500) + '...';
+      return '<b style="color:#58a6ff">' + escapeHtml(role) + ':</b> ' + escapeHtml(content);
+    }).join('\n\n');
+  } catch (e) {
+    return escapeHtml(messagesStr);
+  }
+}
+
+function update(data) {
+  const badge = document.getElementById('phase-badge');
+  badge.textContent = data.phase;
+  badge.className = 'badge badge-' + data.phase;
+  document.getElementById('total-req').textContent = data.total_requests;
+
+  const info = document.getElementById('current-info');
+  const reqResp = document.getElementById('req-resp-section');
+
+  if (data.current) {
+    info.style.display = 'block';
+    reqResp.style.display = 'grid';
+
+    // Reset output accumulator on new request
+    const curId = data.current.prompt_tokens + '_' + data.total_requests;
+    if (curId !== lastRequestId) {
+      outputText = '';
+      lastRequestId = curId;
+      // Clear output and messages for the new request
+      document.getElementById('cur-output').textContent = '';
+      document.getElementById('cur-messages').innerHTML = '';
+    }
+
+    document.getElementById('cur-prompt-tokens').textContent = data.current.prompt_tokens;
+    document.getElementById('cur-completion-tokens').textContent = data.current.completion_tokens;
+    const elapsed = data.current.elapsed_s.toFixed(1);
+    document.getElementById('cur-elapsed').textContent = elapsed + 's';
+
+    // Live tok/s
+    const liveToks = data.current.elapsed_s > 0.5
+      ? (data.current.completion_tokens / data.current.elapsed_s).toFixed(1)
+      : '-';
+    document.getElementById('cur-toks').textContent = liveToks;
+
+    // Tags: cache, pflash, spec_decode, stream, thinking
+    let tags = '';
+    if (data.current.cache_hit) tags += '<span class="tag tag-green">cache hit</span>';
+    if (data.current.pflash) tags += '<span class="tag tag-orange">pflash</span>';
+    if (data.current.spec_decode) tags += '<span class="tag tag-blue">spec decode</span>';
+    if (data.current.stream) tags += '<span class="tag tag-gray">stream</span>';
+    if (data.current.thinking_enabled) tags += '<span class="tag tag-blue">thinking</span>';
+    document.getElementById('cur-tags').innerHTML = tags;
+
+    // Params grid
+    let params = '';
+    function addParam(label, value) {
+      if (value === undefined || value === null || value === '') return;
+      params += '<div class="param"><div class="param-label">' + label + '</div><div class="param-value">' + escapeHtml(String(value)) + '</div></div>';
+    }
+    addParam('Model', data.current.model);
+    addParam('Format', data.current.format);
+    addParam('Max Output', data.current.max_output);
+    addParam('Temperature', data.current.temperature);
+    addParam('Top P', data.current.top_p);
+    if (data.current.top_k > 0) addParam('Top K', data.current.top_k);
+    if (data.current.session_id) addParam('Session', data.current.session_id);
+    document.getElementById('cur-params').innerHTML = params;
+
+    // Draft tokens
+    const dtContainer = document.getElementById('cur-draft-tokens');
+    if (data.current.draft_tokens && data.current.draft_tokens.length) {
+      dtContainer.innerHTML = '<strong style="color:#8b949e;font-size:0.8em">Draft tokens: </strong>' +
+        data.current.draft_tokens.map(function(t) { return '<span class="token">' + escapeHtml(t) + '</span>'; }).join('');
+    } else {
+      dtContainer.innerHTML = '';
+    }
+
+    // Messages
+    const msgEl = document.getElementById('cur-messages');
+    if (data.current.messages) {
+      msgEl.innerHTML = formatMessages(data.current.messages);
+    } else {
+      msgEl.innerHTML = '<span style="color:#484f58">(no messages)</span>';
+    }
+
+    // Output — only set if empty (incremental append handles tokens)
+    const outEl = document.getElementById('cur-output');
+    if (outEl.textContent === '' && outputText) {
+      outEl.textContent = outputText;
+    }
+    outEl.scrollTop = outEl.scrollHeight;
+  } else {
+    info.style.display = 'none';
+    reqResp.style.display = 'none';
+    outputText = '';
+    lastRequestId = null;
+  }
+
+  // Charts
+  const hist = data.perf_history || [];
+  const prefillData = hist.map(function(h) { return h.prefill_tok_s; });
+  const decodeData = hist.map(function(h) { return h.decode_tok_s; });
+  const acceptData = hist.map(function(h) { return h.accept_rate * 100; });
+
+  const prefillMax = Math.max.apply(null, prefillData.concat([100]));
+  drawChart('chart-prefill', [{data: prefillData, color: '#f0883e'}], prefillMax * 1.1);
+
+  const decodeMax = Math.max.apply(null, decodeData.concat(acceptData).concat([10]));
+  drawChart('chart-decode', [
+    {data: decodeData, color: '#3fb950'},
+    {data: acceptData, color: '#58a6ff'}
+  ], decodeMax * 1.1);
+}
+
+// SSE connection
+function connectSSE() {
+  const connEl = document.getElementById('conn-status');
+  const es = new EventSource('/status/events');
+
+  es.onopen = function() {
+    connEl.textContent = 'connected';
+    connEl.className = 'connection-status connected';
+  };
+
+  es.addEventListener('status', function(e) {
+    try {
+      const data = JSON.parse(e.data);
+      update(data);
+    } catch (err) {}
+  });
+
+  // Incremental token events — append to DOM incrementally (no full re-render)
+  es.addEventListener('token', function(e) {
+    try {
+      const data = JSON.parse(e.data);
+      if (data.text) {
+        outputText += data.text;
+        const outEl = document.getElementById('cur-output');
+        outEl.appendChild(document.createTextNode(data.text));
+        outEl.scrollTop = outEl.scrollHeight;
+      }
+    } catch (err) {}
+  });
+
+  es.onerror = function() {
+    connEl.textContent = 'disconnected';
+    connEl.className = 'connection-status disconnected';
+    es.close();
+    setTimeout(connectSSE, 2000);
+  };
+}
+
+connectSSE();
+</script>
+</body>
+</html>
