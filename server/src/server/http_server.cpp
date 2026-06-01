@@ -580,12 +580,16 @@ void HttpServer::broadcast_token(const std::string & text) {
 }
 
 // Send an SSE comment as a heartbeat to detect disconnected clients when idle.
+// Uses non-blocking sends to avoid stalling the worker thread on slow clients.
 void HttpServer::sse_heartbeat() {
     static const char ping[] = ":heartbeat\n\n";
     std::lock_guard<std::mutex> lk(sse_mu_);
     std::vector<int> dead;
     for (int fd : sse_fds_) {
-        if (!sse_try_send(fd, ping, sizeof(ping) - 1)) {
+        // Non-blocking send: if the socket buffer can't accept 12 bytes
+        // immediately, the client is too far behind — treat as dead.
+        ssize_t n = ::send(fd, ping, sizeof(ping) - 1, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n <= 0) {
             dead.push_back(fd);
         }
     }
