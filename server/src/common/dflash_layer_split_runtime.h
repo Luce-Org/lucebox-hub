@@ -19,7 +19,7 @@ namespace dflash::common {
 
 struct LayerSplitRuntimeConfig {
     int kq_stride_pad  = 32;    // KQ_MASK_PAD default; 256 when TBQ KV active
-    int fa_window      = 2048;  // flash-attn sliding window
+    int fa_window      = 0;  // 0 = full attention. qwen3.6 full-attn layers must see the whole context; a finite window drops the system prompt/tools -> breaks tool calls.
     int draft_ctx_max  = 4096;  // draft context cap
     int draft_swa_window = 0;   // draft SWA window (0 = disabled)
 };

@@ -162,6 +162,9 @@ static void print_usage(const char * prog) {
         "  --draft-ipc-bin <path>         Remote backend IPC daemon for mixed backends\n"
         "  --draft-ipc-work-dir <path>    Remote draft IPC scratch directory\n"
         "  --draft-ipc-ring-cap <N>       Remote draft feature ring capacity\n"
+        "  --draft-swa <N>                Draft sliding-window attention size (0=off; e.g.\n"
+        "                                 2048 for unsloth Qwen3.6 targets, per server/README.md.\n"
+        "                                 Env: DFLASH27B_DRAFT_SWA)\n"
         "  --target-devices <list>        Reserved layer-split devices, e.g. cuda:0,cuda:1\n"
         "  --target-layer-split <weights>  Reserved layer-split weights\n"
         "  --peer-access        Enable peer access for multi-GPU placement\n"
@@ -292,6 +295,8 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "[server] bad --target-device value (expected backend:gpu)\n");
                 return 2;
             }
+        } else if (std::strcmp(argv[i], "--draft-swa") == 0 && i + 1 < argc) {
+            bargs.draft_swa_window = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--draft-device") == 0 && i + 1 < argc) {
             if (!parse_placement_device(argv[++i], bargs.draft_device)) {
                 std::fprintf(stderr, "[server] bad --draft-device value (expected backend:gpu)\n");
@@ -554,6 +559,13 @@ int main(int argc, char ** argv) {
                     sconfig.pflash_router.threshold_tokens,
                     sconfig.pflash_router.agentic_keep_target);
             }
+        }
+    }
+
+    // Honor DFLASH27B_DRAFT_SWA env (documented in server/README.md) when --draft-swa is absent.
+    if (bargs.draft_swa_window == 0) {
+        if (const char * e = std::getenv("DFLASH27B_DRAFT_SWA")) {
+            bargs.draft_swa_window = std::atoi(e);
         }
     }
 

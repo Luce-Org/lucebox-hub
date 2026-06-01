@@ -4,15 +4,39 @@ set -euo pipefail
 # Source this file from a client harness launcher on the RTX 3090 host.
 # Assumes the repo and client package cache already exist on that machine.
 
-REPO_DIR="${REPO_DIR:-/workspace/lucebox-hub-harness}"
-CLIENT_WORK_DIR="${CLIENT_WORK_DIR:-/workspace/lucebox-harness-work}"
-RUN_DIR="${RUN_DIR:-/workspace/lucebox-client-harness-runs}"
+SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+DEFAULT_REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_DIR="${REPO_DIR:-$DEFAULT_REPO_DIR}"
+CLIENT_WORK_DIR="${CLIENT_WORK_DIR:-$REPO_DIR/.harness-work}"
+RUN_DIR="${RUN_DIR:-$CLIENT_WORK_DIR/runs}"
+AUTO_INSTALL_CLIENTS="${AUTO_INSTALL_CLIENTS:-1}"
 
-TARGET="${TARGET:-$REPO_DIR/server/models/Qwen3.6-27B-Q4_K_M.gguf}"
-DRAFT="${DRAFT:-$REPO_DIR/server/models/draft/dflash-draft-3.6-q8_0.gguf}"
+DEFAULT_TARGET="$REPO_DIR/server/models/Qwen3.6-27B-Q4_K_M.gguf"
+DEFAULT_DRAFT="$REPO_DIR/server/models/draft/dflash-draft-3.6-q4_k_m.gguf"
+TARGET_WAS_EXPLICIT=0
+if [[ -n "${TARGET+x}" ]]; then
+  TARGET_WAS_EXPLICIT=1
+elif [[ -n "${DFLASH_TARGET+x}" ]]; then
+  TARGET="$DFLASH_TARGET"
+  TARGET_WAS_EXPLICIT=1
+else
+  TARGET="$DEFAULT_TARGET"
+fi
+if [[ -n "${DRAFT+x}" ]]; then
+  :
+elif [[ -n "${DFLASH_DRAFT+x}" ]]; then
+  DRAFT="$DFLASH_DRAFT"
+elif [[ "$TARGET_WAS_EXPLICIT" == "1" ]]; then
+  # A custom target may be Gemma/Laguna/Qwen3 or another model without a
+  # matching DFlash draft. Avoid attaching the default Qwen draft silently.
+  DRAFT=""
+else
+  DRAFT="$DEFAULT_DRAFT"
+fi
 MODEL_SERVER="${MODEL_SERVER:-lucebox}"
 DFLASH_SERVER_BIN="${DFLASH_SERVER_BIN:-$REPO_DIR/server/build/dflash_server}"
-LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/workspace/llama-cpp-server-build/bin/llama-server}"
+LLAMA_BUILD_DIR="${LLAMA_BUILD_DIR:-$CLIENT_WORK_DIR/llama-cpp-server-build}"
+LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-$LLAMA_BUILD_DIR/bin/llama-server}"
 LLAMA_N_GPU_LAYERS="${LLAMA_N_GPU_LAYERS:-999}"
 LLAMA_FLASH_ATTN="${LLAMA_FLASH_ATTN:-1}"
 LLAMA_PARALLEL="${LLAMA_PARALLEL:-1}"
@@ -52,6 +76,37 @@ SERVER_LOG="$LOG_DIR/server.log"
 
 mkdir -p "$LOG_DIR"
 
+require_client_binary() {
+  local label="$1"
+  local path="$2"
+  local client="$3"
+  local env_var="$4"
+  if [[ -x "$path" ]]; then
+    return 0
+  fi
+  if [[ "$AUTO_INSTALL_CLIENTS" == "1" ]]; then
+    echo "$label binary not found; installing client package into $CLIENT_WORK_DIR" >&2
+    if ! python3 "$REPO_DIR/harness/client_test_runner.py" \
+      --work-dir "$CLIENT_WORK_DIR" \
+      install \
+      --clients "$client" >&2; then
+      echo "$label auto-install failed." >&2
+    fi
+    if [[ -x "$path" ]]; then
+      return 0
+    fi
+  fi
+  echo "$label binary not found or not executable: $path" >&2
+  echo "Install it with:" >&2
+  echo "  python3 $REPO_DIR/harness/client_test_runner.py --work-dir $CLIENT_WORK_DIR install --clients $client" >&2
+  echo "or set $env_var=/path/to/$(basename "$path")." >&2
+  return 1
+}
+
+draft_enabled() {
+  [[ -n "${DRAFT:-}" && "$DRAFT" != "none" && "$DRAFT" != "off" && "$DRAFT" != "0" ]]
+}
+
 start_lucebox_server() {
   if [[ "$MODEL_SERVER" == "llamacpp" ]]; then
     start_llamacpp_server
@@ -72,6 +127,22 @@ start_dflash_native_server() {
     echo "  cmake --build $REPO_DIR/server/build --target dflash_server -j\$(nproc)" >&2
     return 1
   fi
+  if [[ ! -f "$TARGET" ]]; then
+    echo "target GGUF not found: $TARGET" >&2
+    echo "Set TARGET=/path/to/model.gguf or DFLASH_TARGET=/path/to/model.gguf, or download the default:" >&2
+    echo "  hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir $REPO_DIR/server/models/" >&2
+    return 1
+  fi
+  if draft_enabled && [[ ! -f "$DRAFT" ]]; then
+    echo "DFlash draft not found: $DRAFT" >&2
+    echo "Set DRAFT=/path/to/dflash-draft.gguf or DFLASH_DRAFT=/path/to/dflash-draft.gguf, or download the default:" >&2
+    echo "  hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf --local-dir $REPO_DIR/server/models/draft/" >&2
+    return 1
+  fi
+  local draft_args=()
+  if draft_enabled; then
+    draft_args=(--draft "$DRAFT")
+  fi
   local extra_args=()
   if [[ -n "$EXTRA_SERVER_ARGS" ]]; then
     read -r -a extra_args <<< "$EXTRA_SERVER_ARGS"
@@ -88,7 +159,7 @@ start_dflash_native_server() {
   export DFLASH27B_KV_K="$CACHE_TYPE_K"
   export DFLASH27B_KV_V="$CACHE_TYPE_V"
   "$DFLASH_SERVER_BIN" "$TARGET" \
-    --draft "$DRAFT" \
+    "${draft_args[@]}" \
     --host "$HOST" \
     --port "$PORT" \
     --max-ctx "$MAX_CTX" \
@@ -105,8 +176,14 @@ start_llamacpp_server() {
   if [[ ! -x "$LLAMA_SERVER_BIN" ]]; then
     echo "llama-server not found or not executable: $LLAMA_SERVER_BIN" >&2
     echo "Build it first, for example:" >&2
-    echo "  cmake -S $REPO_DIR/server/deps/llama.cpp -B /workspace/llama-cpp-server-build -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF" >&2
-    echo "  cmake --build /workspace/llama-cpp-server-build --target llama-server -j2" >&2
+    echo "  cmake -S $REPO_DIR/server/deps/llama.cpp -B $LLAMA_BUILD_DIR -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF" >&2
+    echo "  cmake --build $LLAMA_BUILD_DIR --target llama-server -j2" >&2
+    return 1
+  fi
+  if [[ ! -f "$TARGET" ]]; then
+    echo "target GGUF not found: $TARGET" >&2
+    echo "Set TARGET=/path/to/model.gguf or DFLASH_TARGET=/path/to/model.gguf, or download the default:" >&2
+    echo "  hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir $REPO_DIR/server/models/" >&2
     return 1
   fi
   local extra_args=()

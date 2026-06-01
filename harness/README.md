@@ -26,12 +26,18 @@ Each script starts Lucebox, runs one real client, saves logs, then stops the
 server.
 
 ```bash
-cd /workspace/lucebox-hub-harness
+cd lucebox-hub
 
 harness/clients/run_codex.sh
 harness/clients/run_claude_code.sh
 harness/clients/run_opencode.sh
 ```
+
+The launchers default to the current repo, install/use client packages under
+`.harness-work/`, and write logs under `.harness-work/runs/`. Override
+`REPO_DIR`, `CLIENT_WORK_DIR`, or `RUN_DIR` if you want shared paths.
+If a client CLI is missing, the launcher installs it automatically. Set
+`AUTO_INSTALL_CLIENTS=0` to require a preinstalled binary instead.
 
 Common overrides:
 
@@ -53,7 +59,7 @@ paths and profile:
 ```bash
 DFLASH_SERVER_BIN=server/build/dflash_server \
 TARGET=server/models/Qwen3.6-27B-Q4_K_M.gguf \
-DRAFT=server/models/draft/dflash-draft-3.6-q8_0.gguf \
+DRAFT=server/models/draft/dflash-draft-3.6-q4_k_m.gguf \
 MODEL_ID=luce-dflash \
 MAX_CTX=32768 MAX_TOKENS=512 \
 BUDGET=22 VERIFY_MODE=ddtree FA_WINDOW=2048 \
@@ -64,7 +70,7 @@ To test an already-running native server:
 
 ```bash
 server/build/dflash_server server/models/Qwen3.6-27B-Q4_K_M.gguf \
-  --draft server/models/draft/dflash-draft-3.6-q8_0.gguf \
+  --draft server/models/draft/dflash-draft-3.6-q4_k_m.gguf \
   --host 127.0.0.1 --port 18080 \
   --max-ctx 32768 --max-tokens 512 \
   --fa-window 2048 \
@@ -93,6 +99,12 @@ python3 harness/client_test_runner.py probe \
 
 Add `--install-packages` when you also want the runner to install/smoke the
 client packages. Without it, the HTTP protocol probes still run.
+
+To preinstall real-client CLIs yourself:
+
+```bash
+python3 harness/client_test_runner.py install --clients codex,hermes,openwebui
+```
 
 For a GPU sweep, let the runner start Lucebox for each profile:
 

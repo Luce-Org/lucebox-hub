@@ -123,13 +123,35 @@ All launchers spawn the native C++ HTTP server (`dflash_server`). Override defau
 
 ```bash
 DFLASH_SERVER_BIN=server/build/dflash_server \
+DFLASH_TARGET=server/models/Qwen3.6-27B-Q4_K_M.gguf \
+DFLASH_DRAFT=server/models/draft/dflash-draft-3.6-q4_k_m.gguf \
 MAX_CTX=32768 BUDGET=22 VERIFY_MODE=ddtree \
 harness/clients/run_codex.sh
 ```
 
+For no-draft targets such as Gemma, set only `DFLASH_TARGET` or pass
+`DRAFT=none`; the harness will not attach the default Qwen draft to a custom
+target.
+
+Launcher scripts install missing real-client CLIs automatically under
+`.harness-work/`. To preinstall them yourself:
+
+```bash
+python3 harness/client_test_runner.py install --clients codex,hermes,openwebui
+```
+
+For direct TPS/TTFT numbers against a running server:
+
+```bash
+python3 harness/client_test_runner.py bench \
+  --url http://127.0.0.1:8000 \
+  --suite he,agent \
+  --n-sample 3
+```
+
 ## Run the Server
 
-Default: Qwen 3.6-27B Q4_K_M target + Lucebox Q8_0 DFlash drafter on RTX 3090. DDTree budget=22, TQ3_0 KV cache, sliding FA window 2048. OpenAI-compatible HTTP on `:8000`.
+Default: Qwen 3.6-27B Q4_K_M target + Lucebox Q4_K_M DFlash drafter on RTX 3090. DDTree budget=22, TQ3_0 KV cache, sliding FA window 2048. OpenAI-compatible HTTP on `:8000`.
 
 ```bash
 # build (CUDA 12+, CMake 3.18+)
@@ -139,12 +161,12 @@ cmake --build server/build --target dflash_server -j
 
 # default weights (~18 GB)
 hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir server/models/
-hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q8_0.gguf --local-dir server/models/draft/
+hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf --local-dir server/models/draft/
 
 # run (TQ3_0 KV auto-enabled; set =0 to disable)
 DFLASH27B_KV_TQ3=1 \
 ./server/build/dflash_server server/models/Qwen3.6-27B-Q4_K_M.gguf \
-  --draft server/models/draft/dflash-draft-3.6-q8_0.gguf \
+  --draft server/models/draft/dflash-draft-3.6-q4_k_m.gguf \
   --ddtree --ddtree-budget 22 --fa-window 2048 --port 8000
 ```
 
@@ -206,15 +228,19 @@ DFLASH27B_KV_TQ3=1 \
 
 **Multi-GPU / IPC**
 
-| Flag | Default | Effect |
+| Flag / env | Default | Effect |
 |---|---|---|
 | `--target-device <dev>` | `cuda:0` | Target backend (e.g. `cuda:0`, `hip:0`) |
 | `--draft-device <dev>` | same as target | Draft backend; mixed backend needs `--draft-ipc-bin` |
+| `--target-gpu N` | `0` | Target GPU index |
+| `--draft-gpu N` | same as target | Draft GPU index; offload draft to a second GPU |
 | `--target-devices <list>` / `--target-layer-split` | single GPU | Layer-split target across GPUs |
 | `--draft-ipc-bin <path>` | — | Out-of-process draft binary (mixed CUDA/HIP) |
 | `--peer-access` | off | Enable P2P between target GPUs |
 | `--chunk N` | backend default | Prefill ubatch size |
 | `--no-cors` | CORS on | Disable CORS headers |
+| `DFLASH_TARGET_GPU=N` | `0` | Env var equivalent of `--target-gpu` |
+| `DFLASH_DRAFT_GPU=N` | same as target | Env var equivalent of `--draft-gpu` |
 
 [DFlash benchmarks →](server/RESULTS.md) · [DFlash blog →](https://lucebox.com/blog/dflash27b) · [PFlash benchmarks →](optimizations/pflash/README.md) · [PFlash blog →](https://lucebox.com/blog/pflash) · [Per-machine quick starts (DGX Spark, Jetson Thor, HIP) →](server/README.md#quick-start)
 
@@ -244,11 +270,11 @@ uv run --directory megakernel python final_bench.py
 
 ## Why this exists
 
-Local AI should be a default, not a privilege: private data, no per-token bill, no vendor lock-in. The hardware to run capable models already sits on desks. The software to extract real throughput from those chips doesn't.
+Local AI should be the default, not a privilege. Private data, no per-token bill, no vendor lock-in. The hardware to run capable models already sits on desks. The software to get real throughput out of it does not.
 
-General-purpose frameworks dominated the last decade because hand-tuning kernels per chip was too expensive to justify. One stack, decent on everything, great on nothing. Speculative decoding, speculative prefill, fused megakernels are the methods that turn idle silicon into 3-10× speedups, but they stay locked to BF16 weights on data-center GPUs.
+Nothing was built for local AI inference. Most machines bolt a stock GPU onto a desktop CPU and run a stock runtime, never tuning the kernels to the silicon underneath. On the same 27B model, a DGX Spark or Mac Studio leaves four to six times the real throughput on the table. General-purpose frameworks won the last decade because hand-tuning per chip cost more than it returned: one stack, decent on everything, great on nothing. Speculative decoding, speculative prefill, and fused megakernels turn idle silicon into 3-10× speedups, but they stay locked to BF16 weights on data-center GPUs. Consumer cards inherit the leftovers.
 
-AI-assisted development flips that calculus. Rewrites that took a quarter now fit in a release cycle. Lucebox ports those speculative methods down to quantized GGUF on consumer cards, one chip and one model family at a time. Apache 2.0 source, full writeup, reproducible benchmarks.
+**See the benchmarks and the machine at [lucebox.com](https://lucebox.com).**
 
 <p align="center">
   <a href="https://lucebox.com"><img src="assets/lucebox.png" alt="Lucebox local AI PC" width="85%" /></a>

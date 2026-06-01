@@ -28,7 +28,7 @@ struct Qwen35LayerSplitAdapterConfig {
     int draft_gpu = 0;
     RemoteDraftConfig remote_draft;
 
-    int fa_window = 2048;
+    int fa_window = 0;  // 0 = full attention. qwen3.6 full-attn layers must see the whole context; a finite window drops the system prompt/tools -> breaks tool calls.
     int kq_stride_pad = 32;
     int draft_ctx_max = 4096;
     int max_verify_tokens = DFLASH27B_DRAFT_BLOCK_SIZE;

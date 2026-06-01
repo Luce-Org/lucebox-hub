@@ -43,7 +43,7 @@ struct Qwen35Config {
     int          stream_fd   = -1;
 
     // FA/KV
-    int          fa_window       = 2048;
+    int          fa_window       = 0;  // 0 = full attention. qwen3.6 full-attn layers must see the whole context; a finite window drops the system prompt/tools -> breaks tool calls.
     int          kq_stride_pad   = 32;   // KQ_MASK_PAD or 256 for TBQ
 
     // Draft

@@ -1932,6 +1932,45 @@ static void test_backend_ipc_rejects_file_work_dir() {
     unlink(file_path.c_str());
 }
 
+static void test_backend_ipc_payload_pipe_round_trip() {
+    int payload_pipe[2] = {-1, -1};
+    int status_pipe[2] = {-1, -1};
+    TEST_ASSERT(pipe(payload_pipe) == 0);
+    TEST_ASSERT(pipe(status_pipe) == 0);
+    if (payload_pipe[0] < 0 || payload_pipe[1] < 0 ||
+        status_pipe[0] < 0 || status_pipe[1] < 0) {
+        if (payload_pipe[0] >= 0) close(payload_pipe[0]);
+        if (payload_pipe[1] >= 0) close(payload_pipe[1]);
+        if (status_pipe[0] >= 0) close(status_pipe[0]);
+        if (status_pipe[1] >= 0) close(status_pipe[1]);
+        return;
+    }
+
+    const std::vector<float> payload = {1.0f, 2.5f, -3.0f, 4.25f};
+    TEST_ASSERT(write_exact_fd(payload_pipe[1],
+                               payload.data(),
+                               payload.size() * sizeof(float)));
+    close(payload_pipe[1]);
+    payload_pipe[1] = -1;
+
+    std::vector<float> received(payload.size(), 0.0f);
+    TEST_ASSERT(read_exact_fd(payload_pipe[0],
+                              received.data(),
+                              received.size() * sizeof(float)));
+    close(payload_pipe[0]);
+    payload_pipe[0] = -1;
+    TEST_ASSERT(received == payload);
+
+    const int32_t ready = 0;
+    TEST_ASSERT(write_exact_fd(status_pipe[1], &ready, sizeof(ready)));
+    close(status_pipe[1]);
+    status_pipe[1] = -1;
+    int32_t status = -1;
+    TEST_ASSERT(read_exact_fd(status_pipe[0], &status, sizeof(status)));
+    TEST_ASSERT(status == 0);
+    close(status_pipe[0]);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Sampler tests (model-independent, CPU-only)
 // ═══════════════════════════════════════════════════════════════════════
@@ -2529,6 +2568,79 @@ static void test_usage_timings_omitted_when_null() {
     TEST_ASSERT(finish_str.find("[DONE]") != std::string::npos);
 }
 
+// ModelBackend common empty-spec retry tests
+// ═══════════════════════════════════════════════════════════════════════
+
+struct EmptySpecRetryBackend : MockBackend {
+    int generate_calls = 0;
+    int restore_calls = 0;
+    bool generate_saw_force_ar = false;
+    bool restore_saw_force_ar = false;
+
+    GenerateResult generate(const GenerateRequest & req,
+                            const DaemonIO &) override {
+        generate_calls++;
+        GenerateResult result;
+        result.ok = true;
+        if (req.force_ar_decode) {
+            generate_saw_force_ar = true;
+            result.tokens = {42};
+        } else {
+            result.spec_decode_ran = true;
+        }
+        return result;
+    }
+
+    GenerateResult restore_and_generate(int, const GenerateRequest & req,
+                                        const DaemonIO &) override {
+        restore_calls++;
+        GenerateResult result;
+        result.ok = true;
+        if (req.force_ar_decode) {
+            restore_saw_force_ar = true;
+            result.tokens = {84};
+        } else {
+            result.spec_decode_ran = true;
+        }
+        return result;
+    }
+};
+
+static void test_model_backend_retries_empty_spec_generate_once_with_ar() {
+    EmptySpecRetryBackend backend;
+    GenerateRequest req;
+    req.prompt = {1, 2, 3};
+    req.n_gen = 4;
+    DaemonIO io;
+
+    GenerateResult result = backend.generate_with_empty_spec_fallback(req, io);
+
+    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.tokens.size() == 1);
+    TEST_ASSERT(result.tokens[0] == 42);
+    TEST_ASSERT(result.spec_decode_ran);
+    TEST_ASSERT(backend.generate_calls == 2);
+    TEST_ASSERT(backend.generate_saw_force_ar);
+}
+
+static void test_model_backend_retries_empty_spec_restore_once_with_ar() {
+    EmptySpecRetryBackend backend;
+    GenerateRequest req;
+    req.prompt = {1, 2, 3};
+    req.n_gen = 4;
+    DaemonIO io;
+
+    GenerateResult result =
+        backend.restore_and_generate_with_empty_spec_fallback(7, req, io);
+
+    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.tokens.size() == 1);
+    TEST_ASSERT(result.tokens[0] == 84);
+    TEST_ASSERT(result.spec_decode_ran);
+    TEST_ASSERT(backend.restore_calls == 2);
+    TEST_ASSERT(backend.restore_saw_force_ar);
+}
+
 // GenerateResult.accept_rate plumbing tests (Day 1 of bandit MVP)
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -2790,6 +2902,7 @@ int main() {
     RUN_TEST(test_disk_cache_lookup_miss_no_layout);
     RUN_TEST(test_disk_cache_save_below_min_tokens);
     RUN_TEST(test_backend_ipc_rejects_file_work_dir);
+    RUN_TEST(test_backend_ipc_payload_pipe_round_trip);
 
     std::fprintf(stderr, "\n── Sampler ──\n");
     RUN_TEST(test_sampler_cfg_defaults);
@@ -2823,6 +2936,10 @@ int main() {
     RUN_TEST(test_usage_timings_responses_streaming);
     RUN_TEST(test_usage_timings_zero_decode_no_div_by_zero);
     RUN_TEST(test_usage_timings_omitted_when_null);
+
+    std::fprintf(stderr, "\n── ModelBackend empty-spec retry ──\n");
+    RUN_TEST(test_model_backend_retries_empty_spec_generate_once_with_ar);
+    RUN_TEST(test_model_backend_retries_empty_spec_restore_once_with_ar);
 
     std::fprintf(stderr, "\n── GenerateResult.accept_rate ──\n");
     RUN_TEST(test_generate_result_accept_rate_defaults_to_zero);

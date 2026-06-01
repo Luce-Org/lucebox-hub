@@ -657,12 +657,14 @@ GenerateResult Gemma4Backend::generate(const GenerateRequest & req,
     auto t_decode_start = std::chrono::steady_clock::now();
     if (req.n_gen > 0) {
         // Try speculative decode if draft is available and temp==0
-        const bool can_spec = dflash_target_
+        const bool can_spec = !req.force_ar_decode
+            && dflash_target_
             && !draft_parked_
             && feature_mirror_.target_feat
             && !sampler_.needs_logit_processing();
 
         if (can_spec) {
+            result.spec_decode_ran = true;
             if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
                                 &req.budget_hook,
                                 &result.budget_forced_close)) {
@@ -835,12 +837,14 @@ GenerateResult Gemma4Backend::restore_and_generate(int slot,
     // Generate
     auto t_decode_start = std::chrono::steady_clock::now();
     if (req.n_gen > 0) {
-        const bool can_spec = dflash_target_
+        const bool can_spec = !req.force_ar_decode
+            && dflash_target_
             && !draft_parked_
             && feature_mirror_.target_feat
             && sampler_.temp == 0.0f;
 
         if (can_spec) {
+            result.spec_decode_ran = true;
             if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
                                 &req.budget_hook,
                                 &result.budget_forced_close)) {

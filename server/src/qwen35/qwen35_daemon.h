@@ -19,7 +19,7 @@ struct Qwen35DaemonArgs {
     int          chunk          = 512;
 
     // FA/KV
-    int          fa_window      = 2048;
+    int          fa_window      = 0;  // 0 = full attention. qwen3.6 full-attn layers must see the whole context; a finite window drops the system prompt/tools -> breaks tool calls.
     int          kq_stride_pad  = 32;
 
     // Draft

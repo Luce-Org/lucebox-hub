@@ -822,13 +822,15 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
         auto t_decode_start = std::chrono::steady_clock::now();
 
         // Check if hybrid spec-decode is available
-        const bool can_hybrid_spec = cfg_.draft_path
+        const bool can_hybrid_spec = !req.force_ar_decode
+            && cfg_.draft_path
             && !is_draft_parked()
             && feature_mirror().target_feat
             && sampler_config().temp == 0.0f
             && draft_weights().block_size > 0;
 
         if (can_hybrid_spec) {
+            result.spec_decode_ran = true;
             // Sync prefill features to mirror before spec-decode
             if (target_cache().target_feat) {
                 draft_feature_mirror_sync_range(target_cache().target_feat,
