@@ -316,6 +316,172 @@ static void test_parse_tool_allowed_filter() {
     TEST_ASSERT(result.tool_calls.empty());
 }
 
+// ─── Pattern 5: call:<verb>{relaxed-JSON args} (gemma plain-text) ─────
+
+static void test_parse_call_verb_single() {
+    std::string text = "call:get_country_info{country: \"France\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "get_country_info");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["country"] == "France");
+    }
+    TEST_ASSERT(result.cleaned_text.find("call:") == std::string::npos);
+}
+
+static void test_parse_call_verb_back_to_back() {
+    std::string text =
+        "call:get_country_info{country: \"France\"}"
+        "call:summarize{text: \"ok\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 2);
+    if (result.tool_calls.size() == 2) {
+        TEST_ASSERT(result.tool_calls[0].name == "get_country_info");
+        TEST_ASSERT(result.tool_calls[1].name == "summarize");
+    }
+}
+
+static void test_parse_call_verb_namespaced() {
+    std::string text = "call:execute-bead:read-file{path: \"crates/foo/src/lib.rs\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        // Verb only — namespace stripped.
+        TEST_ASSERT(result.tool_calls[0].name == "read-file");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "crates/foo/src/lib.rs");
+    }
+}
+
+static void test_parse_call_verb_snake_and_hyphen() {
+    std::string text =
+        "call:execute-bead:list-files{path: \"src/\"}\n\n"
+        "call:execute-bead:read_file{path: \"a/b.rs\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 2);
+    if (result.tool_calls.size() == 2) {
+        TEST_ASSERT(result.tool_calls[0].name == "list-files");
+        TEST_ASSERT(result.tool_calls[1].name == "read_file");
+    }
+}
+
+static void test_parse_call_verb_tool_allowed_filter() {
+    std::string text = "call:disallowed_verb{x: 1}call:allowed_verb{y: 2}";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {{"name", "allowed_verb"}}}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "allowed_verb");
+    }
+}
+
+static void test_parse_call_verb_inline_prose_rejected() {
+    // No sentinel char before `call:` — must NOT match.
+    std::string text = "narrative.call:foo{x:1}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.empty());
+}
+
+static void test_parse_call_verb_inline_prose_after_space() {
+    // Whitespace IS a valid sentinel — this should match.
+    std::string text = "Sure, I'll call:foo{x: 1}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "foo");
+    }
+}
+
+static void test_parse_call_verb_malformed_args() {
+    // Unterminated brace — drop the call, don't crash.
+    std::string text = "call:foo{country: \"France\"";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.empty());
+}
+
+static void test_parse_call_verb_inner_brace_in_string() {
+    // The `{` and `}` inside the string value must not confuse the
+    // balanced-brace scanner.
+    std::string text = "call:foo{cmd: \"echo {not_a_brace} ok\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["cmd"] == "echo {not_a_brace} ok");
+    }
+}
+
+static void test_parse_call_verb_strict_json_args() {
+    // Strict-JSON path: keys already quoted.
+    std::string text = "call:foo{\"path\": \"x\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "x");
+    }
+}
+
+static void test_parse_call_verb_unquoted_keys() {
+    // Relaxed-JSON path: bare keys get quoted.
+    std::string text = "call:foo{path: \"x\", count: 3}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "x");
+        TEST_ASSERT(args["count"] == 3);
+    }
+}
+
+static void test_parse_call_verb_cleaned_text() {
+    // The matched span should be stripped from cleaned_text.
+    std::string text = "Hello call:foo{x: 1} world.";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    TEST_ASSERT(result.cleaned_text.find("call:") == std::string::npos);
+    TEST_ASSERT(result.cleaned_text.find("Hello") != std::string::npos);
+    TEST_ASSERT(result.cleaned_text.find("world.") != std::string::npos);
+}
+
+static void test_parse_call_verb_intercept_inner_json() {
+    // Codex-requested: inner args of the form {"name": ..., "arguments": ...}
+    // must NOT be picked up by pattern 6 (bare-JSON sweep) as a spurious
+    // `inner` ToolCall. Exactly one ToolCall, named `outer`, with the
+    // inner JSON intact in its arguments.
+    std::string text = "call:outer{\"name\": \"inner\", \"arguments\": {}}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "outer");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["name"] == "inner");
+        TEST_ASSERT(args["arguments"].is_object());
+    }
+}
+
+static void test_parse_call_verb_multiline_args() {
+    // Snapshot rows have multi-line nested args; the balanced-brace
+    // scanner is line-agnostic, so this must Just Work.
+    std::string text =
+        "call:default_api:analyze_data{\n"
+        "  data: [{\"date\": \"2024-10-05\", \"qty\": 50}, {\"date\": \"2024-10-06\", \"qty\": 60}],\n"
+        "  metric: \"qty\"\n"
+        "}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "analyze_data");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["metric"] == "qty");
+        TEST_ASSERT(args["data"].is_array());
+        TEST_ASSERT(args["data"].size() == 2);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // SSE Emitter tests
 // ═══════════════════════════════════════════════════════════════════════
@@ -700,6 +866,204 @@ static void test_emitter_anthropic_thinking_blocks() {
     TEST_ASSERT(all.find("thinking") != std::string::npos);
     TEST_ASSERT(!em.reasoning_text().empty());
     TEST_ASSERT(!em.accumulated_text().empty());
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// CONTENT-mode plain-text `call:<verb>{...}` tool-call hoist
+//
+// Regression coverage for the finalize-pass branch that runs
+// parse_tool_calls over accumulated_content_ when the stream stayed
+// in CONTENT mode (Gemma4-style `call:foo{...}` plain text — no XML
+// envelope to trip TOOL_BUFFER). Without this branch the emitter
+// returns finish_reason="stop" / stop_reason="end_turn" and never
+// emits a tool_use block, breaking forge / agent_recorded.
+// ═══════════════════════════════════════════════════════════════════════
+
+static void test_emitter_content_mode_plain_text_call_parsed() {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, weather_tools());
+    em.emit_start();
+    // Feed enough text past the holdback so the prose flushes into
+    // accumulated_content_ before finalize. The call: span itself stays
+    // in accumulated_content_ either way (no XML opener to redirect to
+    // TOOL_BUFFER); finalize parses and strips it.
+    em.emit_token("I'll fetch the forecast for you right now: ");
+    em.emit_token("call:get_weather{\"location\": \"SF\"}");
+    em.emit_token(" — let me know what you'd like next.");
+    em.emit_finish(20);
+
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "get_weather");
+        auto args = json::parse(em.tool_calls()[0].arguments);
+        TEST_ASSERT(args["location"] == "SF");
+    }
+    // finish_reason should now be "tool_calls" (drives Anthropic
+    // stop_reason="tool_use" downstream).
+    TEST_ASSERT(em.finish_reason() == "tool_calls");
+}
+
+static void test_emitter_content_mode_no_tools_skips_plain_text_call() {
+    // Empty tools array: branch is gated on has_request_tools(tools_),
+    // so the call: text remains as visible content.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
+    em.emit_start();
+    em.emit_token("I'll fetch the forecast for you right now: ");
+    em.emit_token("call:get_weather{\"location\": \"SF\"}");
+    em.emit_token(" — let me know what you'd like next.");
+    em.emit_finish(20);
+
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.finish_reason() == "stop");
+    TEST_ASSERT(em.accumulated_text().find("call:get_weather") != std::string::npos);
+}
+
+static void test_emitter_content_mode_underscore_prefix_call_parsed() {
+    // Regression for the `_call:foo{}` SentencePiece artifact (commit
+    // 004a81b). Parser Pattern 5 sentinel set includes `_`, so the
+    // verb is captured even with the leading underscore. The emitter
+    // wiring must surface it the same way as the bare `call:` form.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, weather_tools());
+    em.emit_start();
+    em.emit_token("Sure thing, here is the call you asked for: ");
+    em.emit_token("_call:get_weather{\"location\": \"NYC\"}");
+    em.emit_token(" — happy to refine if needed.");
+    em.emit_finish(20);
+
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "get_weather");
+        auto args = json::parse(em.tool_calls()[0].arguments);
+        TEST_ASSERT(args["location"] == "NYC");
+    }
+    TEST_ASSERT(em.finish_reason() == "tool_calls");
+}
+
+static void test_emitter_content_mode_no_call_substring_skips_parser() {
+    // Pure prose with no `call:` substring: the pre-check
+    // looks_like_plain_text_call short-circuits before parse_tool_calls
+    // runs. Accumulated text is preserved; finish_reason stays "stop".
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, weather_tools());
+    em.emit_start();
+    em.emit_token("Sorry, I cannot help with that ");
+    em.emit_token("specific question today. Please consult a local guide ");
+    em.emit_token("for the most accurate information.");
+    em.emit_finish(20);
+
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.finish_reason() == "stop");
+    TEST_ASSERT(em.accumulated_text().find("Sorry") != std::string::npos);
+}
+
+static void test_emitter_content_mode_mixed_calls_multiple() {
+    // Multiple back-to-back calls in the same response. Parser
+    // Pattern 5 sentinel set includes `}` so consecutive invocations
+    // are captured. Verify the emitter hoists both in emission order.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, weather_tools());
+    em.emit_start();
+    em.emit_token("start. ");
+    em.emit_token("call:get_weather{\"location\": \"A\"} ");
+    em.emit_token("middle. ");
+    em.emit_token("call:get_weather{\"location\": \"B\"} ");
+    em.emit_token("end of the message.");
+    em.emit_finish(20);
+
+    TEST_ASSERT(em.tool_calls().size() == 2);
+    if (em.tool_calls().size() == 2) {
+        auto args0 = json::parse(em.tool_calls()[0].arguments);
+        auto args1 = json::parse(em.tool_calls()[1].arguments);
+        TEST_ASSERT(args0["location"] == "A");
+        TEST_ASSERT(args1["location"] == "B");
+    }
+    TEST_ASSERT(em.finish_reason() == "tool_calls");
+    // Codex Q3 residue guard: the stripped accumulated text must NOT
+    // contain `call:` any more.
+    TEST_ASSERT(em.accumulated_text().find("call:") == std::string::npos);
+}
+
+static void test_emitter_content_mode_malformed_call_dropped() {
+    // Unbalanced `{`: balanced_braces_end inside parse_tool_calls
+    // returns npos and the match is dropped. Emitter must not crash
+    // and the malformed text remains in accumulated_text (no tool
+    // hoist, no silent strip — caller-visible signal that the model
+    // produced garbage).
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, weather_tools());
+    em.emit_start();
+    em.emit_token("Here is the call you wanted with malformed args: ");
+    em.emit_token("call:get_weather{location: \"unclosed");
+    em.emit_finish(20);
+
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.finish_reason() == "stop");
+    // Malformed call span is left visible (no strip on parse failure).
+    TEST_ASSERT(em.accumulated_text().find("call:get_weather") != std::string::npos);
+}
+
+static void test_emitter_content_mode_does_not_double_fire_on_tool_call_xml() {
+    // Regression guard: a `<tool_call>` XML envelope must continue to
+    // route through the TOOL_BUFFER path (transition fires inside
+    // emit_token). The new CONTENT-mode branch sits in an `else if`
+    // tied to `mode_ == CONTENT` at emit_finish entry, so it cannot
+    // fire when TOOL_BUFFER handled the call. Verify exactly 1
+    // ToolCall is emitted, not 2.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, weather_tools());
+    em.emit_start();
+    em.emit_token("<tool_call>\n"
+                  "<function=get_weather>\n"
+                  "<parameter=location>SF</parameter>\n"
+                  "</function>\n"
+                  "</tool_call>");
+    em.emit_finish(20);
+
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    TEST_ASSERT(em.finish_reason() == "tool_calls");
+}
+
+static void test_emitter_content_mode_strips_call_span_from_accumulated_text() {
+    // Codex Q3 "residue" hazard guard. After a successful hoist,
+    // accumulated_text() must not contain the `call:` substring (the
+    // matched span is replaced by cleaned_text). Without this guard
+    // the OpenAI Chat / Anthropic / Responses final-message shapes
+    // would echo the call as both literal text AND a tool_use block,
+    // producing UI double-display.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, weather_tools());
+    em.emit_start();
+    em.emit_token("prefix prose here. ");
+    em.emit_token("call:get_weather{\"location\": \"SF\"}");
+    em.emit_token(" suffix prose continues to flush the holdback.");
+    em.emit_finish(20);
+
+    TEST_ASSERT(!em.tool_calls().empty());
+    TEST_ASSERT(em.accumulated_text().find("call:") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("prefix prose") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("suffix prose") != std::string::npos);
+}
+
+static void test_emitter_content_mode_anthropic_emits_tool_use_block() {
+    // Verify the Anthropic format-specific events fire from the new
+    // branch (content_block_stop on the open text block, then
+    // content_block_start tool_use + input_json_delta + content_block_stop).
+    json tools = json::array();
+    tools.push_back({
+        {"name", "get_weather"},
+        {"description", "weather"},
+        {"input_schema", {{"type", "object"},
+                          {"properties", {{"city", {{"type", "string"}}}}}}}
+    });
+    SseEmitter em(ApiFormat::ANTHROPIC, "req_id", "test-model", 10,
+                  tools, nullptr);
+    em.emit_start();
+    em.emit_token("Let me fetch the data you need from the service: ");
+    em.emit_token("call:get_weather{\"city\": \"Tokyo\"}");
+    em.emit_token(" — back in a moment.");
+    auto finish = em.emit_finish(20);
+    std::string s = concat(finish);
+
+    TEST_ASSERT(!em.tool_calls().empty());
+    TEST_ASSERT(s.find("\"type\":\"tool_use\"")          != std::string::npos);
+    TEST_ASSERT(s.find("\"name\":\"get_weather\"")     != std::string::npos);
+    TEST_ASSERT(s.find("\"type\":\"input_json_delta\"") != std::string::npos);
+    TEST_ASSERT(s.find("Tokyo")                          != std::string::npos);
+    TEST_ASSERT(s.find("\"stop_reason\":\"tool_use\"")  != std::string::npos);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2590,6 +2954,20 @@ int main() {
     RUN_TEST(test_parse_no_tools);
     RUN_TEST(test_parse_tool_code_wrapper);
     RUN_TEST(test_parse_tool_allowed_filter);
+    RUN_TEST(test_parse_call_verb_single);
+    RUN_TEST(test_parse_call_verb_back_to_back);
+    RUN_TEST(test_parse_call_verb_namespaced);
+    RUN_TEST(test_parse_call_verb_snake_and_hyphen);
+    RUN_TEST(test_parse_call_verb_tool_allowed_filter);
+    RUN_TEST(test_parse_call_verb_inline_prose_rejected);
+    RUN_TEST(test_parse_call_verb_inline_prose_after_space);
+    RUN_TEST(test_parse_call_verb_malformed_args);
+    RUN_TEST(test_parse_call_verb_inner_brace_in_string);
+    RUN_TEST(test_parse_call_verb_strict_json_args);
+    RUN_TEST(test_parse_call_verb_unquoted_keys);
+    RUN_TEST(test_parse_call_verb_cleaned_text);
+    RUN_TEST(test_parse_call_verb_intercept_inner_json);
+    RUN_TEST(test_parse_call_verb_multiline_args);
 
     std::fprintf(stderr, "\n── SSE Emitter ──\n");
     RUN_TEST(test_emitter_reasoning_split_openai);
@@ -2611,6 +2989,17 @@ int main() {
     RUN_TEST(test_emitter_streaming_openai_has_done);
     RUN_TEST(test_emitter_nonstreaming_accumulates);
     RUN_TEST(test_emitter_anthropic_thinking_blocks);
+
+    std::fprintf(stderr, "\n── CONTENT-mode plain-text call:<verb>{} ──\n");
+    RUN_TEST(test_emitter_content_mode_plain_text_call_parsed);
+    RUN_TEST(test_emitter_content_mode_no_tools_skips_plain_text_call);
+    RUN_TEST(test_emitter_content_mode_underscore_prefix_call_parsed);
+    RUN_TEST(test_emitter_content_mode_no_call_substring_skips_parser);
+    RUN_TEST(test_emitter_content_mode_mixed_calls_multiple);
+    RUN_TEST(test_emitter_content_mode_malformed_call_dropped);
+    RUN_TEST(test_emitter_content_mode_does_not_double_fire_on_tool_call_xml);
+    RUN_TEST(test_emitter_content_mode_strips_call_span_from_accumulated_text);
+    RUN_TEST(test_emitter_content_mode_anthropic_emits_tool_use_block);
 
     std::fprintf(stderr, "\n── Stop sequences ──\n");
     RUN_TEST(test_stop_sequence_basic);
