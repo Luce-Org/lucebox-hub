@@ -11,11 +11,87 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <inttypes.h>
+#include <limits>
 #include <string>
 #include <vector>
 
 namespace dflash::common {
+
+namespace {
+
+BackendIpcPayloadTransport draft_ipc_transport_from_env() {
+    const char * raw = std::getenv("DFLASH_DRAFT_IPC_TRANSPORT");
+    if (!raw || !*raw) {
+        return BackendIpcPayloadTransport::Stream;
+    }
+    BackendIpcPayloadTransport transport = BackendIpcPayloadTransport::Stream;
+    if (!parse_backend_ipc_payload_transport(raw, transport)) {
+        return BackendIpcPayloadTransport::Stream;
+    }
+    return transport;
+}
+
+bool checked_mul_size(size_t a, size_t b, size_t & out) {
+    if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
+        return false;
+    }
+    out = a * b;
+    return true;
+}
+
+size_t dflash_draft_ipc_required_shared_bytes(int hidden_size,
+                                              int block_size,
+                                              int ring_cap) {
+    if (hidden_size <= 0 || block_size <= 0 || ring_cap <= 0) {
+        return 0;
+    }
+    const size_t max_tokens =
+        (size_t)std::max(block_size, ring_cap);
+    size_t elements = 0;
+    size_t bytes = 0;
+    if (!checked_mul_size(max_tokens, (size_t)hidden_size, elements) ||
+        !checked_mul_size(elements, sizeof(float), bytes)) {
+        return 0;
+    }
+    return bytes;
+}
+
+size_t draft_ipc_shared_bytes_from_env(size_t required_bytes) {
+    const char * raw = std::getenv("DFLASH_DRAFT_IPC_SHARED_BYTES");
+    if (!raw || !*raw) {
+        return required_bytes;
+    }
+    const char * p = raw;
+    while (*p == ' ' || *p == '\t' || *p == '\n' ||
+           *p == '\r' || *p == '\f' || *p == '\v') {
+        ++p;
+    }
+    if (*p == '-') {
+        std::fprintf(stderr,
+                     "draft-ipc ignoring negative DFLASH_DRAFT_IPC_SHARED_BYTES=%s\n",
+                     raw);
+        return required_bytes;
+    }
+    errno = 0;
+    char * end = nullptr;
+    const unsigned long long parsed = std::strtoull(p, &end, 10);
+    if (errno == ERANGE || end == p || *end != '\0' ||
+        parsed > (unsigned long long)std::numeric_limits<size_t>::max()) {
+        std::fprintf(stderr,
+                     "draft-ipc ignoring invalid DFLASH_DRAFT_IPC_SHARED_BYTES=%s\n",
+                     raw);
+        return required_bytes;
+    }
+    return std::max((size_t)parsed, required_bytes);
+}
+
+}  // namespace
 
 // ── DFlashDraftIpcClient ────────────────────────────────────────────
 
@@ -37,6 +113,9 @@ bool DFlashDraftIpcClient::start(
     launch.mode = BackendIpcMode::DFlashDraft;
     launch.payload_path = draft_path;
     launch.work_dir = work_dir;
+    launch.payload_transport = draft_ipc_transport_from_env();
+    launch.shared_payload_bytes = draft_ipc_shared_bytes_from_env(
+        dflash_draft_ipc_required_shared_bytes(hidden_size_, block_size_, ring_cap));
     launch.args.push_back("--ring-cap=" + std::to_string(ring_cap));
     launch.args.push_back("--draft-gpu=" + std::to_string(std::max(0, draft_gpu)));
     if (!process_.start(launch)) {
@@ -69,8 +148,28 @@ bool DFlashDraftIpcClient::send_feature_slice(
     }
     const size_t expected = (size_t)n_tokens * hidden_size_;
     if (slice.size() != expected) return false;
+    const size_t bytes = slice.size() * sizeof(float);
+    if (process_.resolved_payload_transport() == BackendIpcPayloadTransport::Shared) {
+        uint64_t seq = 0;
+        if (!process_.write_shared_payload(slice.data(), bytes, seq)) {
+            std::fprintf(stderr,
+                         "draft-ipc feature_slice shared payload too large bytes=%zu capacity=%zu\n",
+                         bytes, process_.shared_payload_capacity());
+            return false;
+        }
+        std::fprintf(cmd, "feature_slice_shared %d %d %d %zu %" PRIu64 "\n",
+                     capture_idx, start_pos, n_tokens, bytes, seq);
+        std::fflush(cmd);
+        int32_t status = -1;
+        const bool ok =
+            read_exact_fd(stream_fd, &status, sizeof(status)) && status == 0;
+        if (!ok) {
+            std::fprintf(stderr, "draft-ipc feature_slice_shared failed status=%d\n",
+                         status);
+        }
+        return ok;
+    }
     if (payload_fd >= 0) {
-        const size_t bytes = slice.size() * sizeof(float);
         std::fprintf(cmd, "feature_slice_pipe %d %d %d %zu\n",
                      capture_idx, start_pos, n_tokens, bytes);
         std::fflush(cmd);
@@ -122,8 +221,31 @@ bool DFlashDraftIpcClient::propose(
     const size_t noise_expected =
         (size_t)hidden_size_ * block_size_;
     if (noise_embed.size() != noise_expected) return false;
+    const size_t bytes = noise_embed.size() * sizeof(float);
+    if (process_.resolved_payload_transport() == BackendIpcPayloadTransport::Shared) {
+        uint64_t seq = 0;
+        if (!process_.write_shared_payload(noise_embed.data(), bytes, seq)) {
+            std::fprintf(stderr,
+                         "draft-ipc propose shared payload too large bytes=%zu capacity=%zu\n",
+                         bytes, process_.shared_payload_capacity());
+            return false;
+        }
+        std::fprintf(cmd, "propose_shared %d %d %zu %" PRIu64 "\n",
+                     committed, ctx_len, bytes, seq);
+        std::fflush(cmd);
+        int32_t status = -1;
+        bool ok = read_exact_fd(stream_fd, &status, sizeof(status)) && status == 0;
+        if (ok) {
+            hidden_out.assign(noise_expected, 0.0f);
+            ok = read_exact_fd(stream_fd, hidden_out.data(),
+                               hidden_out.size() * sizeof(float));
+        }
+        if (!ok) {
+            std::fprintf(stderr, "draft-ipc propose_shared failed status=%d\n", status);
+        }
+        return ok;
+    }
     if (payload_fd >= 0) {
-        const size_t bytes = noise_embed.size() * sizeof(float);
         std::fprintf(cmd, "propose_pipe %d %d %zu\n", committed, ctx_len, bytes);
         std::fflush(cmd);
         if (!write_exact_fd(payload_fd, noise_embed.data(), bytes)) {

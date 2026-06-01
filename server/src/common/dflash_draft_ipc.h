@@ -104,6 +104,8 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
                                 int ring_cap,
                                 int draft_gpu,
                                 int stream_fd,
-                                int payload_fd = -1);
+                                int payload_fd = -1,
+                                int shared_payload_fd = -1,
+                                size_t shared_payload_bytes = 0);
 
 } // namespace dflash::common
