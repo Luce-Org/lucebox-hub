@@ -23,6 +23,7 @@
 #include "placement/placement_config.h"
 #include "common/layer_split_backend.h"
 #include "common/layer_split_utils.h"
+#include "qwen35/c2_gate.h"
 #include <nlohmann/json.hpp>
 
 #include <cmath>
@@ -314,6 +315,172 @@ static void test_parse_tool_allowed_filter() {
     auto result = parse_tool_calls(text, tools);
     // Tool not in allow-list should be filtered
     TEST_ASSERT(result.tool_calls.empty());
+}
+
+// ─── Pattern 5: call:<verb>{relaxed-JSON args} (gemma plain-text) ─────
+
+static void test_parse_call_verb_single() {
+    std::string text = "call:get_country_info{country: \"France\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "get_country_info");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["country"] == "France");
+    }
+    TEST_ASSERT(result.cleaned_text.find("call:") == std::string::npos);
+}
+
+static void test_parse_call_verb_back_to_back() {
+    std::string text =
+        "call:get_country_info{country: \"France\"}"
+        "call:summarize{text: \"ok\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 2);
+    if (result.tool_calls.size() == 2) {
+        TEST_ASSERT(result.tool_calls[0].name == "get_country_info");
+        TEST_ASSERT(result.tool_calls[1].name == "summarize");
+    }
+}
+
+static void test_parse_call_verb_namespaced() {
+    std::string text = "call:execute-bead:read-file{path: \"crates/foo/src/lib.rs\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        // Verb only — namespace stripped.
+        TEST_ASSERT(result.tool_calls[0].name == "read-file");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "crates/foo/src/lib.rs");
+    }
+}
+
+static void test_parse_call_verb_snake_and_hyphen() {
+    std::string text =
+        "call:execute-bead:list-files{path: \"src/\"}\n\n"
+        "call:execute-bead:read_file{path: \"a/b.rs\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 2);
+    if (result.tool_calls.size() == 2) {
+        TEST_ASSERT(result.tool_calls[0].name == "list-files");
+        TEST_ASSERT(result.tool_calls[1].name == "read_file");
+    }
+}
+
+static void test_parse_call_verb_tool_allowed_filter() {
+    std::string text = "call:disallowed_verb{x: 1}call:allowed_verb{y: 2}";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {{"name", "allowed_verb"}}}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "allowed_verb");
+    }
+}
+
+static void test_parse_call_verb_inline_prose_rejected() {
+    // No sentinel char before `call:` — must NOT match.
+    std::string text = "narrative.call:foo{x:1}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.empty());
+}
+
+static void test_parse_call_verb_inline_prose_after_space() {
+    // Whitespace IS a valid sentinel — this should match.
+    std::string text = "Sure, I'll call:foo{x: 1}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "foo");
+    }
+}
+
+static void test_parse_call_verb_malformed_args() {
+    // Unterminated brace — drop the call, don't crash.
+    std::string text = "call:foo{country: \"France\"";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.empty());
+}
+
+static void test_parse_call_verb_inner_brace_in_string() {
+    // The `{` and `}` inside the string value must not confuse the
+    // balanced-brace scanner.
+    std::string text = "call:foo{cmd: \"echo {not_a_brace} ok\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["cmd"] == "echo {not_a_brace} ok");
+    }
+}
+
+static void test_parse_call_verb_strict_json_args() {
+    // Strict-JSON path: keys already quoted.
+    std::string text = "call:foo{\"path\": \"x\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "x");
+    }
+}
+
+static void test_parse_call_verb_unquoted_keys() {
+    // Relaxed-JSON path: bare keys get quoted.
+    std::string text = "call:foo{path: \"x\", count: 3}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "x");
+        TEST_ASSERT(args["count"] == 3);
+    }
+}
+
+static void test_parse_call_verb_cleaned_text() {
+    // The matched span should be stripped from cleaned_text.
+    std::string text = "Hello call:foo{x: 1} world.";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    TEST_ASSERT(result.cleaned_text.find("call:") == std::string::npos);
+    TEST_ASSERT(result.cleaned_text.find("Hello") != std::string::npos);
+    TEST_ASSERT(result.cleaned_text.find("world.") != std::string::npos);
+}
+
+static void test_parse_call_verb_intercept_inner_json() {
+    // Codex-requested: inner args of the form {"name": ..., "arguments": ...}
+    // must NOT be picked up by pattern 6 (bare-JSON sweep) as a spurious
+    // `inner` ToolCall. Exactly one ToolCall, named `outer`, with the
+    // inner JSON intact in its arguments.
+    std::string text = "call:outer{\"name\": \"inner\", \"arguments\": {}}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "outer");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["name"] == "inner");
+        TEST_ASSERT(args["arguments"].is_object());
+    }
+}
+
+static void test_parse_call_verb_multiline_args() {
+    // Snapshot rows have multi-line nested args; the balanced-brace
+    // scanner is line-agnostic, so this must Just Work.
+    std::string text =
+        "call:default_api:analyze_data{\n"
+        "  data: [{\"date\": \"2024-10-05\", \"qty\": 50}, {\"date\": \"2024-10-06\", \"qty\": 60}],\n"
+        "  metric: \"qty\"\n"
+        "}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "analyze_data");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["metric"] == "qty");
+        TEST_ASSERT(args["data"].is_array());
+        TEST_ASSERT(args["data"].size() == 2);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -889,7 +1056,7 @@ static void test_pflash_config_defaults() {
     ServerConfig cfg;
     TEST_ASSERT(cfg.pflash_mode == ServerConfig::PflashMode::OFF);
     TEST_ASSERT(cfg.pflash_threshold == 32000);
-    TEST_ASSERT(cfg.pflash_keep_ratio > 0.04f && cfg.pflash_keep_ratio < 0.06f);
+    TEST_ASSERT(cfg.pflash_keep_ratio > 0.09f && cfg.pflash_keep_ratio < 0.11f);
     TEST_ASSERT(cfg.pflash_drafter_path.empty());
     TEST_ASSERT(!cfg.pflash_skip_park);
 }
@@ -951,6 +1118,76 @@ static void test_pflash_threshold_always_mode() {
     bool should = (cfg.pflash_mode == ServerConfig::PflashMode::ALWAYS) ||
                   (cfg.pflash_mode == ServerConfig::PflashMode::AUTO && n_prompt >= cfg.pflash_threshold);
     TEST_ASSERT(should);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Admission gate tests (check_admission pure helper)
+// ═══════════════════════════════════════════════════════════════════════
+
+static void test_admission_pflash_raw_large_effective_fits() {
+    // pflash on, raw=170000, effective=65000, max_output=512, max_ctx=131072 → ADMITTED
+    TEST_ASSERT(check_admission(/*effective=*/65000, /*raw=*/170000,
+                                /*max_output=*/512, /*max_ctx=*/131072,
+                                /*pflash_on=*/true));
+}
+
+static void test_admission_pflash_effective_too_large() {
+    // Post-compression: effective still too large → REJECTED.
+    // The post-compression call uses pflash_on=false (direct effective check).
+    TEST_ASSERT(!check_admission(/*effective=*/131000, /*raw=*/170000,
+                                 /*max_output=*/512, /*max_ctx=*/131072,
+                                 /*pflash_on=*/false));
+}
+
+static void test_admission_no_pflash_raw_too_large() {
+    // pflash off, raw > max_ctx → REJECTED (unchanged from original behavior)
+    TEST_ASSERT(!check_admission(/*effective=*/100000, /*raw=*/100000,
+                                 /*max_output=*/512, /*max_ctx=*/8192,
+                                 /*pflash_on=*/false));
+}
+
+static void test_admission_small_request_admitted() {
+    // Normal small request → ADMITTED regardless of pflash flag
+    TEST_ASSERT(check_admission(/*effective=*/1000, /*raw=*/1000,
+                                /*max_output=*/512, /*max_ctx=*/8192,
+                                /*pflash_on=*/false));
+    TEST_ASSERT(check_admission(/*effective=*/1000, /*raw=*/1000,
+                                /*max_output=*/512, /*max_ctx=*/8192,
+                                /*pflash_on=*/true));
+}
+
+static void test_admission_pflash_raw_sanity_guard() {
+    // pflash on, keep_ratio=0.25 (explicit guard-test input), raw=32769:
+    // 32769*0.25 + 512 = 8704.25 > 8192 → REJECTED.
+    TEST_ASSERT(!check_admission(/*effective=*/1000, /*raw=*/32769,
+                                 /*max_output=*/512, /*max_ctx=*/8192,
+                                 /*pflash_on=*/true, /*keep_ratio=*/0.25f));
+}
+
+static void test_admission_no_max_ctx_always_admits() {
+    // max_ctx=0 means no limit: always admit
+    TEST_ASSERT(check_admission(/*effective=*/999999, /*raw=*/999999,
+                                /*max_output=*/9999, /*max_ctx=*/0,
+                                /*pflash_on=*/false));
+}
+
+static void test_admission_keep_ratio_derived_guard_admits_low_ratio() {
+    // keep_ratio=0.05, raw=65536 (8× max_ctx=8192):
+    // best-case effective = 65536*0.05 = 3276.8 tokens.
+    // 3276.8 + 512 = 3788.8 < 8192 → guard PASSES → ADMITTED.
+    // The old hardcoded 4× guard would have rejected (65536 > 4*8192=32768).
+    TEST_ASSERT(check_admission(/*effective=*/65536, /*raw=*/65536,
+                                /*max_output=*/512, /*max_ctx=*/8192,
+                                /*pflash_on=*/true, /*keep_ratio=*/0.05f));
+}
+
+static void test_admission_keep_ratio_derived_guard_rejects_impossible() {
+    // keep_ratio=0.05, raw=2_000_000, max_ctx=8192:
+    // best-case effective = 2000000*0.05 = 100000 tokens.
+    // 100000 + 512 = 100512 > 8192 → REJECTED.
+    TEST_ASSERT(!check_admission(/*effective=*/2000000, /*raw=*/2000000,
+                                 /*max_output=*/512, /*max_ctx=*/8192,
+                                 /*pflash_on=*/true, /*keep_ratio=*/0.05f));
 }
 
 static void test_pflash_placement_same_backend_local() {
@@ -1058,11 +1295,11 @@ static void test_jinja_render_basic() {
         {"system", "you are helpful", ""},
         {"user",   "hi",              ""},
     };
-    std::string out = render_chat_template_jinja(
+    auto out = render_chat_template_jinja(
         MINI_JINJA_TEMPLATE, msgs,
         /*bos=*/"<s>", /*eos=*/"</s>",
         /*add_gen=*/true, /*think=*/false,
-        /*tools=*/"");
+        /*tools=*/"").text;
     TEST_ASSERT(out.find("<|system|>you are helpful") != std::string::npos);
     TEST_ASSERT(out.find("<|user|>hi")               != std::string::npos);
     TEST_ASSERT(out.find("<|assistant|>")            != std::string::npos);
@@ -1070,9 +1307,9 @@ static void test_jinja_render_basic() {
 
 static void test_jinja_render_no_gen_prompt() {
     std::vector<ChatMessage> msgs = {{"user", "ping", ""}};
-    std::string out = render_chat_template_jinja(
+    auto out = render_chat_template_jinja(
         MINI_JINJA_TEMPLATE, msgs, "", "",
-        /*add_gen=*/false, /*think=*/false, "");
+        /*add_gen=*/false, /*think=*/false, "").text;
     TEST_ASSERT(out.find("<|user|>ping") != std::string::npos);
     TEST_ASSERT(out.find("<|assistant|>") == std::string::npos);
 }
@@ -1084,8 +1321,8 @@ static void test_jinja_render_tools_injected() {
         "{%- for m in messages -%}<|{{ m.role }}|>{{ m.content }}{%- endfor -%}";
     std::vector<ChatMessage> msgs = {{"user", "?", ""}};
     std::string tools = R"([{"name":"my_tool","description":"test"}])";
-    std::string out = render_chat_template_jinja(
-        TPL, msgs, "", "", false, false, tools);
+    auto out = render_chat_template_jinja(
+        TPL, msgs, "", "", false, false, tools).text;
     TEST_ASSERT(out.find("TOOLS_PRESENT:my_tool") != std::string::npos);
 }
 
@@ -1094,8 +1331,8 @@ static void test_jinja_render_empty_tools_skipped() {
     static const char TPL[] =
         "{%- if tools -%}TOOLS_PRESENT{%- else -%}NO_TOOLS{%- endif -%}";
     std::vector<ChatMessage> msgs = {{"user", "?", ""}};
-    std::string out = render_chat_template_jinja(
-        TPL, msgs, "", "", false, false, "[]");
+    auto out = render_chat_template_jinja(
+        TPL, msgs, "", "", false, false, "[]").text;
     TEST_ASSERT(out.find("NO_TOOLS")        != std::string::npos);
     TEST_ASSERT(out.find("TOOLS_PRESENT")   == std::string::npos);
 }
@@ -1104,8 +1341,8 @@ static void test_jinja_render_bos_eos_threaded() {
     // {{ bos_token }} and {{ eos_token }} must reach the template.
     static const char TPL[] = "{{ bos_token }}HI{{ eos_token }}";
     std::vector<ChatMessage> msgs;
-    std::string out = render_chat_template_jinja(
-        TPL, msgs, "<BOS>", "<EOS>", false, false, "");
+    auto out = render_chat_template_jinja(
+        TPL, msgs, "<BOS>", "<EOS>", false, false, "").text;
     TEST_ASSERT(out == "<BOS>HI<EOS>");
 }
 
@@ -1131,6 +1368,396 @@ static void test_jinja_render_bad_tools_json_throws() {
         threw = true;
     }
     TEST_ASSERT(threw);
+}
+
+// ─── started_in_thinking provenance ─────────────────────────────────────
+//
+// Regression suite for the Qwen3.6 / Laguna think-mode channel-routing
+// bug: the rendered prompt suffix pre-opens `<think>` so the model
+// starts emitting reasoning tokens with no explicit opener. Callers
+// route PromptRenderResult.started_in_thinking → SseEmitter initial
+// mode so reasoning text lands in reasoning_content, not content.
+
+static void test_chat_template_qwen3_enable_thinking_pre_opens() {
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    auto result = render_chat_template(msgs, ChatFormat::QWEN3,
+                                       /*add_gen=*/true,
+                                       /*enable_thinking=*/true,
+                                       /*tools=*/"");
+    TEST_ASSERT(result.started_in_thinking);
+    // Sanity: rendered suffix ends with `<think>\n` per the Qwen3.6
+    // chat_template.jinja's enable_thinking branch.
+    TEST_ASSERT(result.text.size() >= 8);
+    TEST_ASSERT(result.text.compare(result.text.size() - 8, 8, "<think>\n") == 0);
+}
+
+static void test_chat_template_qwen3_disable_thinking_does_not_pre_open() {
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    auto result = render_chat_template(msgs, ChatFormat::QWEN3,
+                                       /*add_gen=*/true,
+                                       /*enable_thinking=*/false,
+                                       /*tools=*/"");
+    TEST_ASSERT(!result.started_in_thinking);
+    // The disabled branch emits `<think>\n\n</think>\n\n` — closes
+    // immediately, so the reasoning channel is NOT left open.
+    TEST_ASSERT(result.text.find("</think>") != std::string::npos);
+}
+
+static void test_chat_template_qwen3_no_gen_prompt_does_not_pre_open() {
+    // Without add_generation_prompt the assistant turn isn't appended
+    // and there's nothing to pre-open.
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    auto result = render_chat_template(msgs, ChatFormat::QWEN3,
+                                       /*add_gen=*/false,
+                                       /*enable_thinking=*/true,
+                                       /*tools=*/"");
+    TEST_ASSERT(!result.started_in_thinking);
+}
+
+static void test_chat_template_laguna_enable_thinking_pre_opens() {
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    auto result = render_chat_template(msgs, ChatFormat::LAGUNA,
+                                       /*add_gen=*/true,
+                                       /*enable_thinking=*/true,
+                                       /*tools=*/"");
+    TEST_ASSERT(result.started_in_thinking);
+    TEST_ASSERT(result.text.size() >= 7);
+    TEST_ASSERT(result.text.compare(result.text.size() - 7, 7, "<think>") == 0);
+}
+
+static void test_chat_template_laguna_disable_thinking_does_not_pre_open() {
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    auto result = render_chat_template(msgs, ChatFormat::LAGUNA,
+                                       /*add_gen=*/true,
+                                       /*enable_thinking=*/false,
+                                       /*tools=*/"");
+    TEST_ASSERT(!result.started_in_thinking);
+}
+
+static void test_chat_template_gemma4_does_not_pre_open() {
+    // Gemma4's reasoning channel is opened by the model's `<|channel>`
+    // token (which http_server forwards into the emitter as `<think>`).
+    // The prompt itself never pre-opens `<think>` regardless of
+    // enable_thinking, so started_in_thinking must stay false.
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    auto enabled = render_chat_template(msgs, ChatFormat::GEMMA4,
+                                        /*add_gen=*/true,
+                                        /*enable_thinking=*/true,
+                                        /*tools=*/"");
+    TEST_ASSERT(!enabled.started_in_thinking);
+    auto disabled = render_chat_template(msgs, ChatFormat::GEMMA4,
+                                         /*add_gen=*/true,
+                                         /*enable_thinking=*/false,
+                                         /*tools=*/"");
+    TEST_ASSERT(!disabled.started_in_thinking);
+}
+
+// Jinja path: suffix-sniff detection. The renderer should set
+// started_in_thinking=true when the rendered prompt ends with `<think>`
+// (optionally followed by whitespace) AND enable_thinking is honored.
+static void test_jinja_render_suffix_sniff_sets_started_in_thinking() {
+    static const char TPL[] =
+        "{%- for m in messages -%}<|{{ m.role }}|>{{ m.content }}{%- endfor -%}"
+        "{%- if add_generation_prompt -%}"
+        "<|assistant|>{%- if enable_thinking -%}<think>\n{%- endif -%}"
+        "{%- endif -%}";
+    std::vector<ChatMessage> msgs = {{"user", "?", ""}};
+    auto r = render_chat_template_jinja(
+        TPL, msgs, "", "", /*add_gen=*/true, /*think=*/true, "");
+    TEST_ASSERT(r.started_in_thinking);
+}
+
+static void test_jinja_render_suffix_sniff_negative() {
+    // Template doesn't end with `<think>` → started_in_thinking=false
+    // even with enable_thinking=true.
+    static const char TPL[] =
+        "{%- for m in messages -%}<|{{ m.role }}|>{{ m.content }}{%- endfor -%}"
+        "{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
+    std::vector<ChatMessage> msgs = {{"user", "?", ""}};
+    auto r = render_chat_template_jinja(
+        TPL, msgs, "", "", /*add_gen=*/true, /*think=*/true, "");
+    TEST_ASSERT(!r.started_in_thinking);
+}
+
+// ─── SseEmitter initial_mode=REASONING ──────────────────────────────────
+//
+// Regression: when constructed with initial_mode=REASONING (the
+// Qwen3.6/Laguna enable_thinking path), the emitter must route the
+// model's first generated tokens to reasoning_content until a natural
+// `</think>` is seen, even though no explicit `<think>` opener appears
+// in the stream.
+
+static void test_emitter_initial_mode_reasoning_routes_to_reasoning_content() {
+    SseEmitter em(ApiFormat::OPENAI_CHAT, "req-1", "test-model", 10,
+                  json::array(), nullptr,
+                  /*stops=*/{},
+                  StreamMode::REASONING);
+    em.emit_start();
+
+    // Model emits reasoning tokens directly with no leading `<think>`
+    // (because the prompt suffix already opened the channel), then
+    // closes with `</think>` and emits the answer.
+    em.emit_token("alpha ");
+    em.emit_token("beta ");
+    em.emit_token("</think>\n\nAnswer: 4");
+    em.emit_finish(4);
+
+    TEST_ASSERT(em.reasoning_text().find("alpha")  != std::string::npos);
+    TEST_ASSERT(em.reasoning_text().find("beta")   != std::string::npos);
+    // No spurious <think> tag leaked into reasoning or content.
+    TEST_ASSERT(em.reasoning_text().find("<think>")  == std::string::npos);
+    TEST_ASSERT(em.reasoning_text().find("</think>") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("<think>")  == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("</think>") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("Answer: 4") != std::string::npos);
+}
+
+static void test_emitter_initial_mode_reasoning_unclosed_stays_reasoning() {
+    // No </think> close — everything stays in reasoning_content, content
+    // stays empty. Matches parse_reasoning(started_in_thinking=true)
+    // behavior for the non-streaming path.
+    SseEmitter em(ApiFormat::OPENAI_CHAT, "req-2", "test-model", 10,
+                  json::array(), nullptr,
+                  /*stops=*/{},
+                  StreamMode::REASONING);
+    em.emit_start();
+    em.emit_token("still thinking");
+    em.emit_token(" more thinking");
+    em.emit_finish(3);
+
+    TEST_ASSERT(em.reasoning_text().find("still thinking") != std::string::npos);
+    TEST_ASSERT(em.reasoning_text().find("more thinking")  != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().empty());
+}
+
+static void test_emitter_initial_mode_reasoning_strips_redundant_think_opener() {
+    // Edge case: prompt pre-opened <think>, but the model also emits a
+    // leading <think> anyway (template/model-card mismatch). The
+    // emitter's strip guard (checked_think_prefix_) must still trip
+    // because we deliberately leave it at its default (false) in the
+    // constructor — otherwise the duplicate opener would leak into
+    // reasoning_text.
+    SseEmitter em(ApiFormat::OPENAI_CHAT, "req-3", "test-model", 10,
+                  json::array(), nullptr,
+                  /*stops=*/{},
+                  StreamMode::REASONING);
+    em.emit_start();
+    em.emit_token("<think>actual reasoning</think>answer");
+    em.emit_finish(3);
+
+    TEST_ASSERT(em.reasoning_text().find("<think>") == std::string::npos);
+    TEST_ASSERT(em.reasoning_text().find("actual reasoning") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("answer") != std::string::npos);
+}
+
+static void test_emitter_initial_mode_reasoning_anthropic_first_block_is_thinking() {
+    // Anthropic format: when starting in REASONING mode, the very first
+    // content_block_start must be `thinking`, not `text`. Otherwise the
+    // emitter would open a text block, then have to stop+restart it as
+    // thinking on the first reasoning delta — wasteful and visible to
+    // SDK clients as a spurious empty text block.
+    SseEmitter em(ApiFormat::ANTHROPIC, "req-4", "test-model", 10,
+                  json::array(), nullptr,
+                  /*stops=*/{},
+                  StreamMode::REASONING);
+    auto start = em.emit_start();
+    std::string all;
+    for (const auto & c : start) all += c;
+    // First content block must be a thinking block. nlohmann::json sorts
+    // keys alphabetically on dump(), so the inner block serializes as
+    // `{"thinking":"","type":"thinking"}` (NOT type-first). Assert on
+    // the unique `"thinking":""` opener which only appears in the
+    // thinking-kind serialization.
+    TEST_ASSERT(all.find("\"thinking\":\"\",\"type\":\"thinking\"")
+                != std::string::npos);
+    // And the initial text-block opener must NOT appear (regression: if
+    // active_kind_ defaulted to "text", emit_start would have emitted
+    // `{"text":"","type":"text"}` here instead).
+    TEST_ASSERT(all.find("\"text\":\"\",\"type\":\"text\"")
+                == std::string::npos);
+}
+
+// ─── Integration: render_chat_template → SseEmitter wiring ──────────────
+//
+// The original bug was an integration gap: render_chat_template correctly
+// reported started_in_thinking=true, but no caller routed it into the
+// SseEmitter's initial_mode, so reasoning text leaked into content and
+// reasoning_content stayed empty. Each end of the wire has its own unit
+// tests above; these chain the two ends so a future refactor that drops
+// the propagation cannot pass without an assertion failure here.
+//
+// The body mirrors the production wiring in
+// server/src/server/http_server.cpp (the `started_in_thinking →
+// initial_mode → SseEmitter` chain). Keep these in sync if that wiring
+// moves.
+
+static void test_integration_qwen3_enable_thinking_render_to_emit_routes_to_reasoning() {
+    std::vector<ChatMessage> msgs = {{"user", "What is 2+2?", ""}};
+    auto render = render_chat_template(msgs, ChatFormat::QWEN3,
+                                       /*add_gen=*/true,
+                                       /*enable_thinking=*/true,
+                                       /*tools=*/"");
+    TEST_ASSERT_MSG(render.started_in_thinking,
+        "renderer end of wire: QWEN3 enable_thinking must pre-open <think>");
+
+    const StreamMode initial_mode = render.started_in_thinking
+        ? StreamMode::REASONING : StreamMode::CONTENT;
+    SseEmitter em(ApiFormat::OPENAI_CHAT, "rid-q", "test-model", 10,
+                  json::array(), nullptr, /*stops=*/{}, initial_mode);
+    em.emit_start();
+    em.emit_token("Let me compute. ");
+    em.emit_token("2+2 equals 4.");
+    em.emit_token("</think>\n\nThe answer is 4.");
+    em.emit_finish(5);
+
+    TEST_ASSERT_MSG(!em.reasoning_text().empty(),
+        "wiring broken: reasoning_content empty despite started_in_thinking=true");
+    TEST_ASSERT(em.reasoning_text().find("Let me compute")    != std::string::npos);
+    TEST_ASSERT(em.reasoning_text().find("<think>")           == std::string::npos);
+    TEST_ASSERT(em.reasoning_text().find("</think>")          == std::string::npos);
+    TEST_ASSERT_MSG(em.accumulated_text().find("Let me compute") == std::string::npos,
+        "wiring broken: reasoning text leaked into content channel");
+    TEST_ASSERT(em.accumulated_text().find("The answer is 4") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("<think>")         == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("</think>")        == std::string::npos);
+}
+
+static void test_integration_laguna_enable_thinking_render_to_emit_routes_to_reasoning() {
+    std::vector<ChatMessage> msgs = {{"user", "Solve 7*8.", ""}};
+    auto render = render_chat_template(msgs, ChatFormat::LAGUNA,
+                                       /*add_gen=*/true,
+                                       /*enable_thinking=*/true,
+                                       /*tools=*/"");
+    TEST_ASSERT_MSG(render.started_in_thinking,
+        "renderer end of wire: LAGUNA enable_thinking must pre-open <think>");
+
+    const StreamMode initial_mode = render.started_in_thinking
+        ? StreamMode::REASONING : StreamMode::CONTENT;
+    SseEmitter em(ApiFormat::OPENAI_CHAT, "rid-l", "test-model", 10,
+                  json::array(), nullptr, /*stops=*/{}, initial_mode);
+    em.emit_start();
+    em.emit_token("Working through it: ");
+    em.emit_token("7*8 = 56.");
+    em.emit_token("</think>\n\n56.");
+    em.emit_finish(4);
+
+    TEST_ASSERT_MSG(!em.reasoning_text().empty(),
+        "wiring broken: reasoning_content empty despite started_in_thinking=true");
+    TEST_ASSERT(em.reasoning_text().find("Working through it") != std::string::npos);
+    TEST_ASSERT_MSG(em.accumulated_text().find("Working through it") == std::string::npos,
+        "wiring broken: reasoning text leaked into content channel");
+    TEST_ASSERT(em.accumulated_text().find("56.") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("<think>")  == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("</think>") == std::string::npos);
+}
+
+static void test_integration_qwen3_disable_thinking_render_to_emit_stays_in_content() {
+    // Inverse direction: when enable_thinking=false the renderer must not
+    // pre-open and the emitter must start in CONTENT, so the model's
+    // tokens land in content from the first byte. Guards against the
+    // opposite regression of unconditionally starting in REASONING.
+    std::vector<ChatMessage> msgs = {{"user", "Hi.", ""}};
+    auto render = render_chat_template(msgs, ChatFormat::QWEN3,
+                                       /*add_gen=*/true,
+                                       /*enable_thinking=*/false,
+                                       /*tools=*/"");
+    TEST_ASSERT(!render.started_in_thinking);
+
+    const StreamMode initial_mode = render.started_in_thinking
+        ? StreamMode::REASONING : StreamMode::CONTENT;
+    SseEmitter em(ApiFormat::OPENAI_CHAT, "rid-n", "test-model", 10,
+                  json::array(), nullptr, /*stops=*/{}, initial_mode);
+    em.emit_start();
+    em.emit_token("Hello there.");
+    em.emit_finish(2);
+
+    TEST_ASSERT(em.reasoning_text().empty());
+    TEST_ASSERT(em.accumulated_text().find("Hello there") != std::string::npos);
+}
+
+
+// ---------------------------------------------------------------------------
+// Drafter / target distribution alignment (closed <think> prefill on Qwen3).
+// The hard-coded Qwen renderer appends a closed think prefill when thinking is
+// disabled; some Qwen3.6 Jinja templates omit it. render_chat_template_jinja
+// mirrors the hard-coded behavior when arch_hint == QWEN3 && !enable_thinking
+// && the rendered prompt ends with a bare assistant generation marker.
+// ---------------------------------------------------------------------------
+
+static const char QWEN3_BARE_ASSISTANT_TPL[] =
+    "{%- for m in messages -%}"
+    "<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n"
+    "{%- endfor -%}"
+    "{%- if add_generation_prompt -%}"
+    "<|im_start|>assistant\n"
+    "{%- endif -%}";
+
+static void test_jinja_render_qwen3_closes_think_when_thinking_off() {
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    auto out = render_chat_template_jinja(
+        QWEN3_BARE_ASSISTANT_TPL, msgs, "", "",
+        /*add_gen=*/true, /*think=*/false, /*tools=*/"",
+        /*arch_hint=*/ChatFormat::QWEN3).text;
+    TEST_ASSERT(out.find("<|im_start|>assistant\n<think>\n\n</think>\n\n") != std::string::npos);
+}
+
+static void test_jinja_render_does_not_close_think_when_thinking_on() {
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    auto out = render_chat_template_jinja(
+        QWEN3_BARE_ASSISTANT_TPL, msgs, "", "",
+        /*add_gen=*/true, /*think=*/true, /*tools=*/"",
+        /*arch_hint=*/ChatFormat::QWEN3).text;
+    TEST_ASSERT(out.find("</think>") == std::string::npos);
+}
+
+static void test_jinja_render_does_not_close_think_for_non_qwen3_arch() {
+    // Laguna and Gemma4 do not use ChatML tokens; the closed-think suffix
+    // must NOT be appended for them even if the rendered prompt happens to
+    // end with the same string.
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    auto out_laguna = render_chat_template_jinja(
+        QWEN3_BARE_ASSISTANT_TPL, msgs, "", "",
+        /*add_gen=*/true, /*think=*/false, /*tools=*/"",
+        /*arch_hint=*/ChatFormat::LAGUNA).text;
+    TEST_ASSERT(out_laguna.find("</think>") == std::string::npos);
+    auto out_gemma4 = render_chat_template_jinja(
+        QWEN3_BARE_ASSISTANT_TPL, msgs, "", "",
+        /*add_gen=*/true, /*think=*/false, /*tools=*/"",
+        /*arch_hint=*/ChatFormat::GEMMA4).text;
+    TEST_ASSERT(out_gemma4.find("</think>") == std::string::npos);
+}
+
+static void test_chat_format_for_arch_qwen35moe_returns_qwen3() {
+    // qwen35moe MUST inherit ChatFormat::QWEN3 — the closed-think prefill
+    // depends on it, and a future enum-add must not silently flip behavior.
+    TEST_ASSERT(chat_format_for_arch("qwen35moe") == ChatFormat::QWEN3);
+    TEST_ASSERT(chat_format_for_arch("qwen35")    == ChatFormat::QWEN3);
+    TEST_ASSERT(chat_format_for_arch("qwen3")     == ChatFormat::QWEN3);
+    TEST_ASSERT(chat_format_for_arch("laguna")    == ChatFormat::LAGUNA);
+    TEST_ASSERT(chat_format_for_arch("gemma4")    == ChatFormat::GEMMA4);
+}
+
+static void test_jinja_render_does_not_double_append_close_think() {
+    // A user-supplied template that already closes the think block must not
+    // get a second </think> suffix from the bare-marker post-processing.
+    static const char TPL_ALREADY_CLOSED[] =
+        "{%- for m in messages -%}"
+        "<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n"
+        "{%- endfor -%}"
+        "{%- if add_generation_prompt -%}"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        "{%- endif -%}";
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    auto out = render_chat_template_jinja(
+        TPL_ALREADY_CLOSED, msgs, "", "",
+        /*add_gen=*/true, /*think=*/false, /*tools=*/"",
+        /*arch_hint=*/ChatFormat::QWEN3).text;
+    // Exactly one </think> — the one the template emitted itself.
+    size_t first  = out.find("</think>");
+    size_t second = (first == std::string::npos) ? std::string::npos
+                                                  : out.find("</think>", first + 1);
+    TEST_ASSERT(first  != std::string::npos);
+    TEST_ASSERT(second == std::string::npos);
 }
 
 static void test_normalize_responses_tool_followup_messages() {
@@ -2272,8 +2899,11 @@ static void test_props_budget_envelope_shape() {
     TEST_ASSERT(body["model_card"]["max_tokens"].get<int>() == 32768);
     TEST_ASSERT(be["default_max_tokens"].get<int>() == 16000);
 
-    // Sanity: props_schema bumped to 2 (breaking change).
-    TEST_ASSERT(body["server"]["props_schema"].get<int>() == 2);
+    // Sanity: props_schema bumped to 4 (schema 4 added the top-level
+    // `host` block over schema 3; schema 3 over 2 added `build` and
+    // `model.target`/`model.draft`. All additive but the bump
+    // propagates so consumers can negotiate.)
+    TEST_ASSERT(body["server"]["props_schema"].get<int>() == 4);
 }
 
 // ─── /props.runtime captures full config (§4.16) ──────────────────────
@@ -2318,6 +2948,257 @@ static void test_props_runtime_shape() {
     cfg.draft_device.clear();
     body = build_props_body(cfg, pc, tm);
     TEST_ASSERT(body["runtime"]["draft_device"].is_null());
+}
+
+// ─── /props.build block (schema 3) ────────────────────────────────────
+// The new structured replacement for the single-string `build_info`.
+// Always emitted; image_* fields are null when the binary isn't running
+// in a Docker image (no /opt/lucebox-hub/IMAGE_INFO baked in).
+static void test_props_build_block_shape_no_image_info() {
+    ServerConfig cfg = make_props_config_with_sidecar(json{
+        {"name", "Qwen3.6 27B"},
+        {"source", "https://huggingface.co/Qwen/Qwen3.6-27B"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens", 32768},
+    });
+    // image_info default = null → image_* fields stay null.
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body.contains("build"));
+    const json & b = body["build"];
+    // Stable identity always populated.
+    TEST_ASSERT(b["server_name"].get<std::string>() == "luce-dflash");
+    TEST_ASSERT(b["server_version"].is_string());
+    TEST_ASSERT(b["props_schema"].get<int>() == 4);
+    // Image-baked fields null in the no-IMAGE_INFO case.
+    TEST_ASSERT(b["git_sha"].is_null());
+    TEST_ASSERT(b["image_tag"].is_null());
+    TEST_ASSERT(b["image_digest"].is_null());
+    TEST_ASSERT(b["build_time"].is_null());
+
+    // Legacy build_info still present for back-compat readers.
+    TEST_ASSERT(body.contains("build_info"));
+    TEST_ASSERT(body["build_info"].get<std::string>().find("props_schema=4")
+                != std::string::npos);
+}
+
+// ─── /props.host (schema 4) ───────────────────────────────────────────
+// Verbatim pass-through of the JSON written by entrypoint.sh to
+// /opt/lucebox-hub/HOST_INFO. Surfaces /props.host so luce-bench's
+// snapshot subcommand can capture the rig identity alongside the run.
+// `null` when ServerConfig.host_info was not populated (bare-metal
+// dev builds that bypass the container entrypoint).
+static void test_props_host_block_present_when_populated() {
+    ServerConfig cfg = make_props_config_with_sidecar(json{
+        {"name", "Qwen3.6 27B"},
+        {"source", "https://huggingface.co/Qwen/Qwen3.6-27B"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens", 32768},
+    });
+    cfg.host_info = json::object({
+        {"os_pretty",          "Ubuntu 22.04.3 LTS"},
+        {"kernel",             "6.6.87.2-microsoft-standard-WSL2"},
+        {"wsl_version",        "wsl2"},
+        {"docker_version",     "29.1.3"},
+        {"nvidia_driver",      "596.36"},
+        {"nvidia_ctk_version", "1.16.2"},
+        {"cpu_model",          "Intel(R) Core(TM) Ultra 9 275HX"},
+        {"nproc",              24},
+        {"ram_gb",             64},
+        {"gpus", json::array({
+            json::object({
+                {"index",         0},
+                {"uuid",          "GPU-abc"},
+                {"pci_bus_id",    "00000000:01:00.0"},
+                {"name",          "NVIDIA GeForce RTX 5090 Laptop GPU"},
+                {"sm",            "12.0"},
+                {"vram_gb",       24},
+                {"power_limit_w", 175},
+            }),
+        })},
+        {"cuda_visible_devices", "0"},
+        {"source",               "lucebox.sh"},
+        {"collector",            "lucebox.sh"},
+        {"collected_at",         "2026-05-28T20:31:42Z"},
+    });
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body.contains("host"));
+    TEST_ASSERT(!body["host"].is_null());
+    const json & h = body["host"];
+    TEST_ASSERT(h["os_pretty"].get<std::string>()    == "Ubuntu 22.04.3 LTS");
+    TEST_ASSERT(h["wsl_version"].get<std::string>()  == "wsl2");
+    TEST_ASSERT(h["nvidia_ctk_version"].get<std::string>() == "1.16.2");
+    TEST_ASSERT(h["source"].get<std::string>()       == "lucebox.sh");
+    TEST_ASSERT(h["gpus"].is_array());
+    TEST_ASSERT(h["gpus"].size() == 1);
+    TEST_ASSERT(h["gpus"][0]["name"].get<std::string>()
+                == "NVIDIA GeForce RTX 5090 Laptop GPU");
+    TEST_ASSERT(h["gpus"][0]["vram_gb"].get<int>()   == 24);
+}
+
+static void test_props_host_block_null_when_missing() {
+    // ServerConfig.host_info default = null → /props.host emits JSON null.
+    ServerConfig cfg = make_props_config_with_sidecar(json{
+        {"name", "Qwen3.6 27B"},
+        {"source", "https://huggingface.co/Qwen/Qwen3.6-27B"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens", 32768},
+    });
+    // cfg.host_info stays at its default nullptr.
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body.contains("host"));
+    TEST_ASSERT(body["host"].is_null());
+    // /props.server.props_schema reflects the schema-4 bump regardless.
+    TEST_ASSERT(body["server"]["props_schema"].get<int>() == 4);
+}
+
+static void test_props_build_block_with_image_info() {
+    ServerConfig cfg = make_props_config_with_sidecar(json{
+        {"name", "Qwen3.6 27B"},
+        {"source", "https://huggingface.co/Qwen/Qwen3.6-27B"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens", 32768},
+    });
+    cfg.image_info = json::object({
+        {"git_sha",    "6d12378"},
+        {"image_tag",  "sha-6d12378-cuda12"},
+        {"build_time", "2026-05-28T13:43:57Z"},
+    });
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    const json & b = body["build"];
+    TEST_ASSERT(b["git_sha"].get<std::string>()    == "6d12378");
+    TEST_ASSERT(b["image_tag"].get<std::string>()  == "sha-6d12378-cuda12");
+    TEST_ASSERT(b["build_time"].get<std::string>() == "2026-05-28T13:43:57Z");
+    // image_digest is reserved for external population; still null.
+    TEST_ASSERT(b["image_digest"].is_null());
+}
+
+// ─── /props.model.target + /props.model.draft (schema 3) ──────────────
+// Verbatim GGUF identity surfaced under model.target / model.draft.
+// `draft` is null when no draft GGUF is loaded; the legacy
+// `model.draft_path` string stays alongside for back-compat readers.
+static void test_props_model_target_draft_shape() {
+    ServerConfig cfg = make_props_config_with_sidecar(json{
+        {"name", "Qwen3.6 27B"},
+        {"source", "https://huggingface.co/Qwen/Qwen3.6-27B"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens", 32768},
+    });
+    cfg.draft_path = "/opt/models/dflash-draft-3.6-q4_k_m.gguf";
+    cfg.target_gguf = json::object({
+        {"path",       "/opt/models/Qwen3.6-27B-Q4_K_M.gguf"},
+        {"size_bytes", int64_t(17134510080)},
+        {"sha256",     "abc123def456" + std::string(52, '0')},
+        {"gguf", {
+            {"general.architecture",         "qwen35"},
+            {"general.name",                 "Qwen3.6-27B"},
+            {"general.file_type",            15},
+            {"general.file_type_name",       "Q4_K_M"},
+            {"general.quantization_version", 2},
+            {"block_count",                  64},
+            {"embedding_length",             5120},
+            {"context_length",               65536},
+            {"vocab_size",                   152064},
+        }},
+    });
+    cfg.draft_gguf = json::object({
+        {"path",       "/opt/models/dflash-draft-3.6-q4_k_m.gguf"},
+        {"size_bytes", int64_t(425000000)},
+        {"sha256",     "deadbeef" + std::string(56, '0')},
+        {"gguf", {
+            {"general.architecture",         "qwen3"},
+            {"general.name",                 "Qwen3-0.6B-DFlash-draft"},
+            {"general.file_type",            15},
+            {"general.file_type_name",       "Q4_K_M"},
+            {"general.quantization_version", 2},
+            {"block_count",                  28},
+            {"embedding_length",             1024},
+            {"context_length",               32768},
+            {"vocab_size",                   152064},
+        }},
+    });
+
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    const json & m = body["model"];
+
+    // arch + back-compat fields preserved.
+    TEST_ASSERT(m["arch"].get<std::string>() == "qwen35");
+    TEST_ASSERT(m["alias"].get<std::string>() == cfg.model_name);
+    TEST_ASSERT(m["draft_path"].get<std::string>() ==
+                "/opt/models/dflash-draft-3.6-q4_k_m.gguf");
+
+    // target: required, never null when GGUF is loaded.
+    TEST_ASSERT(!m["target"].is_null());
+    const json & tgt = m["target"];
+    TEST_ASSERT(tgt["path"].get<std::string>() ==
+                "/opt/models/Qwen3.6-27B-Q4_K_M.gguf");
+    TEST_ASSERT(tgt["size_bytes"].get<int64_t>() == int64_t(17134510080));
+    TEST_ASSERT(tgt["sha256"].get<std::string>().size() == 64);
+    TEST_ASSERT(tgt["gguf"]["general.architecture"].get<std::string>() == "qwen35");
+    TEST_ASSERT(tgt["gguf"]["general.file_type_name"].get<std::string>() == "Q4_K_M");
+    TEST_ASSERT(tgt["gguf"]["context_length"].get<int>() == 65536);
+    TEST_ASSERT(tgt["gguf"]["vocab_size"].get<int>() == 152064);
+
+    // draft: required key, populated when --draft was passed.
+    TEST_ASSERT(!m["draft"].is_null());
+    TEST_ASSERT(m["draft"]["path"].get<std::string>() ==
+                "/opt/models/dflash-draft-3.6-q4_k_m.gguf");
+    TEST_ASSERT(m["draft"]["gguf"]["general.architecture"].get<std::string>() == "qwen3");
+}
+
+static void test_props_model_draft_null_when_target_only() {
+    // laguna / qwen3.6-moe configs run target-only: model.draft is JSON
+    // null (NOT omitted), so consumers can distinguish "feature absent"
+    // from "field not in this schema version".
+    ServerConfig cfg = make_props_config_with_sidecar(json{
+        {"name", "qwen3.6-moe-test"},
+        {"source", "https://huggingface.co/test"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens", 32768},
+    });
+    cfg.draft_path = "";              // no --draft
+    cfg.target_gguf = json::object({
+        {"path",       "/opt/models/qwen3.6-moe.gguf"},
+        {"size_bytes", int64_t(18000000000)},
+        {"sha256",     nullptr},
+        {"gguf", {
+            {"general.architecture", "qwen35moe"},
+            {"general.name",         "Qwen3.6-35B-A3B"},
+        }},
+    });
+    // draft_gguf left at default (null).
+
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body["model"].contains("draft"));
+    TEST_ASSERT(body["model"]["draft"].is_null());
+    TEST_ASSERT(body["model"]["draft_path"].is_null());  // legacy field too
+    // target still populated.
+    TEST_ASSERT(!body["model"]["target"].is_null());
+    TEST_ASSERT(body["model"]["target"]["gguf"]["general.architecture"]
+                    .get<std::string>() == "qwen35moe");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2560,6 +3441,58 @@ static void test_generate_result_accept_rate_zero_when_no_spec_decode() {
     TEST_ASSERT(r.accept_rate == 0.0f);
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// C2 gate: c2_spec_decode_permitted() unit tests
+//
+// Gate logic: permit spec-decode when eff_fa_window <= 2*fa_window_cfg.
+// eff_fa_window = fa_window_override when set, else fa_window_cfg.
+//
+// Empirical validation (Round 5 bench):
+// - D_composition 128K: effective_in=10988, eff_fa_window=11244 > 4096
+//   → gate BLOCKS spec-decode → AR at 27.5 tok/s (correct — spec at 5.74)
+// - D_composition short: eff_fa_window <= 4096 → gate permits spec-decode
+// ═══════════════════════════════════════════════════════════════════════
+
+static void test_c2_gate_no_override_always_permits() {
+    // fa_window_override == 0 → no pflash, always spec-decode permitted.
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(0, 2048, 1));
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(0, 2048, 4096));
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(0, 2048, 131072));
+}
+
+static void test_c2_gate_128k_compressed_blocks_spec() {
+    // Round 5 D 128K: effective_in=10988, fa_window_override=11244.
+    // 11244 > 2*2048=4096 → gate correctly BLOCKS spec-decode (AR wins empirically).
+    int fa_window_cfg = 2048;
+    int compressed_size = 10988;
+    int fa_window_override = compressed_size + 256;  // = 11244
+    TEST_ASSERT(!dflash::common::c2_spec_decode_permitted(
+        fa_window_override, fa_window_cfg, compressed_size));
+}
+
+static void test_c2_gate_65k_compressed_blocks_spec() {
+    // D 65K cell: effective_in≈5383, fa_window_override≈5639 > 4096 → blocks.
+    int compressed_size = 5383;
+    int fa_window_override = compressed_size + 256;
+    TEST_ASSERT(!dflash::common::c2_spec_decode_permitted(
+        fa_window_override, 2048, compressed_size));
+}
+
+static void test_c2_gate_small_compressed_permits_spec() {
+    // Small compressed KV (override <= 2*fa_window): spec-decode permitted.
+    // fa_window_override=3000 <= 4096 → permit
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(3000, 2048, 2744));
+    // fa_window_override=4096 == 2*2048 → permit (at boundary)
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(4096, 2048, 3840));
+}
+
+static void test_c2_gate_boundary_at_2x_fa_window() {
+    // At exactly 2*fa_window_cfg: permit (<=).
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(4096, 2048, 3840));
+    // At 2*fa_window_cfg + 1: block.
+    TEST_ASSERT(!dflash::common::c2_spec_decode_permitted(4097, 2048, 3841));
+}
+
 int main() {
     std::fprintf(stderr, "══════════════════════════════════════════\n");
     std::fprintf(stderr, " Server Unit Tests\n");
@@ -2590,6 +3523,20 @@ int main() {
     RUN_TEST(test_parse_no_tools);
     RUN_TEST(test_parse_tool_code_wrapper);
     RUN_TEST(test_parse_tool_allowed_filter);
+    RUN_TEST(test_parse_call_verb_single);
+    RUN_TEST(test_parse_call_verb_back_to_back);
+    RUN_TEST(test_parse_call_verb_namespaced);
+    RUN_TEST(test_parse_call_verb_snake_and_hyphen);
+    RUN_TEST(test_parse_call_verb_tool_allowed_filter);
+    RUN_TEST(test_parse_call_verb_inline_prose_rejected);
+    RUN_TEST(test_parse_call_verb_inline_prose_after_space);
+    RUN_TEST(test_parse_call_verb_malformed_args);
+    RUN_TEST(test_parse_call_verb_inner_brace_in_string);
+    RUN_TEST(test_parse_call_verb_strict_json_args);
+    RUN_TEST(test_parse_call_verb_unquoted_keys);
+    RUN_TEST(test_parse_call_verb_cleaned_text);
+    RUN_TEST(test_parse_call_verb_intercept_inner_json);
+    RUN_TEST(test_parse_call_verb_multiline_args);
 
     std::fprintf(stderr, "\n── SSE Emitter ──\n");
     RUN_TEST(test_emitter_reasoning_split_openai);
@@ -2611,6 +3558,10 @@ int main() {
     RUN_TEST(test_emitter_streaming_openai_has_done);
     RUN_TEST(test_emitter_nonstreaming_accumulates);
     RUN_TEST(test_emitter_anthropic_thinking_blocks);
+    RUN_TEST(test_emitter_initial_mode_reasoning_routes_to_reasoning_content);
+    RUN_TEST(test_emitter_initial_mode_reasoning_unclosed_stays_reasoning);
+    RUN_TEST(test_emitter_initial_mode_reasoning_strips_redundant_think_opener);
+    RUN_TEST(test_emitter_initial_mode_reasoning_anthropic_first_block_is_thinking);
 
     std::fprintf(stderr, "\n── Stop sequences ──\n");
     RUN_TEST(test_stop_sequence_basic);
@@ -2638,6 +3589,17 @@ int main() {
     RUN_TEST(test_pflash_compress_result_defaults);
     RUN_TEST(test_pflash_threshold_auto_mode);
     RUN_TEST(test_pflash_threshold_always_mode);
+
+    std::fprintf(stderr, "\n── Admission gate ──\n");
+    RUN_TEST(test_admission_pflash_raw_large_effective_fits);
+    RUN_TEST(test_admission_pflash_effective_too_large);
+    RUN_TEST(test_admission_no_pflash_raw_too_large);
+    RUN_TEST(test_admission_small_request_admitted);
+    RUN_TEST(test_admission_pflash_raw_sanity_guard);
+    RUN_TEST(test_admission_no_max_ctx_always_admits);
+    RUN_TEST(test_admission_keep_ratio_derived_guard_admits_low_ratio);
+    RUN_TEST(test_admission_keep_ratio_derived_guard_rejects_impossible);
+
     RUN_TEST(test_pflash_placement_same_backend_local);
     RUN_TEST(test_pflash_placement_mixed_backend_remote);
     RUN_TEST(test_pflash_placement_auto_draft_follows_target);
@@ -2651,7 +3613,23 @@ int main() {
     RUN_TEST(test_jinja_render_empty_tools_skipped);
     RUN_TEST(test_jinja_render_bos_eos_threaded);
     RUN_TEST(test_jinja_render_empty_template_throws);
+    RUN_TEST(test_jinja_render_qwen3_closes_think_when_thinking_off);
+    RUN_TEST(test_jinja_render_does_not_close_think_when_thinking_on);
+    RUN_TEST(test_jinja_render_does_not_close_think_for_non_qwen3_arch);
+    RUN_TEST(test_chat_format_for_arch_qwen35moe_returns_qwen3);
+    RUN_TEST(test_jinja_render_does_not_double_append_close_think);
     RUN_TEST(test_jinja_render_bad_tools_json_throws);
+    RUN_TEST(test_chat_template_qwen3_enable_thinking_pre_opens);
+    RUN_TEST(test_chat_template_qwen3_disable_thinking_does_not_pre_open);
+    RUN_TEST(test_chat_template_qwen3_no_gen_prompt_does_not_pre_open);
+    RUN_TEST(test_chat_template_laguna_enable_thinking_pre_opens);
+    RUN_TEST(test_chat_template_laguna_disable_thinking_does_not_pre_open);
+    RUN_TEST(test_chat_template_gemma4_does_not_pre_open);
+    RUN_TEST(test_jinja_render_suffix_sniff_sets_started_in_thinking);
+    RUN_TEST(test_jinja_render_suffix_sniff_negative);
+    RUN_TEST(test_integration_qwen3_enable_thinking_render_to_emit_routes_to_reasoning);
+    RUN_TEST(test_integration_laguna_enable_thinking_render_to_emit_routes_to_reasoning);
+    RUN_TEST(test_integration_qwen3_disable_thinking_render_to_emit_stays_in_content);
     RUN_TEST(test_normalize_responses_tool_followup_messages);
 
     std::fprintf(stderr, "\n── Placement config ──\n");
@@ -2706,6 +3684,12 @@ int main() {
     RUN_TEST(test_props_model_card_null_on_family_fallback);
     RUN_TEST(test_props_budget_envelope_shape);
     RUN_TEST(test_props_runtime_shape);
+    RUN_TEST(test_props_build_block_shape_no_image_info);
+    RUN_TEST(test_props_build_block_with_image_info);
+    RUN_TEST(test_props_model_target_draft_shape);
+    RUN_TEST(test_props_model_draft_null_when_target_only);
+    RUN_TEST(test_props_host_block_present_when_populated);
+    RUN_TEST(test_props_host_block_null_when_missing);
 
     std::fprintf(stderr, "\n── usage.timings ──\n");
     RUN_TEST(test_usage_timings_openai_chat_streaming);
@@ -2725,6 +3709,13 @@ int main() {
     RUN_TEST(test_generate_result_accept_rate_in_usage_openai);
     RUN_TEST(test_generate_result_accept_rate_in_usage_anthropic);
     RUN_TEST(test_generate_result_accept_rate_zero_when_no_spec_decode);
+
+    std::fprintf(stderr, "\n── C2 gate (spec-decode gate) ──\n");
+    RUN_TEST(test_c2_gate_no_override_always_permits);
+    RUN_TEST(test_c2_gate_128k_compressed_blocks_spec);
+    RUN_TEST(test_c2_gate_65k_compressed_blocks_spec);
+    RUN_TEST(test_c2_gate_small_compressed_permits_spec);
+    RUN_TEST(test_c2_gate_boundary_at_2x_fa_window);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");
     std::fprintf(stderr, " Results: %d assertions, %d failures\n",

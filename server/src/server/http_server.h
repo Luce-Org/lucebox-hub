@@ -12,6 +12,7 @@
 #pragma once
 
 #include "common/model_backend.h"
+#include "common/regime_router.h"
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "tool_memory.h"
@@ -143,13 +144,18 @@ struct ServerConfig {
     enum class PflashMode { OFF, AUTO, ALWAYS };
     PflashMode  pflash_mode      = PflashMode::OFF;
     int         pflash_threshold = 32000;   // token count threshold for AUTO mode
-    float       pflash_keep_ratio = 0.05f;  // fraction of tokens to keep
+    float       pflash_keep_ratio = 0.10f;  // fraction of tokens to keep
     std::string pflash_drafter_path;        // path to drafter GGUF (Qwen3-0.6B)
     int         pflash_drafter_gpu = 0;     // backend-local GPU for PFlash drafter
     bool        pflash_remote_drafter = false; // use IPC drafter for mixed backends
     RemoteDraftConfig pflash_remote;        // IPC binary/work-dir for remote PFlash drafter
     bool        pflash_skip_park = false;   // skip park/unpark for >=32GB GPUs
     bool        lazy_draft      = false;   // park decode draft when idle to save VRAM
+
+    // TYPE-gate compression router (v2).
+    // Default: disabled (exact no-op, correct-by-construction).
+    // Enable via PFLASH_ROUTER_ENABLE=1 env var at server startup.
+    RouterPolicyV2 pflash_router;          // enabled=false by default
 
     // Disk prefix cache
     std::string disk_cache_dir;             // empty = disabled
@@ -163,6 +169,39 @@ struct ServerConfig {
     // the Anthropic tool_use envelope, e.g. froggeric Qwen3.6 template.
     std::string chat_template_src;          // literal Jinja source (loaded from file)
     std::string chat_template_path;         // path it was loaded from (logged at startup)
+
+    // ── /props identity payloads (filled by server_main at startup) ──
+    //
+    // `target_gguf` / `draft_gguf`: JSON blobs produced by reading the GGUF
+    // header + sha256 for each loaded model. Surface verbatim under
+    // /props.model.target / /props.model.draft so an operator can pin the
+    // exact weights + quant + sha from a single curl. Empty/null when
+    // not loaded; `draft_gguf` is null when --draft was not passed.
+    // See docs/specs/props-endpoint.md §4.8 and build_props_body().
+    nlohmann::json target_gguf = nullptr;
+    nlohmann::json draft_gguf  = nullptr;
+
+    // `image_info`: container/image identity read from /opt/lucebox-hub/
+    // IMAGE_INFO at server start. Three lines: git_sha, image_tag,
+    // build_time (ISO 8601). Object with three string fields or null
+    // when the file is missing (e.g. local non-Docker builds). Surfaced
+    // under /props.build as git_sha/image_tag/build_time. Path overridable
+    // via $DFLASH_IMAGE_INFO_PATH for tests.
+    nlohmann::json image_info = nullptr;
+
+    // `host_info`: host-identity facts read from /opt/lucebox-hub/HOST_INFO
+    // at server start. JSON object written by server/scripts/entrypoint.sh
+    // from the LUCEBOX_HOST_* env vars the host wrapper exports. Surfaced
+    // verbatim under /props.host so every benchmark snapshot can self-
+    // classify the rig it ran on (OS, kernel, WSL version, GPU list with
+    // per-GPU UUID/PCI/SM/VRAM/power, nvidia driver + CTK versions).
+    // Null when the file is missing (e.g. bare-metal dev or someone ran
+    // `docker run` without lucebox.sh — entrypoint still writes a stub
+    // {"source":"unknown",...} so this is null only on the bare-metal
+    // path that bypasses entrypoint entirely). Path overridable via
+    // $DFLASH_HOST_INFO_PATH for tests. See HOST_INFO doc at
+    // docs/specs/props-endpoint.md §4.10.
+    nlohmann::json host_info = nullptr;
 };
 
 // ─── Parsed request ─────────────────────────────────────────────────────
@@ -200,6 +239,12 @@ struct ParsedRequest {
     std::vector<std::string>  stop_sequences;
     // Bandit: per-session adaptive keep_ratio opt-in
     std::string               session_id;
+    // Set by the chat-template renderer when the rendered prompt suffix
+    // pre-opens a `<think>` block (Qwen3.6 / Laguna enable_thinking path).
+    // Drives the SseEmitter's initial mode so reasoning tokens emitted
+    // before any explicit `<think>` opener route to reasoning_content
+    // instead of leaking into content.
+    bool                      started_in_thinking = false;
 };
 
 // Build the /props response body. Exposed (non-static) so unit tests
@@ -316,6 +361,23 @@ struct ServerJob {
     std::condition_variable cv;
     ServerJob *   next = nullptr;
 };
+
+// ─── Admission gate (pure, testable) ────────────────────────────────────
+// Returns true when the request should be admitted (effective prompt fits).
+//
+// effective_size   : post-compression prompt token count (== raw_size when
+//                    pflash is off or the prompt is below threshold).
+// raw_size         : pre-compression token count; used for the pre-compression
+//                    sanity guard: reject early when even best-case compression
+//                    cannot fit — i.e. raw*keep_ratio + max_output > max_ctx.
+// max_output       : request's requested generation tokens.
+// max_ctx          : server's configured context window (--max-ctx).
+// pflash_on        : true when pflash compressed this request.
+// pflash_keep_ratio: configured keep fraction; drives the pre-compression guard.
+//                    Guard is skipped when <= 0.
+bool check_admission(int effective_size, int raw_size,
+                     int max_output, int max_ctx, bool pflash_on,
+                     float pflash_keep_ratio = 0.10f);
 
 // ─── Parse session_id from a chat-completion JSON body ──────────────────
 // Returns empty string when session_id is absent or not a string (int/null/array).
