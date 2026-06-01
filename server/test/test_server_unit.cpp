@@ -1844,6 +1844,21 @@ static void test_backend_ipc_payload_bounds() {
         std::numeric_limits<size_t>::max(), 1, 16));
 }
 
+static void test_backend_ipc_shared_payload_map_sizing() {
+    size_t map_bytes = 0;
+    TEST_ASSERT(backend_ipc_shared_payload_map_bytes(1024, map_bytes));
+    TEST_ASSERT(map_bytes == 1024 + backend_ipc_shared_payload_header_bytes());
+
+    BackendIpcSharedPayloadHeader header;
+    header.sequence = 7;
+    header.bytes = 1024;
+    TEST_ASSERT(header.sequence == 7);
+    TEST_ASSERT(header.bytes == 1024);
+
+    TEST_ASSERT(!backend_ipc_shared_payload_map_bytes(
+        std::numeric_limits<size_t>::max(), map_bytes));
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Sampler tests (model-independent, CPU-only)
 // ═══════════════════════════════════════════════════════════════════════
@@ -2604,6 +2619,7 @@ int main() {
     RUN_TEST(test_backend_ipc_payload_pipe_round_trip);
     RUN_TEST(test_backend_ipc_payload_transport_parse);
     RUN_TEST(test_backend_ipc_payload_bounds);
+    RUN_TEST(test_backend_ipc_shared_payload_map_sizing);
 
     std::fprintf(stderr, "\n── Jinja chat template ──\n");
     RUN_TEST(test_jinja_render_basic);
