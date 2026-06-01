@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -25,16 +26,39 @@ namespace dflash::common {
 // Token callback for streaming generation. Called once per committed token.
 // Return true to continue generation, false to abort.
 using TokenCallback = std::function<bool(int32_t token)>;
+using CancelCallback = std::function<bool()>;
 
 // ─── I/O handle passed to backend methods that need protocol output ─────
 struct DaemonIO {
     int stream_fd = -1;
 
+    DaemonIO() = default;
+    DaemonIO(const DaemonIO & other)
+        : stream_fd(other.stream_fd)
+        , on_token(other.on_token)
+        , is_cancelled(other.is_cancelled)
+        , cancelled(other.cancelled.load(std::memory_order_relaxed)) {}
+
+    DaemonIO & operator=(const DaemonIO & other) {
+        if (this == &other) return *this;
+        stream_fd = other.stream_fd;
+        on_token = other.on_token;
+        is_cancelled = other.is_cancelled;
+        cancelled.store(other.cancelled.load(std::memory_order_relaxed),
+                        std::memory_order_relaxed);
+        return *this;
+    }
+
     // Optional token callback. When set, emit() calls this for each token
     // (excluding the -1 sentinel). If it returns false, the `cancelled`
     // flag is set and the caller should abort generation.
     TokenCallback on_token;
-    mutable bool cancelled = false;
+    CancelCallback is_cancelled;
+    mutable std::atomic<bool> cancelled{false};
+
+    // Observe cooperative cancellation even before a token callback fires
+    // (for example while a long prefill/spec-decode step is still working).
+    bool should_cancel() const;
 
     // Write a single int32 to the stream fd (token or -1 sentinel).
     // Also invokes on_token if set. Sets cancelled=true if on_token
@@ -44,6 +68,22 @@ struct DaemonIO {
     // Return an IO handle that also invokes `cb` for emitted tokens.
     DaemonIO with_token_callback(const TokenCallback & cb) const;
 };
+
+enum class DaemonComputeResult {
+    Success,
+    Cancelled,
+    Failed,
+};
+
+inline DaemonComputeResult classify_daemon_compute_result(
+        ggml_status status,
+        const DaemonIO & io) {
+    // A completed graph failure is a backend error even if the client also
+    // disconnected while the graph was running.
+    if (status != GGML_STATUS_SUCCESS) return DaemonComputeResult::Failed;
+    if (io.should_cancel()) return DaemonComputeResult::Cancelled;
+    return DaemonComputeResult::Success;
+}
 
 // ─── Generate request/result ────────────────────────────────────────────
 
@@ -131,6 +171,11 @@ struct GenerateResult {
     float                      accept_rate     = 0.0f;
     // True when spec decode actually ran (accept_rate==0 still needs a bandit update).
     bool                       spec_decode_ran = false;
+    // True when decode emitted only tokens that the API layer suppresses
+    // (for example an immediate EOS/EOT). This is semantically equivalent
+    // to zero output for clients and should take the same AR retry path as
+    // an empty token vector.
+    bool                       empty_visible_output = false;
 };
 
 // ─── Backend interface ──────────────────────────────────────────────────
@@ -160,7 +205,7 @@ struct ModelBackend {
         if (!should_retry_empty_spec_decode(req, result)) return result;
 
         std::fprintf(stderr,
-            "[backend] spec-decode produced zero tokens; retrying with AR decode\n");
+            "[backend] spec-decode produced no visible output; retrying with AR decode\n");
         GenerateRequest retry = req;
         retry.force_ar_decode = true;
         return merge_empty_spec_retry_result(result, generate(retry, io));
@@ -188,7 +233,7 @@ struct ModelBackend {
         if (!should_retry_empty_spec_decode(req, result)) return result;
 
         std::fprintf(stderr,
-            "[backend] restored spec-decode produced zero tokens; retrying with AR decode\n");
+            "[backend] restored spec-decode produced no visible output; retrying with AR decode\n");
         GenerateRequest retry = req;
         retry.force_ar_decode = true;
         return merge_empty_spec_retry_result(result,
@@ -201,7 +246,7 @@ struct ModelBackend {
             && !req.force_ar_decode
             && result.ok
             && result.spec_decode_ran
-            && result.tokens.empty();
+            && (result.tokens.empty() || result.empty_visible_output);
     }
 
     static GenerateResult merge_empty_spec_retry_result(

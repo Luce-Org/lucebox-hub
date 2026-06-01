@@ -374,7 +374,7 @@ bool Gemma4LayerSplitAdapter::decode_ar(
     const auto & w = shards_.front().weights;
     out_tokens.push_back(last_tok);
     io.emit(last_tok);
-    if (io.cancelled) {
+    if (io.should_cancel()) {
         io.emit(-1);
         return true;
     }
@@ -392,7 +392,7 @@ bool Gemma4LayerSplitAdapter::decode_ar(
         out_tokens.push_back(last_tok);
         io.emit(last_tok);
         ++committed;
-        if (io.cancelled) break;
+        if (io.should_cancel()) break;
         if (last_tok == w.eos_id || last_tok == w.eos_chat_id) break;
     }
     io.emit(-1);

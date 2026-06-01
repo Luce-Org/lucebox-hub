@@ -171,11 +171,19 @@ GenerateResult LagunaBackend::generate(const GenerateRequest & req,
     bool ok = true;
     const int n_chunks = (N + args_.chunk - 1) / args_.chunk;
     for (int c = 0; c < n_chunks && ok; ++c) {
+        if (out_io.should_cancel()) {
+            result.ok = true;
+            return result;
+        }
         const int kv_start = c * args_.chunk;
         const int n_tok    = std::min(args_.chunk, N - c * args_.chunk);
         ok = laguna_step(backend_, w_, cache_,
                           embed_pf.data() + (size_t)kv_start * w_.n_embd,
                           n_tok, kv_start, no_mask, last_logits);
+        if (out_io.should_cancel()) {
+            result.ok = true;
+            return result;
+        }
     }
     if (!ok) { result.error = "prefill"; return result; }
     auto t_pf1 = std::chrono::steady_clock::now();
@@ -267,7 +275,7 @@ GenerateResult LagunaBackend::generate(const GenerateRequest & req,
         history.push_back(next_tok);
         if (should_emit) {
             out_io.emit(next_tok);
-            if (out_io.cancelled) break;
+            if (out_io.should_cancel()) break;
         }
         if (!w_.embedder.embed(&next_tok, 1, embed_step.data())) { ok = false; break; }
         std::vector<float> step_logits;
@@ -328,12 +336,20 @@ GenerateResult LagunaBackend::restore_and_generate(int slot,
     bool ok = true;
     const int n_chunks = (diff_n + args_.chunk - 1) / args_.chunk;
     for (int c = 0; c < n_chunks && ok; ++c) {
+        if (out_io.should_cancel()) {
+            result.ok = true;
+            return result;
+        }
         const int off   = c * args_.chunk;
         const int n_tok = std::min(args_.chunk, diff_n - off);
         const int starts = kv_start + off;
         ok = laguna_step(backend_, w_, cache_,
                           embed_diff.data() + (size_t)off * w_.n_embd,
                           n_tok, starts, no_mask, last_logits);
+        if (out_io.should_cancel()) {
+            result.ok = true;
+            return result;
+        }
     }
     if (!ok) { result.error = "prefill"; return result; }
 
@@ -402,7 +418,7 @@ GenerateResult LagunaBackend::restore_and_generate(int slot,
         history.push_back(next_tok);
         result.tokens.push_back(next_tok);
         out_io.emit(next_tok);
-        if (out_io.cancelled) break;
+        if (out_io.should_cancel()) break;
         if (!w_.embedder.embed(&next_tok, 1, embed_step.data())) { ok = false; break; }
         std::vector<float> step_logits;
         if (!laguna_step(backend_, w_, cache_, embed_step.data(), 1,

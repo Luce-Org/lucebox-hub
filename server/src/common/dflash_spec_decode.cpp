@@ -86,6 +86,7 @@ bool run_dflash_spec_decode(
 
     auto t_dec0 = std::chrono::steady_clock::now();
     while (n_generated < n_gen) {
+        if (io.should_cancel()) break;
         const int need_commit_budget = n_gen - n_generated;
 
         // ── Build noise input for draft ────────────────────────────────────
@@ -109,10 +110,12 @@ bool run_dflash_spec_decode(
         // ── Draft compute (local or remote) ───────────────────────────────
         const float * draft_hidden_host = nullptr;
         if (use_remote_draft) {
+            if (io.should_cancel()) break;
             if (!remote_draft->propose(committed, draft_ctx, noise_embed, remote_hidden)) {
                 std::fprintf(stderr, "dflash-spec remote draft propose failed\n");
                 return false;
             }
+            if (io.should_cancel()) break;
             draft_hidden_host = remote_hidden.data();
         } else {
             if (!build_draft_step(draft_sg, draft_weights, /*lm_head=*/nullptr, draft_backend,
@@ -138,10 +141,12 @@ bool run_dflash_spec_decode(
             ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
                                     sizeof(int32_t) * pos_k.size());
             auto st = ggml_backend_graph_compute(draft_backend, draft_sg.gf);
-            if (st != GGML_STATUS_SUCCESS) {
+            const auto compute_result = classify_daemon_compute_result(st, io);
+            if (compute_result == DaemonComputeResult::Failed) {
                 std::fprintf(stderr, "dflash-spec draft compute %d\n", (int)st);
                 return false;
             }
+            if (compute_result == DaemonComputeResult::Cancelled) break;
             // Read draft hidden states out to host so the target adapter can
             // project them through its own LM head (target-internal layout).
             local_hidden.resize((size_t)hidden * q_len);
@@ -174,6 +179,7 @@ bool run_dflash_spec_decode(
             std::fprintf(stderr, "dflash-spec snapshot_kv failed\n");
             return false;
         }
+        if (io.should_cancel()) break;
 
         int verify_last_tok = -1;
         if (!target.verify_batch(draft_tok, committed, verify_last_tok, &target_tok)) {
@@ -209,6 +215,7 @@ bool run_dflash_spec_decode(
             std::fprintf(stderr, "dflash-spec restore_kv failed\n");
             return false;
         }
+        if (io.should_cancel()) break;
 
         std::vector<int32_t> replay_tok((size_t)commit_n);
         for (int i = 0; i < commit_n; i++) {
@@ -226,7 +233,7 @@ bool run_dflash_spec_decode(
         for (int i = 0; i < commit_n; i++) {
             out_all.push_back(replay_tok[i]);
             io.emit(replay_tok[i]);
-            if (io.cancelled) break;
+            if (io.should_cancel()) break;
             ++emitted;
             if (target.is_eos(replay_tok[i])) hit_eos = true;
         }
@@ -234,7 +241,7 @@ bool run_dflash_spec_decode(
         n_generated += emitted;
         n_accept_sum += std::min(accept_n, emitted);
         n_draft_steps++;
-        if (io.cancelled) break;
+        if (io.should_cancel()) break;
         if (hit_eos) break;
     }
     if (!use_remote_draft && draft_backend) ggml_backend_synchronize(draft_backend);

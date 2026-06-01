@@ -16,6 +16,7 @@
 #include "server/api_types.h"
 #include "server/http_server.h"
 #include "server/chat_template.h"
+#include "common/model_backend.h"
 #include "common/sampler.h"
 #include "common/backend_ipc.h"
 #include "placement/pflash_placement.h"
@@ -1340,7 +1341,7 @@ static void test_layer_split_backend_inline_snapshot_and_restore_delta() {
     req.snap_slot = 2;
     req.snap_pos = 3;
     DaemonIO io;
-    GenerateResult result = backend.generate(req, io);
+    GenerateResult result = backend.generate_with_empty_spec_fallback(req, io);
 
     TEST_ASSERT(result.ok);
     TEST_ASSERT(raw->reset_called);
@@ -2413,6 +2414,99 @@ static void test_usage_timings_omitted_when_null() {
     TEST_ASSERT(finish_str.find("[DONE]") != std::string::npos);
 }
 
+// DaemonIO cancellation tests
+// ═══════════════════════════════════════════════════════════════════════
+
+static void test_daemon_io_cancel_callback_stops_emit_before_token_callback() {
+    bool token_callback_called = false;
+    DaemonIO io;
+    io.is_cancelled = []() { return true; };
+    io.on_token = [&](int32_t) -> bool {
+        token_callback_called = true;
+        return true;
+    };
+
+    io.emit(123);
+
+    TEST_ASSERT(io.cancelled.load());
+    TEST_ASSERT(!token_callback_called);
+}
+
+static void test_daemon_io_with_token_callback_preserves_cancel_callback() {
+    bool cancelled = false;
+    int callback_score = 0;
+
+    DaemonIO io;
+    io.is_cancelled = [&]() { return cancelled; };
+    io.on_token = [&](int32_t) -> bool {
+        callback_score += 1;
+        return true;
+    };
+
+    DaemonIO out = io.with_token_callback([&](int32_t) -> bool {
+        callback_score += 10;
+        return true;
+    });
+
+    out.emit(7);
+    TEST_ASSERT(callback_score == 11);
+
+    cancelled = true;
+    out.emit(8);
+    TEST_ASSERT(out.cancelled.load());
+    TEST_ASSERT(callback_score == 11);
+}
+
+static void test_daemon_compute_result_prefers_failure_over_cancel() {
+    int cancel_polls = 0;
+    DaemonIO io;
+    io.is_cancelled = [&]() {
+        cancel_polls++;
+        return true;
+    };
+
+    const auto result =
+        classify_daemon_compute_result(GGML_STATUS_FAILED, io);
+
+    TEST_ASSERT(result == DaemonComputeResult::Failed);
+    TEST_ASSERT(cancel_polls == 0);
+    TEST_ASSERT(!io.cancelled.load());
+}
+
+static void test_daemon_compute_result_reports_cancel_after_success() {
+    int cancel_polls = 0;
+    DaemonIO io;
+    io.is_cancelled = [&]() {
+        cancel_polls++;
+        return true;
+    };
+
+    const auto result =
+        classify_daemon_compute_result(GGML_STATUS_SUCCESS, io);
+
+    TEST_ASSERT(result == DaemonComputeResult::Cancelled);
+    TEST_ASSERT(cancel_polls == 1);
+    TEST_ASSERT(io.cancelled.load());
+}
+
+static void test_tokenizer_encode_honors_cancel_callback() {
+    Tokenizer tok;
+    int cancel_polls = 0;
+    bool cancelled = false;
+
+    try {
+        tok.encode("large request body", [&]() {
+            cancel_polls++;
+            return cancel_polls >= 2;
+        });
+    } catch (const TokenizationCancelled &) {
+        cancelled = true;
+    }
+
+    TEST_ASSERT(cancel_polls >= 2);
+    TEST_ASSERT(cancelled);
+}
+
 // ModelBackend common empty-spec retry tests
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -2421,6 +2515,8 @@ struct EmptySpecRetryBackend : MockBackend {
     int restore_calls = 0;
     bool generate_saw_force_ar = false;
     bool restore_saw_force_ar = false;
+    bool generate_first_empty_visible = false;
+    bool restore_first_empty_visible = false;
 
     GenerateResult generate(const GenerateRequest & req,
                             const DaemonIO &) override {
@@ -2432,6 +2528,10 @@ struct EmptySpecRetryBackend : MockBackend {
             result.tokens = {42};
         } else {
             result.spec_decode_ran = true;
+            if (generate_first_empty_visible) {
+                result.tokens = {2};
+                result.empty_visible_output = true;
+            }
         }
         return result;
     }
@@ -2446,6 +2546,10 @@ struct EmptySpecRetryBackend : MockBackend {
             result.tokens = {84};
         } else {
             result.spec_decode_ran = true;
+            if (restore_first_empty_visible) {
+                result.tokens = {2};
+                result.empty_visible_output = true;
+            }
         }
         return result;
     }
@@ -2481,6 +2585,45 @@ static void test_model_backend_retries_empty_spec_restore_once_with_ar() {
     TEST_ASSERT(result.ok);
     TEST_ASSERT(result.tokens.size() == 1);
     TEST_ASSERT(result.tokens[0] == 84);
+    TEST_ASSERT(result.spec_decode_ran);
+    TEST_ASSERT(backend.restore_calls == 2);
+    TEST_ASSERT(backend.restore_saw_force_ar);
+}
+
+static void test_model_backend_retries_empty_visible_spec_generate_once_with_ar() {
+    EmptySpecRetryBackend backend;
+    backend.generate_first_empty_visible = true;
+    GenerateRequest req;
+    req.prompt = {1, 2, 3};
+    req.n_gen = 4;
+    DaemonIO io;
+
+    GenerateResult result = backend.generate_with_empty_spec_fallback(req, io);
+
+    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.tokens.size() == 1);
+    TEST_ASSERT(result.tokens[0] == 42);
+    TEST_ASSERT(!result.empty_visible_output);
+    TEST_ASSERT(result.spec_decode_ran);
+    TEST_ASSERT(backend.generate_calls == 2);
+    TEST_ASSERT(backend.generate_saw_force_ar);
+}
+
+static void test_model_backend_retries_empty_visible_spec_restore_once_with_ar() {
+    EmptySpecRetryBackend backend;
+    backend.restore_first_empty_visible = true;
+    GenerateRequest req;
+    req.prompt = {1, 2, 3};
+    req.n_gen = 4;
+    DaemonIO io;
+
+    GenerateResult result =
+        backend.restore_and_generate_with_empty_spec_fallback(7, req, io);
+
+    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.tokens.size() == 1);
+    TEST_ASSERT(result.tokens[0] == 84);
+    TEST_ASSERT(!result.empty_visible_output);
     TEST_ASSERT(result.spec_decode_ran);
     TEST_ASSERT(backend.restore_calls == 2);
     TEST_ASSERT(backend.restore_saw_force_ar);
@@ -2714,9 +2857,18 @@ int main() {
     RUN_TEST(test_usage_timings_zero_decode_no_div_by_zero);
     RUN_TEST(test_usage_timings_omitted_when_null);
 
+    std::fprintf(stderr, "\n── DaemonIO cancellation ──\n");
+    RUN_TEST(test_daemon_io_cancel_callback_stops_emit_before_token_callback);
+    RUN_TEST(test_daemon_io_with_token_callback_preserves_cancel_callback);
+    RUN_TEST(test_daemon_compute_result_prefers_failure_over_cancel);
+    RUN_TEST(test_daemon_compute_result_reports_cancel_after_success);
+    RUN_TEST(test_tokenizer_encode_honors_cancel_callback);
+
     std::fprintf(stderr, "\n── ModelBackend empty-spec retry ──\n");
     RUN_TEST(test_model_backend_retries_empty_spec_generate_once_with_ar);
     RUN_TEST(test_model_backend_retries_empty_spec_restore_once_with_ar);
+    RUN_TEST(test_model_backend_retries_empty_visible_spec_generate_once_with_ar);
+    RUN_TEST(test_model_backend_retries_empty_visible_spec_restore_once_with_ar);
 
     std::fprintf(stderr, "\n── GenerateResult.accept_rate ──\n");
     RUN_TEST(test_generate_result_accept_rate_defaults_to_zero);

@@ -18,6 +18,13 @@
 
 namespace dflash::common {
 
+static void check_tokenizer_cancelled(
+        const TokenizerCancelCallback & should_cancel) {
+    if (should_cancel && should_cancel()) {
+        throw TokenizationCancelled();
+    }
+}
+
 // ─── Unicode helpers ────────────────────────────────────────────────────
 
 static int utf8_len(uint8_t c) {
@@ -147,7 +154,9 @@ static bool is_newline(uint32_t cp) {
 //   \s+(?!\S) |
 //   \s+
 
-std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const {
+std::vector<std::string> Tokenizer::pre_tokenize(
+        const std::string & text,
+        const TokenizerCancelCallback & should_cancel) const {
     std::vector<std::string> pieces;
     const char * s = text.c_str();
     const size_t len = text.size();
@@ -159,6 +168,8 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
     };
 
     while (pos < len) {
+        check_tokenizer_cancelled(should_cancel);
+
         size_t start = pos;
         int cplen = 0;
         uint32_t cp = peek_cp(pos, &cplen);
@@ -204,6 +215,7 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
             // One or more letter/mark chars
             if (cl > 0 && (is_letter(c) || is_mark(c))) {
                 while (cl > 0 && (is_letter(c) || is_mark(c))) {
+                    check_tokenizer_cancelled(should_cancel);
                     p += cl;
                     c = peek_cp(p, &cl);
                 }
@@ -234,12 +246,14 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
             size_t punc_start = p;
             while (cl > 0 && !is_whitespace(c) && !is_letter(c) &&
                    !is_mark(c) && !is_digit(c)) {
+                check_tokenizer_cancelled(should_cancel);
                 p += cl;
                 c = peek_cp(p, &cl);
             }
             if (p > punc_start) {
                 // Trailing newlines
                 while (cl > 0 && is_newline(c)) {
+                    check_tokenizer_cancelled(should_cancel);
                     p += cl;
                     c = peek_cp(p, &cl);
                 }
@@ -256,11 +270,13 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
             uint32_t c = peek_cp(p, &cl);
             // Consume leading whitespace
             while (cl > 0 && is_whitespace(c) && !is_newline(c)) {
+                check_tokenizer_cancelled(should_cancel);
                 p += cl;
                 c = peek_cp(p, &cl);
             }
             if (cl > 0 && is_newline(c)) {
                 while (cl > 0 && is_newline(c)) {
+                    check_tokenizer_cancelled(should_cancel);
                     p += cl;
                     c = peek_cp(p, &cl);
                 }
@@ -277,6 +293,7 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
             c = peek_cp(p, &cl);
             size_t prev_p = pos;  // position before last whitespace char
             while (cl > 0 && is_whitespace(c)) {
+                check_tokenizer_cancelled(should_cancel);
                 prev_p = p;
                 p += cl;
                 c = peek_cp(p, &cl);
@@ -361,7 +378,10 @@ static std::string encode_gpt2_bpe(const std::string & text) {
 }
 
 // Encode a single pre-tokenized piece using BPE merges.
-std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) const {
+std::vector<int32_t> Tokenizer::bpe_encode_piece(
+        const std::string & piece,
+        const TokenizerCancelCallback & should_cancel) const {
+    check_tokenizer_cancelled(should_cancel);
     if (piece.empty()) return {};
 
     std::vector<std::string> symbols;
@@ -380,6 +400,7 @@ std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) cons
         std::string encoded;
         encoded.reserve(sp_piece.size());
         for (char c : sp_piece) {
+            check_tokenizer_cancelled(should_cancel);
             if (c == ' ') {
                 encoded += "\xe2\x96\x81";
             } else {
@@ -397,6 +418,7 @@ std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) cons
         const char * p = encoded.c_str();
         const char * end = p + encoded.size();
         while (p < end) {
+            check_tokenizer_cancelled(should_cancel);
             int cplen;
             utf8_decode(p, (size_t)(end - p), &cplen);
             if (cplen <= 0) cplen = 1;
@@ -424,6 +446,7 @@ std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) cons
 
         // Split into individual GPT-2-encoded bytes as initial BPE symbols.
         for (size_t i = 0; i < piece.size(); i++) {
+            check_tokenizer_cancelled(should_cancel);
             std::string sym = byte_to_gpt2_unicode((uint8_t)piece[i]);
             auto sit = token_to_id_.find(sym);
             if (sit != token_to_id_.end()) {
@@ -446,10 +469,12 @@ std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) cons
 
     // Iteratively merge the highest-priority pair until no more merges apply.
     while (symbols.size() > 1) {
+        check_tokenizer_cancelled(should_cancel);
         int best_rank = std::numeric_limits<int>::max();
         size_t best_pos = SIZE_MAX;
 
         for (size_t i = 0; i + 1 < symbols.size(); i++) {
+            check_tokenizer_cancelled(should_cancel);
             std::string pair = symbols[i] + " " + symbols[i + 1];
             auto mit = merge_rank_.find(pair);
             if (mit != merge_rank_.end() && mit->second < best_rank) {
@@ -469,6 +494,7 @@ std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) cons
     std::vector<int32_t> ids;
     ids.reserve(symbols.size());
     for (const auto & sym : symbols) {
+        check_tokenizer_cancelled(should_cancel);
         auto sit = token_to_id_.find(sym);
         if (sit != token_to_id_.end()) {
             ids.push_back(sit->second);
@@ -493,6 +519,7 @@ std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) cons
             const char * p = sym.c_str();
             const char * end = p + sym.size();
             while (p < end) {
+                check_tokenizer_cancelled(should_cancel);
                 int cplen;
                 uint32_t cp = utf8_decode(p, (size_t)(end - p), &cplen);
                 uint8_t orig_byte;
@@ -634,12 +661,21 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
 }
 
 std::vector<int32_t> Tokenizer::encode(const std::string & text) const {
+    return encode(text, TokenizerCancelCallback{});
+}
+
+std::vector<int32_t> Tokenizer::encode(
+        const std::string & text,
+        const TokenizerCancelCallback & should_cancel) const {
+    check_tokenizer_cancelled(should_cancel);
+
     // If no added tokens, fast path: pre-tokenize → BPE entire text.
     if (added_tokens_.empty()) {
-        std::vector<std::string> pieces = pre_tokenize(text);
+        std::vector<std::string> pieces = pre_tokenize(text, should_cancel);
         std::vector<int32_t> ids;
         for (const auto & piece : pieces) {
-            auto piece_ids = bpe_encode_piece(piece);
+            check_tokenizer_cancelled(should_cancel);
+            auto piece_ids = bpe_encode_piece(piece, should_cancel);
             ids.insert(ids.end(), piece_ids.begin(), piece_ids.end());
         }
         return ids;
@@ -650,6 +686,8 @@ std::vector<int32_t> Tokenizer::encode(const std::string & text) const {
     std::vector<int32_t> ids;
     size_t pos = 0;
     while (pos < text.size()) {
+        check_tokenizer_cancelled(should_cancel);
+
         // Try to match any added token at current position.
         bool matched = false;
         for (const auto & [tok_str, tok_id] : added_tokens_) {
@@ -666,6 +704,7 @@ std::vector<int32_t> Tokenizer::encode(const std::string & text) const {
         // Find the next special token (or end of string).
         size_t next_special = text.size();
         for (const auto & [tok_str, tok_id] : added_tokens_) {
+            check_tokenizer_cancelled(should_cancel);
             size_t found = text.find(tok_str, pos);
             if (found != std::string::npos && found < next_special) {
                 next_special = found;
@@ -674,9 +713,10 @@ std::vector<int32_t> Tokenizer::encode(const std::string & text) const {
 
         // Pre-tokenize + BPE the normal segment.
         std::string segment = text.substr(pos, next_special - pos);
-        std::vector<std::string> pieces = pre_tokenize(segment);
+        std::vector<std::string> pieces = pre_tokenize(segment, should_cancel);
         for (const auto & piece : pieces) {
-            auto piece_ids = bpe_encode_piece(piece);
+            check_tokenizer_cancelled(should_cancel);
+            auto piece_ids = bpe_encode_piece(piece, should_cancel);
             ids.insert(ids.end(), piece_ids.begin(), piece_ids.end());
         }
         pos = next_special;
